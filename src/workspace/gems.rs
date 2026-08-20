@@ -47,7 +47,23 @@ pub struct Env {
     pub xdg_cache_home: Option<PathBuf>,
     /// The Windows spelling of the same thing.
     pub local_app_data: Option<PathBuf>,
+    /// Where a system-wide Ruby keeps its gems, in priority order.
+    ///
+    /// These are absolute paths that no environment variable steers, so they are the one rung of
+    /// discovery a fixture could not neutralise while they were written into `gem_roots` — and a
+    /// test whose answer depends on whether the machine running it has Ruby installed passes on
+    /// a laptop and fails on CI. `from_process` fills them in; `Default` leaves them empty, so
+    /// every fixture is hermetic by construction.
+    pub system_roots: Vec<PathBuf>,
 }
+
+/// The system-wide gem roots `Env::from_process` searches.
+const SYSTEM_GEM_ROOTS: [&str; 4] = [
+    "/opt/homebrew/lib/ruby/gems",
+    "/usr/local/lib/ruby/gems",
+    "/usr/lib/ruby/gems",
+    "/Library/Ruby/Gems",
+];
 
 impl Env {
     #[must_use]
@@ -73,6 +89,7 @@ impl Env {
             mise_data_dir: var("MISE_DATA_DIR"),
             xdg_cache_home: var("XDG_CACHE_HOME"),
             local_app_data: var("LOCALAPPDATA"),
+            system_roots: SYSTEM_GEM_ROOTS.iter().map(PathBuf::from).collect(),
         }
     }
 }
@@ -397,11 +414,11 @@ fn gem_roots(
         candidates.extend(ruby_installs(&home.join(".rvm/gems"), "ruby-", version));
     }
 
-    // 5. System-wide installs.
-    candidates.extend(abi_dirs(Path::new("/opt/homebrew/lib/ruby/gems"), version));
-    candidates.extend(abi_dirs(Path::new("/usr/local/lib/ruby/gems"), version));
-    candidates.extend(abi_dirs(Path::new("/usr/lib/ruby/gems"), version));
-    candidates.extend(abi_dirs(Path::new("/Library/Ruby/Gems"), version));
+    // 5. System-wide installs. Carried on `Env` rather than written here, because they are
+    //    absolute and a test has no way to point them somewhere harmless.
+    for base in &env.system_roots {
+        candidates.extend(abi_dirs(base, version));
+    }
 
     if let Some(home) = env.home.as_deref() {
         // 6. `gem install --user-install`. Modern RubyGems puts this under XDG; `~/.gem` is the
@@ -1026,6 +1043,41 @@ mod tests {
             let gems = discover(&project, &GemsConfig::default(), &env);
             assert_eq!(gems.gems.len(), 1, "{name} layout not found: {gems:?}");
         }
+    }
+
+    #[test]
+    fn the_system_gem_roots_are_searched_but_only_when_the_environment_says_so() {
+        // The four system roots are absolute, so while they were written into `gem_roots` no
+        // fixture could keep them out: a machine with a system Ruby answered questions the test
+        // meant to ask about its own temp directory. That is a test which passes on a laptop
+        // with no Ruby and fails on CI — `workspace::rbs`'s vendored-fallback tests did exactly
+        // that, finding the runner's `rbs` gem and reporting `Discovered`.
+        assert!(
+            Env::default().system_roots.is_empty(),
+            "a default Env must reach nothing outside the fixture"
+        );
+        assert!(
+            Env::from_process()
+                .system_roots
+                .contains(&PathBuf::from("/usr/lib/ruby/gems")),
+            "the real environment must still search the system roots"
+        );
+
+        // And they are still searched, or a machine whose only Ruby is the system one silently
+        // loses every gem.
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("system/lib/ruby/gems");
+        let project = dir.path().join("project");
+        lockfile(&project, RAILS_LOCK);
+        std::fs::write(project.join(".ruby-version"), "3.4.1\n").unwrap();
+        install(&system.join("3.4.0"), "rails-8.1.3", &["lib"]);
+
+        let env = Env {
+            system_roots: vec![system],
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+        assert_eq!(gems.gems.len(), 1, "{gems:?}");
     }
 
     #[test]

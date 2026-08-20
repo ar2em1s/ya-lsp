@@ -1499,13 +1499,10 @@ mod tests {
             encoding: PositionEncoding,
             env: gems::Env,
         ) -> Self {
-            // `Env::default()` keeps discovery away from the machine's version managers, but
-            // it cannot suppress the absolute system paths — `/opt/homebrew/lib/ruby/gems` and
-            // friends are not read from the environment. Those roots used to contribute
-            // nothing, because a lockfile names an exact `name-version` directory that a
-            // stranger's Ruby does not have; Ruby's own library and the vendored signatures
-            // have no such filter and would put the machine's stdlib in every test's graph.
-            // A fixture that wrote its own configuration keeps it.
+            // `Env::default()` carries no gem roots at all, system ones included, so nothing
+            // here can reach the machine's Ruby. This still turns the two off: extracting and
+            // indexing the vendored signatures is ~800 files of work that no test in this
+            // module is asking about. A fixture that wrote its own configuration keeps it.
             let config = root.path().join("ya-lsp.toml");
             if !config.exists() {
                 std::fs::write(

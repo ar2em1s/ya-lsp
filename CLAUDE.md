@@ -169,11 +169,15 @@ rubydex's exactly or `ruby-prism-sys` links twice), no async runtime.
   dropped rather than reported unresolved: resolution succeeded and `load_paths_for` then found no
   `lib/`. The fix is Ruby's own library as a load path, held once on `Gems::ruby_lib` rather than
   attached to each of the forty gems inside it.
-- **`Env::default()` does not make gem discovery hermetic.** `gem_roots` ends with four absolute
-  system paths that no environment variable controls. It never mattered while the lockfile named
-  an exact `name-version` directory; Ruby's library has no such filter, so the analysis test
-  harness writes a `ya-lsp.toml` turning `default_gems` and `rbs` off unless a fixture wrote its
-  own.
+- **Every gem root reaches `gem_roots` through `Env`, the four absolute system paths included.**
+  They used to be written into `gem_roots` itself, where nothing could steer them: a lockfile
+  names an exact `name-version` directory a stranger's Ruby does not have, so they contributed
+  nothing until Ruby's own library and rbs arrived with no such filter. `workspace::rbs`'s
+  vendored-fallback tests then passed on a laptop with no Ruby and failed on CI, where a system
+  Ruby's `rbs` gem answered `Discovered`. `Env::from_process` fills `system_roots` in;
+  `Env::default` leaves it empty, which is what makes a fixture hermetic. The analysis harness
+  still writes a `ya-lsp.toml` turning `default_gems` and `rbs` off, now only to skip ~800 files
+  of signature work no test there asks about.
 - **Which classes are "core" is rbs's call and it moves.** `Set` and `Pathname` are both in
   `core/` as of rbs 4.x. A test that needs a genuinely stdlib-only constant uses `OptionParser`.
 - **Bumping `vendor/rbs` changes the answers ya-lsp gives.** Measured across rbs 3.10 → 4.1.3:

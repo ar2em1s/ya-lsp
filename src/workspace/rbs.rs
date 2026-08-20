@@ -418,11 +418,22 @@ mod tests {
     fn discovery_falls_back_to_the_vendored_copy() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
+        let env = env_with(home.path());
+
+        // Stated rather than assumed: the rung below is only reached because nothing on the
+        // machine is visible from here. `Env::default()` carries no system roots for exactly
+        // this reason — when it did, a CI runner with a system `rbs` gem answered `Discovered`
+        // and this assertion failed on a machine nobody could see.
+        assert!(
+            gems::roots(workspace.path(), &GemsConfig::default(), &env).is_empty(),
+            "gem discovery escaped the fixture"
+        );
+
         let signatures = discover(
             workspace.path(),
             &RbsConfig::default(),
             &GemsConfig::default(),
-            &env_with(home.path()),
+            &env,
         );
 
         assert_eq!(signatures.origin, Some(Origin::Vendored));
