@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run the extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/editors/vscode",
+        "${workspaceFolder}/tmp"
+      ],
+      "outFiles": ["${workspaceFolder}/editors/vscode/dist/**/*.js"],
+      "preLaunchTask": "build the extension",
+      "env": {
+        "YA_LSP_LOG": "ya_lsp=debug"
+      }
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    // TypeScript 7 no longer auto-discovers `node_modules/@types`, and being explicit also keeps
+    // a transitive `@types` package from leaking globals into the build.
+    "types": ["node", "vscode"],
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "outDir": "out",
+    "rootDir": "src",
+    "sourceMap": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "out", "dist"]
+}

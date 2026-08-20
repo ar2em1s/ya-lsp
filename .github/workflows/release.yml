@@ -1,0 +1,210 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Buildable on demand, so the matrix can be exercised without cutting a release.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # The tag decides which version is announced; the version actually inside the VSIX comes from
+  # `package.json`, and nothing else connects the two. Publishing 0.1.0 under a release labelled
+  # v0.2.0 cannot be walked back, because a Marketplace version number is never reusable — so the
+  # three places that name a version have to agree before six runners spend twenty minutes
+  # building anything. Its own job rather than a first step, so it fails in seconds.
+  guard:
+    name: the tag matches the manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No `if:` on the job — a skipped job skips everything that `needs` it, which would quietly
+      # disable the whole matrix on `workflow_dispatch`. The check opts out from the inside.
+      - name: the tag, the extension and the crate all name one version
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "not a tag build; nothing to check"
+            exit 0
+          fi
+
+          tag="${GITHUB_REF_NAME#v}"
+          extension=$(jq -r .version editors/vscode/package.json)
+          # The crate version without needing cargo: the first `version` inside `[package]`,
+          # which is why the section has to be tracked rather than grepping the whole file.
+          crate=$(awk '/^\[package\]/{inside=1; next} /^\[/{inside=0} inside && /^version[[:space:]]*=/{gsub(/["[:space:]]/, ""); sub(/^version=/, ""); print; exit}' Cargo.toml)
+
+          echo "tag=$tag  extension=$extension  crate=$crate"
+
+          status=0
+          if [ -z "$tag" ] || [ "$tag" = "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' is not of the form v<version>"
+            status=1
+          fi
+          if [ "$tag" != "$extension" ]; then
+            echo "::error::tag says $tag, editors/vscode/package.json says $extension"
+            status=1
+          fi
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag says $tag, Cargo.toml says $crate"
+            status=1
+          fi
+          exit $status
+
+  vsix:
+    name: ${{ matrix.vscode }}
+    needs: guard
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One platform failing must not cancel the others: a missing runner label is far more
+      # likely than a real regression, and the rest of the matrix is still worth having.
+      fail-fast: false
+      matrix:
+        include:
+          # Built natively rather than cross-compiled: `ruby-prism-sys` compiles C, so a cross
+          # build needs a full target toolchain rather than just a Rust target.
+          - { vscode: darwin-arm64, runner: macos-14, rust: aarch64-apple-darwin }
+          - { vscode: darwin-x64, runner: macos-13, rust: x86_64-apple-darwin }
+          # The oldest supported runner on purpose: a glibc-linked binary runs on that glibc and
+          # anything newer, never anything older, so building on the newest image would silently
+          # drop every long-term-support distro.
+          - { vscode: linux-x64, runner: ubuntu-22.04, rust: x86_64-unknown-linux-gnu }
+          - { vscode: linux-arm64, runner: ubuntu-22.04-arm, rust: aarch64-unknown-linux-gnu }
+          - { vscode: win32-x64, runner: windows-latest, rust: x86_64-pc-windows-msvc }
+          - { vscode: win32-arm64, runner: windows-11-arm, rust: aarch64-pc-windows-msvc }
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.1"
+          targets: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          # One source of truth with the local toolchain; setup-node reads `.tool-versions`.
+          node-version-file: .tool-versions
+          cache: yarn
+          cache-dependency-path: editors/vscode/yarn.lock
+
+      - run: cargo build --release --target ${{ matrix.rust }}
+
+      - name: stage the server
+        shell: bash
+        run: |
+          mkdir -p editors/vscode/server
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.rust }}/release/ya-lsp.exe" editors/vscode/server/ya-lsp.exe
+          else
+            cp "target/${{ matrix.rust }}/release/ya-lsp" editors/vscode/server/ya-lsp
+            chmod +x editors/vscode/server/ya-lsp
+          fi
+
+      - run: yarn install --frozen-lockfile
+        working-directory: editors/vscode
+      - run: yarn test
+        working-directory: editors/vscode
+
+      - name: package
+        working-directory: editors/vscode
+        run: yarn vsce package --target ${{ matrix.vscode }} --out "ya-lsp-${{ matrix.vscode }}.vsix"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ya-lsp-${{ matrix.vscode }}
+          path: editors/vscode/*.vsix
+          if-no-files-found: error
+
+      # The server on its own, for anyone not using VS Code. Archived rather than attached bare
+      # for two reasons: a release asset downloaded over HTTP arrives without its executable bit,
+      # and a lone binary has no materials accompanying it — which is what BSD-2-Clause wants the
+      # `rbs` notice to appear in. `--licenses` covers that from inside the binary; NOTICE.txt
+      # beside it is what somebody sees without running anything.
+      #
+      # Each platform archives *and checks* in its own shell. The check was one `bash` step for
+      # all six until it was noticed that it needed `unzip`, which is not guaranteed on the
+      # Windows runners — and a missing tool there fails at release time and nowhere earlier.
+      - name: archive the server
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="ya-lsp-${{ matrix.rust }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.rust }}/release/ya-lsp" "dist/$name/ya-lsp"
+          chmod +x "dist/$name/ya-lsp"
+          cp CHANGELOG.md LICENSE.txt NOTICE.txt README.md THIRD-PARTY-NOTICES.txt "dist/$name/"
+          tar czf "dist/$name.tar.gz" -C dist "$name"
+          rm -rf "dist/$name"
+
+          tar tzf "dist/$name.tar.gz"
+          tar xzf "dist/$name.tar.gz" -O "$name/NOTICE.txt" | grep -qF "Soutaro Matsumoto" \
+            || { echo "::error::$name.tar.gz has no third-party notice"; exit 1; }
+
+      - name: archive the server (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "ya-lsp-${{ matrix.rust }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.rust }}/release/ya-lsp.exe" "dist/$name/ya-lsp.exe"
+          Copy-Item CHANGELOG.md, LICENSE.txt, NOTICE.txt, README.md, THIRD-PARTY-NOTICES.txt "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          Remove-Item -Recurse -Force "dist/$name"
+
+          Expand-Archive -Path "dist/$name.zip" -DestinationPath "check"
+          Get-ChildItem -Recurse check | ForEach-Object { $_.FullName }
+          if (-not (Select-String -Path "check/$name/NOTICE.txt" -SimpleMatch "Soutaro Matsumoto" -Quiet)) {
+            Write-Output "::error::$name.zip has no third-party notice"
+            exit 1
+          }
+          Remove-Item -Recurse -Force check
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ya-lsp-server-${{ matrix.rust }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: attach to the release
+    needs: vsix
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # One file covering everything, rather than a `.sha256` beside each asset: a reader wants
+      # to check one download against one list, and `sha256sum -c` takes this shape directly.
+      #
+      # `nullglob` because the matrix is `fail-fast: false` on purpose — a platform whose runner
+      # label went stale must not take the release down with it, so a missing archive is a gap in
+      # the list rather than an error here. An empty list *is* an error.
+      - name: checksums
+        working-directory: artifacts
+        run: |
+          shopt -s nullglob
+          files=(*.vsix *.tar.gz *.zip)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no artifacts to attach to the release"
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: true
+
+  # Publishing to the Marketplace is deliberately not automatic. It is irreversible per version,
+  # it needs a `VSCE_PAT` secret, and the six VSIXs have to go up together or the Marketplace
+  # serves a platform mismatch. Run it by hand once the release artifacts look right:
+  #
+  #   yarn vsce publish --packagePath ya-lsp-*.vsix

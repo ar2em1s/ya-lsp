@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A build failure is not worth the debug info it produces here.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  server:
+    name: server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Hard-coded because no toolchain action reads `.tool-versions`. Asserted rather than
+      # trusted, so the two cannot drift into building against a compiler nobody uses.
+      - run: grep -qx "rust 1.93.1" .tool-versions
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.1"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+      # `THIRD-PARTY-NOTICES.txt` is committed rather than generated at build time, so that
+      # `cargo build` and `cargo install` need no extra tool. The trade is that it can go stale,
+      # and a stale notice is one that silently omits a dependency somebody added — so it is
+      # regenerated here and the result has to match byte for byte. `about.toml` lists the
+      # licences that may appear; an unlisted one fails this step rather than shipping.
+      - name: the third-party notices are current
+        run: |
+          cargo install cargo-about --locked --features cli --version ^0.9
+          cargo about generate about.hbs -o /tmp/notices.txt
+          diff -u THIRD-PARTY-NOTICES.txt /tmp/notices.txt || {
+            echo "::error::THIRD-PARTY-NOTICES.txt is stale; run: cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt"
+            exit 1
+          }
+
+      # Two copies of the Prism C library link twice and fail with duplicate symbols, and the
+      # version constraint that prevents it lives in Cargo.toml where nothing enforces it. The
+      # same goes for `line-index`, which rubydex and ya-lsp both use to index the same text.
+      - name: one copy of each shared native dependency
+        run: |
+          for crate in ruby-prism-sys line-index; do
+            count=$(cargo tree --invert "$crate" --prefix none \
+              | grep -c "^$crate v" || true)
+            if [ "$count" -ne 1 ]; then
+              echo "::error::$count copies of $crate; expected exactly 1"
+              cargo tree --invert "$crate"
+              exit 1
+            fi
+          done
+
+  extension:
+    name: extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.1"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          # One source of truth with the local toolchain; setup-node reads `.tool-versions`.
+          node-version-file: .tool-versions
+          cache: yarn
+          cache-dependency-path: editors/vscode/yarn.lock
+
+      # The extension's contract test talks to a real server. Without one it skips, which would
+      # make this job pass while proving nothing.
+      - run: cargo build --release
+      - run: |
+          mkdir -p editors/vscode/server
+          cp target/release/ya-lsp editors/vscode/server/ya-lsp
+
+      - run: yarn install --frozen-lockfile
+        working-directory: editors/vscode
+      - run: yarn lint
+        working-directory: editors/vscode
+      - run: yarn test
+        working-directory: editors/vscode
+
+      # Catch a `.vscodeignore` or manifest mistake here rather than at release time.
+      - run: yarn vsce package --target linux-x64 --out /tmp/ya-lsp.vsix
+        working-directory: editors/vscode
+      - name: the VSIX contains a runnable server
+        run: |
+          unzip -l /tmp/ya-lsp.vsix | grep -q 'extension/dist/extension.js'
+          # The mode bits, not just the path. A zip that loses the executable bit installs
+          # cleanly and then fails to spawn for every user, and nothing before this notices.
+          unzip -Z /tmp/ya-lsp.vsix 'extension/server/*' | grep -qE '^-rwx' \
+            || { echo "::error::the server in the VSIX is not executable"; exit 1; }
+
+      # The bundled binary embeds the `rbs` gem's signatures, and the 2-clause BSD licence
+      # requires its notice to appear in the materials accompanying a *binary* distribution.
+      # The VSIX is the only binary ya-lsp ships, so these files are that material. Both are
+      # staged from the repository root at package time rather than committed here, so they can
+      # go missing without anything in the extension's own tree changing — which is how the
+      # notice was briefly absent once already.
+      - name: the VSIX carries the third-party notices
+        run: |
+          unzip -p /tmp/ya-lsp.vsix extension/NOTICE.txt > /tmp/vsix-notice.txt
+          # The three things BSD-2-Clause names: the copyright notice, the conditions, and the
+          # disclaimer. `cargo about` cannot supply the first of them — neither rbs crate ships
+          # a licence file to harvest — so this is the only copy in the VSIX.
+          for phrase in "Soutaro Matsumoto" "Redistributions in binary form" \
+                        "THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS"; do
+            grep -qF "$phrase" /tmp/vsix-notice.txt \
+              || { echo "::error::the VSIX notice is missing: $phrase"; exit 1; }
+          done
+          unzip -p /tmp/ya-lsp.vsix extension/THIRD-PARTY-NOTICES.txt | grep -qF "ruby-rbs-sys" \
+            || { echo "::error::the VSIX is missing the crate notices"; exit 1; }
+          # LICENSE.txt is MIT and nothing else: appending to it is what a licence detector
+          # fails to recognise, and it is why NOTICE.txt exists as a separate file.
+          unzip -p /tmp/ya-lsp.vsix extension/LICENSE.txt > /tmp/vsix-licence.txt
+          grep -qF "The MIT License (MIT)" /tmp/vsix-licence.txt \
+            || { echo "::error::the VSIX has no MIT licence"; exit 1; }
+          if grep -qF "Soutaro" /tmp/vsix-licence.txt; then
+            echo "::error::the rbs notice is back in LICENSE.txt; it belongs in NOTICE.txt"
+            exit 1
+          fi

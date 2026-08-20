@@ -1,0 +1,33 @@
+# Which licences may appear in the dependency graph. An unlisted one fails generation rather
+# than landing quietly in a shipped notice, which is the point of the list: it turns "we picked
+# up a new dependency" into a decision somebody makes.
+# Order matters: for a crate offered under several licences, the first entry here that satisfies
+# its expression is the one elected — and the one whose text gets reproduced. MIT leads because
+# almost the whole tree is `MIT OR Apache-2.0`, and MIT is shorter and asks less of us.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# Every platform a release is built for, so one generated notice is correct for all six. The
+# Windows-only and Unix-only crates differ, and a notice generated on one machine must not be
+# missing the licences that ship on another.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
+# Neither ships in the binary, so neither owes a notice in it.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

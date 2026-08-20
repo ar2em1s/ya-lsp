@@ -1,0 +1,12 @@
+# Everything the VSIX does not need. The server binary is deliberately NOT here: CI copies it
+# into `server/` before packaging, and it is the whole point of a per-platform build.
+.vscode/**
+.vscode-test/**
+src/**
+out/**
+node_modules/**
+esbuild.mjs
+tsconfig.json
+**/*.map
+**/*.ts
+.gitignore

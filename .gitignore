@@ -1,0 +1,8 @@
+/target
+
+/tmp/**/*
+!/tmp/.keep
+
+# The extension's own build outputs are ignored in editors/vscode/.gitignore; this catches the
+# staged server binary if it is ever copied somewhere else.
+*.vsix

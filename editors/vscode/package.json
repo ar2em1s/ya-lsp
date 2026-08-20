@@ -1,0 +1,159 @@
+{
+  "name": "ya-lsp",
+  "displayName": "ya-lsp — Ruby",
+  "description": "A standalone Ruby language server. No Ruby runtime required.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "icon": "images/logo.png",
+  "publisher": "ar2em1s",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ar2em1s/ya-lsp.git",
+    "directory": "editors/vscode"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "ruby",
+    "language server",
+    "lsp"
+  ],
+  "engines": {
+    "vscode": "^1.108.0"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onLanguage:ruby"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "ya-lsp",
+      "properties": {
+        "ya-lsp.serverPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to a `ya-lsp` binary to use instead of the one bundled with this extension. Point it at `target/release/ya-lsp` to develop against a local build. `~` and `${workspaceFolder}` are expanded.",
+          "scope": "machine-overridable"
+        },
+        "ya-lsp.logLevel": {
+          "type": "string",
+          "enum": [
+            "off",
+            "error",
+            "warn",
+            "info",
+            "debug",
+            "trace"
+          ],
+          "default": "warn",
+          "markdownDescription": "How much the server writes to the ya-lsp output channel. Read from the environment when the server starts, so changing it restarts the server.",
+          "scope": "machine-overridable"
+        },
+        "ya-lsp.gems.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Index the project's gems, so that go-to-definition and completion reach into them. Turning this off makes startup slightly faster and everything else worse."
+        },
+        "ya-lsp.gems.defaultGems": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Index the gems that ship inside Ruby itself — `json`, `uri`, `forwardable`, `optparse` and about forty others. Their directories under `gems/` are empty placeholders, so without this they resolve to nothing and `require \"json\"` leads nowhere."
+        },
+        "ya-lsp.gems.rubyVersion": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Which Ruby's gems to index, as in `3.3.0`. Leave empty to detect it from `.ruby-version`, `Gemfile.lock`, or `.tool-versions`."
+        },
+        "ya-lsp.rbs.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Index Ruby's own core signatures, so `String`, `Array`, `Hash` and `Kernel` have members to complete and documentation to hover. Comes from the `rbs` gem when one is installed, and from a copy inside ya-lsp when none is."
+        },
+        "ya-lsp.rbs.stdlib": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Also index the standard library's signatures — `CSV`, `URI`, `Logger`, `OptionParser` and ~57 others. Adds about 3.5 ms to every request, so turn it off on a very large project that only needs the core classes."
+        },
+        "ya-lsp.rbs.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "An explicit directory of RBS signatures — one holding `core/`, usually an unpacked `rbs` gem. Leave empty to find one automatically."
+        },
+        "ya-lsp.diagnostics.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Report problems found while indexing."
+        },
+        "ya-lsp.diagnostics.rules": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string",
+            "enum": [
+              "off",
+              "error",
+              "warning",
+              "information",
+              "hint"
+            ]
+          },
+          "markdownDescription": "How loudly an individual rule reports, keyed by the rule name shown in the problem's `code`. Most rules ship `off` because they fire on correct Ruby; `{ \"dynamic-ancestor\": \"warning\" }` turns one back on.",
+          "examples": [
+            {
+              "parse-error": "error",
+              "dynamic-ancestor": "off"
+            }
+          ]
+        },
+        "ya-lsp.index.maxFiles": {
+          "type": "integer",
+          "default": 50000,
+          "minimum": 1,
+          "markdownDescription": "Refuse to index a workspace larger than this rather than thrashing."
+        },
+        "ya-lsp.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Log the LSP traffic between VS Code and ya-lsp. For debugging the extension itself."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "ya-lsp.restart",
+        "title": "Restart Server",
+        "category": "ya-lsp"
+      },
+      {
+        "command": "ya-lsp.showOutput",
+        "title": "Show Output",
+        "category": "ya-lsp"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "lint": "tsc -p . --noEmit",
+    "bundle": "node esbuild.mjs",
+    "test": "yarn compile && yarn bundle && node --test \"out/**/*.test.js\"",
+    "stage-shared": "node -e \"for (const f of ['NOTICE.txt','THIRD-PARTY-NOTICES.txt','CHANGELOG.md']) require('fs').copyFileSync('../../'+f, f)\"",
+    "vscode:prepublish": "yarn stage-shared && yarn bundle",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "@types/vscode": "1.108.1",
+    "@vscode/vsce": "^3.9.0",
+    "esbuild": "^0.28.0",
+    "typescript": "^7.0.0"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build the extension",
+      "type": "shell",
+      // The debug build, because F5 is for finding out what the server does rather than how
+      // fast it does it. Point `ya-lsp.serverPath` at target/release/ya-lsp to measure.
+      "command": "cargo build && mkdir -p editors/vscode/server && cp target/debug/ya-lsp editors/vscode/server/ya-lsp && cd editors/vscode && yarn install --frozen-lockfile && yarn bundle",
+      "group": "build",
+      "problemMatcher": ["$rustc", "$tsc"]
+    }
+  ]
+}

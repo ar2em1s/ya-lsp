@@ -1,0 +1,9 @@
+node_modules/
+out/
+dist/
+server/
+*.vsix
+# Staged from the repository root at package time; the root holds the only copy.
+NOTICE.txt
+THIRD-PARTY-NOTICES.txt
+CHANGELOG.md
