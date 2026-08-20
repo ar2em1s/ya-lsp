@@ -66,7 +66,6 @@ jobs:
           # Built natively rather than cross-compiled: `ruby-prism-sys` compiles C, so a cross
           # build needs a full target toolchain rather than just a Rust target.
           - { vscode: darwin-arm64, runner: macos-14, rust: aarch64-apple-darwin }
-          - { vscode: darwin-x64, runner: macos-13, rust: x86_64-apple-darwin }
           # The oldest supported runner on purpose: a glibc-linked binary runs on that glibc and
           # anything newer, never anything older, so building on the newest image would silently
           # drop every long-term-support distro.
