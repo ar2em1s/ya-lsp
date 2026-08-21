@@ -1,6 +1,6 @@
 {
-  "name": "ya-lsp",
-  "displayName": "ya-lsp — Ruby",
+  "name": "ya_lsp",
+  "displayName": "ya-lsp",
   "description": "A standalone Ruby language server. No Ruby runtime required.",
   "version": "0.1.0",
   "license": "MIT",
