@@ -1,5 +1,5 @@
 {
-  "name": "ya_lsp",
+  "name": "yalsp",
   "displayName": "ya-lsp",
   "description": "A standalone Ruby language server. No Ruby runtime required.",
   "version": "0.1.0",
