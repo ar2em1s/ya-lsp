@@ -14,6 +14,8 @@ use std::{
 
 use serde::Deserialize;
 
+use crate::messages;
+
 pub const CONFIG_FILE_NAME: &str = "ya-lsp.toml";
 
 /// How loudly a diagnostic rule reports, or `Off` to silence it.
@@ -281,7 +283,7 @@ pub fn load(root: &Path, initialization_options: Option<&serde_json::Value>) -> 
     if let Some(options) = initialization_options {
         match serde_json::from_value::<PartialConfig>(options.clone()) {
             Ok(layer) => config.apply(layer),
-            Err(error) => problems.push(format!("ignoring initializationOptions: {error}")),
+            Err(error) => problems.push(messages::initialization_options_ignored(&error)),
         }
     }
 
@@ -291,13 +293,15 @@ pub fn load(root: &Path, initialization_options: Option<&serde_json::Value>) -> 
             match toml::from_str::<PartialConfig>(&text) {
                 Ok(layer) => config.apply(layer),
                 // serde's message already names the offending key and lists the valid ones.
-                Err(error) => problems.push(format!("ignoring {CONFIG_FILE_NAME}: {error}")),
+                Err(error) => {
+                    problems.push(messages::config_file_ignored(CONFIG_FILE_NAME, &error));
+                }
             }
             Some(path)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
-            problems.push(format!("could not read {}: {error}", path.display()));
+            problems.push(messages::config_file_unreadable(&path, &error));
             None
         }
     };
@@ -321,16 +325,18 @@ fn validate(config: &Config) -> Vec<String> {
     ] {
         for pattern in patterns {
             if let Err(error) = glob::Pattern::new(pattern) {
-                problems.push(format!("{field}: invalid glob {pattern:?}: {error}"));
+                problems.push(messages::invalid_glob(field, pattern, &error));
             }
         }
     }
 
     if config.index.include.is_empty() {
-        problems.push("index.include is empty: nothing will be indexed".to_owned());
+        problems.push(messages::include_is_empty(&IndexConfig::default().include));
     }
     if config.index.max_files == 0 {
-        problems.push("index.max_files is 0: nothing will be indexed".to_owned());
+        problems.push(messages::max_files_is_zero(
+            IndexConfig::default().max_files,
+        ));
     }
 
     // A configured rbs root that is not one is worth saying out loud: the fallback is silent,
@@ -338,15 +344,13 @@ fn validate(config: &Config) -> Vec<String> {
     if let Some(path) = &config.rbs.path
         && !path.join("core").is_dir()
     {
-        problems.push(format!(
-            "rbs.path {} has no core/ directory: falling back to the vendored signatures",
-            path.display()
-        ));
+        problems.push(messages::rbs_path_has_no_core(path));
     }
 
     problems
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +368,95 @@ mod tests {
         assert_eq!(loaded.config, Config::default());
         assert!(loaded.path.is_none());
         assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+    }
+
+    #[test]
+    fn a_config_file_that_cannot_be_read_is_a_problem_not_a_missing_file() {
+        // "Not there" is the ordinary case and says nothing. Anything else — a directory where
+        // the file should be, a permission error — is a config the user believes is in effect.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(CONFIG_FILE_NAME)).unwrap();
+
+        let loaded = load(dir.path(), None);
+        assert_eq!(loaded.config, Config::default(), "the defaults still apply");
+        assert!(loaded.path.is_none());
+        assert_eq!(loaded.problems.len(), 1, "{:?}", loaded.problems);
+        assert!(
+            loaded.problems[0].contains("could not be opened"),
+            "{:?}",
+            loaded.problems
+        );
+    }
+
+    #[test]
+    fn initialization_options_that_do_not_parse_are_reported_and_dropped() {
+        // The editor's layer is the one the user cannot see. Silently ignoring it would leave
+        // every setting they changed apparently doing nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let options = serde_json::json!({ "index": { "max_files": "lots" } });
+        let loaded = load(dir.path(), Some(&options));
+        assert_eq!(loaded.config, Config::default());
+        assert_eq!(loaded.problems.len(), 1, "{:?}", loaded.problems);
+        assert!(
+            loaded.problems[0].contains("initializationOptions"),
+            "{:?}",
+            loaded.problems
+        );
+    }
+
+    #[test]
+    fn a_configuration_that_would_index_nothing_says_so() {
+        // Each of these is a config that starts a server which then answers every question with
+        // silence — the single hardest failure to attribute to a setting.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            "[index]\ninclude = []\nmax_files = 0\nexclude = [\"[\"]\n",
+        )
+        .unwrap();
+
+        let loaded = load(dir.path(), None);
+        let joined = loaded.problems.join("\n");
+        for expected in [
+            "index.include is empty",
+            "index.max_files is 0",
+            "index.exclude has an invalid glob",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "missing {expected:?} in {joined}"
+            );
+        }
+        assert!(loaded.path.is_some(), "the file was still read");
+    }
+
+    #[test]
+    fn an_rbs_path_that_is_not_a_signature_root_is_worth_saying_out_loud() {
+        // The fallback is silent, and "my signatures are the wrong version" is not a symptom
+        // anyone traces back to a typo in a path.
+        let dir = tempfile::tempdir().unwrap();
+        let signatures = dir.path().join("signatures");
+        std::fs::create_dir_all(&signatures).unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            format!("[rbs]\npath = \"{}\"\n", signatures.display()),
+        )
+        .unwrap();
+
+        let loaded = load(dir.path(), None);
+        assert_eq!(loaded.problems.len(), 1, "{:?}", loaded.problems);
+        assert!(
+            loaded.problems[0].contains("has no core directory"),
+            "{:?}",
+            loaded.problems
+        );
+
+        // With `core/` there, it is a signature root and there is nothing to report.
+        std::fs::create_dir_all(signatures.join("core")).unwrap();
+        assert!(
+            load(dir.path(), None).problems.is_empty(),
+            "a real signature root should be silent"
+        );
     }
 
     #[test]

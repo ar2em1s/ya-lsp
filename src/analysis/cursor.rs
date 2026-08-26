@@ -44,6 +44,30 @@ pub enum Context {
     Argument { name: u32 },
 }
 
+impl Context {
+    /// Whether Ruby would let a *private* method be written where the cursor is.
+    ///
+    /// It permits one with an implicit receiver, and since 2.7 with a receiver spelled `self` —
+    /// through `.` and through `::` alike; both were checked against a real interpreter, as was
+    /// the fact that `other.secret` still raises from inside the class that declares `secret`.
+    ///
+    /// Which of those the cursor sits in is a question about the syntax and nothing else, so it
+    /// is answered here rather than where the graph is. It is deliberately stricter than
+    /// rubydex, whose own check passes a private method whenever the caller's `self` is the same
+    /// class as the receiver — Ruby's exemption is for the receiver being *written* `self`, not
+    /// for it happening to be the same class.
+    #[must_use]
+    pub fn allows_private(self) -> bool {
+        match self {
+            // No receiver written at all, so the call has one implicitly.
+            Context::Expression | Context::Argument { .. } => true,
+            Context::MethodCall { receiver } | Context::NamespaceAccess { receiver } => {
+                matches!(receiver, Receiver::SelfObject)
+            }
+        }
+    }
+}
+
 /// The thing to the left of the `.` or the `::`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Receiver {
@@ -178,7 +202,8 @@ struct Finder<'s> {
     operator: Option<Context>,
     /// An offset inside the name of the innermost call whose argument list holds the cursor.
     arguments: Option<u32>,
-    /// The span of the local variable the innermost operator's receiver is, when it is one.
+    /// The span of the innermost operator's receiver, when it is a local the parse could not
+    /// type — the only case `type_the_local` has anything to say about.
     ///
     /// Held rather than resolved on the spot because the walk is pre-order: an assignment
     /// earlier in the file has not necessarily been visited by the time the call is.
@@ -209,10 +234,16 @@ impl<'pr> Visit<'pr> for Finder<'_> {
             && self.offset <= message.end_offset() as u32
         {
             let receiver = node.receiver();
+            let classified = receiver_of(receiver.as_ref());
+            // Only when the parse said nothing about the type: `type_the_local` exists to fill
+            // that in, and holding the span in any other case would mean re-establishing at the
+            // point of use what is already known here.
+            self.local = matches!(classified, Receiver::Unknown)
+                .then(|| receiver.as_ref().and_then(local_span))
+                .flatten();
             self.operator = Some(Context::MethodCall {
-                receiver: receiver_of(receiver.as_ref()),
+                receiver: classified,
             });
-            self.local = receiver.as_ref().and_then(local_span);
         }
 
         if let Some(region) = self.argument_region(node)
@@ -319,13 +350,9 @@ impl Finder<'_> {
     /// project. `depth` is ignored for the same reason — a block's `x` and the outer `x` are
     /// treated as one variable, which is what they usually are.
     fn type_the_local(&mut self) {
+        // `local` is set only alongside a `MethodCall` whose receiver came out `Unknown`, so
+        // this needs no second look at `operator` to know what it is about to overwrite.
         let Some((start, end)) = self.local else {
-            return;
-        };
-        let Some(Context::MethodCall {
-            receiver: Receiver::Unknown,
-        }) = self.operator
-        else {
             return;
         };
 
@@ -472,6 +499,7 @@ fn local_span(node: &Node<'_>) -> Option<(u32, u32)> {
     Some((location.start_offset() as u32, location.end_offset() as u32))
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +531,93 @@ mod tests {
     }
 
     #[test]
+    fn nothing_written_after_the_cursor_is_something_the_cursor_is_inside() {
+        // Every span this module tests is a pair of bounds, and a fixture written *around* the
+        // cursor only ever exercises the upper one. A comment, a `::` and a literal that all
+        // begin after the offset have to leave the classification alone — miss the lower bound
+        // and completion goes silent on the first line of a file that has a string later in it.
+        assert!(
+            matches!(
+                context("~\n# a note\nHR::Person\n\"later\"\n"),
+                Context::Expression
+            ),
+            "a comment, a namespace and a string that all start later are not where the cursor is"
+        );
+    }
+
+    #[test]
+    fn a_call_with_no_name_in_it_is_not_somewhere_to_complete() {
+        // `foo.()` is `foo.call()` written with no name at all, and it is the only shape Prism
+        // gives a call operator and no message. Neither half of `visit_call_node` may claim it:
+        // there is no name for a completion to replace, and no signature for the parentheses to
+        // be the arguments of.
+        assert!(
+            matches!(context("foo.(~)"), Context::Expression),
+            "the parentheses of a `.()` call are not an argument list we know the callee of"
+        );
+    }
+
+    #[test]
+    fn a_comment_ends_at_its_line_and_code_after_it_is_code() {
+        // Both bounds of the same test. Completion must not fire inside a comment, and must
+        // fire again on the line below one — the check is inclusive of the end because a
+        // comment's span stops at its last character, and the cursor parks past it.
+        assert!(at_marker("# a note ~").is_none(), "inside the comment");
+        assert!(at_marker("# a note~").is_none(), "at its last character");
+        assert!(
+            matches!(context("# a note\n\"x\".~"), Context::MethodCall { .. }),
+            "the line below a comment is code"
+        );
+        assert!(
+            matches!(context("x = 1 # why\n\"y\".~"), Context::MethodCall { .. }),
+            "and so is the line below a trailing comment"
+        );
+    }
+
+    #[test]
+    fn a_local_takes_the_type_of_the_last_assignment_that_had_one() {
+        // The one place this module can be confidently wrong, so the rule is stated: the
+        // textually last preceding assignment whose value ends before the cursor — and
+        // assignments whose value has no knowable type are passed over rather than taken.
+        assert_eq!(receiver("x = 1\nx.~"), Receiver::Literal("Integer"));
+        assert_eq!(
+            receiver("x = whatever\nx = \"s\"\nx.~"),
+            Receiver::Literal("String"),
+            "an untypeable assignment is not the answer when a typed one exists"
+        );
+        assert_eq!(
+            receiver("x = 1\nother = \"s\"\nx.~"),
+            Receiver::Literal("Integer"),
+            "and neither is a later assignment to a different name"
+        );
+        assert_eq!(
+            receiver("x = \"s\"\nx = whatever\nx.~"),
+            Receiver::Literal("String"),
+            "and it does not erase one either"
+        );
+        assert_eq!(
+            receiver("x = whatever\nx.~"),
+            Receiver::Unknown,
+            "with nothing typed anywhere, the receiver stays unknown"
+        );
+    }
+
+    #[test]
+    fn a_cursor_past_a_literal_is_out_of_it_again() {
+        // The bound that lets `"foo".` complete at all: the closing quote is where the next
+        // `.` gets typed, and everything after the literal is ordinary code.
+        assert!(at_marker("\"foo~\"").is_none(), "inside the string");
+        assert!(
+            matches!(context("[\"foo\", ~]"), Context::Expression),
+            "past the string, inside the array"
+        );
+        assert!(
+            matches!(context(":foo\nbar~"), Context::Expression),
+            "the line after a symbol"
+        );
+    }
+
+    #[test]
     fn a_literal_receiver_is_named_by_its_class() {
         for (source, class) in [
             (r#""hello".~"#, "String"),
@@ -523,6 +638,12 @@ mod tests {
             ("-> { }.~", "Proc"),
             ("__FILE__.~", "String"),
             ("__LINE__.~", "Integer"),
+            // The interpolated forms are the same classes: `"a#{b}"` is a String however the
+            // pieces were assembled, and Prism gives each of them a node of its own.
+            ("`ls #{dir}`.~", "String"),
+            (r#":"a#{b}".~"#, "Symbol"),
+            ("/re#{x}/.~", "Regexp"),
+            ("__ENCODING__.~", "Encoding"),
         ] {
             assert_eq!(
                 receiver(source),

@@ -2,7 +2,7 @@
   "name": "yalsp",
   "displayName": "ya-lsp",
   "description": "A standalone Ruby language server. No Ruby runtime required.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "icon": "images/logo.png",
   "publisher": "ar2em1s",

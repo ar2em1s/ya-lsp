@@ -58,6 +58,16 @@ jobs:
             fi
           done
 
+      # Last, because installing nightly makes it the default toolchain and every step above is
+      # meant to run on the pinned stable one. Nothing in the crate is nightly-only on an
+      # ordinary build: `#[coverage(off)]` sits behind `cfg(coverage_nightly)`, which
+      # cargo-llvm-cov sets itself. The bars, and the version of the tool, live in the Makefile
+      # so that a local `make coverage` and this step cannot disagree about either.
+      - name: coverage
+        run: |
+          make setup-coverage
+          make coverage
+
   extension:
     name: extension
     runs-on: ubuntu-latest

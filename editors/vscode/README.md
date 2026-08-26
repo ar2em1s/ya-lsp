@@ -2,9 +2,15 @@
 
 Ruby language support that does not need Ruby.
 
-The extension bundles a `ya-lsp` binary for your platform. There is nothing to install, nothing to
-add to your `Gemfile`, and no version manager to detect — it works on a machine where the
-project's Ruby is not installed at all.
+The extension bundles a `ya-lsp` binary for your platform. There is nothing to install and nothing
+to add to your `Gemfile`: ya-lsp never executes Ruby, `bundle` or `gem`, so it works on a machine
+where the project's Ruby is not installed at all.
+
+It does *read* `.ruby-version` and `.tool-versions` — in the project or any directory above it, the
+way rbenv, chruby, RVM, asdf and mise all resolve them — falling back to `RUBY VERSION` in
+`Gemfile.lock`. That is how it knows which Ruby's own library to index. When none of them answer it
+says so rather than guessing, and `json`, `uri` and the other ~40 gems inside Ruby stay out of the
+index; `ya-lsp.gems.rubyVersion` settles it, and `ya-lsp.gems.defaultGems` silences it.
 
 ## What you get
 
@@ -26,7 +32,11 @@ call in a class body all resolve properly. The repository README goes into this 
 | `ya-lsp.serverPath` | Run a binary of your own instead of the bundled one. Takes `~` and `${workspaceFolder}`. |
 | `ya-lsp.logLevel` | How much the server writes to its output channel. Changing it restarts the server. |
 | `ya-lsp.gems.enabled` | Index the project's gems. On by default; it is most of the value. |
-| `ya-lsp.gems.rubyVersion` | Override which Ruby's gems to index. |
+| `ya-lsp.gems.rubyVersion` | Override which Ruby's gems to index, as in `3.3.0`. Detected when empty. |
+| `ya-lsp.gems.defaultGems` | Index the ~40 gems that ship inside Ruby itself — `json`, `uri`, `optparse`. |
+| `ya-lsp.rbs.enabled` | Index Ruby's core signatures, so `String`, `Array` and `Kernel` have members. |
+| `ya-lsp.rbs.stdlib` | Also index the ~60 standard library signatures — `CSV`, `URI`, `Logger`. |
+| `ya-lsp.rbs.path` | An explicit directory of RBS signatures. Found automatically when empty. |
 | `ya-lsp.diagnostics.enabled` | Report problems found while indexing. |
 | `ya-lsp.diagnostics.rules` | Per-rule severity, keyed by the rule name in the problem's code. |
 | `ya-lsp.index.maxFiles` | Refuse to index a workspace larger than this. |
@@ -42,5 +52,6 @@ setup that works in every editor. Changing it takes effect without a restart.
 ## Multi-root workspaces
 
 One server per folder, because everything a server does — the index, gem discovery, `ya-lsp.toml`
-— is scoped to a single root. The first folder starts with the window; the rest start when you
-open a Ruby file inside them.
+— is scoped to a single root. A workspace with a single folder starts its server with the window.
+In a multi-root workspace each folder starts when you open a Ruby file inside it, so a folder with
+no Ruby in it — infrastructure, docs, a service in another language — never gets one.

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use glob::{MatchOptions, Pattern};
 
+use crate::messages;
+
 pub use config::{Config, Severity};
 pub use gems::{Gem, Gems};
 pub use rbs::Signatures;
@@ -110,12 +112,6 @@ impl Workspace {
             .get_or_insert_with(|| gems::discover(&self.root, &self.config.gems, &self.env))
     }
 
-    /// The gems found so far, without triggering discovery.
-    #[must_use]
-    pub fn gems_if_discovered(&self) -> Option<&Gems> {
-        self.gems.as_ref()
-    }
-
     /// Find Ruby's own signatures, once. The result is cached until the configuration reloads.
     ///
     /// Independent of `[gems] enabled`: see `rbs::newest_installed`.
@@ -203,7 +199,7 @@ fn discover(root: &Path, index: &config::IndexConfig) -> Discovery {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                problems.push(format!("while scanning workspace: {error}"));
+                problems.push(messages::workspace_scan_failed(&error));
                 continue;
             }
         };
@@ -237,22 +233,30 @@ fn discover(root: &Path, index: &config::IndexConfig) -> Discovery {
     }
 
     if files.is_empty() {
-        // Always a misconfiguration, and otherwise invisible: every feature just returns
-        // nothing, which reads as "the server is broken" rather than "the server indexed
-        // nothing".
-        problems.push(format!(
-            "no files matched index.include {:?} under {} — nothing will be indexed",
-            index.include,
-            root.display()
-        ));
+        let defaults = config::IndexConfig::default();
+        if index.include == defaults.include && index.exclude == defaults.exclude {
+            // A folder with no Ruby in it is not a misconfiguration — it is a folder with no
+            // Ruby in it, which in a multi-root workspace is an ordinary thing to have open.
+            // Warning here handed that user a remedy that was wrong for them ("widen
+            // index.include" when the globs are untouched and there is simply nothing to match)
+            // about a folder they had not opened. Still said, because every feature answering
+            // nothing needs something to point at, but said where someone reading a log will
+            // find it rather than in a notification nobody asked for.
+            tracing::debug!(
+                "no Ruby file under {}: navigation, completion and diagnostics answer nothing \
+                 for this folder",
+                root.display()
+            );
+        } else {
+            // The globs were written by hand and matched nothing, which is the case the warning
+            // was always for: otherwise invisible, because every feature just returns nothing,
+            // which reads as "the server is broken" rather than "the server indexed nothing".
+            problems.push(messages::nothing_matched(&index.include, root));
+        }
     }
 
     if truncated {
-        problems.push(format!(
-            "stopped at index.max_files ({}); the index is incomplete. Narrow index.include or \
-             widen index.exclude.",
-            index.max_files
-        ));
+        problems.push(messages::index_truncated(index.max_files));
     }
 
     // Stable order keeps logs and test fixtures reproducible; indexing itself is parallel.
@@ -271,13 +275,14 @@ fn compile(patterns: &[String], field: &str, problems: &mut Vec<String>) -> Vec<
         .filter_map(|pattern| match Pattern::new(pattern) {
             Ok(compiled) => Some(compiled),
             Err(error) => {
-                problems.push(format!("{field}: invalid glob {pattern:?}: {error}"));
+                problems.push(messages::invalid_glob(field, pattern, &error));
                 None
             }
         })
         .collect()
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +299,90 @@ mod tests {
             .iter()
             .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn an_invalid_glob_is_reported_against_the_field_it_came_from() {
+        // Both pattern lists go through the same compiler, and the field name is the only thing
+        // in the message that tells a user which key in their `ya-lsp.toml` to go and fix. A
+        // bad pattern drops itself and nothing else — an unreadable `exclude` must not take
+        // `include` down with it and leave the workspace unindexed.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "lib/thing.rb", "class Thing; end\n");
+
+        let index = config::IndexConfig {
+            include: vec!["**/*.rb".to_owned(), "lib/[".to_owned()],
+            exclude: vec!["vendor/[".to_owned()],
+            ..config::IndexConfig::default()
+        };
+        let discovery = discover(dir.path(), &index);
+
+        assert_eq!(
+            names(&discovery, dir.path()),
+            vec!["lib/thing.rb".to_owned()]
+        );
+        assert_eq!(discovery.problems.len(), 2, "{:?}", discovery.problems);
+        assert!(
+            discovery.problems[0].starts_with("index.include has an invalid glob \"lib/[\""),
+            "{:?}",
+            discovery.problems
+        );
+        assert!(
+            discovery.problems[1].starts_with("index.exclude has an invalid glob \"vendor/[\""),
+            "{:?}",
+            discovery.problems
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_read_is_reported_and_the_rest_is_indexed() {
+        // A workspace with one unreadable directory in it is not an unindexable workspace. The
+        // walker surfaces the failure per entry, and swallowing it would leave a project
+        // silently missing whatever was under there with nothing said about it.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "lib/thing.rb", "class Thing; end\n");
+        write(dir.path(), "secret/hidden.rb", "class Hidden; end\n");
+        let secret = dir.path().join("secret");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let discovery = discover(dir.path(), &config::IndexConfig::default());
+
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            names(&discovery, dir.path()),
+            vec!["lib/thing.rb".to_owned()]
+        );
+        assert_eq!(discovery.problems.len(), 1, "{:?}", discovery.problems);
+        assert!(
+            discovery.problems[0].starts_with("part of the workspace could not be scanned"),
+            "{:?}",
+            discovery.problems
+        );
+    }
+
+    #[test]
+    fn the_config_a_workspace_actually_loaded_is_the_one_it_names() {
+        // `config_path` is what the startup log and any "which settings am I running?" question
+        // read. It is `None` for defaults rather than a guessed path, so that a project with no
+        // `ya-lsp.toml` cannot be reported as having one.
+        let dir = tempfile::tempdir().unwrap();
+        let (bare, problems) =
+            Workspace::load_with_env(dir.path().to_path_buf(), None, gems::Env::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(bare.config_path(), None);
+
+        write(dir.path(), "ya-lsp.toml", "[gems]\nenabled = false\n");
+        let (configured, problems) =
+            Workspace::load_with_env(dir.path().to_path_buf(), None, gems::Env::default());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            configured.config_path(),
+            Some(dir.path().join("ya-lsp.toml").as_path())
+        );
     }
 
     #[test]
@@ -346,12 +435,68 @@ mod tests {
         assert!(discovery.problems.is_empty(), "{:?}", discovery.problems);
     }
 
+    /// A folder with no Ruby in it says nothing to the user.
+    ///
+    /// The remedy the warning carries — widen `index.include` — is wrong advice for someone who
+    /// never narrowed it, and in a multi-root workspace an infrastructure or docs folder sitting
+    /// beside a Ruby one is ordinary rather than a mistake. What is lost goes to the log.
     #[test]
-    fn an_empty_index_is_reported_rather_than_left_silent() {
+    fn a_folder_with_no_ruby_is_not_a_misconfiguration() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "README.md", "no ruby here");
 
         let discovery = discover(dir.path(), &config::IndexConfig::default());
+        assert!(discovery.files.is_empty());
+        assert!(
+            discovery.problems.is_empty(),
+            "untouched globs over a folder with no Ruby is not something to warn about: {:?}",
+            discovery.problems
+        );
+    }
+
+    /// Globs written by hand that match nothing are still reported.
+    ///
+    /// This is the case the warning has always been for, and the one the test above must not
+    /// take down with it: the user asked for something specific, got an index of nothing, and
+    /// every feature answering nothing reads as a broken server rather than an empty index.
+    #[test]
+    fn globs_that_were_narrowed_by_hand_and_matched_nothing_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "lib/thing.rb", "x");
+
+        let index = config::IndexConfig {
+            include: vec!["app/**/*.rb".to_owned()],
+            ..config::IndexConfig::default()
+        };
+
+        let discovery = discover(dir.path(), &index);
+        assert!(discovery.files.is_empty());
+        assert!(
+            discovery
+                .problems
+                .iter()
+                .any(|p| p.contains("nothing will be indexed")),
+            "{:?}",
+            discovery.problems
+        );
+    }
+
+    /// A hand-written `index.exclude` counts as narrowing too, not only `include`.
+    ///
+    /// Excluding everything is the other half of the same mistake, and reaching it through
+    /// `exclude` leaves `include` at its default — so a guard that only watched `include` would
+    /// fall silent on it.
+    #[test]
+    fn an_exclude_that_swallows_the_workspace_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "lib/thing.rb", "x");
+
+        let index = config::IndexConfig {
+            exclude: vec!["**/*".to_owned()],
+            ..config::IndexConfig::default()
+        };
+
+        let discovery = discover(dir.path(), &index);
         assert!(discovery.files.is_empty());
         assert!(
             discovery

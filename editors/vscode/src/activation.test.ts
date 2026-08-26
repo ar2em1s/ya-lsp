@@ -14,6 +14,8 @@ import * as path from 'node:path';
 import { after, test } from 'node:test';
 
 const registered: string[] = [];
+/** One entry per `showErrorMessage`, which `start` raises once per folder it tries to serve. */
+const errors: true[] = [];
 const disposable = { dispose(): void {} };
 const emitter = () => disposable;
 
@@ -37,7 +39,6 @@ const strict: Record<string, unknown> = {
     onDidOpenTextDocument: emitter,
     onDidChangeWorkspaceFolders: emitter,
     onDidChangeConfiguration: emitter,
-    createFileSystemWatcher: () => disposable,
     getConfiguration: () => ({ inspect: () => undefined }),
     getWorkspaceFolder: () => undefined,
   },
@@ -56,7 +57,10 @@ const strict: Record<string, unknown> = {
       logLevel: 0,
       onDidChangeLogLevel: emitter,
     }),
-    showErrorMessage: () => Promise.resolve(undefined),
+    showErrorMessage: (): Promise<undefined> => {
+      errors.push(true);
+      return Promise.resolve(undefined);
+    },
     activeTextEditor: undefined,
   },
   // The client's protocol converter builds both of these when it turns a protocol relative
@@ -140,6 +144,71 @@ test('activating with no workspace folders registers every declared command', as
   ).contributes.commands.map((entry) => entry.command);
 
   assert.deepEqual(registered.sort(), declared.sort());
+});
+
+/**
+ * A multi-root workspace starts no server until a Ruby file asks for one.
+ *
+ * `folders[0]` is whichever folder the `.code-workspace` lists first. Activation is
+ * `onLanguage:ruby`, so opening a Ruby file in *any* folder used to start a server on that one —
+ * and a workspace whose first folder holds no Ruby (infrastructure, docs, a sibling service in
+ * another language) got an index of nothing plus a warning telling it to widen `index.include`,
+ * for a folder the user had not opened. Counted through `showErrorMessage`, which `start` raises
+ * once per folder when it cannot find a server binary.
+ */
+test('a multi-root workspace starts no server before a Ruby file is opened', async () => {
+  const extension = require(bundle) as {
+    activate(context: unknown): Promise<void>;
+    deactivate(): Promise<void>;
+  };
+  const folder = (name: string): unknown => ({
+    name,
+    uri: { toString: () => `file:///multi/${name}`, fsPath: `/multi/${name}` },
+  });
+
+  strict.workspace = {
+    ...(strict.workspace as Record<string, unknown>),
+    workspaceFolders: [folder('infrastructure'), folder('app')],
+  };
+  errors.length = 0;
+  await extension.activate({ subscriptions: [], extensionPath: '/nonexistent' });
+  await extension.deactivate();
+
+  assert.equal(
+    errors.length,
+    0,
+    'a folder nobody opened a Ruby file in must not get a server'
+  );
+});
+
+/**
+ * The single-folder case still starts eagerly, so the fix above cannot be "never start".
+ *
+ * Nearly every project is one folder, and for those the eager start is the difference between a
+ * warm server and one that begins indexing at the first keystroke. A guard that turned it off
+ * everywhere would fix the multi-root warning by making the common case slower, which is why
+ * both halves are pinned.
+ */
+test('a single-folder workspace still starts its server eagerly', async () => {
+  const extension = require(bundle) as {
+    activate(context: unknown): Promise<void>;
+    deactivate(): Promise<void>;
+  };
+
+  strict.workspace = {
+    ...(strict.workspace as Record<string, unknown>),
+    workspaceFolders: [
+      {
+        name: 'solo',
+        uri: { toString: () => 'file:///solo', fsPath: '/solo' },
+      },
+    ],
+  };
+  errors.length = 0;
+  await extension.activate({ subscriptions: [], extensionPath: '/nonexistent' });
+  await extension.deactivate();
+
+  assert.equal(errors.length, 1, 'the only folder must be served without waiting for a file');
 });
 
 test('the language client turns a protocol relative pattern into an editor one', () => {

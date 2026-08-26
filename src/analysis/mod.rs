@@ -22,11 +22,13 @@ pub mod references;
 pub mod render;
 pub mod requires;
 pub mod search;
+pub mod signatures;
 pub mod symbols;
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    ffi::OsStr,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -48,6 +50,7 @@ use rubydex::{
     resolution::Resolver,
 };
 
+use crate::messages;
 use crate::workspace::{DocUri, Workspace, gems};
 use locator::Site;
 use position::{PositionEncoding, TextDocument};
@@ -197,7 +200,7 @@ impl Cancellations {
     }
 
     /// Consume the cancellation for `id`, if any.
-    fn take(&self, id: &RequestId) -> bool {
+    pub(crate) fn take(&self, id: &RequestId) -> bool {
         self.lock().remove(id)
     }
 
@@ -376,11 +379,12 @@ impl Analysis {
         }
 
         let count = discovery.files.len();
-        let errors = indexing::index_files(
-            &mut self.graph,
-            discovery.files,
-            IndexerBackend::RubyIndexer,
-        );
+        // `index.include` is `**/*.rb` by default, so this usually finds nothing to do. It is
+        // not usually: a project that keeps its own `sig/` and adds `sig/**/*.rbs` to the
+        // include reaches this path and no other, and an `interface` there lands its members on
+        // `Object` exactly as one in Ruby's own signatures would.
+        let files = self.index_edited_signatures(discovery.files);
+        let errors = indexing::index_files(&mut self.graph, files, IndexerBackend::RubyIndexer);
         let indexed = started.elapsed();
 
         for error in &errors {
@@ -617,10 +621,7 @@ impl Analysis {
             );
         }
         if truncated {
-            let message = format!(
-                "stopped indexing gems at [gems].max_files ({max_files}); gem intelligence is \
-                 incomplete."
-            );
+            let message = messages::gem_index_truncated(max_files);
             tracing::warn!("{message}");
             self.show_warning(&message);
         }
@@ -678,6 +679,7 @@ impl Analysis {
         }
 
         if !batch.is_empty() {
+            let batch = self.index_edited_signatures(batch);
             let errors = indexing::index_files(&mut self.graph, batch, IndexerBackend::RubyIndexer);
             for error in &errors {
                 // Debug, not warn: a bundle of a hundred gems will always contain something
@@ -718,10 +720,55 @@ impl Analysis {
         false
     }
 
+    /// Index the signature files in `batch` that need editing first, and hand back the rest.
+    ///
+    /// See [`signatures`] for what is edited and why. Every route an `.rbs` file can take into
+    /// the graph goes through here or through [`Self::index_buffer`] — the signature root that
+    /// `workspace::rbs` discovered, a `sig/` directory `index.include` was widened to cover, and
+    /// a buffer the editor opened. The rule is one rule; a file that is indexed differently
+    /// depending on how it was found is worse than one that is not filtered at all.
+    ///
+    /// The file has to be read here to know whether it holds an interface at all, so only `.rbs`
+    /// paths are looked at, and only the one in five that does hold one leaves the parallel path
+    /// — everything else is still a plain path for a worker thread to read.
+    fn index_edited_signatures(&mut self, batch: Vec<PathBuf>) -> Vec<PathBuf> {
+        batch
+            .into_iter()
+            .filter(|path| !self.index_edited_signature(path))
+            .collect()
+    }
+
+    /// Whether `path` was a signature file with an interface in it, and has now been indexed.
+    fn index_edited_signature(&mut self, path: &Path) -> bool {
+        if path.extension() != Some(OsStr::new("rbs")) {
+            return false;
+        }
+        let Ok(source) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let Some(edited) = signatures::without_interfaces(&source) else {
+            return false;
+        };
+        // The URI has to be spelled the way `index_files` would have spelled it, or this forks a
+        // second document for the same file. `DocUri` is that spelling.
+        let Some(uri) = DocUri::from_path(path) else {
+            return false;
+        };
+        indexing::index_source(&mut self.graph, uri.as_str(), &edited, &LanguageId::Rbs);
+        true
+    }
+
     fn index_buffer(&mut self, uri: &DocUri, text: &str) {
         let language = uri
             .to_path()
             .map_or(LanguageId::Ruby, |path| LanguageId::from_path(&path));
+        // The same rule as on the indexing path, or opening a signature file in the editor puts
+        // back the declarations that path took out — and leaves them there, because nothing
+        // re-indexes the file once the buffer closes.
+        let edited = matches!(language, LanguageId::Rbs)
+            .then(|| signatures::without_interfaces(text))
+            .flatten();
+        let text = edited.as_deref().unwrap_or(text);
         indexing::index_source(&mut self.graph, uri.as_str(), text, &language);
         self.mark_dirty();
     }
@@ -883,15 +930,12 @@ impl Analysis {
             // Lets the client throw away diagnostics for text the user has already edited past.
             version: self.open.get(uri).and_then(|open| open.version),
         };
-        let Ok(params) = serde_json::to_value(params) else {
-            return;
-        };
         let _ = self
             .outgoing
-            .send(Message::Notification(lsp_server::Notification {
-                method: "textDocument/publishDiagnostics".to_owned(),
+            .send(Message::Notification(lsp_server::Notification::new(
+                "textDocument/publishDiagnostics".to_owned(),
                 params,
-            }));
+            )));
     }
 
     /// Whether a document is the user's own code — inside the workspace, outside every gem.
@@ -936,10 +980,7 @@ impl Analysis {
                 continue;
             }
             let known = diagnostics::known_names().collect::<Vec<_>>().join(", ");
-            let message = format!(
-                "unknown diagnostic rule `{name}` in [diagnostics.rules]; it will be ignored. \
-                 Known rules: {known}"
-            );
+            let message = messages::unknown_diagnostic_rule(name, &known);
             tracing::warn!("{message}");
             self.show_warning(&message);
         }
@@ -1123,11 +1164,7 @@ impl Analysis {
             // decide what to do about it. It takes a workspace of tens of thousands of files to
             // reach — measured: `.new` across 17,557 files finds 35,733 — so this is rare
             // enough that a message is information rather than noise.
-            let message = format!(
-                "{} references found; showing the first {MAX_REFERENCES}. The list is \
-                 incomplete.",
-                found.len()
-            );
+            let message = messages::references_truncated(found.len(), MAX_REFERENCES);
             tracing::warn!("{message}");
             self.show_warning(&message);
             found.truncate(MAX_REFERENCES);
@@ -1288,6 +1325,7 @@ impl Analysis {
                     &locator::Resolution {
                         declarations: vec![DeclarationId::new(raw)],
                         precise: true,
+                        redirected: false,
                     },
                 )
             });
@@ -1355,15 +1393,12 @@ impl Analysis {
             typ: lsp_types::MessageType::WARNING,
             message: message.to_owned(),
         };
-        let Ok(params) = serde_json::to_value(params) else {
-            return;
-        };
         let _ = self
             .outgoing
-            .send(Message::Notification(lsp_server::Notification {
-                method: "window/showMessage".to_owned(),
+            .send(Message::Notification(lsp_server::Notification::new(
+                "window/showMessage".to_owned(),
                 params,
-            }));
+            )));
     }
 }
 
@@ -1450,6 +1485,7 @@ fn parse_params<T: serde::de::DeserializeOwned>(params: serde_json::Value) -> Op
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1465,6 +1501,54 @@ mod tests {
         let line = source[..offset].matches('\n').count();
         let column = offset - source[..offset].rfind('\n').map_or(0, |index| index + 1);
         serde_json::json!({ "line": line, "character": column })
+    }
+
+    /// Every symbol in an outline, parents and children alike, in no particular order.
+    fn all_symbols(outline: &serde_json::Value) -> Vec<&serde_json::Value> {
+        let mut queue: Vec<&serde_json::Value> = outline
+            .as_array()
+            .map(|list| list.iter().collect())
+            .unwrap_or_default();
+        let mut flat = Vec::new();
+        while let Some(symbol) = queue.pop() {
+            if let Some(children) = symbol["children"].as_array() {
+                queue.extend(children);
+            }
+            flat.push(symbol);
+        }
+        flat
+    }
+
+    /// The symbols whose `selectionRange` their own `range` does not contain.
+    ///
+    /// The protocol requires containment, and VS Code enforces it by throwing — which discards
+    /// the whole outline, not the one bad symbol. "None" is the assertion; naming the offenders
+    /// is what makes a failure readable.
+    fn uncontained(outline: &serde_json::Value) -> Vec<String> {
+        fn point(value: &serde_json::Value) -> (u64, u64) {
+            (
+                value["line"].as_u64().unwrap_or_default(),
+                value["character"].as_u64().unwrap_or_default(),
+            )
+        }
+        all_symbols(outline)
+            .into_iter()
+            .filter(|symbol| {
+                let (range, selection) = (&symbol["range"], &symbol["selectionRange"]);
+                point(&selection["start"]) < point(&range["start"])
+                    || point(&selection["end"]) > point(&range["end"])
+            })
+            .map(|symbol| {
+                format!(
+                    "{}: range {:?}..{:?}, selection {:?}..{:?}",
+                    symbol["name"],
+                    point(&symbol["range"]["start"]),
+                    point(&symbol["range"]["end"]),
+                    point(&symbol["selectionRange"]["start"]),
+                    point(&symbol["selectionRange"]["end"]),
+                )
+            })
+            .collect()
     }
 
     /// An `Analysis` wired to a discarded output channel, over a throwaway workspace.
@@ -1787,6 +1871,29 @@ mod tests {
                 .collect()
         }
 
+        /// The first `count` rows offered at the `~`, spelled the way the editor draws them.
+        ///
+        /// The detail is the owner, and including it is what makes an assertion here readable
+        /// as a *ranking* rather than as a list of names — the owner is what the order is
+        /// supposed to be about.
+        fn first_rows(&mut self, uri: &DocUri, marked: &str, count: usize) -> Vec<String> {
+            let found = self.complete(uri, marked);
+            let Some(items) = found["items"].as_array() else {
+                return Vec::new();
+            };
+            items
+                .iter()
+                .take(count)
+                .map(|item| {
+                    let label = item["label"].as_str().unwrap_or_default();
+                    match item["detail"].as_str() {
+                        Some(detail) => format!("{label}  {detail}"),
+                        None => label.to_owned(),
+                    }
+                })
+                .collect()
+        }
+
         /// The labels offered at the `~`, with Ruby's keywords dropped.
         ///
         /// Keywords are in every expression list and are not what any of these tests are about;
@@ -2021,6 +2128,66 @@ mod tests {
 
     fn code(name: &str) -> Option<lsp_types::NumberOrString> {
         Some(lsp_types::NumberOrString::String(name.to_owned()))
+    }
+
+    #[test]
+    fn parse_errors_read_the_way_prism_wrote_them() {
+        // ya-lsp owns the severity and the `code` of a diagnostic and **not one word of the
+        // text**: `diagnostic.message()` is forwarded verbatim. That is the decision, and it is
+        // the right one — rewriting a parser's diagnostics is a real cost and a real risk of
+        // saying something false about code the rewriter did not parse.
+        //
+        // What was wrong is that it was assumed rather than pinned. The only assertion anywhere
+        // was that the message is non-empty, which is the same gap as an unranked completion
+        // list: the mechanism tested, the content not. So the actual sentences are here. If
+        // Prism rewrites one, this fails and someone reads the new wording and decides whether
+        // users are better off — which is the entire point of a pass-through being deliberate.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/broken.rb", UNTERMINATED);
+        harness.index();
+
+        let items = harness.latest(&uri).expect("diagnostics");
+        let said: Vec<(Option<String>, &str)> = items
+            .iter()
+            .map(|item| {
+                (
+                    match &item.code {
+                        Some(lsp_types::NumberOrString::String(name)) => Some(name.clone()),
+                        _ => None,
+                    },
+                    item.message.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            said,
+            vec![
+                (
+                    Some("parse-error".to_owned()),
+                    "expected an `end` to close the `class` statement",
+                ),
+                (
+                    Some("parse-error".to_owned()),
+                    "expected an `end` to close the `def` statement",
+                ),
+                (
+                    Some("parse-warning".to_owned()),
+                    "mismatched indentations at '\n' with 'def' at 2",
+                ),
+                (
+                    Some("parse-error".to_owned()),
+                    "unexpected end-of-input, assuming it is closing the parent top level \
+                     context",
+                ),
+            ],
+            "{items:?}"
+        );
+        // Two of these are worth reading twice. The indentation warning names the character it
+        // mismatched against and that character is a newline, so a user sees a message with a
+        // line break in the middle of it. The last says "assuming it is closing the parent top
+        // level context", which is Prism explaining its own error recovery to someone who did
+        // not ask. Neither is ya-lsp's to fix — but neither was anyone's to notice either,
+        // until they were written down.
     }
 
     #[test]
@@ -2354,6 +2521,92 @@ end
         assert_eq!(shout["range"]["end"]["line"], 16);
     }
 
+    /// Every construct the outline spells differently from its bare name.
+    ///
+    /// `class << self` has no name of its own, a method can carry a receiver, and six kinds
+    /// have a `detail` that is a keyword rather than a parameter list. Each was reachable only
+    /// through a fixture nothing had written.
+    const SHAPES: &str = "\
+module Outer
+  class Widget
+    attr_writer :width
+    attr_accessor :height
+    attr_reader :depth
+
+    LIMIT = 10
+    CAP = LIMIT
+
+    class << self
+      def registry
+      end
+    end
+
+    def self.build
+    end
+
+    def resize
+    end
+    alias grow resize
+    alias_method :enlarge, :resize
+  end
+end
+
+def Outer.configure
+end
+";
+
+    #[test]
+    fn the_outline_spells_each_construct_the_way_a_reader_would() {
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/shapes.rb", SHAPES);
+        harness.index();
+        harness.open(&uri, SHAPES);
+        let outline = harness.outline(&uri);
+
+        /// `name | kind | detail` for every symbol, depth first, indented by nesting.
+        fn rows(symbols: &serde_json::Value, depth: usize, out: &mut Vec<String>) {
+            for symbol in symbols.as_array().into_iter().flatten() {
+                out.push(format!(
+                    "{:indent$}{} | {} | {}",
+                    "",
+                    symbol["name"].as_str().unwrap_or("?"),
+                    symbol["kind"],
+                    symbol["detail"].as_str().unwrap_or("-"),
+                    indent = depth * 2,
+                ));
+                rows(&symbol["children"], depth + 1, out);
+            }
+        }
+
+        let mut listed = Vec::new();
+        rows(&outline, 0, &mut listed);
+        assert_eq!(
+            listed,
+            vec![
+                "Outer | 2 | -",
+                "  Widget | 5 | -",
+                // The three `attr_*` kinds are PROPERTY, and their detail is the keyword: there
+                // is no parameter list to show and "width" alone says nothing.
+                "    width | 7 | attr_writer",
+                "    height | 7 | attr_accessor",
+                "    depth | 7 | attr_reader",
+                "    LIMIT | 14 | -",
+                // `CAP = LIMIT` is a constant *alias*, not a second constant.
+                "    CAP | 14 | alias",
+                // `class << self` has no name of its own; rubydex calls it `<Widget>`.
+                "    << Widget | 5 | -",
+                "      registry | 6 | -",
+                "    self.build | 6 | -",
+                "    resize | 6 | -",
+                "    grow | 6 | alias",
+                "    enlarge | 6 | alias",
+                // A method written on a constant receiver keeps it, which is the only thing
+                // telling `def Outer.configure` apart from a top-level `def configure`.
+                "Outer.configure | 6 | -",
+            ],
+        );
+    }
+
     #[test]
     fn hover_shows_the_signature_and_the_comment_above_it() {
         let (mut harness, uri) = library();
@@ -2369,6 +2622,54 @@ end
     }
 
     #[test]
+    fn an_anonymous_rest_parameter_hovers_as_ruby_wrote_it() {
+        // rubydex records an anonymous `*`, `**` or `&` under the sigil itself rather than
+        // under an empty name, and `render` used to prepend a second one — `**` came out as
+        // `****`. The pure test in `render` pins the spelling; this pins the convention it is
+        // written against, which is rubydex's to change.
+        let mut harness = Harness::new();
+        let source = "class Relay\n  def send_on(one, *, k:, **, &)\n  end\nend\n";
+        let uri = harness.write("lib/relay.rb", source);
+        harness.index();
+
+        let markdown = harness.hover_at(&uri, source, "send_on")["contents"]["value"]
+            .as_str()
+            .expect("markdown")
+            .to_owned();
+        assert!(
+            markdown.contains("Relay#send_on(one, *, k:, **, &)"),
+            "{markdown}"
+        );
+    }
+
+    #[test]
+    fn every_kind_of_parameter_ruby_has_is_spelled_the_way_it_was_written() {
+        // `render::parameter_list` has an arm per `Parameter` variant and two had never been
+        // asked for — an optional keyword and a forwarding `...`. `def call(retries: 3)` is
+        // ordinary Ruby, and its hover is the only place a reader learns the argument is
+        // optional at all: `retries:` and `retries: ...` say different things.
+        let mut harness = Harness::new();
+        let source = "class Job\n  def call(one, two = 1, *rest, key:, opt: 2, **kw, &blk)\n                        end\n\n  def forward(...)\n  end\nend\n";
+        let uri = harness.write("lib/job.rb", source);
+        harness.index();
+
+        let markdown = harness.hover_at(&uri, source, "call(one")["contents"]["value"]
+            .as_str()
+            .expect("markdown")
+            .to_owned();
+        assert!(
+            markdown.contains("Job#call(one, two = ..., *rest, key:, opt: ..., **kw, &blk)"),
+            "{markdown}"
+        );
+
+        let forwarding = harness.hover_at(&uri, source, "forward(")["contents"]["value"]
+            .as_str()
+            .expect("markdown")
+            .to_owned();
+        assert!(forwarding.contains("Job#forward(...)"), "{forwarding}");
+    }
+
+    #[test]
     fn a_singleton_method_hovers_as_ruby_spells_it() {
         // rubydex calls this `Person::<Person>#build()`. Showing that to a user would be
         // showing them the index's internals.
@@ -2378,6 +2679,68 @@ end
             .expect("markdown")
             .to_owned();
         assert!(markdown.contains("Person.build(name)"), "{markdown}");
+    }
+
+    #[test]
+    fn hover_names_every_construct_the_way_ruby_writes_it() {
+        // `hover::signature` has an arm per kind of declaration and only two of them — a class
+        // and a public method — had ever been asked for. The rest were reachable, rendered, and
+        // asserted nowhere: a module hovering as `class`, or a private method hovering without
+        // its visibility, would have gone out under a green suite.
+        let mut harness = Harness::new();
+        let source = "\
+# A place to keep things.
+module Storage
+  LIMIT = 10
+
+  class << self
+    # Wipe it.
+    def reset
+    end
+  end
+
+  # Stash a thing.
+  private def stash(thing)
+  end
+
+  protected def peek
+  end
+end
+";
+        let uri = harness.write("app/storage.rb", source);
+        harness.index();
+
+        let markdown = |harness: &mut Harness, needle: &str| -> String {
+            harness.hover_at(&uri, source, needle)["contents"]["value"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no hover on {needle:?}"))
+                .to_owned()
+        };
+
+        let module = markdown(&mut harness, "Storage\n");
+        assert!(module.contains("module Storage"), "{module}");
+        assert!(module.contains("A place to keep things."), "{module}");
+
+        // rubydex spells this `Storage::<Storage>`, which is not what the file says.
+        // On `self`, not on the keyword: a definition matches its *name* span, which for
+        // `class << self` is the receiver, so hover does not fire over the `class` either.
+        assert!(harness.hover_at(&uri, source, "class << self").is_null());
+        let singleton = markdown(&mut harness, "self");
+        assert!(singleton.contains("class << Storage"), "{singleton}");
+
+        // The visibility prefix, which is the whole reason a reader hovers a method they did
+        // not write: `stash` is callable from inside `Storage` and nowhere else.
+        let private = markdown(&mut harness, "stash(thing)");
+        assert!(private.contains("private "), "{private}");
+        assert!(private.contains("Storage#stash(thing)"), "{private}");
+        assert!(private.contains("Stash a thing."), "{private}");
+
+        let protected = markdown(&mut harness, "peek\n");
+        assert!(protected.contains("protected "), "{protected}");
+
+        // A constant is neither a namespace nor a method, and has no signature to render.
+        let constant = markdown(&mut harness, "LIMIT");
+        assert!(constant.contains("Storage::LIMIT"), "{constant}");
     }
 
     #[test]
@@ -2391,6 +2754,177 @@ end
         assert!(markdown.contains("Someone with a name."), "{markdown}");
         // The whole point: the rest of the class is in a place this hover cannot show.
         assert!(markdown.contains("Defined in 2 places"), "{markdown}");
+    }
+
+    /// An rbs root shaped the way Ruby's own is, with RDoc's markup in it.
+    ///
+    /// Synthetic rather than the vendored copy, deliberately: what the tests below pin is the
+    /// *card*, and pinning a card against 800 files of upstream prose would break on every rbs
+    /// release for a reason that has nothing to do with ya-lsp. Every shape that matters is
+    /// here — the call-seq header, a `<code>` span, an indented example, a dead `rdoc-ref:`
+    /// link — and each was copied from the real `String#upcase` comment.
+    const CORE_RBS: &str = "\
+class String
+  # <!--
+  #   rdoc-file=string.c
+  #   - upcase(mapping = :ascii) -> new_string
+  # -->
+  # Returns a new string containing <code>self</code>'s upcased characters:
+  #
+  #     'hello'.upcase # => \"HELLO\"
+  #
+  # See [Case Mapping](rdoc-ref:case_mapping.rdoc).
+  #
+  def upcase: (?Symbol mapping) -> String
+end
+";
+
+    const STDLIB_RBS: &str = "\
+class OptionParser
+  # <!--
+  #   rdoc-file=optparse.rb
+  #   - parse!(argv = default_argv) -> argv
+  # -->
+  # Parses <tt>argv</tt> in place and returns what is left of it.
+  def parse!: (?Array[String] argv) -> Array[String]
+end
+";
+
+    /// A workspace with the signatures above indexed, plus the project's own `lib/person.rb`.
+    fn with_signatures(source: &str) -> (Harness, DocUri) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let signatures = dir.path().join("sig");
+        std::fs::create_dir_all(signatures.join("core")).unwrap();
+        std::fs::create_dir_all(signatures.join("stdlib/optparse/0")).unwrap();
+        std::fs::write(signatures.join("core/string.rbs"), CORE_RBS).unwrap();
+        std::fs::write(
+            signatures.join("stdlib/optparse/0/optparse.rbs"),
+            STDLIB_RBS,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            format!(
+                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
+                signatures.display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        harness.write("lib/person.rb", LIBRARY);
+        let uri = harness.write("lib/main.rb", source);
+        harness.index();
+        harness.index_gems();
+        (harness, uri)
+    }
+
+    fn card(harness: &mut Harness, uri: &DocUri, source: &str, needle: &str) -> String {
+        harness.hover_at(uri, source, needle)["contents"]["value"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no hover on {needle:?}"))
+            .to_owned()
+    }
+
+    #[test]
+    fn a_core_method_hovers_as_rdoc_written_in_markdown() {
+        // The whole card, not a `contains`. `ANCESTRY` pins the first ten completions because a
+        // ranking is either plausible or it is not, and a hover card is the same kind of
+        // object: composition, not a feature. Every part of `hover::card` was asserted by some
+        // `contains` somewhere and the card itself nowhere, which is how the two shapes of one
+        // answer — a guessed single match and a guessed list — drifted apart.
+        //
+        // What this pins on the way past: `<code>self</code>` reaching the user as markdown
+        // rather than as a span a client silently eats, `[Case Mapping](rdoc-ref:…)` losing a
+        // link that goes nowhere while keeping its words, the call-seq lifted out of RDoc's
+        // HTML header as Ruby, and the indented example surviving both untouched.
+        let source = "greeting = \"hello\"\ngreeting.upcase\n";
+        let (mut harness, uri) = with_signatures(source);
+        assert_eq!(
+            card(&mut harness, &uri, source, "upcase"),
+            "```ruby\n\
+             String#upcase(mapping = ...)\n\
+             ```\n\
+             \n\
+             ---\n\
+             \n\
+             ```ruby\n\
+             upcase(mapping = :ascii) -> new_string\n\
+             ```\n\
+             \n\
+             Returns a new string containing `self`'s upcased characters:\n\
+             \n\
+             \u{20}   'hello'.upcase # => \"HELLO\"\n\
+             \n\
+             See Case Mapping.\n\
+             \n\
+             *Matched on the method name alone — the receiver's type is unknown.*"
+        );
+    }
+
+    #[test]
+    fn a_stdlib_method_hovers_the_same_way_a_core_one_does() {
+        // Different directory under the rbs root, same card. `<tt>` is RDoc's other spelling of
+        // `<code>` and appears 22 times in the vendored signatures; it must not be the one that
+        // still leaks.
+        let source = "parser = OptionParser.new\nparser.parse!\n";
+        let (mut harness, uri) = with_signatures(source);
+        assert_eq!(
+            card(&mut harness, &uri, source, "parse!\n"),
+            "```ruby\n\
+             OptionParser#parse!(argv = ...)\n\
+             ```\n\
+             \n\
+             ---\n\
+             \n\
+             ```ruby\n\
+             parse!(argv = default_argv) -> argv\n\
+             ```\n\
+             \n\
+             Parses `argv` in place and returns what is left of it.\n\
+             \n\
+             *Matched on the method name alone — the receiver's type is unknown.*"
+        );
+    }
+
+    #[test]
+    fn every_shape_of_card_puts_what_it_knows_in_the_same_place() {
+        // The four cards side by side, which is the only way the convention is visible: answer
+        // first, then one italic line per thing ya-lsp knows *about* the answer. A precise hit
+        // says nothing extra; a reopened class says where else it lives; a guess says it is a
+        // guess; and a guess with more than one candidate says the same sentence in the same
+        // place rather than in bold at the top after an em dash, which is what it used to do.
+        let source =
+            "class Radio\n  def shout; end\nend\n\nPerson.build(\"x\")\nthing.shout\nthing.extra\n";
+        let (mut harness, uri) = with_signatures(source);
+
+        // Precise: a constant receiver is the one thing rubydex can name without inference.
+        assert_eq!(
+            card(&mut harness, &uri, source, "build("),
+            "```ruby\nPerson.build(name)\n```\n\n---\n\nBuild one."
+        );
+
+        // Reopened, and the one thing a hover cannot show is the half that is elsewhere.
+        assert_eq!(
+            card(&mut harness, &uri, source, "Person.build"),
+            "```ruby\nclass Person\n```\n\n---\n\nSomeone with a name.\n\nReopened \
+             below.\n\n*Defined in 2 places.*"
+        );
+
+        // One name-based match: a whole card, and the caveat under it.
+        assert_eq!(
+            card(&mut harness, &uri, source, "extra"),
+            "```ruby\nPerson#extra\n```\n\n*Matched on the method name alone — the \
+             receiver's type is unknown.*"
+        );
+
+        // Several: a list, and the same caveat in the same place. Naming one of them would be
+        // presenting a coin flip as an answer.
+        assert_eq!(
+            card(&mut harness, &uri, source, "shout\n"),
+            "**2 possible definitions**\n\n- `Person#shout`\n- `Radio#shout`\n\n*Matched on \
+             the method name alone — the receiver's type is unknown.*"
+        );
     }
 
     #[test]
@@ -2430,6 +2964,161 @@ end
             assert_eq!(target["targetUri"], serde_json::json!(library.as_str()));
             assert_eq!(target["targetSelectionRange"]["start"]["character"], 6);
         }
+    }
+
+    /// Three shapes of `new`: an ordinary constructor, a class that writes its own `self.new`,
+    /// and a class with no constructor at all.
+    const CONSTRUCTORS: &str = "\
+class Money
+  def initialize(cents)
+    @cents = cents
+  end
+end
+
+class Registry
+  def self.new(*args)
+    super
+  end
+
+  def initialize; end
+end
+
+class Plain
+end
+";
+
+    #[test]
+    fn new_navigates_to_the_constructor_rather_than_to_class_new() {
+        // `Foo.new` really is `Class#new`, so the exact answer is a signature file nobody asked
+        // to read. Both goto-definition and hover redirect to the constructor, and hover is the
+        // half that matters most: it is where the parameter list comes from.
+        let mut harness = Harness::new();
+        let library = harness.write("lib/shop.rb", CONSTRUCTORS);
+        let source = "Money.new(1)\nRegistry.new\n";
+        let caller = harness.write("lib/main.rb", source);
+        harness.index();
+
+        let targets = harness.definition_at(&caller, source, "new(1)");
+        assert_eq!(targets.as_array().unwrap().len(), 1, "{targets}");
+        assert_eq!(targets[0]["targetUri"], serde_json::json!(library.as_str()));
+        assert_eq!(
+            targets[0]["targetSelectionRange"]["start"]["line"], 1,
+            "the `initialize` on line 2, not the class: {targets}"
+        );
+
+        let markdown = harness.hover_at(&caller, source, "new(1)")["contents"]["value"]
+            .as_str()
+            .expect("markdown")
+            .to_owned();
+        assert!(markdown.contains("Money#initialize(cents)"), "{markdown}");
+        assert!(
+            !markdown.contains("receiver's type is unknown"),
+            "a redirect is still exact: {markdown}"
+        );
+
+        // A class that writes its own `new` is reached by that method, and `initialize` is one
+        // `super` further on. Redirecting here would skip the code the call actually runs.
+        let markdown = harness.hover_at(&caller, source, "new\n")["contents"]["value"]
+            .as_str()
+            .expect("markdown")
+            .to_owned();
+        assert!(markdown.contains("Registry.new(*args)"), "{markdown}");
+    }
+
+    #[test]
+    fn find_all_references_on_new_lists_call_sites_and_not_the_constructor() {
+        // The redirect is a navigation affordance, and `references` is the one caller that must
+        // not take it: `def initialize` is not a declaration of `new`, and a work list of
+        // `.new` call sites with the constructor in it is noise. Before the flag it appeared
+        // for every class whose constructor is in the user's own code.
+        let mut harness = Harness::new();
+        harness.write("lib/shop.rb", CONSTRUCTORS);
+        let source = "Money.new(1)\nMoney.new(2)\n";
+        let caller = harness.write("lib/main.rb", source);
+        harness.index();
+
+        assert_eq!(
+            harness.reference_list(&caller, source, "new(1)", true),
+            vec!["main.rb:0:6", "main.rb:1:6"]
+        );
+    }
+
+    #[test]
+    fn a_constructors_keyword_arguments_complete_at_the_call() {
+        // The redirect goes through `locator::resolve`, which is also where `Context::Argument`
+        // gets the method whose parameters it offers. Before it, `Foo.new(` completed against
+        // `Class#new`'s `(*untyped, **untyped)` — a signature with no keywords in it at all.
+        let mut harness = Harness::new();
+        harness.write(
+            "lib/order.rb",
+            "class Order\n  def initialize(total:, currency: \"USD\")\n  end\nend\n",
+        );
+        let caller = harness.write("lib/main.rb", "");
+        harness.index();
+
+        let offered = harness.declarations_at(&caller, "Order.new(~)\n");
+
+        assert!(offered.contains(&"total:".to_owned()), "{offered:?}");
+        assert!(offered.contains(&"currency:".to_owned()), "{offered:?}");
+    }
+
+    #[test]
+    fn a_class_with_no_constructor_keeps_the_honest_answer() {
+        // Every object inherits `BasicObject#initialize`, so with rbs indexed there is always
+        // *an* `initialize` to redirect to — and for a class that defines none it is as useless
+        // as `Class#new` and less true. The guard is what keeps the redirect meaning something.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = dir.path().join("sig/core");
+        std::fs::create_dir_all(&core).unwrap();
+        std::fs::write(
+            core.join("core.rbs"),
+            "\
+class BasicObject
+  def initialize: () -> void
+end
+
+class Class
+  def new: (*untyped) -> untyped
+end
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            format!(
+                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
+                dir.path().join("sig").display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        harness.write("lib/shop.rb", CONSTRUCTORS);
+        let source = "Plain.new\nMoney.new(1)\n";
+        let caller = harness.write("lib/main.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        assert!(
+            harness.has("BasicObject#initialize()"),
+            "the signature root was not indexed"
+        );
+
+        let markdown = harness.hover_at(&caller, source, "new\n")["contents"]["value"]
+            .as_str()
+            .expect("markdown")
+            .to_owned();
+        assert!(
+            markdown.contains("Class#new"),
+            "an inherited empty constructor is not a constructor to redirect to: {markdown}"
+        );
+
+        // And the guard has not simply turned the redirect off for everyone.
+        let markdown = harness.hover_at(&caller, source, "new(1)")["contents"]["value"]
+            .as_str()
+            .expect("markdown")
+            .to_owned();
+        assert!(markdown.contains("Money#initialize(cents)"), "{markdown}");
     }
 
     #[test]
@@ -2617,6 +3306,439 @@ end
             );
         }
     }
+    #[test]
+    fn the_outline_lists_definitions_and_not_the_statements_around_them() {
+        // Each of these is something rubydex records as a definition for resolution's sake and
+        // nobody would want in a file's structure: `private :shout` is a visibility statement,
+        // not a second declaration of `shout`, and a variable would appear once per assignment.
+        let mut harness = Harness::new();
+        let source = "\
+$LOG = nil
+alias $log $LOG
+
+class Widget
+  @@count = 0
+  @name = nil
+
+  def shout
+    @volume = 1
+  end
+  private :shout
+
+  SECRET = 1
+  private_constant :SECRET
+end
+";
+        let uri = harness.write("lib/widget.rb", source);
+        harness.index();
+        harness.open(&uri, source);
+
+        let listed: Vec<String> = all_symbols(&harness.outline(&uri))
+            .into_iter()
+            .map(|symbol| symbol["name"].as_str().unwrap_or("?").to_owned())
+            .collect();
+        for statement in ["$LOG", "$log", "@@count", "@name", "@volume"] {
+            assert!(
+                !listed.contains(&statement.to_owned()),
+                "{statement} is not an outline entry: {listed:?}"
+            );
+        }
+        // Not vacuous: the definitions those statements are about are all still there.
+        for wanted in ["Widget", "shout", "SECRET"] {
+            assert!(listed.contains(&wanted.to_owned()), "{listed:?}");
+        }
+    }
+
+    #[test]
+    fn the_symbol_picker_answers_nothing_when_asked_for_nothing() {
+        // `MAX_WORKSPACE_SYMBOLS` is a latency control — a subsequence match on one character
+        // hits most of a bundle on every keystroke — so a zero limit has to stop before the
+        // search runs at all rather than after it.
+        let mut harness = Harness::new();
+        harness.write("app/person.rb", "class Person\nend\n");
+        harness.index();
+
+        let own = harness.analysis.own_documents();
+        assert!(
+            search::search(&harness.analysis.graph, "Person", 1, &own).len() == 1,
+            "the fixture has to match at all for a zero limit to mean anything"
+        );
+        assert!(search::search(&harness.analysis.graph, "Person", 0, &own).is_empty());
+    }
+
+    #[test]
+    fn a_constant_that_is_not_a_namespace_offers_nothing_after_its_colons() {
+        // `MAX::` is legal to type and means nothing: an `Integer` has no members to write
+        // there. rubydex resolves the receiver to a declaration all the same, and every step
+        // that follows — the ancestor walk, the member list — has to answer "not a namespace"
+        // rather than assume the id it was handed names one.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/main.rb", "MAX = 10\n");
+        harness.index();
+
+        let offered = harness.suggestions(&uri, "MAX = 10\nMAX::~\n");
+        assert!(offered.is_empty(), "{offered:?}");
+    }
+
+    #[test]
+    fn a_call_on_a_constant_that_was_never_declared_still_answers() {
+        // `Nowhere` is a receiver rubydex can name and cannot resolve — the normal state of a
+        // file mid-refactor, and of every constant a gem defines when the gem is not indexed.
+        // The precise path has to stand down rather than resolve against a missing owner.
+        let mut harness = Harness::new();
+        let person = harness.write(
+            "app/person.rb",
+            "class Person\n  def frobnicate\n  end\nend\n",
+        );
+        let source = "Nowhere.frobnicate\n";
+        let main = harness.write("app/main.rb", source);
+        harness.index();
+
+        // Name-based, so the one declaration spelled this way is still the answer — and *which*
+        // declaration is the assertion. "not null" would pass just as happily on a jump to the
+        // wrong file, which is the failure this degradation actually risks.
+        let found = harness.definition_at(&main, source, "frobnicate");
+        let targets = found.as_array().expect("link targets");
+        assert_eq!(targets.len(), 1, "{found}");
+        assert_eq!(targets[0]["targetUri"], serde_json::json!(person.as_str()));
+        assert_eq!(
+            targets[0]["targetSelectionRange"]["start"],
+            serde_json::json!({ "line": 1, "character": 6 }),
+            "the name in `def frobnicate`, not the class or the body: {found}"
+        );
+    }
+
+    #[test]
+    fn a_singleton_method_written_on_a_constant_is_scoped_to_that_class() {
+        // `def Person.build` is the same method as `def self.build` written from outside the
+        // class body, and rubydex records the receiver differently for each. Only the `self`
+        // form had a test, so the constant form's `self` could have been anything at all —
+        // and inside it `self` is `Person`, which is what decides whether the class's own
+        // singleton methods are callable without a receiver.
+        let mut harness = Harness::new();
+        harness.write(
+            "app/person.rb",
+            "class Person\n  def self.find\n  end\n  def self.all\n  end\nend\n",
+        );
+        harness.index();
+        let uri = harness.write("app/patch.rb", "");
+
+        let offered = harness.suggestions(&uri, "def Person.build\n  fin~\nend\n");
+        assert!(
+            offered.contains(&"find".to_owned()),
+            "`self` inside `def Person.build` is Person: {offered:?}"
+        );
+    }
+
+    #[test]
+    fn every_receiver_that_can_precede_a_double_colon_is_answered() {
+        // `::` after something that is not a namespace is legal to type and means nothing, and
+        // each shape reaches a different arm. Left unanswered they are not silence but a
+        // *wrong* list — the fall-through would offer whatever the enclosing scope had.
+        let mut harness = Harness::new();
+        harness.write(
+            "app/hr.rb",
+            "module HR\n  MAX = 1\n  class Person\nend\nend\n",
+        );
+        harness.index();
+        let uri = harness.write("app/main.rb", "");
+
+        // `self::` is legal and rare: the nesting is what it means, so a module's own
+        // constants are what it can be followed by.
+        // The answer has to be the same one `HR::` gives, from inside the module and from
+        // inside one of its methods alike: `::` asks about a namespace, and the namespace is
+        // the same either way.
+        let named = harness.suggestions(&uri, "HR::~\n");
+        assert_eq!(named, vec!["MAX".to_owned(), "Person".to_owned()]);
+        assert_eq!(
+            // Something has to follow the line: `self::` with only an `end` after it is a
+            // *method* call in Prism's recovery, with `::` read as the call operator.
+            harness.suggestions(&uri, "module HR\n  self::~\n  X = 1\nend\n"),
+            named,
+            "in a module body, `self` is the module"
+        );
+        assert_eq!(
+            harness.suggestions(&uri, "module HR\n  def y\n    self::P~\n  end\nend\n"),
+            vec!["Person".to_owned()],
+            "and inside a method it is still the module that `::` asks about"
+        );
+
+        // An instance is not a namespace, and neither is a literal. Both parse.
+        for marked in ["\"foo\"::~\n", "HR::Person.new::~\n", "whatever::~\n"] {
+            let offered = harness.suggestions(&uri, marked);
+            assert!(offered.is_empty(), "{marked:?} offered {offered:?}");
+        }
+    }
+
+    #[test]
+    fn hover_reads_a_method_that_no_def_wrote() {
+        // `attr_reader :name` declares a method whose definition is not a `Definition::Method`,
+        // so the signature lookup finds nothing to read parameters or visibility from. It still
+        // has to name the method rather than fall through to a bare string — and `attr_reader`
+        // is how a large share of a Rails app's methods are declared.
+        let (mut harness, uri) = library();
+        let markdown = harness.hover_at(&uri, LIBRARY, "name\n\n  # Build")["contents"]["value"]
+            .as_str()
+            .expect("markdown")
+            .to_owned();
+        assert!(markdown.contains("Person#name"), "{markdown}");
+        assert!(
+            !markdown.contains('('),
+            "no parameter list to render: {markdown}"
+        );
+    }
+
+    #[test]
+    fn an_outline_names_a_singleton_method_on_a_constant_it_cannot_resolve() {
+        // `def Nowhere.thing` parses and is indexed; the receiver names a constant the graph
+        // never saw. The outline still has to carry a row for it, and the honest name is the
+        // bare method — inventing `Nowhere.thing` from an unresolved reference would put a
+        // name in the picker that leads nowhere.
+        let mut harness = Harness::new();
+        let source = "def Nowhere.thing\nend\n";
+        let uri = harness.write("app/patch.rb", source);
+        harness.index();
+        harness.open(&uri, source);
+
+        let outline = harness.ask(
+            "textDocument/documentSymbol",
+            serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+        );
+        let names: Vec<&str> = all_symbols(&outline)
+            .into_iter()
+            .filter_map(|symbol| symbol["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Nowhere.thing"],
+            "the receiver is named from the reference, declared or not: {outline}"
+        );
+    }
+
+    #[test]
+    fn a_namespace_the_resolver_invented_is_not_somewhere_to_jump() {
+        // `Missing::Thing` makes the resolver record a `Missing` it never saw defined. It is a
+        // placeholder with no definitions behind it, so listing it in the picker would offer a
+        // destination that does not exist.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/main.rb", "Missing::Thing.new\n");
+        harness.index();
+
+        // Nor somewhere to hover. The cursor is on a real reference, so there is something to
+        // resolve — but what it resolves to is a name the resolver wrote down and nothing else,
+        // and a card saying `Missing` over a constant spelled `Missing` tells a reader only
+        // that the server has no idea either. Silence says the same thing and takes no space.
+        let source = "Missing::Thing.new\n";
+        assert!(harness.hover_at(&uri, source, "Missing").is_null());
+
+        let names: Vec<String> = harness
+            .ask(
+                "workspace/symbol",
+                serde_json::json!({ "query": "Missing" }),
+            )
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|symbol| symbol["name"].as_str().unwrap_or("?").to_owned())
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn a_file_the_index_never_took_answers_nothing_rather_than_guessing() {
+        // `index.include` is `**/*.rb`, so a Ruby-looking buffer under another extension has
+        // text on disk and no document in the graph. Every request has to survive that: the
+        // text is readable, so nothing short of the graph lookup can tell them apart.
+        let mut harness = Harness::new();
+        let source = "class Person\nend\n";
+        let uri = harness.write("app/notes.txt", source);
+        harness.index();
+
+        assert!(harness.outline(&uri).is_null(), "{}", harness.outline(&uri));
+        assert!(harness.hover_at(&uri, source, "Person").is_null());
+        assert!(
+            harness
+                .ask(
+                    "textDocument/definition",
+                    serde_json::json!({
+                        "textDocument": { "uri": uri.as_str() },
+                        "position": position_of(source, "Person"),
+                    }),
+                )
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn a_recovered_span_that_does_not_contain_its_name_is_widened_to_fit() {
+        // The other half of `a_half_typed_def_does_not_take_the_outline_down_with_it`. The
+        // outline drops a nameless `def` before it ever builds a range; goto-definition does
+        // not, because looking a name up per definition would cost every hover in the file.
+        // So `locator::spans` is the one place the containment rule is enforced, and this is
+        // the request that reaches it.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/a.rb", "");
+        harness.index();
+
+        // Asked of `spans` directly: containment is a property of every pair it hands out, and
+        // the requests that carry one filter half-typed definitions out before they get there.
+        let mut broken = 0;
+        for source in [
+            "class A\n def\n",
+            "class A\n def \n",
+            "def \n",
+            "class A\n  private def \n",
+            "module M\n  class B\n    def\n",
+        ] {
+            harness.change(&uri, source);
+            for definition in harness.analysis.graph.definitions().values() {
+                let (full, selection) = locator::spans(definition);
+                assert!(
+                    selection.0 >= full.0 && selection.1 <= full.1,
+                    "{source:?}: selection {selection:?} escapes {full:?}"
+                );
+                if definition.name_offset().is_some_and(|name| {
+                    let raw = definition.offset();
+                    name.start() < raw.start() || name.end() > raw.end()
+                }) {
+                    // The shape VS Code threw on: Prism recovered `def` into a node spanning
+                    // the three keyword bytes, with its name span in the whitespace after them.
+                    assert_eq!(
+                        selection, full,
+                        "{source:?}: a name outside the span widens"
+                    );
+                    broken += 1;
+                }
+            }
+        }
+        assert!(
+            broken > 0,
+            "no fixture here recovered the pair the rule exists for"
+        );
+    }
+
+    #[test]
+    fn an_alias_is_navigable_from_its_call_sites() {
+        // rubydex records a method call under its bare name — except an `alias`, which it
+        // records with the parentheses already on. Both have to arrive at the same member key
+        // or the lookup silently misses and `yell` navigates nowhere.
+        let mut harness = Harness::new();
+        let library = "class Person\n  def shout\n  end\n  alias yell shout\nend\n";
+        let person = harness.write("app/person.rb", library);
+        let source = "Person.new.yell\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        let link = harness.ask(
+            "textDocument/definition",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": position_of(source, "yell"),
+            }),
+        );
+        assert!(!link.is_null(), "an alias call site navigates nowhere");
+        assert_eq!(link[0]["targetUri"], person.as_str(), "{link}");
+
+        // And from inside the `alias` statement itself, which is the reference rubydex records
+        // with the parentheses already on.
+        let from_alias = harness.ask(
+            "textDocument/definition",
+            serde_json::json!({
+                "textDocument": { "uri": person.as_str() },
+                "position": position_of(library, "shout\nend"),
+            }),
+        );
+        assert!(!from_alias.is_null(), "{from_alias}");
+    }
+
+    #[test]
+    fn a_half_typed_def_does_not_take_the_outline_down_with_it() {
+        // Reported from a real editor: typing `def` inside a class made VS Code throw
+        // `selectionRange must be contained in fullRange` and drop the *entire* outline, so the
+        // file's structure vanished mid-keystroke. Prism recovers a bare `def` into a node whose
+        // location is the three keyword bytes and whose name location is the whitespace *after*
+        // them, so `range` ended where `selectionRange` began.
+        //
+        // Half-typed code is the normal state of a buffer, not an edge case, so the containment
+        // rule has to hold for whatever the parser recovered.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/a.rb", "");
+        harness.index();
+        harness.open(&uri, "");
+
+        for source in [
+            "class A\n def\n",
+            "class A\n def \n",
+            "def \n",
+            "class A\n  private def \n",
+            "module M\n  class B\n    def\n",
+        ] {
+            harness.change(&uri, source);
+            let outline = harness.outline(&uri);
+
+            assert!(
+                uncontained(&outline).is_empty(),
+                "{source:?}: {:?}\n{outline}",
+                uncontained(&outline)
+            );
+            // And nothing with no name in it: the recovered node is not a symbol yet, and a
+            // blank row in the outline is the visible half of the same bug.
+            for symbol in all_symbols(&outline) {
+                let name = symbol["name"].as_str().unwrap_or_default();
+                assert!(
+                    !name.trim().is_empty(),
+                    "{source:?}: blank symbol\n{outline}"
+                );
+            }
+        }
+
+        // Not vacuous by way of an empty answer: the enclosing class is still outlined while
+        // the method inside it is being typed.
+        harness.change(&uri, "class A\n def\n");
+        assert_eq!(harness.outline(&uri)[0]["name"], "A");
+    }
+
+    #[test]
+    fn a_definition_link_never_points_outside_the_construct_it_names() {
+        // `LocationLink::targetSelectionRange` carries the identical containment rule, from the
+        // identical pair of spans. VS Code does not validate this one, so the symptom is quieter
+        // — goto-definition parks the cursor on a newline outside the construct it claims — but
+        // it is the same defect and it is fixed in the same place.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/a.rb", "");
+        harness.index();
+        let source = "class A\n def\n";
+        harness.open(&uri, source);
+
+        // The whitespace after the keyword, which is where the recovered name span sits.
+        let targets = harness.ask(
+            "textDocument/definition",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 1, "character": 4 },
+            }),
+        );
+
+        let point = |value: &serde_json::Value| {
+            (
+                value["line"].as_u64().unwrap_or_default(),
+                value["character"].as_u64().unwrap_or_default(),
+            )
+        };
+        assert!(
+            targets.as_array().is_some_and(|links| !links.is_empty()),
+            "nothing to check: {targets}"
+        );
+        for target in targets.as_array().into_iter().flatten() {
+            let (range, selection) = (&target["targetRange"], &target["targetSelectionRange"]);
+            assert!(
+                point(&selection["start"]) >= point(&range["start"])
+                    && point(&selection["end"]) <= point(&range["end"]),
+                "{targets}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // M3 — gem indexing
     // -----------------------------------------------------------------------
@@ -2703,6 +3825,436 @@ end
             target.ends_with("gems/shouty-1.2.3/lib/shouty.rb"),
             "{definition}"
         );
+    }
+
+    #[test]
+    fn a_change_to_a_buffer_that_was_never_opened_is_recovered_only_when_it_is_safe() {
+        // Clients do occasionally get this wrong. An incremental range only means anything
+        // against the exact text it was computed from, so applying one to an empty buffer is
+        // worse than dropping it — but a whole-buffer change carries its own base and can be
+        // treated as the `didOpen` that never arrived.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/person.rb", "class Person\nend\n");
+        harness.index();
+
+        harness.run(Task::DidChange {
+            uri: uri.clone(),
+            changes: vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 0,
+                        character: 6,
+                    },
+                    end: lsp_types::Position {
+                        line: 0,
+                        character: 12,
+                    },
+                }),
+                text: "Ghost".to_owned(),
+            }],
+            version: Some(2),
+        });
+        assert!(
+            harness.has("Person"),
+            "an incremental edit against no buffer must be dropped"
+        );
+        assert!(!harness.has("Ghost"));
+
+        harness.run(Task::DidChange {
+            uri: uri.clone(),
+            changes: vec![TextChange {
+                range: None,
+                text: "class Ghost\nend\n".to_owned(),
+            }],
+            version: Some(3),
+        });
+        assert!(
+            harness.has("Ghost"),
+            "a whole buffer can stand in for an open"
+        );
+    }
+
+    #[test]
+    fn closing_a_buffer_falls_back_to_disk_and_forgets_a_file_that_is_gone() {
+        // Closing an editor tab does not remove the file from the project. The graph has to
+        // return to what is on disk — and only drop the document when there is no disk copy
+        // left, which is what a rename or a delete looks like from here.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/person.rb", "class Person\nend\n");
+        harness.index();
+
+        harness.open(&uri, "class Person\n  def shout\n  end\nend\n");
+        assert!(harness.has("Person#shout()"), "the buffer shadows disk");
+
+        harness.run(Task::DidClose { uri: uri.clone() });
+        assert!(harness.has("Person"), "the file is still in the project");
+        assert!(
+            !harness.has("Person#shout()"),
+            "the unsaved method is not on disk and must not survive the close"
+        );
+
+        harness.open(&uri, "class Person\nend\n");
+        std::fs::remove_file(uri.to_path().expect("a path")).unwrap();
+        harness.run(Task::DidClose { uri: uri.clone() });
+        assert!(
+            !harness.has("Person"),
+            "a file that is gone from disk is gone from the graph"
+        );
+    }
+
+    #[test]
+    fn saving_changes_nothing_because_the_buffer_was_already_indexed() {
+        // `didSave` arrives after every `didChange` for the same text. Re-indexing here would
+        // double the work of typing for no new information at all.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/person.rb", "class Person\nend\n");
+        harness.index();
+        harness.open(&uri, "class Person\n  def shout\n  end\nend\n");
+        let before = harness.latest(&uri);
+
+        harness.run(Task::DidSave { uri: uri.clone() });
+
+        assert!(harness.has("Person#shout()"), "the buffer is still indexed");
+        assert_eq!(harness.latest(&uri), before, "nothing was re-published");
+    }
+
+    #[test]
+    fn a_reload_that_breaks_the_config_warns_and_keeps_serving() {
+        // `ya-lsp.toml` is edited by hand and saved half-written. The server has to say so and
+        // carry on with the defaults; going quiet is indistinguishable from a crash.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/person.rb", "class Person\nend\n");
+        harness.index();
+        let _ = harness.messages();
+
+        std::fs::write(
+            harness.root.path().join("ya-lsp.toml"),
+            "[index]\ninclude = [\n",
+        )
+        .unwrap();
+        harness.run(Task::ReloadConfig);
+
+        let messages = harness.messages();
+        assert!(
+            messages.iter().any(|shown| shown.contains("ya-lsp.toml")),
+            "{messages:?}"
+        );
+        assert!(
+            harness.has("Person"),
+            "the workspace is re-indexed with the defaults"
+        );
+        assert!(
+            uri.as_str().ends_with("person.rb"),
+            "the document keeps its identity across a reload"
+        );
+    }
+
+    #[test]
+    fn changed_editor_settings_reload_the_config_without_a_file() {
+        // The editor's layer never touches the filesystem, so it arrives carried rather than
+        // re-read — and it still has to rebuild the graph, because it can change what is
+        // indexed at all.
+        let mut harness = Harness::new();
+        harness.write("app/person.rb", "class Person\nend\n");
+        harness.write("spec/person_spec.rb", "class PersonSpec\nend\n");
+        harness.index();
+        assert!(harness.has("PersonSpec"));
+
+        harness.run(Task::ChangeConfig {
+            options: Some(serde_json::json!({ "index": { "exclude": ["spec/**/*"] } })),
+        });
+
+        assert!(harness.has("Person"), "the project is still indexed");
+        assert!(
+            !harness.has("PersonSpec"),
+            "the new exclude glob is in effect"
+        );
+    }
+
+    #[test]
+    fn a_reload_during_gem_indexing_closes_the_progress_stream_it_cancelled() {
+        // The queued files refer to the old configuration's gem roots, and the graph they were
+        // going to be indexed into no longer exists. A stream left open is a spinner forever.
+        let (dir, _gem_home, env) = project_with_gem("module Shouty\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/main.rb", "Shouty\n");
+        harness.index();
+        // Queued but not stepped: the files are still waiting when the config changes, which is
+        // the whole situation this is about.
+        harness.analysis.queue_background_indexing();
+        let started: Vec<String> = harness
+            .progress()
+            .into_iter()
+            .map(|(kind, _)| kind)
+            .collect();
+        assert_eq!(started, vec!["begin".to_owned()], "{started:?}");
+
+        harness.run(Task::ReloadConfig);
+
+        // The cancelled stream is closed *before* the reload's own indexing opens a new one.
+        // Leaving the first open would put two spinners in the status bar, one of them forever.
+        let progress = harness.progress();
+        let kinds: Vec<&str> = progress.iter().map(|(kind, _)| kind.as_str()).collect();
+        assert_eq!(kinds, vec!["end", "begin"], "{progress:?}");
+        assert_eq!(progress[0].1, "cancelled", "{progress:?}");
+    }
+
+    #[test]
+    fn a_reload_with_no_progress_stream_open_cancels_just_as_quietly() {
+        // The same cancellation, for a client that never advertised `window/workDoneProgress`.
+        // There is a stream to close only when there was one to open, and reaching for it
+        // unconditionally would take the analysis thread down on the client that asked for
+        // least — which is the one least likely to be tested against.
+        let (dir, _gem_home, env) = project_with_gem("module Shouty\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.analysis.client.work_done_progress = false;
+        harness.write("app/main.rb", "Shouty\n");
+        harness.index();
+        harness.analysis.queue_background_indexing();
+        assert!(
+            harness.analysis.gem_work.is_some(),
+            "there is background work to cancel"
+        );
+
+        harness.run(Task::ReloadConfig);
+
+        assert_eq!(
+            harness.progress(),
+            Vec::new(),
+            "no stream, no notifications"
+        );
+        assert_eq!(harness.messages(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn gem_indexing_stops_at_max_files_and_says_so() {
+        // Silence here is the worst outcome: half a bundle indexed looks exactly like a bundle
+        // where the gem you wanted was never installed.
+        let (dir, _gem_home, env) = project_with_gem("module Shouty\nend\n");
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            "[gems]\ndefault_gems = false\nmax_files = 0\n\n[rbs]\nenabled = false\n",
+        )
+        .unwrap();
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/main.rb", "Shouty\n");
+        harness.index();
+        let _ = harness.messages();
+
+        harness.index_gems();
+
+        assert_eq!(
+            harness.messages(),
+            vec![messages::gem_index_truncated(0)],
+            "the message names the setting to raise, in the spelling ya-lsp.toml takes"
+        );
+        assert!(
+            !harness.has("Shouty"),
+            "nothing was indexed, which is what the warning is about"
+        );
+    }
+
+    #[test]
+    fn a_workspace_that_never_says_which_ruby_it_uses_hears_about_it() {
+        // Finding F, through the wire it actually travels. `ruby_lib_dirs` refuses to guess a
+        // Ruby — rightly, because guessing put Apple's vestigial 2.6 stdlib into the graph and
+        // answered `"hello".u` with `unspace` — and until v0.2.0 it refused in silence, at a
+        // cost of every one of Ruby's own 727 library files. The unit test in `workspace::gems`
+        // pins the text; this pins that it reaches `window/showMessage` at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("ya-lsp.toml"), "[rbs]\nenabled = false\n").unwrap();
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        harness.write("lib/thing.rb", "class Thing\nend\n");
+        harness.index();
+        let _ = harness.messages();
+
+        harness.index_gems();
+
+        assert_eq!(harness.messages(), vec![messages::no_ruby_version()]);
+    }
+
+    #[test]
+    fn diagnostics_are_skipped_for_a_file_that_has_gone_from_disk() {
+        // The declaration still carries its diagnostic after the file is deleted. Placing a
+        // range needs the text, and squiggles in guessed positions are worse than none.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/broken.rb", "class Broken\n  def oops(\nend\n");
+        harness.index();
+        assert!(
+            harness.latest(&uri).is_some_and(|items| !items.is_empty()),
+            "the syntax error is reported while the file is there"
+        );
+
+        std::fs::remove_file(uri.to_path().expect("a path")).unwrap();
+        harness.analysis.publish_diagnostics();
+
+        // Not silence: `publishDiagnostics` is stateful per URI, so the squiggles that are no
+        // longer placeable have to be cleared with an explicit empty array. Sending nothing
+        // would leave them on screen for as long as the editor is open.
+        assert_eq!(
+            harness.latest(&uri),
+            Some(Vec::new()),
+            "the stale diagnostics have to be cleared, not merely stopped"
+        );
+    }
+
+    #[test]
+    fn closing_an_unsaved_buffer_clears_the_squiggles_it_had() {
+        // A different loss from `..._gone_from_disk`: there the document stays in the graph and
+        // only its text goes, so the diagnostics survive with nowhere to be placed. Here the
+        // document is deleted outright — `didClose` on a buffer with no file behind it — and
+        // its diagnostics go with it.
+        //
+        // Which makes the *clearing* the whole assertion: `publishDiagnostics` is stateful per
+        // URI, so a document that no longer exists still needs an explicit empty array sent
+        // for it. Publishing nothing would leave the squiggles on screen with no buffer under
+        // them and no way to ever remove them.
+        let mut harness = Harness::new();
+        let uri = DocUri::from_path(&harness.root.path().join("untitled.rb")).expect("a uri");
+
+        harness.open(
+            &uri,
+            "class Broken
+  def oops(
+end
+",
+        );
+        assert!(
+            harness.latest(&uri).is_some_and(|items| !items.is_empty()),
+            "the syntax error is reported while the buffer is open"
+        );
+
+        harness.run(Task::DidClose { uri: uri.clone() });
+        harness.analysis.publish_diagnostics();
+
+        assert_eq!(
+            harness.latest(&uri),
+            Some(Vec::new()),
+            "cleared, and nothing published for a document that is not there"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_buffer_whose_file_cannot_be_read_forgets_it_rather_than_keeping_stale_text() {
+        // On close the buffer stops shadowing disk and the file is re-read, so the graph holds
+        // what is really there. A file that exists and cannot be read is the one case where
+        // neither answer is available: keeping the buffer's text would leave the graph
+        // asserting the contents of a file nobody can open.
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut harness = Harness::new();
+        let source = "class Person\n  def shout\n  end\nend\n";
+        let uri = harness.write("app/person.rb", source);
+        harness.index();
+        harness.open(&uri, source);
+        assert!(
+            !harness.symbol_names("shout").is_empty(),
+            "indexed to start"
+        );
+
+        let path = uri.to_path().expect("a path");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        harness.run(Task::DidClose { uri: uri.clone() });
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            harness.symbol_names("shout").is_empty(),
+            "the document is dropped rather than left holding the closed buffer's text"
+        );
+    }
+
+    #[test]
+    fn a_response_that_cannot_be_serialised_becomes_an_error_rather_than_silence() {
+        // Every request's answer goes out through `reply`. `serde_json::to_value` cannot fail
+        // for any type it is handed today, but the protocol has no shape for "no response":
+        // a client that sent an id waits on it forever. An `InternalError` is the only exit
+        // that lets the editor carry on.
+        let id = RequestId::from(7);
+        let ok = reply(&id, Some("fine"));
+        assert_eq!(ok.response_result.expect("a result"), "fine");
+
+        // A map whose keys are not strings is what `serde_json` actually refuses — a non-finite
+        // float is quietly written as `null` rather than rejected.
+        let broken = reply(
+            &id,
+            Some(std::collections::BTreeMap::from([((1u8, 2u8), 3u8)])),
+        );
+        let error = broken.response_result.expect_err("an error");
+        assert_eq!(error.code, ErrorCode::InternalError as i32);
+        assert!(error.message.contains("could not serialise"), "{error:?}");
+    }
+
+    #[test]
+    fn a_signature_file_that_cannot_be_read_is_skipped_rather_than_indexed_raw() {
+        // A signature root is walked and then read, and a file can go between the two. The
+        // fallback is to leave it to `index_files`, which is the same answer as for a file
+        // with no interfaces in it.
+        let mut harness = Harness::new();
+        let absent = harness.root.path().join("gone.rbs");
+        assert!(!harness.analysis.index_edited_signature(&absent));
+
+        // Not a signature file at all: nothing to edit, and the same answer.
+        let ruby = harness.write("app/person.rb", "class Person\nend\n");
+        assert!(
+            !harness
+                .analysis
+                .index_edited_signature(&ruby.to_path().expect("a path"))
+        );
+    }
+
+    #[test]
+    fn references_from_a_method_definition_find_its_call_sites() {
+        // The other half of `method_references_are_name_based`: the cursor on `def shout`
+        // rather than on a call. What was defined decides the mechanism — a method is matched
+        // by name, and a constant through the resolution.
+        let mut harness = Harness::new();
+        let declaration = "class Person\n  def shout\n  end\n  attr_reader :volume\nend\n";
+        let person = harness.write("app/person.rb", declaration);
+        let main = harness.write(
+            "app/main.rb",
+            "Person.new.shout\nPerson.new.volume\nother.shout\n",
+        );
+        harness.index();
+        // Open, so the ranges come from the buffer rather than from a re-read of disk: an open
+        // file is the one a find-references result is most likely to name.
+        harness.open(&main, "Person.new.shout\nPerson.new.volume\nother.shout\n");
+
+        // Name-based, so `other.shout` is in the answer too — stated rather than hidden.
+        assert_eq!(
+            harness.reference_list(&person, declaration, "shout", false),
+            vec!["main.rb:0:11", "main.rb:2:6"]
+        );
+        // `attr_reader :volume` defines a method as much as `def` does.
+        assert_eq!(
+            harness.reference_list(&person, declaration, "volume", false),
+            vec!["main.rb:1:11"]
+        );
+    }
+
+    #[test]
+    fn a_hover_on_an_untyped_receiver_caps_the_list_of_candidates() {
+        // With no inference there is nothing to narrow `thing.call` down to. Listing all of
+        // them would be a page; the count is what tells the user the answer is a guess.
+        let mut harness = Harness::new();
+        let mut classes = String::new();
+        for index in 0..12 {
+            classes.push_str(&format!("class Holder{index}\n  def call\n  end\nend\n"));
+        }
+        harness.write("app/holders.rb", &classes);
+        let source = "thing.call\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        let markdown = harness.hover_at(&uri, source, "call")["contents"]["value"]
+            .as_str()
+            .expect("markdown")
+            .to_owned();
+        assert!(
+            markdown.contains("**12 possible definitions**"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("…and 2 more"), "{markdown}");
     }
 
     #[test]
@@ -3177,11 +4729,14 @@ end
         let found = harness.references_at(&uri, &source, "ping", false);
         assert_eq!(found.as_array().map(Vec::len), Some(MAX_REFERENCES));
 
-        let told = harness
-            .messages()
-            .into_iter()
-            .any(|message| message.contains("incomplete"));
-        assert!(told, "a truncated answer has to say so");
+        assert_eq!(
+            harness.messages(),
+            vec![messages::references_truncated(
+                MAX_REFERENCES + 1,
+                MAX_REFERENCES
+            )],
+            "a truncated answer has to say so, and say by how much"
+        );
     }
 
     #[test]
@@ -3324,6 +4879,473 @@ end
         }
         // `build` is a singleton method: not callable on an instance, so not offered.
         assert!(!found.contains(&"build".to_owned()), "{found:?}");
+    }
+
+    /// A project whose ancestry is written down, for pinning the *order* of a list.
+    ///
+    /// Every other fixture in this module asks whether a name is offered. This one asks where
+    /// it lands, which is the question v0.1.0 never asked anywhere — `"hello".` shipped opening
+    /// on `DelegateClass, Digest, append_as_bytes, …` through a green suite and a benchmark that
+    /// only ever measured milliseconds.
+    ///
+    /// The shape is chosen so every rung of the ancestor chain holds exactly one method: `Item`
+    /// includes `Auditable` and inherits `Record`, and `Object` sits past both. Reopening
+    /// `String` and `Object` is what lets a literal receiver be ranked here at all — this
+    /// harness has no core signatures by design, and adding them would be ~800 files of work
+    /// for a question about ordering.
+    ///
+    /// `Item#initialize` and its `private def stash` are here so the pinned lists carry the
+    /// other half of the question: not only where a row lands, but whether Ruby would let it be
+    /// written at all. Both are absent from every explicit receiver below — and from the class
+    /// body, where `self` is the class rather than an instance. They appear in exactly one list,
+    /// the expression inside `#price`, which is the only cursor here that could write either.
+    const ANCESTRY: &str = "\
+module Store
+  DEFAULT_CURRENCY = 1
+
+  module Auditable
+    def audit
+    end
+  end
+
+  class Record
+    def save
+    end
+  end
+
+  class Item < Record
+    include Auditable
+
+    LIMIT = 10
+
+    def self.build
+    end
+
+    def initialize
+    end
+
+    def price
+      audit
+    end
+
+    private
+
+    def stash
+    end
+  end
+end
+
+class String
+  def shout
+  end
+end
+
+class Object
+  def global_helper
+  end
+end
+";
+
+    #[test]
+    fn an_instance_receiver_is_ranked_by_ancestor_distance() {
+        let mut harness = Harness::new();
+        harness.write("app/store.rb", ANCESTRY);
+        harness.index();
+        let uri = harness.write("app/main.rb", "");
+
+        // One method per rung, in the order Ruby resolves them: the class, the module it
+        // includes, the class it inherits, and `Object` past all three. Alphabetically this
+        // reads `audit, global_helper, price, save`, which is what shipped.
+        assert_eq!(
+            harness.first_rows(&uri, "Store::Item.new.~\n", 10),
+            [
+                "price  Store::Item#price",
+                "audit  Store::Auditable#audit",
+                "save  Store::Record#save",
+                "global_helper  Object#global_helper",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_literal_receiver_leads_with_its_own_class() {
+        let mut harness = Harness::new();
+        harness.write("app/store.rb", ANCESTRY);
+        harness.index();
+        let uri = harness.write("app/main.rb", "");
+
+        // The finding, in the small: alphabetical order puts `global_helper` first, and it is
+        // the one row here that `String` does not declare.
+        assert_eq!(
+            harness.first_rows(&uri, "\"hi\".~\n", 10),
+            ["shout  String#shout", "global_helper  Object#global_helper"]
+        );
+    }
+
+    #[test]
+    fn a_singleton_receiver_leads_with_the_class_own_methods() {
+        let mut harness = Harness::new();
+        harness.write("app/store.rb", ANCESTRY);
+        harness.index();
+        let uri = harness.write("app/main.rb", "");
+
+        assert_eq!(
+            harness.first_rows(&uri, "Store::Item.~\n", 10),
+            [
+                "build  Store::Item.build",
+                "global_helper  Object#global_helper"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_namespace_receiver_leads_with_what_is_nested_in_it() {
+        let mut harness = Harness::new();
+        harness.write("app/store.rb", ANCESTRY);
+        harness.index();
+        let uri = harness.write("app/main.rb", "");
+
+        // A module's `::` is its own contents and stops there. Alphabetical, because nothing has
+        // been typed and a namespace has no ancestor chain to measure — the same seam the
+        // untyped receiver sits on, for the same reason.
+        //
+        // What matters more than the order is the last row: there isn't one from `Object`.
+        // rubydex's namespace walk deliberately stops before `Object`'s own members, or `String::`
+        // would list every top-level constant in the project — and `Object` is where everything
+        // it could not attribute ends up.
+        assert_eq!(
+            harness.first_rows(&uri, "Store::~\n", 10),
+            [
+                "Auditable  Store::Auditable",
+                "DEFAULT_CURRENCY  Store::DEFAULT_CURRENCY",
+                "Item  Store::Item",
+                "Record  Store::Record",
+            ]
+        );
+
+        // A *class* under `::` carries its singleton chain as well, because `Store::Item.build`
+        // may also be written `Store::Item::build`. So the nested constant leads, the class's own
+        // singleton method follows, and `Object` sits at the bottom where distance puts it.
+        //
+        // Which makes the two lists above and below asymmetric: `Store.` offers `global_helper`
+        // and `Store::` does not, though both name the same module object. That is rubydex's
+        // namespace walk rather than a rule stated here, and it is finding B's territory — the
+        // fixture's job is to make the seam visible, not to close it.
+        assert_eq!(
+            harness.first_rows(&uri, "Store::Item::~\n", 10),
+            [
+                "LIMIT  Store::Item::LIMIT",
+                "build  Store::Item.build",
+                "global_helper  Object#global_helper",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_namespace_receiver_is_ranked_by_how_well_the_name_matches() {
+        let mut harness = Harness::new();
+        harness.write("app/store.rb", ANCESTRY);
+        harness.index();
+        let uri = harness.write("app/main.rb", "");
+
+        // One letter is enough to separate them, and it has to be the right way round: `Item`
+        // starts with it, `Auditable` merely contains it (`aud-i-table`, folded). Alphabetically
+        // `Auditable` leads, so this is the one namespace list whose order is a claim rather
+        // than the alphabet — and the row a user typed `I` for is the one they get.
+        assert_eq!(
+            harness.first_rows(&uri, "Store::I~\n", 10),
+            ["Item  Store::Item", "Auditable  Store::Auditable"]
+        );
+    }
+
+    #[test]
+    fn an_expression_is_ranked_outwards_from_the_cursor() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/store.rb", ANCESTRY);
+        harness.index();
+
+        // Two scales meeting on one number. Constants are reached through the lexical nesting
+        // and methods through the ancestor chain, so each walk is counted from the cursor
+        // rather than laid end to end — otherwise every method in the list would sit below
+        // every constant, or the reverse.
+        //
+        // `Object` is where they touch: it is the last rung of the ancestor chain *and* the
+        // outermost lexical scope. It has to be scored as the former, which is why `save` on
+        // `Record` outranks `global_helper` here. Score it as the latter and everything rubydex
+        // could not attribute — the whole of finding B — lands one step from the cursor.
+        assert_eq!(
+            harness.first_rows(&uri, &ANCESTRY.replace("      audit\n", "      ~\n"), 12),
+            [
+                "LIMIT  Store::Item::LIMIT",
+                // The receiver is implicit here, so Ruby permits both of these and the three
+                // receiver lists above must not carry either. That they do not is what makes
+                // this pair a guard rather than decoration.
+                "initialize  Store::Item#initialize",
+                "price  Store::Item#price",
+                "stash  Store::Item#stash",
+                "Auditable  Store::Auditable",
+                "DEFAULT_CURRENCY  Store::DEFAULT_CURRENCY",
+                "Item  Store::Item",
+                "Record  Store::Record",
+                "audit  Store::Auditable#audit",
+                "save  Store::Record#save",
+                "Object  Object",
+                "Store  Store",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_class_body_is_ranked_from_the_class_the_cursor_is_writing() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/store.rb", ANCESTRY);
+        harness.index();
+
+        // The receiver is implicit and `self` is the *class*, not an instance of it — so this
+        // list is the mirror of the one above. `build` is offered without a receiver, because
+        // that is where `def self.build` can be called from; `initialize`, `price` and `stash`
+        // are gone, because none of the three can be written here at all. The pair is the whole
+        // point of both assertions: the same fixture, the same names, two cursors, and Ruby
+        // permits a different set at each.
+        assert_eq!(
+            harness.first_rows(
+                &uri,
+                &ANCESTRY.replace("    LIMIT = 10\n", "    LIMIT = 10\n    ~\n"),
+                10
+            ),
+            [
+                "LIMIT  Store::Item::LIMIT",
+                "build  Store::Item.build",
+                "Auditable  Store::Auditable",
+                "DEFAULT_CURRENCY  Store::DEFAULT_CURRENCY",
+                "Item  Store::Item",
+                "Record  Store::Record",
+                "Object  Object",
+                "Store  Store",
+                "String  String",
+                // Last of the declarations, which is where `Object` belongs: everything rubydex
+                // could not attribute lands there, and a class body is one keystroke from being
+                // the list finding B is about.
+                "global_helper  Object#global_helper",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_untyped_receiver_falls_back_to_the_alphabet_when_nothing_is_nearer() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/store.rb", ANCESTRY);
+        harness.index();
+
+        // The seam, pinned deliberately. The typed and untyped paths share a ranking
+        // constructor and nothing else: one walks a receiver's ancestor chain, the other is a
+        // flat name search over the graph with no receiver in it at all. There is no distance
+        // where there is no chain, so this list is exactly what it was — which is the case
+        // against leaving it as a list, not an argument that it is fine.
+        //
+        // Every candidate is in the one file this fixture has, so `Locality` scores them all
+        // alike and says nothing — which is the point. A ranking term that invents an order
+        // where there is no information would be worse than the alphabet, not better.
+        //
+        // The receiver is written after the last `end` on purpose. Put it inside the method and
+        // Prism's recovery eats that `end` instead, refiling every later top-level class one
+        // level deeper: the answer is the same six names, spelled `Store::String#shout`.
+        assert_eq!(
+            harness.first_rows(&uri, &format!("{ANCESTRY}@foo.~\n"), 12),
+            [
+                "audit  Store::Auditable#audit",
+                "build  Store::Item.build",
+                "global_helper  Object#global_helper",
+                "price  Store::Item#price",
+                "save  Store::Record#save",
+                "shout  String#shout",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_untyped_receiver_is_ranked_by_how_near_the_file_is() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/store.rb", ANCESTRY);
+        harness.write("app/near.rb", "class Near\n  def zzz_near\n  end\nend\n");
+        harness.write("lib/far.rb", "class Far\n  def aaa_far\n  end\nend\n");
+        harness.index();
+
+        // The two names are spelled to sort the wrong way round on purpose: `aaa_far` is the
+        // alphabetically first method in the whole project and it belongs last, `zzz_near` is
+        // the last and belongs above it. Nothing else here can tell them apart — both are the
+        // user's own code, neither matches a prefix, and there is no receiver to measure a
+        // chain from.
+        assert_eq!(
+            harness.first_rows(&uri, &format!("{ANCESTRY}@foo.~\n"), 12),
+            [
+                "audit  Store::Auditable#audit",
+                "build  Store::Item.build",
+                "global_helper  Object#global_helper",
+                "price  Store::Item#price",
+                "save  Store::Record#save",
+                "shout  String#shout",
+                "zzz_near  Near#zzz_near",
+                "aaa_far  Far#aaa_far",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_rbs_interface_never_reaches_the_graph() {
+        // The end of the path `analysis::signatures` starts: the unit tests there check the text
+        // that comes out, and this checks that rubydex agreed to read it and that nothing from
+        // inside the block survived indexing.
+        //
+        // A signature root of its own rather than the vendored one, so the fixture owns exactly
+        // what is in it: `_Reader` at the top level lands its member on `Object`, and `_Rand`
+        // inside `class Bag` lands its member on `Bag` — both shapes appear in one real file,
+        // `core/array.rbs`, and a rule that only looked at the top level would miss the second.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = dir.path().join("sig/core");
+        std::fs::create_dir_all(&core).unwrap();
+        std::fs::write(
+            core.join("bag.rbs"),
+            "\
+class Bag
+  %a{deprecated: Use Bag::_Rand, or make your own}
+  interface _Rand
+    def roll: (Integer max) -> Integer
+  end
+
+  def keep: () -> void
+end
+
+interface _Reader
+  def read: () -> String
+end
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            format!(
+                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
+                dir.path().join("sig").display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        let uri = harness.write("app/main.rb", "");
+        harness.index();
+        harness.index_gems();
+
+        // The signatures did get indexed — without this the rest of the test passes vacuously,
+        // and an edited file rbs refuses to parse is exactly how it would come to.
+        assert!(
+            harness.has("Bag#keep()"),
+            "the signature root was not indexed"
+        );
+        assert!(!harness.has("Bag#roll()"));
+        assert!(!harness.has("Object#read()"));
+
+        // And the shape a user sees: `Object` is every receiver's ancestor, so a member misfiled
+        // there is offered on everything in the language.
+        let found = harness.declarations_at(&uri, "Bag.new.~\n");
+        assert!(found.contains(&"keep".to_owned()), "{found:?}");
+        assert!(!found.contains(&"roll".to_owned()), "{found:?}");
+        assert!(!found.contains(&"read".to_owned()), "{found:?}");
+    }
+
+    #[test]
+    fn a_projects_own_signatures_are_edited_the_same_way() {
+        // The second of the two routes an `.rbs` file takes into the graph, and the one that was
+        // missed the first time. `index.include` is `**/*.rb` by default, so a project that keeps
+        // its own `sig/` has to widen it — and then the files arrive through `index_workspace`
+        // rather than through the background signature index. Filtered one way and not the other,
+        // `Object#slurp` came back and was offered on every receiver in the project.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("sig")).unwrap();
+        std::fs::write(
+            dir.path().join("sig/widget.rbs"),
+            "\
+class Widget
+  interface _Spinnable
+    def spin: () -> void
+  end
+
+  def render: () -> String
+end
+
+interface _Readerish
+  def slurp: () -> String
+end
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            "[gems]\nenabled = false\ndefault_gems = false\n\n[rbs]\nenabled = false\n\n\
+             [index]\ninclude = [\"**/*.rb\", \"sig/**/*.rbs\"]\n",
+        )
+        .unwrap();
+
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        let uri = harness.write("lib/app.rb", "class Widget\nend\n");
+        harness.index();
+
+        assert!(
+            harness.has("Widget#render()"),
+            "the sig/ directory was not indexed"
+        );
+        assert!(!harness.has("Widget#spin()"));
+        assert!(!harness.has("Object#slurp()"));
+
+        let found = harness.declarations_at(&uri, "Widget.new.~\n");
+        assert_eq!(found, vec!["render".to_owned()], "{found:?}");
+    }
+
+    #[test]
+    fn ruby_keeps_initialize_private_however_it_was_declared() {
+        let mut harness = Harness::new();
+        let item = harness.write("app/store.rb", ANCESTRY);
+        harness.index();
+        let uri = harness.write("app/main.rb", "");
+
+        // `rb_add_method` privatises five names at the point of definition, so `def initialize`
+        // is private whatever its class said — and nothing in the graph records that. rbs is not
+        // even consistent about it: `Kernel#initialize_copy` is marked private and
+        // `String#initialize_copy` public, so `"hi".` offered `initialize` and `initialize_copy`
+        // while `count.` offered only the first.
+        let outside = harness.declarations_at(&uri, "Store::Item.new.~\n");
+        assert!(outside.contains(&"price".to_owned()), "{outside:?}");
+        assert!(!outside.contains(&"initialize".to_owned()), "{outside:?}");
+
+        // And the guard, so this cannot pass by banning the name outright: Ruby 2.7 onwards
+        // permits a private call on a receiver written `self`, `initialize` included.
+        let inside =
+            harness.declarations_at(&item, &ANCESTRY.replace("      audit\n", "      self.~\n"));
+        assert!(inside.contains(&"initialize".to_owned()), "{inside:?}");
+    }
+
+    #[test]
+    fn a_private_method_needs_a_receiver_written_self() {
+        let mut harness = Harness::new();
+        let item = harness.write("app/store.rb", ANCESTRY);
+        harness.index();
+
+        // rubydex passes a private method whenever the caller's `self` is the same *class* as
+        // the receiver. Ruby's exemption is for the receiver being *written* `self`, so this
+        // offered `stash` from inside `Item` where a real interpreter raises `NoMethodError`.
+        let other = harness.declarations_at(
+            &item,
+            &ANCESTRY.replace("      audit\n", "      Store::Item.new.~\n"),
+        );
+        assert!(other.contains(&"price".to_owned()), "{other:?}");
+        assert!(!other.contains(&"stash".to_owned()), "{other:?}");
+
+        // `::` is a method call too, and Ruby exempts it on the same terms — both halves
+        // checked against a real interpreter rather than assumed.
+        for marked in ["      self.~\n", "      self::~\n"] {
+            let found = harness.declarations_at(&item, &ANCESTRY.replace("      audit\n", marked));
+            assert!(found.contains(&"stash".to_owned()), "{marked}: {found:?}");
+        }
     }
 
     #[test]
@@ -3679,5 +5701,55 @@ end
             .unwrap_or_default();
         assert!(markdown.contains("Says it loudly"), "{resolved}");
         assert!(markdown.contains("shout(volume)"), "{resolved}");
+    }
+
+    #[test]
+    fn resolving_an_item_the_graph_no_longer_holds_answers_the_item_it_was_given() {
+        // A list is built, the configuration reloads, the graph is dropped and rebuilt, and the
+        // user then arrows down onto a row from the old list. The `data` on that row is a
+        // declaration id nothing answers to any more — which arrives from the client, so it is
+        // handed to the server rather than produced by it, and rubydex ids are hashes with no
+        // way to tell a stale one from a wrong one. The protocol says the item comes back
+        // either way; enriching it is the optional half.
+        let mut harness = Harness::new();
+        harness.write("app/hr.rb", "class Person\nend\n");
+        harness.index();
+
+        let resolved = harness.ask(
+            "completionItem/resolve",
+            serde_json::json!({ "label": "shout", "data": "1234567890123456789" }),
+        );
+
+        assert_eq!(resolved["label"], "shout", "the item comes back regardless");
+        assert!(
+            resolved["documentation"].is_null(),
+            "and carries nothing invented: {resolved}"
+        );
+    }
+
+    #[test]
+    fn a_definition_whose_file_is_gone_answers_nothing_rather_than_a_dead_link() {
+        // The graph still holds the declaration and still knows which file it was written in.
+        // Turning that into a `LocationLink` needs the text, to place two ranges in it, and a
+        // file deleted since indexing has none — the same situation
+        // `diagnostics_are_skipped_for_a_file_that_has_gone_from_disk` covers from the other
+        // end. Every site failing leaves an empty list, which must be answered as `null`: a
+        // client handed `[]` opens an empty peek window instead of saying nothing was found.
+        let mut harness = Harness::new();
+        let person = harness.write("app/person.rb", "class Person\nend\n");
+        let source = "Person.new\n";
+        let main = harness.write("app/main.rb", source);
+        harness.index();
+        assert!(
+            !harness.definition_at(&main, source, "Person").is_null(),
+            "the jump works while the file is there"
+        );
+
+        std::fs::remove_file(person.to_path().expect("a path")).unwrap();
+
+        assert!(
+            harness.definition_at(&main, source, "Person").is_null(),
+            "and answers nothing once it is not"
+        );
     }
 }

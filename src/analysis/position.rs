@@ -128,13 +128,19 @@ impl TextDocument {
     }
 
     #[must_use]
-    pub fn text(&self) -> &str {
-        &self.text
+    pub fn len(&self) -> u32 {
+        self.text.len() as u32
+    }
+
+    /// Kept beside `len` because a public `len` without one is a lint and a bad API alike.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
     }
 
     #[must_use]
-    pub fn encoding(&self) -> PositionEncoding {
-        self.encoding
+    pub fn text(&self) -> &str {
+        &self.text
     }
 
     /// Convert an LSP position to a byte offset.
@@ -203,16 +209,6 @@ impl TextDocument {
         }
     }
 
-    #[must_use]
-    pub fn len(&self) -> u32 {
-        self.text.len() as u32
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
-    }
-
     /// A line's text without its terminator, so a column can never address the newline itself.
     fn line_content(&self, range: TextRange) -> &str {
         let line = &self.text[usize::from(range.start())..usize::from(range.end())];
@@ -231,9 +227,23 @@ impl TextDocument {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn length_is_bytes_and_agrees_with_emptiness() {
+        // Offsets are byte offsets everywhere in this crate — `offset_at` clamps to `len` —
+        // so a multi-byte character must count as its bytes rather than as one character.
+        let empty = TextDocument::new(String::new(), PositionEncoding::Utf16);
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+
+        let text = TextDocument::new("caf\u{e9}".to_owned(), PositionEncoding::Utf16);
+        assert_eq!(text.len(), 5, "four characters, five bytes");
+        assert!(!text.is_empty());
+    }
 
     const ALL: [PositionEncoding; 3] = [
         PositionEncoding::Utf8,

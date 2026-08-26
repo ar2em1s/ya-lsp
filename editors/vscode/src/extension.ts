@@ -6,9 +6,10 @@
  * that three features turn on. A single process handed several roots would have to re-derive all
  * of that per request.
  *
- * Only the first folder starts eagerly. A monorepo with a dozen folders would otherwise index a
- * dozen bundles before the editor finishes opening, for folders nobody has looked at; the rest
- * start when a Ruby file inside them is opened.
+ * A folder starts eagerly only when it is the workspace's only one. A monorepo with a dozen
+ * folders would otherwise index a dozen bundles before the editor finishes opening, for folders
+ * nobody has looked at; every folder of a multi-root workspace starts when a Ruby file inside it
+ * is opened.
  */
 
 import * as fs from 'node:fs';
@@ -27,11 +28,6 @@ import { resolveServer } from './server';
 
 const clients = new Map<string, LanguageClient>();
 const channels = new Map<string, vscode.LogOutputChannel>();
-/**
- * A watcher handed to a client through `synchronize` stays the caller's to dispose, and every
- * restart makes a new one — so without this each restart leaves a live watcher behind.
- */
-const watchers = new Map<string, vscode.FileSystemWatcher>();
 /** Folders whose server could not be found, so the error is reported once and not per file. */
 const reported = new Set<string>();
 
@@ -48,11 +44,18 @@ export async function activate(extensionContext: vscode.ExtensionContext): Promi
     vscode.workspace.onDidChangeConfiguration(onConfigurationChanged)
   );
 
-  // The first folder eagerly, so a single-folder project — which is nearly all of them — has a
+  // The one folder eagerly, so a single-folder project — which is nearly all of them — has a
   // server warming up before the user's first keystroke.
-  const first = vscode.workspace.workspaceFolders?.[0];
-  if (first) {
-    await start(first);
+  //
+  // Only when there is exactly one. `folders[0]` in a multi-root workspace is whichever folder
+  // the `.code-workspace` happens to list first, which says nothing about whether it holds any
+  // Ruby: activation is `onLanguage:ruby`, so opening a file in the *second* folder would start
+  // a server on the first, index a folder nobody asked about, and warn that it found no Ruby
+  // there. Multi-root falls through to the lazy path below, which is what the rest of this
+  // module already documents.
+  const folders = vscode.workspace.workspaceFolders;
+  if (folders?.length === 1 && folders[0]) {
+    await start(folders[0]);
   }
   // Activation is usually *caused* by opening a Ruby file, and it may be in a different folder
   // than the first one.
@@ -128,8 +131,11 @@ async function start(folder: vscode.WorkspaceFolder): Promise<void> {
     workspaceFolder: folder,
     outputChannel: channelFor(folder),
     initializationOptions: serverOptions(settings),
-    // The server has always known how to reload `ya-lsp.toml`; until now nothing told it to.
-    synchronize: { fileEvents: watcherFor(folder) },
+    // No `synchronize.fileEvents`. The server registers its own `ya-lsp.toml` watcher through
+    // `client/registerCapability` as of v0.2.0, which is what makes reload work in editors that
+    // have no extension to bring one — and the client installs that registration itself. Passing
+    // one here as well would mean two watchers on one file, so two `didChangeWatchedFiles` per
+    // save, and a reload drops the whole graph and re-runs the gem index each time.
   };
 
   // The id is also the settings prefix the client reads `trace.server` from.
@@ -144,8 +150,6 @@ async function start(folder: vscode.WorkspaceFolder): Promise<void> {
 }
 
 async function stop(key: string): Promise<void> {
-  watchers.get(key)?.dispose();
-  watchers.delete(key);
   const client = clients.get(key);
   if (!client) {
     return;
@@ -173,7 +177,7 @@ async function restartAll(): Promise<void> {
 async function onFoldersChanged(event: vscode.WorkspaceFoldersChangeEvent): Promise<void> {
   for (const folder of event.removed) {
     const key = folder.uri.toString();
-    // `stop` takes the client and the watcher with it; the channel is this function's to close.
+    // `stop` takes the client with it; the channel is this function's to close.
     await stop(key);
     channels.get(key)?.dispose();
     channels.delete(key);
@@ -213,16 +217,6 @@ function showOutput(): void {
   const channel =
     (folder && channels.get(folder.uri.toString())) ?? [...channels.values()][0];
   channel?.show();
-}
-
-function watcherFor(folder: vscode.WorkspaceFolder): vscode.FileSystemWatcher {
-  const key = folder.uri.toString();
-  watchers.get(key)?.dispose();
-  const watcher = vscode.workspace.createFileSystemWatcher(
-    new vscode.RelativePattern(folder, 'ya-lsp.toml')
-  );
-  watchers.set(key, watcher);
-  return watcher;
 }
 
 function channelFor(folder: vscode.WorkspaceFolder): vscode.LogOutputChannel {

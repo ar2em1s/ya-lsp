@@ -9,7 +9,7 @@ use rubydex::model::{
     ids::{DefinitionId, UriId},
 };
 
-use super::{position::TextDocument, render};
+use super::{locator, position::TextDocument, render};
 
 /// The outline of `uri_id`, nested the way the file is nested.
 ///
@@ -26,7 +26,7 @@ pub fn document_symbols(graph: &Graph, uri_id: UriId, text: &TextDocument) -> Ve
         .definitions()
         .iter()
         .filter_map(|id| Some((*id, graph.definitions().get(id)?)))
-        .filter(|(_, definition)| is_outline_worthy(definition))
+        .filter(|(_, definition)| is_outline_worthy(graph, definition))
         .collect();
 
     // rubydex emits definitions in source order already, but nothing in its API promises that,
@@ -48,9 +48,12 @@ pub fn document_symbols(graph: &Graph, uri_id: UriId, text: &TextDocument) -> Ve
     // own parent.
     let mut roots = Vec::new();
     for index in (0..nodes.len()).rev() {
-        let Some(node) = nodes[index].take() else {
-            continue;
-        };
+        // Each index is visited once and only a *parent* is ever borrowed, never taken, so this
+        // is `Some` for the same reason the arm below is — stated the same way, rather than as
+        // a silent skip that would drop a symbol if it ever stopped being true.
+        let node = nodes[index]
+            .take()
+            .expect("each index is taken exactly once");
         match parent_of(graph, listed[index].1, &position) {
             Some(parent) if parent < index => nodes[parent]
                 .as_mut()
@@ -129,8 +132,9 @@ fn parent_of(
 const MAX_NESTING: usize = 64;
 
 fn symbol(graph: &Graph, definition: &Definition, text: &TextDocument) -> DocumentSymbol {
-    let full = definition.offset();
-    let selection = definition.name_offset().unwrap_or(full);
+    // `selectionRange` has to sit inside `range` or VS Code throws away the whole outline;
+    // `locator::spans` is the one place that guarantees it.
+    let (full, selection) = locator::spans(definition);
 
     #[allow(deprecated)] // Same: required field, superseded by `tags`.
     DocumentSymbol {
@@ -141,8 +145,8 @@ fn symbol(graph: &Graph, definition: &Definition, text: &TextDocument) -> Docume
             .is_deprecated()
             .then(|| vec![SymbolTag::DEPRECATED]),
         deprecated: None,
-        range: text.range_at(full.start(), full.end()),
-        selection_range: text.range_at(selection.start(), selection.end()),
+        range: text.range_at(full.0, full.1),
+        selection_range: text.range_at(selection.0, selection.1),
         children: None,
     }
 }
@@ -208,10 +212,15 @@ pub(super) fn kind_of(definition: &Definition) -> SymbolKind {
 
 /// What belongs in an outline.
 ///
-/// The exclusions are all things rubydex records for resolution rather than for reading:
-/// `private :foo` is a visibility *statement*, not a definition of `foo`, and instance and
-/// class variables would list `@name` once per assignment.
-fn is_outline_worthy(definition: &Definition) -> bool {
+/// The exclusions by kind are all things rubydex records for resolution rather than for reading:
+/// `private :foo` is a visibility *statement*, not a definition of `foo`, and instance and class
+/// variables would list `@name` once per assignment.
+///
+/// The name is checked because Prism recovers a half-typed `def` into a node whose name span is
+/// the whitespace after the keyword, and a row with nothing written in it is not an outline
+/// entry. Dropping one is safe for the tree: `parent_of` walks past a definition it cannot find,
+/// so anything nested inside reparents outwards rather than disappearing.
+fn is_outline_worthy(graph: &Graph, definition: &Definition) -> bool {
     !matches!(
         definition,
         Definition::ConstantVisibility(_)
@@ -220,5 +229,5 @@ fn is_outline_worthy(definition: &Definition) -> bool {
             | Definition::GlobalVariableAlias(_)
             | Definition::InstanceVariable(_)
             | Definition::ClassVariable(_)
-    )
+    ) && !name_of(graph, definition).trim().is_empty()
 }

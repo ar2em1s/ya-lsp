@@ -4,15 +4,21 @@
 //! the editor show an empty result instead of falling back to its own heuristics, which is a
 //! worse experience than not advertising at all.
 
+use std::path::Path;
+
 use lsp_types::{
-    CompletionOptions, CompletionOptionsCompletionItem, HoverProviderCapability, OneOf,
-    SaveOptions, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
-    WorkspaceFileOperationsServerCapabilities, WorkspaceFoldersServerCapabilities,
-    WorkspaceServerCapabilities,
+    ClientCapabilities, CompletionOptions, CompletionOptionsCompletionItem,
+    DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher, GlobPattern,
+    HoverProviderCapability, OneOf, Registration, RelativePattern, SaveOptions, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, WorkspaceFileOperationsServerCapabilities,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 
-use crate::analysis::position::PositionEncoding;
+use crate::{
+    analysis::position::PositionEncoding,
+    workspace::{DocUri, config::CONFIG_FILE_NAME},
+};
 
 #[must_use]
 pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
@@ -88,6 +94,71 @@ pub fn server_info() -> serde_json::Value {
     })
 }
 
+/// The id the `ya-lsp.toml` watcher is registered under.
+///
+/// Fixed rather than generated: the protocol identifies a registration by this string, so
+/// anything that later unregisters it has to be able to name the same one.
+const CONFIG_WATCHER_ID: &str = "ya-lsp-config-watcher";
+
+/// Ask the client to watch the project's `ya-lsp.toml`, so a change to it reloads.
+///
+/// The protocol has no static form for file watching — `initialize` cannot announce it, which is
+/// why this is not in `server_capabilities` — so `client/registerCapability` is the only way to
+/// ask, and `None` here means the client did not say it accepts one. Until v0.2.0 nothing sent
+/// this at all: the VS Code extension supplied a watcher of its own through
+/// `synchronize.fileEvents`, so reload worked there and in no other editor.
+#[must_use]
+pub fn config_watcher(root: &Path, capabilities: &ClientCapabilities) -> Option<Registration> {
+    let watched_files = capabilities
+        .workspace
+        .as_ref()?
+        .did_change_watched_files
+        .as_ref()?;
+    if watched_files.dynamic_registration != Some(true) {
+        return None;
+    }
+    let options = DidChangeWatchedFilesRegistrationOptions {
+        watchers: vec![FileSystemWatcher {
+            glob_pattern: config_glob(root, watched_files.relative_pattern_support == Some(true)),
+            // All three kinds, which is what omitting `kind` means. A deleted `ya-lsp.toml` is a
+            // configuration change — it means back to the defaults — and so is one written for
+            // the first time in a project that never had one.
+            kind: None,
+        }],
+    };
+    Some(Registration {
+        id: CONFIG_WATCHER_ID.to_owned(),
+        method: "workspace/didChangeWatchedFiles".to_owned(),
+        // Infallible for this shape — every field in it is a string — but the type is a
+        // `Result`, and a registration whose options went missing asks the client to watch
+        // nothing at all. Better no registration than one that silently watches nothing.
+        register_options: Some(serde_json::to_value(options).ok()?),
+    })
+}
+
+/// The pattern the watcher is registered with.
+///
+/// Relative when the client says it takes one (LSP 3.17). The base there is a URI rather than
+/// glob syntax, so a root holding `[`, `{`, `*` or `?` — a directory named `[wip]` is enough —
+/// cannot be read as a pattern. The absolute form has no defence against that: LSP's glob
+/// syntax defines no escape. Its separators are `/` on every platform, Windows included, which
+/// is why the path is not simply handed over as the OS spells it.
+fn config_glob(root: &Path, relative_patterns: bool) -> GlobPattern {
+    if relative_patterns
+        && let Some(base) = DocUri::from_path(root).and_then(|uri| uri.to_lsp().ok())
+    {
+        return GlobPattern::Relative(RelativePattern {
+            base_uri: OneOf::Right(base),
+            pattern: CONFIG_FILE_NAME.to_owned(),
+        });
+    }
+    GlobPattern::String(
+        root.join(CONFIG_FILE_NAME)
+            .to_string_lossy()
+            .replace('\\', "/"),
+    )
+}
+
 #[must_use]
 pub fn sync_kind(capabilities: &ServerCapabilities) -> Option<TextDocumentSyncKind> {
     match capabilities.text_document_sync.as_ref()? {
@@ -96,6 +167,7 @@ pub fn sync_kind(capabilities: &ServerCapabilities) -> Option<TextDocumentSyncKi
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +207,149 @@ mod tests {
         assert!(capabilities.hover_provider.is_some());
         assert!(capabilities.definition_provider.is_some());
         assert!(capabilities.document_symbol_provider.is_some());
+    }
+
+    // ------------------------------------------------------------------ the config watcher
+
+    /// Client capabilities that answer `didChangeWatchedFiles` the way `answer` says.
+    fn watching(
+        dynamic_registration: Option<bool>,
+        relative_pattern_support: Option<bool>,
+    ) -> ClientCapabilities {
+        ClientCapabilities {
+            workspace: Some(lsp_types::WorkspaceClientCapabilities {
+                did_change_watched_files: Some(
+                    lsp_types::DidChangeWatchedFilesClientCapabilities {
+                        dynamic_registration,
+                        relative_pattern_support,
+                    },
+                ),
+                ..lsp_types::WorkspaceClientCapabilities::default()
+            }),
+            ..ClientCapabilities::default()
+        }
+    }
+
+    fn watchers(registration: &Registration) -> Vec<FileSystemWatcher> {
+        let options: DidChangeWatchedFilesRegistrationOptions = serde_json::from_value(
+            registration
+                .register_options
+                .clone()
+                .expect("a registration carries its options"),
+        )
+        .expect("the options are the shape the protocol names");
+        options.watchers
+    }
+
+    #[test]
+    fn the_watcher_is_registered_against_the_project_root() {
+        // The whole point of item 8: without this the server never asks anyone to watch
+        // anything, and `ya-lsp.toml` only reloads in the one editor that brought its own
+        // watcher.
+        let root = Path::new("/tmp/ya-lsp-watch/project");
+        let registration =
+            config_watcher(root, &watching(Some(true), None)).expect("a watcher is registered");
+        assert_eq!(registration.method, "workspace/didChangeWatchedFiles");
+        assert_eq!(registration.id, CONFIG_WATCHER_ID);
+
+        let watchers = watchers(&registration);
+        assert_eq!(watchers.len(), 1);
+        // `kind` unset is create|change|delete. A `ya-lsp.toml` that is deleted, or written for
+        // the first time, changes the configuration exactly as much as an edit does.
+        assert_eq!(watchers[0].kind, None);
+        assert_eq!(
+            watchers[0].glob_pattern,
+            GlobPattern::String("/tmp/ya-lsp-watch/project/ya-lsp.toml".to_owned()),
+            "a client without relative patterns gets the absolute one, with `/` separators"
+        );
+    }
+
+    #[test]
+    fn a_client_that_takes_relative_patterns_gets_one() {
+        // The absolute form is glob syntax all the way down, so a root under a directory named
+        // `[wip]` would be read as a character class and match nothing. The relative form's base
+        // is a URI, so the only glob in it is the part we wrote.
+        let root = Path::new("/tmp/ya-lsp-watch/[wip]/project");
+        let registration = config_watcher(root, &watching(Some(true), Some(true)))
+            .expect("a watcher is registered");
+        let base = DocUri::from_path(root).expect("an absolute root").to_lsp();
+        assert_eq!(
+            watchers(&registration)[0].glob_pattern,
+            GlobPattern::Relative(RelativePattern {
+                base_uri: OneOf::Right(base.expect("a uri")),
+                pattern: CONFIG_FILE_NAME.to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_relative_root_falls_back_to_the_pattern_it_can_still_spell() {
+        // `workspace_root` ends at `.` when the client sent no folder and the process has no
+        // working directory. There is no URI for that, so there is no relative pattern either —
+        // and answering `None` here would drop the watcher over a case the absolute form
+        // handles.
+        let registration = config_watcher(Path::new("."), &watching(Some(true), Some(true)))
+            .expect("a watcher is registered");
+        assert_eq!(
+            watchers(&registration)[0].glob_pattern,
+            GlobPattern::String("./ya-lsp.toml".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_client_that_cannot_be_asked_is_not_asked() {
+        // Nothing to fall back on: the protocol has no static form for file watching, so a
+        // client that does not take a dynamic registration cannot be given a watcher at all.
+        // The server says so in the log rather than leaving the user to discover it by editing
+        // `ya-lsp.toml` and watching nothing happen.
+        let root = Path::new("/tmp/ya-lsp-watch/project");
+        assert!(config_watcher(root, &ClientCapabilities::default()).is_none());
+        assert!(
+            config_watcher(
+                root,
+                &ClientCapabilities {
+                    workspace: Some(lsp_types::WorkspaceClientCapabilities::default()),
+                    ..ClientCapabilities::default()
+                }
+            )
+            .is_none(),
+            "a workspace section that says nothing about watched files is still a no"
+        );
+        assert!(config_watcher(root, &watching(Some(false), None)).is_none());
+        assert!(
+            config_watcher(root, &watching(None, Some(true))).is_none(),
+            "relative patterns without dynamic registration are not an offer to watch"
+        );
+    }
+
+    #[test]
+    fn the_sync_kind_is_read_out_of_either_shape_the_protocol_allows() {
+        // `sync_kind` is how the test above checks the contract, so it has to read both
+        // spellings or the assertion could be passing on a `None` it produced itself.
+        // `textDocumentSync` is either a bare kind or an options object, and swapping this
+        // server to the options form must not quietly turn that test vacuous.
+        assert_eq!(
+            sync_kind(&ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    lsp_types::TextDocumentSyncOptions {
+                        change: Some(TextDocumentSyncKind::FULL),
+                        ..lsp_types::TextDocumentSyncOptions::default()
+                    }
+                )),
+                ..ServerCapabilities::default()
+            }),
+            Some(TextDocumentSyncKind::FULL)
+        );
+        assert_eq!(
+            sync_kind(&ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::NONE
+                )),
+                ..ServerCapabilities::default()
+            }),
+            Some(TextDocumentSyncKind::NONE),
+            "the bare form, which this server does not send but a reader may meet"
+        );
+        assert_eq!(sync_kind(&ServerCapabilities::default()), None);
     }
 }

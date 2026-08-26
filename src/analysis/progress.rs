@@ -96,17 +96,19 @@ impl Progress {
             token: NumberOrString::String(self.token.clone()),
             value: ProgressParamsValue::WorkDone(value),
         };
-        let Ok(params) = serde_json::to_value(params) else {
-            return;
-        };
+        // `Notification::new` serializes for us. It is infallible here — `ProgressParams` is
+        // strings and an enum — and hand-rolling the struct only to add a dead error arm below
+        // it was a branch no test could ever take.
+        //
         // A send failure means the client is gone and the main loop is already tearing down.
-        let _ = self.outgoing.send(Message::Notification(Notification {
-            method: "$/progress".to_owned(),
+        let _ = self.outgoing.send(Message::Notification(Notification::new(
+            "$/progress".to_owned(),
             params,
-        }));
+        )));
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +158,42 @@ mod tests {
                 "$/progress:end"
             ]
         );
+    }
+
+    #[test]
+    fn a_report_lands_once_the_rate_limit_has_passed() {
+        // Back-dating `last_report` rather than sleeping: what is being tested is the decision,
+        // and a quarter of a second per run is a quarter of a second nobody gets back.
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut progress =
+            Progress::begin(&sender, true, "gems", "Indexing gems", "0/10".to_owned()).unwrap();
+
+        progress.report("swallowed".to_owned(), 10);
+        progress.last_report = Instant::now()
+            .checked_sub(MIN_REPORT_INTERVAL)
+            .expect("the process has been running for at least MIN_REPORT_INTERVAL");
+        // Over 100: the count and the total are read from different places, and a status bar
+        // asked to paint 140% is a bug report rather than a progress stream.
+        progress.report("shown".to_owned(), 140);
+        progress.end("done".to_owned());
+        drop(sender);
+
+        let received: Vec<Message> = receiver.iter().collect();
+        assert_eq!(
+            kinds(&received),
+            vec![
+                "window/workDoneProgress/create",
+                "$/progress:begin",
+                "$/progress:report",
+                "$/progress:end"
+            ]
+        );
+        let report = match &received[2] {
+            Message::Notification(notification) => &notification.params["value"],
+            other => panic!("expected a report, got {other:?}"),
+        };
+        assert_eq!(report["message"], "shown");
+        assert_eq!(report["percentage"], 100, "clamped, not sent as 140");
     }
 
     #[test]

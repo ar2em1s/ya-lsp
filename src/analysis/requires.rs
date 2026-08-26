@@ -87,6 +87,7 @@ impl Finder {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +107,14 @@ mod tests {
             &source[found.start as usize..found.end as usize],
             "lib/person"
         );
+    }
+
+    #[test]
+    fn a_require_written_on_a_receiver_is_somebody_elses_method() {
+        // `Kernel#require` is the one this navigates. `Foo.require "x"` is a method that
+        // happens to share the name, and its argument is an ordinary string.
+        assert_eq!(find("Foo.require \"person\"\n", "person"), None);
+        assert_eq!(find("self.require_relative \"sibling\"\n", "sibling"), None);
     }
 
     #[test]

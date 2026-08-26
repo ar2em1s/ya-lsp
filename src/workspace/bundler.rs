@@ -118,11 +118,17 @@ impl Lockfile {
     }
 }
 
-/// Which top-level section the parser is inside.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which top-level section the parser is inside, and — for a source — the source being filled in.
+///
+/// The source lives *in* the variant rather than beside it in an `Option`. Held separately, the
+/// two encoded one state twice: `Section::Source` was true exactly when the option was `Some`,
+/// which the compiler could not know, so the body needed a `let ... else { continue }` for a
+/// case the header match had already made impossible. One variable, and the impossible case
+/// cannot be written down.
+#[derive(Debug)]
 enum Section {
     /// `GEM` / `PATH` / `GIT` / `PLUGIN SOURCE` — the only ones that carry specs.
-    Source,
+    Source(Source),
     RubyVersion,
     BundledWith,
     /// `PLATFORMS`, `DEPENDENCIES`, `CHECKSUMS`, and anything a future Bundler invents.
@@ -133,7 +139,6 @@ enum Section {
 #[must_use]
 pub fn parse(text: &str) -> Lockfile {
     let mut lockfile = Lockfile::default();
-    let mut current: Option<Source> = None;
     let mut section = Section::Other;
     let mut in_specs = false;
 
@@ -145,27 +150,15 @@ pub fn parse(text: &str) -> Lockfile {
 
         // A header is the only thing that starts at column 0.
         if !line.starts_with(' ') && !line.starts_with('\t') {
-            if let Some(source) = current.take() {
+            if let Section::Source(source) = std::mem::replace(&mut section, Section::Other) {
                 lockfile.sources.push(source);
             }
             in_specs = false;
             section = match line.trim() {
-                "GEM" => {
-                    current = Some(Source::new(SourceKind::Rubygems));
-                    Section::Source
-                }
-                "PATH" => {
-                    current = Some(Source::new(SourceKind::Path));
-                    Section::Source
-                }
-                "GIT" => {
-                    current = Some(Source::new(SourceKind::Git));
-                    Section::Source
-                }
-                "PLUGIN SOURCE" => {
-                    current = Some(Source::new(SourceKind::Plugin));
-                    Section::Source
-                }
+                "GEM" => Section::Source(Source::new(SourceKind::Rubygems)),
+                "PATH" => Section::Source(Source::new(SourceKind::Path)),
+                "GIT" => Section::Source(Source::new(SourceKind::Git)),
+                "PLUGIN SOURCE" => Section::Source(Source::new(SourceKind::Plugin)),
                 "RUBY VERSION" => Section::RubyVersion,
                 "BUNDLED WITH" => Section::BundledWith,
                 _ => Section::Other,
@@ -173,11 +166,8 @@ pub fn parse(text: &str) -> Lockfile {
             continue;
         }
 
-        match section {
-            Section::Source => {
-                let Some(source) = current.as_mut() else {
-                    continue;
-                };
+        match &mut section {
+            Section::Source(source) => {
                 let indent = line.len() - line.trim_start().len();
                 let body = line.trim();
 
@@ -217,7 +207,7 @@ pub fn parse(text: &str) -> Lockfile {
         }
     }
 
-    if let Some(source) = current {
+    if let Section::Source(source) = section {
         lockfile.sources.push(source);
     }
     lockfile
@@ -236,8 +226,10 @@ fn parse_spec(line: &str) -> Option<Spec> {
     let (name, rest) = line.split_at(open);
     let inside = rest.trim().strip_prefix('(')?.strip_suffix(')')?;
 
+    // No emptiness check on the name: the line was trimmed above, so the `" ("` that `rfind`
+    // found is never at index 0 and never leaves nothing in front of it.
     let name = name.trim();
-    if name.is_empty() || inside.is_empty() {
+    if inside.is_empty() {
         return None;
     }
 
@@ -272,6 +264,7 @@ fn parse_ruby_version(line: &str) -> Option<String> {
     (!version.is_empty()).then(|| version.to_owned())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +309,90 @@ RUBY VERSION
 BUNDLED WITH
    2.6.2
 ";
+
+    /// A lockfile nobody would write, made of every shape the parser has to survive.
+    ///
+    /// `parse` never fails — a malformed file yields whatever was still legible — so the only
+    /// way to test that promise is to hand it something malformed and say what "legible" meant.
+    const MANGLED: &str = "\
+GEM
+\tremote: https://rubygems.org/
+  a line with no colon in it
+    indented like a spec before the list opens
+  specs:
+    ok-gem (1.0.0)
+    (2.0.0)
+    nameless ()
+    dashed (-linux)
+    not a spec at all
+  trailing: ignored
+
+RUBY VERSION
+   ruby 3.4.1pXY
+   ruby 9.9.9p0
+
+BUNDLED WITH
+   2.6.2
+   9.9.9
+";
+
+    #[test]
+    fn a_malformed_lockfile_yields_whatever_was_still_legible() {
+        let lockfile = parse(MANGLED);
+
+        // A tab is indentation too, so `\tremote:` is a key of the GEM source rather than a
+        // header that would have closed it.
+        let source = &lockfile.sources[0];
+        assert_eq!(source.kind, SourceKind::Rubygems);
+        assert_eq!(source.remote.as_deref(), Some("https://rubygems.org/"));
+
+        // Of the five lines under `specs:`, only the first is a spec: `(2.0.0)` has no name,
+        // `nameless ()` no version, `dashed (-linux)` an empty version before the platform, and
+        // `not a spec at all` no parentheses.
+        let named: Vec<&str> = source.specs.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(named, vec!["ok-gem"]);
+
+        // The first line of a single-valued section wins; a second is not an overwrite.
+        // `3.4.1pXY` keeps its suffix because `XY` is not a patchlevel.
+        assert_eq!(lockfile.ruby_version.as_deref(), Some("3.4.1pXY"));
+        assert_eq!(lockfile.bundled_with.as_deref(), Some("2.6.2"));
+    }
+
+    #[test]
+    fn a_git_checkout_name_needs_a_remote_and_a_full_revision() {
+        let full = |remote: &str, revision: &str| {
+            let mut source = Source::new(SourceKind::Git);
+            source.remote = Some(remote.to_owned());
+            source.revision = Some(revision.to_owned());
+            source.git_checkout_name()
+        };
+        let sha = "b8ebc2d491016b206e5ac1c41ee71e16ec94dbee";
+
+        // Bundler builds the directory from the *remote URL's* basename, not the gem name.
+        assert_eq!(
+            full("git@host:org/foo.git", sha).as_deref(),
+            Some("foo-b8ebc2d49101")
+        );
+        assert_eq!(
+            full("https://host/org/foo/", sha).as_deref(),
+            Some("foo-b8ebc2d49101")
+        );
+
+        // An abbreviated revision cannot be truncated to twelve characters, and a remote with
+        // no basename left in it names no directory. Both are `None` rather than a guess.
+        assert_eq!(full("https://host/org/foo", "b8ebc2d"), None);
+        assert_eq!(full("/", sha), None);
+
+        // Neither half is optional.
+        let mut bare = Source::new(SourceKind::Git);
+        assert_eq!(bare.git_checkout_name(), None);
+        bare.remote = Some("https://host/org/foo".to_owned());
+        assert_eq!(
+            bare.git_checkout_name(),
+            None,
+            "a remote alone is not enough"
+        );
+    }
 
     #[test]
     fn every_section_of_a_real_lockfile_is_read() {

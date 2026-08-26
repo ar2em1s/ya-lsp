@@ -26,6 +26,7 @@ use super::{
     config::GemsConfig,
     ruby_version::{self, Resolved},
 };
+use crate::messages;
 
 /// Process environment that changes where gems live.
 ///
@@ -38,6 +39,8 @@ pub struct Env {
     pub gem_home: Option<PathBuf>,
     pub gem_path: Vec<PathBuf>,
     pub bundle_path: Option<PathBuf>,
+    /// `BUNDLE_GEMFILE`: which Gemfile — and so which lockfile — Bundler was told to use.
+    pub bundle_gemfile: Option<PathBuf>,
     pub xdg_data_home: Option<PathBuf>,
     pub asdf_data_dir: Option<PathBuf>,
     pub mise_data_dir: Option<PathBuf>,
@@ -65,6 +68,21 @@ const SYSTEM_GEM_ROOTS: [&str; 4] = [
     "/Library/Ruby/Gems",
 ];
 
+/// A `PATH`-shaped variable, split the way the platform separates one.
+///
+/// Its own function so it can be tested without setting a process-wide environment variable,
+/// which the test harness runs threads across. Empty entries are dropped: `GEM_PATH=/a::/b` and
+/// a trailing separator both produce one, and an empty path would be joined onto and searched
+/// as the *current directory*.
+fn split_path_list(raw: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    raw.map(|raw| {
+        std::env::split_paths(&raw)
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 impl Env {
     #[must_use]
     pub fn from_process() -> Self {
@@ -76,14 +94,9 @@ impl Env {
         Self {
             home: var("HOME").or_else(|| var("USERPROFILE")),
             gem_home: var("GEM_HOME"),
-            gem_path: std::env::var_os("GEM_PATH")
-                .map(|raw| {
-                    std::env::split_paths(&raw)
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            gem_path: split_path_list(std::env::var_os("GEM_PATH")),
             bundle_path: var("BUNDLE_PATH"),
+            bundle_gemfile: var("BUNDLE_GEMFILE"),
             xdg_data_home: var("XDG_DATA_HOME"),
             asdf_data_dir: var("ASDF_DATA_DIR"),
             mise_data_dir: var("MISE_DATA_DIR"),
@@ -150,11 +163,12 @@ impl Gems {
 /// installed and whether the project's bundle should be indexed are different questions.
 #[must_use]
 pub fn roots(workspace_root: &Path, config: &GemsConfig, env: &Env) -> Vec<PathBuf> {
-    let lockfile = read_lockfile(workspace_root);
+    let lockfile = read_lockfile(workspace_root, env);
     let version = ruby_version::resolve(
         workspace_root,
         config.ruby_version.as_deref(),
         lockfile.as_ref().map(|(_, lockfile)| lockfile),
+        env.home.as_deref(),
     );
     gem_roots(
         workspace_root,
@@ -177,28 +191,47 @@ pub fn discover(workspace_root: &Path, config: &GemsConfig, env: &Env) -> Gems {
         return gems;
     }
 
-    let lockfile = read_lockfile(workspace_root);
+    let lockfile = read_lockfile(workspace_root, env);
 
+    // The same four arguments as `roots`, and they have to stay the same four: these two
+    // resolve independently, and a disagreement between them means `rbs::discover` searches one
+    // Ruby's tree while the gem index searches another's.
     gems.ruby_version = ruby_version::resolve(
         workspace_root,
         config.ruby_version.as_deref(),
         lockfile.as_ref().map(|(_, lockfile)| lockfile),
+        env.home.as_deref(),
     );
 
     let version = gems.ruby_version.as_ref().map(|it| it.version.as_str());
     gems.roots = gem_roots(workspace_root, config, env, version);
     if config.default_gems {
         gems.ruby_lib = ruby_lib_dirs(&gems.roots, version);
+        // The silent cliff. `ruby_lib_dirs` refuses to guess a Ruby, and it is right to —
+        // guessing once put Apple's vestigial 2.6 stdlib into the graph and answered
+        // `"hello".u` with `unspace`. But refusing costs the whole of Ruby's own library, 727
+        // files on a 3.4 install, and until v0.2.0 it cost it in silence: `require "json"`
+        // answered `null`, `JSON.parse` hovered as nothing, and the only trace anywhere was a
+        // `DEBUG` line about the *bundle*, which is not what went missing.
+        if gems.ruby_lib.is_empty() {
+            gems.problems.push(match version {
+                None => messages::no_ruby_version(),
+                Some(version) => messages::ruby_library_missing(version),
+            });
+        }
     }
 
     // Ruby's own library is found before this point deliberately. A project with no bundle
     // still calls `JSON.parse` and still writes `require "forwardable"`, and the stdlib is not
     // something Bundler grants it.
     let Some((lockfile_path, lockfile)) = lockfile else {
-        // Not a problem worth showing the user: plenty of Ruby projects have no bundle.
+        // Not a problem worth showing the user: plenty of Ruby projects have no bundle. It
+        // deliberately no longer claims Ruby's own library got indexed — whether it did is the
+        // question above, and answering it here is what hid finding F for a whole release.
         tracing::debug!(
-            "no Gemfile.lock under {}; only Ruby's own library to index",
-            workspace_root.display()
+            "no Gemfile.lock under {}: no bundle to index; {} Ruby library path(s)",
+            workspace_root.display(),
+            gems.ruby_lib.len()
         );
         return gems;
     };
@@ -280,23 +313,12 @@ pub fn discover(workspace_root: &Path, config: &GemsConfig, env: &Env) -> Gems {
     let found = gems.gems.len();
     let expected = found + gems.unresolved.len();
     if expected > 0 && found * 2 < expected {
-        gems.problems.push(format!(
-            "found {} but only {found} of its {expected} gems are installed anywhere ya-lsp \
-             looked{}. Navigation into gems will mostly not work. Run `bundle install`, or set \
-             [gems].paths in ya-lsp.toml to the output of `gem env gemdir`, or set \
-             [gems].enabled = false to silence this.",
-            lockfile_path.display(),
-            if gems.roots.is_empty() {
-                " (no gem directory found at all)".to_owned()
-            } else {
-                format!(
-                    " ({} gem directories searched, for ruby {})",
-                    gems.roots.len(),
-                    gems.ruby_version
-                        .as_ref()
-                        .map_or("unknown", |it| it.version.as_str())
-                )
-            },
+        gems.problems.push(messages::bundle_mostly_missing(
+            &lockfile_path,
+            found,
+            expected,
+            gems.roots.len(),
+            gems.ruby_version.as_ref().map(|it| it.version.as_str()),
         ));
     }
 
@@ -307,7 +329,7 @@ pub fn discover(workspace_root: &Path, config: &GemsConfig, env: &Env) -> Gems {
         gems.roots.len(),
         gems.ruby_version.as_ref().map_or_else(
             || "unknown".to_owned(),
-            |it| format!("{} (from {:?})", it.version, it.source)
+            |it| format!("{} (from {})", it.version, it.source)
         ),
     );
     if !gems.unresolved.is_empty() {
@@ -325,9 +347,9 @@ pub fn discover(workspace_root: &Path, config: &GemsConfig, env: &Env) -> Gems {
 
 /// Bundler accepts `Gemfile`/`Gemfile.lock` and the newer `gems.rb`/`gems.locked`, and
 /// `BUNDLE_GEMFILE` overrides both.
-fn read_lockfile(root: &Path) -> Option<(PathBuf, Lockfile)> {
+fn read_lockfile(root: &Path, env: &Env) -> Option<(PathBuf, Lockfile)> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(gemfile) = std::env::var_os("BUNDLE_GEMFILE") {
+    if let Some(gemfile) = env.bundle_gemfile.as_deref() {
         let gemfile = root.join(gemfile);
         // `BUNDLE_GEMFILE` names the Gemfile; the lockfile sits beside it with `.lock` appended
         // — `Gemfile` -> `Gemfile.lock`, `gems.rb` -> `gems.locked`.
@@ -812,6 +834,7 @@ pub fn ruby_files(load_paths: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,6 +922,304 @@ mod tests {
     }
 
     #[test]
+    fn bundle_gemfile_names_the_lockfile_beside_it() {
+        // Bundler appends `.lock` to whatever `BUNDLE_GEMFILE` names — except `gems.rb`, whose
+        // lockfile is `gems.locked`. Both come through `Env` rather than `std::env`, which is
+        // the only reason either can be tested without mutating the process.
+        for (gemfile, lock) in [
+            ("Gemfile.ci", "Gemfile.ci.lock"),
+            ("gems.rb", "gems.locked"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("project");
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join(lock), RAILS_LOCK).unwrap();
+            // The default name is present and holds something else, so a pass would be an
+            // accident if `BUNDLE_GEMFILE` were ignored.
+            std::fs::write(
+                project.join("Gemfile.lock"),
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    sinatra (4.0.0)\n",
+            )
+            .unwrap();
+            install(&root, "rails-8.1.3", &["lib"]);
+
+            let env = Env {
+                gem_home: Some(root.clone()),
+                bundle_gemfile: Some(PathBuf::from(gemfile)),
+                ..Env::default()
+            };
+            let gems = discover(&project, &GemsConfig::default(), &env);
+            let names: Vec<&str> = gems.gems.iter().map(|gem| gem.name.as_str()).collect();
+            assert_eq!(names, vec!["rails"], "BUNDLE_GEMFILE={gemfile}");
+        }
+    }
+
+    #[test]
+    fn a_lockfile_that_names_a_gem_twice_resolves_it_once() {
+        // A lockfile resolved for several platforms lists one spec per platform, and a `PATH`
+        // source can override a `GEM` entry. Bundler applies the first that works; so do we.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let root = dir.path().join("root");
+        lockfile(
+            &project,
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n\
+             \x20   nokogiri (1.18.8-arm64-darwin)\n\
+             \x20   nokogiri (1.18.8-x86_64-linux)\n",
+        );
+        install(&root, "nokogiri-1.18.8-arm64-darwin", &["lib"]);
+
+        let env = Env {
+            gem_home: Some(root),
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+        assert_eq!(gems.gems.len(), 1, "{gems:?}");
+        // The one that is not installed is not reported: it is a platform this machine will
+        // never have, and listing it would bury the cases that matter.
+        assert!(gems.unresolved.is_empty(), "{:?}", gems.unresolved);
+    }
+
+    #[test]
+    fn a_path_source_inside_the_workspace_is_left_to_workspace_discovery() {
+        // A `PATH` gem is the user's own code. Indexing it here would bypass the workspace's
+        // own exclude globs — and index it twice.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join("engines/billing/lib")).unwrap();
+        std::fs::write(
+            project.join("engines/billing/lib/billing.rb"),
+            "module Billing; end\n",
+        )
+        .unwrap();
+        // A sibling of the workspace, which discovery will never reach on its own.
+        let outside = dir.path().join("outside/vendor/tooling");
+        std::fs::create_dir_all(outside.join("lib")).unwrap();
+        std::fs::write(outside.join("lib/tooling.rb"), "module Tooling; end\n").unwrap();
+
+        lockfile(
+            &project,
+            &format!(
+                "PATH\n  remote: engines/billing\n  specs:\n    billing (0.1.0)\n\n\
+                 PATH\n  remote: {}\n  specs:\n    tooling (0.1.0)\n\n\
+                 PATH\n  specs:\n    nowhere (0.1.0)\n\n\
+                 PATH\n  remote: engines/absent\n  specs:\n    absent (0.1.0)\n",
+                outside.display()
+            ),
+        );
+
+        let gems = discover(&project, &GemsConfig::default(), &Env::default());
+        let names: Vec<&str> = gems.gems.iter().map(|gem| gem.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["tooling"],
+            "only the path source outside the workspace is ours to index"
+        );
+        // `nowhere` has no remote at all and `absent` names a directory that is not there.
+        // Neither is a gem we failed to find: one is unparseable and the other is not installed.
+        assert_eq!(gems.unresolved, vec!["absent-0.1.0".to_owned()], "{gems:?}");
+    }
+
+    #[test]
+    fn a_plugin_source_is_never_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let root = dir.path().join("root");
+        lockfile(
+            &project,
+            "PLUGIN SOURCE\n  remote: https://rubygems.org/\n  specs:\n    plug (1.0.0)\n",
+        );
+        install(&root, "plug-1.0.0", &["lib"]);
+
+        let env = Env {
+            gem_home: Some(root),
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+        assert!(gems.gems.is_empty(), "{gems:?}");
+        assert!(gems.unresolved.is_empty(), "{gems:?}");
+    }
+
+    #[test]
+    fn a_git_source_with_several_gemspecs_resolves_to_the_gem_not_the_checkout() {
+        // One checkout can hold several gems, each in a subdirectory. The checkout itself is
+        // the answer only when there is no such subdirectory.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let root = dir.path().join("root");
+        let sha = "b8ebc2d491016b206e5ac1c41ee71e16ec94dbee";
+        lockfile(
+            &project,
+            &format!(
+                "GIT\n  remote: https://github.com/org/monorepo\n  revision: {sha}\n  specs:\n\
+                 \x20   inner (1.0.0)\n\
+                 \x20   outer (1.0.0)\n"
+            ),
+        );
+        // `gems/` is the marker of a gem root; a checkout-only root would be rejected before
+        // `bundler/gems` was ever read.
+        std::fs::create_dir_all(root.join("gems")).unwrap();
+        let checkout = root.join("bundler/gems/monorepo-b8ebc2d49101");
+        std::fs::create_dir_all(checkout.join("inner/lib")).unwrap();
+        std::fs::write(checkout.join("inner/lib/inner.rb"), "module Inner; end\n").unwrap();
+        std::fs::create_dir_all(checkout.join("lib")).unwrap();
+        std::fs::write(checkout.join("lib/outer.rb"), "module Outer; end\n").unwrap();
+        // A plain file beside the checkouts: `absorb` has to step over it rather than record it.
+        std::fs::write(root.join("bundler/gems/README"), "not a gem\n").unwrap();
+
+        let env = Env {
+            gem_home: Some(root),
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+        let paths: Vec<(&str, &Path)> = gems
+            .gems
+            .iter()
+            .map(|gem| (gem.name.as_str(), gem.path.as_path()))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("inner", checkout.join("inner").as_path()),
+                ("outer", checkout.as_path()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_gem_home_that_is_not_a_gem_root_is_ignored() {
+        // The marker of a gem root is `gems/`. Without the check, a `GEM_HOME` pointing at
+        // something that merely exists costs a directory read per gem in the lockfile.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let empty = dir.path().join("not-a-gem-root");
+        lockfile(&project, RAILS_LOCK);
+        std::fs::create_dir_all(&empty).unwrap();
+
+        let env = Env {
+            gem_home: Some(empty),
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+        assert!(gems.roots.is_empty(), "{:?}", gems.roots);
+        assert_eq!(gems.unresolved, vec!["rails-8.1.3".to_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_spellings_of_one_gem_root_are_indexed_once_and_spelled_as_written() {
+        // `/usr/lib/ruby/gems` and the macOS system framework are routinely symlinks to each
+        // other. Deduplicating by the canonical path is what stops the second from doubling
+        // every gem — but the *stored* path stays as spelled, because canonicalising here would
+        // spell a vendored bundle's files differently from every other path in the server.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let real = dir.path().join("real-root");
+        let link = dir.path().join("linked-root");
+        lockfile(&project, RAILS_LOCK);
+        install(&real, "rails-8.1.3", &["lib"]);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let env = Env {
+            gem_home: Some(link.clone()),
+            gem_path: vec![real.clone()],
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+        assert_eq!(gems.roots, vec![link], "as spelled, and only once");
+        assert_eq!(gems.gems.len(), 1, "{gems:?}");
+    }
+
+    #[test]
+    fn a_gem_root_only_reaches_rubys_library_through_the_exact_install_shape() {
+        // `<prefix>/lib/ruby/gems/<abi>` beside `<prefix>/lib/ruby/<abi>` is the whole rule.
+        // Each of these breaks one part of it and must yield nothing rather than a directory
+        // that happens to be there.
+        let dir = tempfile::tempdir().unwrap();
+        for (label, gems_root) in [
+            // `ruby/` is not under `lib/`.
+            ("no lib", "opt/ruby/gems/4.0.0"),
+            // The ABI directory does not match the resolved version.
+            ("wrong abi", "opt/lib/ruby/gems/3.1.0"),
+        ] {
+            let project = dir.path().join(label.replace(' ', "-"));
+            lockfile(&project, RAILS_LOCK);
+            std::fs::write(project.join(".ruby-version"), "4.0.1\n").unwrap();
+
+            let home = dir.path().join(label.replace(' ', "_"));
+            let root = home.join(gems_root);
+            std::fs::create_dir_all(root.join("gems")).unwrap();
+            // The library directory the shape would name, so its absence is not what fails.
+            std::fs::create_dir_all(root.parent().unwrap().parent().unwrap().join("4.0.0"))
+                .unwrap();
+
+            let env = Env {
+                gem_home: Some(root),
+                ..Env::default()
+            };
+            let gems = discover(&project, &GemsConfig::default(), &env);
+            assert!(gems.ruby_lib.is_empty(), "{label}: {:?}", gems.ruby_lib);
+        }
+    }
+
+    #[test]
+    fn a_bundle_path_comes_from_the_environment_or_from_either_bundle_config() {
+        // Three sources, and the two files are read by hand rather than with a YAML parser:
+        // a `.bundle/config` we cannot make sense of has to degrade to "no configured path".
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        lockfile(&project, RAILS_LOCK);
+
+        std::fs::create_dir_all(project.join(".bundle")).unwrap();
+        std::fs::write(
+            project.join(".bundle/config"),
+            // A key we do not read, a `BUNDLE_PATH` with nothing after it, and then the real
+            // one — in that order, so an implementation that takes the first line fails.
+            "---\nBUNDLE_JOBS: \"4\"\nBUNDLE_PATH: \"\"\nBUNDLE_PATH: \"vendor/bundle\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join(".bundle")).unwrap();
+        std::fs::write(
+            home.join(".bundle/config"),
+            "---\nBUNDLE_PATH: 'global-bundle'\n",
+        )
+        .unwrap();
+
+        // Bundler installs into `<path>/ruby/<abi>`, so that — not `<path>` — is the gem root.
+        std::fs::write(project.join(".ruby-version"), "4.0.1\n").unwrap();
+        install(
+            &project.join("vendor/bundle/ruby/4.0.0"),
+            "rails-8.1.3",
+            &["lib"],
+        );
+        install(
+            &project.join("global-bundle/ruby/4.0.0"),
+            "rack-3.1.0",
+            &["lib"],
+        );
+
+        let env = Env {
+            home: Some(home),
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+        assert!(
+            gems.roots
+                .contains(&project.join("vendor/bundle/ruby/4.0.0")),
+            "the project's own .bundle/config: {:?}",
+            gems.roots
+        );
+        assert!(
+            gems.roots
+                .contains(&project.join("global-bundle/ruby/4.0.0")),
+            "the home .bundle/config: {:?}",
+            gems.roots
+        );
+    }
+
+    #[test]
     fn a_gem_root_outside_a_ruby_install_yields_no_library() {
         // RVM keeps its gems at `~/.rvm/gems/ruby-3.4.1`, nowhere near an interpreter, and a
         // `GEM_HOME` can point anywhere at all. Walking up two directories from those would
@@ -906,7 +1227,7 @@ mod tests {
         // indexing nothing.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let project = dir.path().join("project");
+        let project = home.join("project");
         lockfile(&project, RAILS_LOCK);
 
         let root = home.join(".rvm/gems/ruby-4.0.1");
@@ -939,7 +1260,7 @@ mod tests {
         // `String` resolving into a `bigdecimal/util.rb` monkey patch.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let project = dir.path().join("project");
+        let project = home.join("project");
         std::fs::create_dir_all(&project).unwrap();
 
         // A Ruby that exists but that nothing in the project points at.
@@ -955,6 +1276,44 @@ mod tests {
 
         assert_eq!(gems.ruby_version, None, "the premise of this test");
         assert!(gems.ruby_lib.is_empty(), "{:?}", gems.ruby_lib);
+        // And it says so. Refusing to guess is right; refusing in silence cost the whole of
+        // Ruby's own library for a release, with `require "json"` answering null and nothing
+        // anywhere connecting that to a missing `.ruby-version`.
+        assert_eq!(gems.problems, vec![messages::no_ruby_version()]);
+    }
+
+    #[test]
+    fn a_ruby_that_is_not_installed_here_is_named_rather_than_dropped() {
+        // The other half of the cliff: the project does say which Ruby it wants, and that Ruby
+        // is not on this machine. The loss is identical — no stdlib — but the remedy is not, so
+        // the message is not either.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".ruby-version"), "3.4.1\n").unwrap();
+
+        let gems = discover(&project, &GemsConfig::default(), &Env::default());
+
+        assert!(gems.ruby_lib.is_empty(), "{:?}", gems.ruby_lib);
+        assert_eq!(gems.problems, vec![messages::ruby_library_missing("3.4.1")]);
+    }
+
+    #[test]
+    fn a_project_that_asked_for_no_default_gems_is_not_told_it_has_none() {
+        // A warning nobody can act on is a nag. Turning `gems.default_gems` off *is* the
+        // action, so the message the other two tests pin must not survive it — which is also
+        // what the messages themselves offer as the way to silence them.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let config = GemsConfig {
+            default_gems: false,
+            ..GemsConfig::default()
+        };
+        let gems = discover(&project, &config, &Env::default());
+
+        assert!(gems.problems.is_empty(), "{:?}", gems.problems);
     }
 
     #[test]
@@ -984,6 +1343,8 @@ mod tests {
 
         assert!(gems.gems.is_empty());
         assert_eq!(gems.ruby_lib, vec![ruby.join("4.0.0")]);
+        // Found, so nothing is said. The message only exists for the case where it is not.
+        assert!(gems.problems.is_empty(), "{:?}", gems.problems);
     }
 
     #[test]
@@ -1005,10 +1366,133 @@ mod tests {
         };
         let gems = discover(&project, &GemsConfig::default(), &env);
 
-        assert_eq!(gems.problems, Vec::<String>::new());
+        // The bundle resolved, which is what this test is about. The fixture installs no
+        // `lib/ruby/4.0.0` beside the gems, so the stdlib is reported missing and that is the
+        // only thing reported.
+        assert_eq!(gems.problems, vec![messages::ruby_library_missing("4.0.1")]);
         assert_eq!(gems.gems.len(), 1, "{gems:?}");
         assert_eq!(gems.gems[0].name, "rails");
         assert!(gems.gems[0].load_paths[0].ends_with("rails-8.1.3/lib"));
+    }
+
+    #[test]
+    fn a_ruby_whose_abi_directory_is_missing_still_finds_the_gems_that_are_there() {
+        // The stated fallback, which had no fixture: the lockfile asks for 3.4.1, the machine
+        // has 3.3.0, and the *gems* under it are still overwhelmingly the right ones. Preferring
+        // an ABI directory that is not installed must reorder nothing rather than find nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        lockfile(&project, RAILS_LOCK);
+        std::fs::write(project.join(".ruby-version"), "3.4.1\n").unwrap();
+
+        // The interpreter directory matches; the ABI directory below it does not.
+        let root = home.join(".asdf/installs/ruby/3.4.1/lib/ruby/gems/3.3.0");
+        install(&root, "rails-8.1.3", &["lib"]);
+
+        let env = Env {
+            home: Some(home),
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+
+        assert_eq!(gems.problems, vec![messages::ruby_library_missing("3.4.1")]);
+        assert_eq!(gems.gems.len(), 1, "{gems:?}");
+        assert!(gems.gems[0].load_paths[0].ends_with("rails-8.1.3/lib"));
+    }
+
+    #[test]
+    fn a_load_path_yields_ruby_files_and_nothing_else() {
+        // A gem ships its README, its licence and often a compiled `.bundle` beside its code.
+        // Handing any of them to the indexer is a parse error per file and no declarations.
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(lib.join("thing")).unwrap();
+        std::fs::write(lib.join("thing.rb"), "class Thing; end\n").unwrap();
+        std::fs::write(lib.join("thing/version.rb"), "").unwrap();
+        std::fs::write(lib.join("README.md"), "# thing\n").unwrap();
+        std::fs::write(lib.join("thing.bundle"), "").unwrap();
+        std::fs::write(lib.join("noextension"), "").unwrap();
+
+        let files = ruby_files(std::slice::from_ref(&lib));
+
+        assert_eq!(
+            files,
+            // Sorted as paths, so the `thing/` directory comes before `thing.rb` itself.
+            vec![lib.join("thing/version.rb"), lib.join("thing.rb")],
+            "only `.rb`"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_ruby_library_that_cannot_be_listed_costs_only_its_platform_directory() {
+        // The library directory is checked with `is_dir` and then listed, and the two are
+        // different questions: a Homebrew or system Ruby installed under another user leaves a
+        // directory that exists and cannot be read. The platform directory is the half that
+        // needs the listing — the library itself is a path we already have — so losing the
+        // listing must not lose `require "json"` as well.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        lockfile(&project, RAILS_LOCK);
+        std::fs::write(project.join(".ruby-version"), "4.0.1\n").unwrap();
+
+        let ruby = home.join(".asdf/installs/ruby/4.0.1/lib/ruby");
+        install(&ruby.join("gems/4.0.0"), "rails-8.1.3", &["lib"]);
+        let library = ruby.join("4.0.0");
+        std::fs::create_dir_all(library.join("arm64-darwin25")).unwrap();
+        std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let env = Env {
+            home: Some(home),
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+
+        // Restored before any assertion, so a failure does not leave an unremovable tempdir.
+        std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            gems.ruby_lib,
+            vec![library],
+            "the library itself is still a load path; only its platform directory is lost"
+        );
+        assert_eq!(gems.gems.len(), 1, "{gems:?}");
+    }
+
+    #[test]
+    fn a_path_list_is_split_the_way_the_platform_separates_one() {
+        use std::path::MAIN_SEPARATOR;
+
+        // `GEM_PATH` is the one multi-value variable read here, and an empty entry in it is not
+        // "no path" — it is the *current directory*, which would put whatever the editor was
+        // launched from on the gem search path.
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let joined = format!("{}a{sep}{sep}{}b{sep}", MAIN_SEPARATOR, MAIN_SEPARATOR);
+
+        assert_eq!(
+            split_path_list(Some(joined.into())),
+            vec![
+                PathBuf::from(format!("{MAIN_SEPARATOR}a")),
+                PathBuf::from(format!("{MAIN_SEPARATOR}b")),
+            ]
+        );
+        assert!(split_path_list(None).is_empty(), "unset is no paths");
+        assert!(split_path_list(Some("".into())).is_empty(), "set but empty");
+    }
+
+    #[test]
+    fn an_abi_is_the_version_with_its_patch_zeroed_and_nothing_else() {
+        // Used only to *prefer* a globbed directory, so a version it cannot take apart has to
+        // come back unchanged rather than as a guess: preferring `head.0` over `head` would
+        // reorder the installs on a machine running a development build of Ruby.
+        assert_eq!(abi_of("4.0.1"), "4.0.0");
+        assert_eq!(abi_of("3.4"), "3.4.0");
+        assert_eq!(abi_of("head"), "head", "nothing to zero");
+        assert_eq!(abi_of(""), "");
     }
 
     #[test]
@@ -1206,22 +1690,6 @@ mod tests {
     }
 
     #[test]
-    fn a_path_source_inside_the_workspace_is_left_to_workspace_discovery() {
-        // Otherwise a Rails engine gets indexed twice — and the second pass bypasses the
-        // workspace's own exclude globs.
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("project");
-        lockfile(
-            &project,
-            "PATH\n  remote: engines/billing\n  specs:\n    billing (0.1.0)\n",
-        );
-        std::fs::create_dir_all(project.join("engines/billing/lib")).unwrap();
-
-        let gems = discover(&project, &GemsConfig::default(), &Env::default());
-        assert!(gems.gems.is_empty(), "{gems:?}");
-    }
-
-    #[test]
     fn a_native_extensions_absolute_require_path_is_skipped() {
         // RubyGems inserts one pointing at `extensions/...`, which holds compiled objects and
         // no Ruby at all.
@@ -1246,11 +1714,12 @@ mod tests {
     #[test]
     fn a_machine_with_no_gems_says_so_instead_of_going_quiet() {
         let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("project");
+        let home = dir.path().join("empty-home");
+        let project = home.join("project");
         lockfile(&project, RAILS_LOCK);
 
         let env = Env {
-            home: Some(dir.path().join("empty-home")),
+            home: Some(home),
             ..Env::default()
         };
         let gems = discover(&project, &GemsConfig::default(), &env);
@@ -1258,9 +1727,56 @@ mod tests {
         // Whether a system-wide Ruby happens to exist on the machine running this test is not
         // the point; resolving *none* of the lockfile is, and that is what gets reported.
         assert!(
-            gems.problems.iter().any(|p| p.contains("[gems].paths")),
+            gems.problems.iter().any(|p| p.contains("gems.paths")),
             "{:?}",
             gems.problems
+        );
+    }
+
+    #[test]
+    fn the_resolution_summary_says_what_was_found_and_which_ruby_it_used() {
+        // Two lines nobody had asserted, and between them they are the whole answer to "why
+        // does go-to-definition not work in gems?". The `info!` says how much of the lockfile
+        // resolved and against which Ruby; the `debug!` below it names the gems that did not.
+        // A user reads these before they read anything else, and a summary that quietly stops
+        // being true is worse than no summary.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        lockfile(
+            &project,
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (8.1.3)\n    \
+             nokogiri (1.18.0)\n",
+        );
+        std::fs::write(project.join(".ruby-version"), "3.4.1\n").unwrap();
+        install(&home.join(".gem/ruby/3.4.0"), "rails-8.1.3", &["lib"]);
+
+        let env = Env {
+            home: Some(home),
+            ..Env::default()
+        };
+        let (gems, logged) = crate::testing::captured_logs(tracing::Level::DEBUG, || {
+            discover(&project, &GemsConfig::default(), &env)
+        });
+
+        assert_eq!(gems.gems.len(), 1, "{gems:?}");
+        assert!(
+            logged.contains("resolved 1/2 locked gems against 1 gem root(s)"),
+            "how much of the lockfile resolved: {logged}"
+        );
+        assert!(
+            logged.contains(&format!(
+                "ruby 3.4.1 (from {})",
+                project.join(".ruby-version").display()
+            )),
+            "which Ruby, and which file said so — after the walk the kind of file no longer \
+             names one: {logged}"
+        );
+        // And which gem is missing, by name — the difference between "run bundle install" and
+        // "this gem is not installed for this platform".
+        assert!(
+            logged.contains("1 locked gems are not installed here: nokogiri-1.18.0"),
+            "which gems are missing: {logged}"
         );
     }
 
@@ -1311,7 +1827,9 @@ mod tests {
         let gems = discover(&project, &GemsConfig::default(), &env);
         assert_eq!(gems.gems.len(), 2);
         assert_eq!(gems.unresolved, vec!["set-1.1.0"]);
-        assert!(gems.problems.is_empty(), "{:?}", gems.problems);
+        // Nothing about the *bundle*. The fixture points at no Ruby at all, which is a
+        // separate loss with a separate message.
+        assert_eq!(gems.problems, vec![messages::no_ruby_version()]);
     }
 
     #[test]
@@ -1319,7 +1837,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gems = discover(dir.path(), &GemsConfig::default(), &Env::default());
         assert!(gems.gems.is_empty());
-        assert!(gems.problems.is_empty(), "{:?}", gems.problems);
+        // Having no bundle is ordinary and says nothing. Having no Ruby is not the same thing
+        // and is the only entry here.
+        assert_eq!(gems.problems, vec![messages::no_ruby_version()]);
     }
 
     #[test]

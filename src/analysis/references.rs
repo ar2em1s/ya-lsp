@@ -70,7 +70,9 @@ pub fn find(
         }
     };
 
-    if include_declaration {
+    // A redirected resolution is deliberately not the declaration of the name under the cursor
+    // — `Foo.new` answers with `Foo#initialize` — so it has no declaration site to add here.
+    if include_declaration && !resolution.redirected {
         found.extend(declaration_sites(graph, &resolution.declarations, scope));
     }
 
@@ -89,13 +91,13 @@ fn by_declaration(
     scope: &HashSet<UriId>,
 ) -> Vec<Reference> {
     let mut found = Vec::new();
-    for declaration in declarations
+    // One `filter_map` over both steps: a declaration that is not a constant has no constant
+    // references, which is the same nothing as an id the graph does not hold, and neither is a
+    // case with anything to do about it here.
+    for references in declarations
         .iter()
-        .filter_map(|id| graph.declarations().get(id))
+        .filter_map(|id| graph.declarations().get(id)?.constant_references())
     {
-        let Some(references) = declaration.constant_references() else {
-            continue;
-        };
         for reference in references
             .iter()
             .filter_map(|id| graph.constant_references().get(id))
@@ -124,10 +126,12 @@ fn by_declaration(
 /// be discarded anyway.
 fn by_name(graph: &Graph, names: &[StringId], scope: &HashSet<UriId>) -> Vec<Reference> {
     let mut found = Vec::new();
-    for uri_id in scope {
-        let Some(document) = graph.documents().get(uri_id) else {
-            continue;
-        };
+    // `filter_map` to match the inner loop: `scope` is built from the graph's own documents, so
+    // a miss is a lookup that yields nothing rather than a case with anything to do about it.
+    for document in scope
+        .iter()
+        .filter_map(|uri_id| graph.documents().get(uri_id))
+    {
         for reference in document
             .method_references()
             .iter()
@@ -204,4 +208,51 @@ fn at(graph: &Graph, uri_id: UriId, offset: &rubydex::offset::Offset) -> Option<
         start: offset.start(),
         end: offset.end(),
     })
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rubydex::{
+        indexing::{self, LanguageId},
+        resolution::Resolver,
+    };
+
+    /// Every declaration whose name ends in `suffix`, in a graph built from one source.
+    fn declarations_named(graph: &Graph, suffix: &str) -> Vec<DeclarationId> {
+        graph
+            .declarations()
+            .iter()
+            .filter(|(_, declaration)| declaration.name().ends_with(suffix))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    #[test]
+    fn two_declarations_spelled_the_same_contribute_one_pair_of_spellings() {
+        // `names` is scanned against every method reference in the workspace, once per
+        // reference, so a duplicate is not merely untidy — it is a second string comparison per
+        // call site for an answer already known. Two classes defining `shout` is the ordinary
+        // way a resolution comes to hold more than one declaration of one name.
+        let mut graph = Graph::new();
+        indexing::index_source(
+            &mut graph,
+            "file:///fixture/hr.rb",
+            "class Person\n  def shout\n  end\nend\n\nclass Siren\n  def shout\n  end\nend\n",
+            &LanguageId::Ruby,
+        );
+        Resolver::new(&mut graph).resolve();
+
+        let shouts = declarations_named(&graph, "#shout()");
+        assert_eq!(shouts.len(), 2, "two classes, two declarations");
+
+        // Both spellings, because rubydex records a call as `shout` and an `alias` as `shout()`
+        // — and each of them once, however many declarations were spelled that way.
+        let names = method_names(&graph, &shouts);
+        assert_eq!(
+            names,
+            vec![StringId::from("shout"), StringId::from("shout()")]
+        );
+    }
 }

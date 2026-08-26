@@ -1,6 +1,6 @@
 [package]
 name = "ya-lsp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -12,6 +12,10 @@ rubydex = "=0.2.5"
 # MUST stay byte-identical to rubydex's `ruby-prism` requirement, or we link two
 # copies of the Prism C library and get duplicate-symbol errors.
 ruby-prism = "=1.9.0"
+# rbs's own parser, used to find `interface` blocks in a signature file before it is
+# indexed. Requirement matched to rubydex's rather than pinned exactly, so cargo resolves
+# one copy: `ruby-rbs-sys` links rbs's C library and two copies collide at link time.
+ruby-rbs = "0.3"
 # Same version rubydex uses, so cargo unifies to one copy.
 line-index = "=0.1.2"
 # rubydex keys documents by `url::Url::from_file_path(path).to_string()`, so we must
@@ -36,6 +40,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 # Integration tests spell URIs the way a client would.
 url = "2.5"
+
+# `coverage_nightly` is set by cargo-llvm-cov when it builds on a nightly compiler, and is what
+# gates `#[coverage(off)]` on the test modules. Declaring it here is what keeps `cargo check` quiet
+# on the pinned stable toolchain, where the cfg is never set.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [profile.release]
 lto = "thin"

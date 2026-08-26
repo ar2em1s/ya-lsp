@@ -109,6 +109,17 @@ impl Server {
         }
     }
 
+    /// Read messages until a request the *server* made with `method` arrives.
+    fn server_request(&mut self, method: &str) -> Request {
+        loop {
+            if let Message::Request(request) = self.read()
+                && request.method == method
+            {
+                return request;
+            }
+        }
+    }
+
     /// Read messages until a notification of `method` arrives.
     fn notification(&mut self, method: &str) -> serde_json::Value {
         loop {
@@ -413,7 +424,15 @@ fn a_syntax_error_reaches_the_client_as_a_diagnostic() {
         .unwrap_or_else(|| panic!("{items:?}"));
     assert_eq!(error["severity"], 1); // DiagnosticSeverity::ERROR
     assert_eq!(error["source"], "ya-lsp");
-    assert!(error["message"].as_str().is_some_and(|m| !m.is_empty()));
+    // Prism's own words, forwarded verbatim: ya-lsp owns the severity and the code and not one
+    // word of the text. `parse_errors_read_the_way_prism_wrote_them` pins the whole set; here
+    // it is the wire that is being checked, so one sentence is enough — but a sentence, not a
+    // length. "Non-empty" was the entire contract until v0.2.0, which is the same gap as an
+    // unranked completion list: the mechanism tested, the content not.
+    assert_eq!(
+        error["message"],
+        "expected an `end` to close the `class` statement"
+    );
     assert!(error["range"]["start"]["line"].is_number());
 
     // Fixing the file must clear it, and clearing means an explicit empty array: silence would
@@ -912,6 +931,123 @@ fn licenses_are_carried_by_the_binary_itself() {
     );
 }
 
+/// The command line, which no editor uses and every packager does.
+///
+/// `--version` is what a Homebrew formula or a CI step calls to check what it installed;
+/// `--help` is what someone types after the binary did nothing they expected. Both write to
+/// stdout, which is the LSP transport in every other mode — hence the assertion that the
+/// *other* stream stays empty.
+#[test]
+fn the_command_line_answers_version_and_help() {
+    for flags in [["-V", "--version"], ["-h", "--help"]] {
+        for flag in flags {
+            let output = Command::new(env!("CARGO_BIN_EXE_ya-lsp"))
+                .arg(flag)
+                .output()
+                .unwrap_or_else(|error| panic!("ran ya-lsp {flag}: {error}"));
+
+            assert!(output.status.success(), "ya-lsp {flag}: {output:?}");
+            let text = String::from_utf8(output.stdout).expect("utf-8");
+            if flag.contains("version") || flag == "-V" {
+                assert!(
+                    text.starts_with("ya-lsp ") && text.trim().len() > "ya-lsp ".len(),
+                    "ya-lsp {flag} printed {text:?}"
+                );
+            } else {
+                for phrase in ["USAGE:", "--stdio", "--licenses", "YA_LSP_LOG"] {
+                    assert!(text.contains(phrase), "ya-lsp {flag} is missing {phrase:?}");
+                }
+            }
+            assert!(
+                output.stderr.is_empty(),
+                "ya-lsp {flag} wrote to stderr: {:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+/// An argument nobody recognises fails loudly, on stderr, with the usage attached.
+///
+/// Exiting 0 here would let a typo in an editor's configuration look like a server that starts
+/// and then says nothing — the single most confusing way for this binary to fail.
+#[test]
+fn an_unrecognised_argument_fails_with_the_usage() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ya-lsp"))
+        .arg("--socket=1234")
+        .output()
+        .expect("ran ya-lsp");
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "usage errors belong on stderr: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let text = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(
+        text.contains("--socket=1234"),
+        "the argument is not named: {text}"
+    );
+    assert!(text.contains("USAGE:"), "no usage attached: {text}");
+}
+
+/// A transport that breaks before the handshake is a failure, not a quiet success.
+///
+/// Closing stdin immediately is what an editor that crashed on startup looks like from here.
+/// The exit code is the only thing a supervisor can see, so it has to be non-zero.
+#[test]
+fn a_transport_that_never_speaks_exits_non_zero() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ya-lsp"))
+        .arg("--stdio")
+        .env("YA_LSP_LOG", "off")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ya-lsp");
+
+    // Hang up before sending `initialize`.
+    drop(child.stdin.take().expect("stdin"));
+
+    let output = child.wait_with_output().expect("wait");
+    assert!(!output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(
+        text.contains("ya-lsp: "),
+        "the failure should be reported on stderr: {text:?}"
+    );
+}
+
+/// The first log line names the version, and it does not wait for the handshake.
+///
+/// A pasted log is the only thing a bug report reliably carries, and every line in one is
+/// worthless without knowing which build wrote it. Asserted on the path where `initialize` never
+/// arrives, because that is the case the placement exists for: put this after the handshake and
+/// the logs from a client that cannot complete one — the reports hardest to reproduce — carry no
+/// version at all.
+#[test]
+fn startup_logs_the_version_before_the_handshake() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ya-lsp"))
+        .arg("--stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ya-lsp");
+
+    // Hang up before sending `initialize`, as the test above does.
+    drop(child.stdin.take().expect("stdin"));
+
+    let output = child.wait_with_output().expect("wait");
+    let text = String::from_utf8(output.stderr).expect("utf-8");
+    let expected = format!("ya-lsp {} starting", env!("CARGO_PKG_VERSION"));
+    assert!(
+        text.contains(&expected),
+        "no `{expected}` on stderr: {text:?}"
+    );
+}
+
 /// Ruby's own core classes: indexed, navigable, and reachable from a literal.
 ///
 /// This is the whole of M7 through the wire. The workspace has no gems and asks for core only —
@@ -1184,4 +1320,98 @@ fn a_client_without_progress_support_is_sent_no_progress() {
     assert!(result[0]["uri"].is_string(), "{result}");
 
     shut_down(server);
+}
+
+#[test]
+fn the_config_file_reloads_without_a_restart() {
+    // Item 8's whole claim, through the shipped binary rather than an in-process connection:
+    // an editor that takes a dynamic registration is asked to watch `ya-lsp.toml`, and the
+    // change it reports back actually changes an answer. Until v0.2.0 nothing in the server ever
+    // sent `client/registerCapability`, so this worked in exactly one editor — the one whose
+    // extension brought a watcher of its own — and the release notes said otherwise.
+    let root = fixture();
+    std::fs::write(
+        root.path().join("lib/broken.rb"),
+        "class Broken\n  def bar\n",
+    )
+    .unwrap();
+    // Start with the rule off, so the file that cannot parse says nothing.
+    std::fs::write(
+        root.path().join("ya-lsp.toml"),
+        "[diagnostics.rules]\nparse-error = \"off\"\n",
+    )
+    .unwrap();
+
+    let mut server = Server::start(root.path());
+    let mut params = initialize_params(root.path());
+    params["capabilities"]["workspace"] =
+        serde_json::json!({ "didChangeWatchedFiles": { "dynamicRegistration": true } });
+    let id = server.request("initialize", params);
+    server.response(&id).response_result.expect("initialize");
+    server.notify("initialized", serde_json::json!({}));
+
+    // The registration comes first, and it names this workspace's file and no other.
+    let registration = server.server_request("client/registerCapability");
+    let watcher = &registration.params["registrations"][0];
+    assert_eq!(watcher["method"], "workspace/didChangeWatchedFiles");
+    let config = root.path().join("ya-lsp.toml");
+    assert_eq!(
+        watcher["registerOptions"]["watchers"][0]["globPattern"],
+        serde_json::Value::String(config.to_string_lossy().replace('\\', "/"))
+    );
+    server.send(Message::Response(Response::new_ok(
+        registration.id,
+        serde_json::Value::Null,
+    )));
+
+    let broken = url::Url::from_file_path(root.path().join("lib/broken.rb"))
+        .unwrap()
+        .to_string();
+    let silent = loop {
+        let params = server.notification("textDocument/publishDiagnostics");
+        if params["uri"] == serde_json::Value::String(broken.clone()) {
+            break params;
+        }
+    };
+    // `parse-error` only: Prism also reports the indentation as a `parse-warning`, and this
+    // test is about the one rule the file being edited turns on and off.
+    assert!(
+        !has_parse_error(&silent),
+        "the rule was off, so nothing should have reported it: {silent:?}"
+    );
+
+    // Now the edit an editor would make, and the notification its watcher would send.
+    std::fs::write(&config, "[diagnostics.rules]\nparse-error = \"error\"\n").unwrap();
+    server.notify(
+        "workspace/didChangeWatchedFiles",
+        serde_json::json!({
+            "changes": [{
+                "uri": url::Url::from_file_path(&config).unwrap().to_string(),
+                "type": 2
+            }]
+        }),
+    );
+
+    let reloaded = loop {
+        let params = server.notification("textDocument/publishDiagnostics");
+        if params["uri"] == serde_json::Value::String(broken.clone()) && has_parse_error(&params) {
+            break params;
+        }
+    };
+    let error = reloaded["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .find(|item| item["code"] == "parse-error")
+        .expect("the rule the reload turned on");
+    assert_eq!(error["severity"], 1); // DiagnosticSeverity::ERROR
+
+    shut_down(server);
+}
+
+/// Whether a `publishDiagnostics` payload reports the rule the reload test switches.
+fn has_parse_error(published: &serde_json::Value) -> bool {
+    published["diagnostics"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["code"] == "parse-error"))
 }

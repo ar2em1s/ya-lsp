@@ -14,17 +14,28 @@ use super::{
 const MAX_CANDIDATES: usize = 10;
 
 /// Markdown for a resolved cursor, or `None` when there is nothing worth saying.
+///
+/// # The shape of a card
+///
+/// Every hover reads the same way, and the order is the point: **the answer, then what ya-lsp
+/// knows about the answer.** A fenced signature, a rule, RDoc's prose, and then the footnotes —
+/// one italic line each, at the bottom, never woven into the text above. A reader who trusts
+/// the answer stops at the fence; a reader who does not gets told why in the same place every
+/// time.
+///
+/// Everything a footnote says is about ya-lsp's confidence rather than about the code: the
+/// receiver's type was not known, or the class is reopened somewhere this card cannot show.
+/// That is the test for whether a new line belongs in one.
 #[must_use]
 pub fn markdown(graph: &Graph, resolution: &Resolution) -> Option<String> {
     match resolution.declarations.as_slice() {
         [] => None,
         [only] => {
-            let card = card(graph, *only)?;
-            if resolution.precise {
-                Some(card)
-            } else {
-                Some(format!("{card}\n\n*{GUESS}*"))
+            let mut card = card(graph, *only)?;
+            if !resolution.precise {
+                card.push_str(&footnote(GUESS));
             }
+            Some(card)
         }
         // Only the name-based fallback can produce more than one, and picking one of them
         // arbitrarily would be presenting a coin flip as an answer.
@@ -33,6 +44,15 @@ pub fn markdown(graph: &Graph, resolution: &Resolution) -> Option<String> {
 }
 
 const GUESS: &str = "Matched on the method name alone — the receiver's type is unknown.";
+
+/// What ya-lsp knows about an answer, as one italic line under it.
+///
+/// The single place the convention lives, because it was two before: a guessed single match
+/// carried it as a trailing italic and a guessed *list* carried the same sentence inline after
+/// an em dash, in bold, at the top. Same fact, same uncertainty, two shapes.
+fn footnote(note: &str) -> String {
+    format!("\n\n*{note}*")
+}
 
 fn card(graph: &Graph, declaration_id: DeclarationId) -> Option<String> {
     let declaration = graph.declarations().get(&declaration_id)?;
@@ -54,7 +74,10 @@ fn card(graph: &Graph, declaration_id: DeclarationId) -> Option<String> {
     // Reopened classes and monkey-patched methods are the norm in Ruby, and the one thing a
     // hover cannot show is the code that is somewhere else.
     if definitions.len() > 1 {
-        card.push_str(&format!("\n\n*Defined in {} places.*", definitions.len()));
+        card.push_str(&footnote(&format!(
+            "Defined in {} places.",
+            definitions.len()
+        )));
     }
 
     Some(card)
@@ -109,16 +132,20 @@ fn candidate_list(graph: &Graph, declarations: &[DeclarationId]) -> String {
     names.dedup();
 
     let total = names.len();
-    let mut listing = format!("**{total} possible definitions** — {GUESS}\n");
+    let mut listing = format!("**{total} possible definitions**\n");
     for name in names.iter().take(MAX_CANDIDATES) {
         listing.push_str(&format!("\n- `{name}`"));
     }
     if total > MAX_CANDIDATES {
         listing.push_str(&format!("\n- …and {} more", total - MAX_CANDIDATES));
     }
+    // The list is the answer; why it is a list is the footnote, in the place every other card
+    // puts one.
+    listing.push_str(&footnote(GUESS));
     listing
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

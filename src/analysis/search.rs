@@ -63,9 +63,13 @@ pub fn search(graph: &Graph, query: &str, limit: usize, own: &HashSet<UriId>) ->
         .into_iter()
         .filter_map(|id| {
             let declaration = graph.declarations().get(&id)?;
-            // A declaration with no definitions is a placeholder the resolver invented for a
-            // namespace it never saw — `Foo::Bar` mentioned by a reference to a `Foo` that does
-            // not exist. There is nowhere to jump.
+            // A placeholder the resolver invented for a namespace it never saw — `Foo::Bar`
+            // mentioned by a reference to a `Foo` that does not exist — is filed as
+            // `Namespace::Todo`, so `is_listable` is what actually turns those away and the
+            // second test has never fired. It stays because the two ask different questions:
+            // `Todo` is how *today's* rubydex spells "invented", while "nowhere to jump" is the
+            // property the picker actually needs, for any declaration that ends up with no
+            // definitions behind it.
             if !is_listable(declaration) || declaration.has_no_definitions() {
                 return None;
             }
@@ -249,4 +253,60 @@ fn eq_ci(left: char, right: char) -> bool {
         return left.eq_ignore_ascii_case(&right);
     }
     left == right || left.to_lowercase().eq(right.to_lowercase())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_is_case_insensitive_without_allocating_a_lowercased_copy() {
+        // This runs once per candidate and a bundle has ~150k of them, so the folding is done
+        // character by character rather than by lowercasing both sides. These are the cases
+        // where that hand-rolled comparison could differ from the obvious one.
+        assert!(equal_ci("Person", "person"));
+        assert!(!equal_ci("Person", "persona"), "a prefix is not equality");
+        assert!(!equal_ci("persona", "Person"), "nor is a suffix");
+        assert!(!equal_ci("Person", "Persan"));
+
+        assert!(starts_with_ci("PersonName", "person"));
+        assert!(!starts_with_ci("Per", "person"), "the haystack runs out");
+
+        assert!(contains_ci("ApplicationRecord", "record"));
+        assert!(!contains_ci("ApplicationRecord", "reccord"));
+        // An empty query matches everything, which is what makes an empty picker list the
+        // workspace rather than nothing at all.
+        assert!(contains_ci("anything", ""));
+        assert!(contains_ci("", ""));
+    }
+
+    #[test]
+    fn non_ascii_identifiers_fold_by_unicode_rather_than_by_byte() {
+        // Ruby allows them and a UTF-8 workspace has them. ASCII on either side takes the fast
+        // path; two non-ASCII characters need the full lowercase mapping, which is the only
+        // route through `eq_ci`'s second line.
+        assert!(equal_ci("Ünicorn", "ünicorn"));
+        assert!(equal_ci("ПРИВЕТ", "привет"));
+        assert!(!equal_ci("Ünicorn", "unicorn"), "not a transliteration");
+        assert!(!equal_ci("привет", "приват"));
+        // Mixed: one side ASCII means the ASCII rule decides, and `ü` is not `u`.
+        assert!(!equal_ci("ü", "u"));
+    }
+
+    #[test]
+    fn a_query_is_tiered_by_how_much_of_the_name_it_accounts_for() {
+        // The ordering `search::rank` reads. Exact beats prefix beats substring beats a match
+        // that only appears once the namespace is included.
+        assert_eq!(tier("shout", "Person#shout()"), 4);
+        assert_eq!(tier("SHOUT", "Person#shout()"), 4, "and case-insensitively");
+        assert_eq!(tier("sho", "Person#shout()"), 3);
+        assert_eq!(tier("hou", "Person#shout()"), 2);
+        assert_eq!(
+            tier("person#sh", "Person#shout()"),
+            1,
+            "the query is a path"
+        );
+        assert_eq!(tier("widget", "Person#shout()"), 0);
+    }
 }

@@ -138,7 +138,16 @@ jobs:
           rm -rf "dist/$name"
 
           tar tzf "dist/$name.tar.gz"
-          tar xzf "dist/$name.tar.gz" -O "$name/NOTICE.txt" | grep -qF "Soutaro Matsumoto" \
+          # Extracted to a file, never piped into `grep -q`. This step sets `shell: bash`, which
+          # is what turns `pipefail` on, and under `pipefail` that pipeline fails precisely when
+          # the notice is *present*: grep -q exits at the first match and closes the pipe, tar
+          # takes SIGPIPE on its next write, and the pipeline reports tar's failure — so a correct
+          # NOTICE.txt is announced as "has no third-party notice". tar writes one slice per
+          # 10 KiB record, so any member straddling a record boundary is written more than once
+          # and can lose that race; which members straddle one depends on the sizes of the files
+          # stored ahead of them, i.e. on nothing this check controls.
+          tar xzf "dist/$name.tar.gz" -O "$name/NOTICE.txt" > /tmp/tarball-notice.txt
+          grep -qF "Soutaro Matsumoto" /tmp/tarball-notice.txt \
             || { echo "::error::$name.tar.gz has no third-party notice"; exit 1; }
 
       - name: archive the server (Windows)

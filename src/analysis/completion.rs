@@ -30,11 +30,12 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use rubydex::{
     model::{
-        declaration::{Declaration, Namespace},
+        declaration::{Ancestor, Declaration, Namespace},
         definitions::{Definition, Receiver as DefinitionReceiver},
         graph::Graph,
         ids::{DeclarationId, NameId, StringId, UriId},
         name::{Name, ParentScope},
+        visibility::Visibility,
     },
     query::{self, CompletionCandidate, CompletionContext, CompletionReceiver, MatchMode},
 };
@@ -100,12 +101,33 @@ pub fn complete(
     let prefix = &source[cursor.start as usize..cursor.end as usize];
 
     let scope = Scope::at(graph, uri_id, offset);
+    // Pure syntax, and decided before anything is looked up: see `Context::allows_private`.
+    let private_ok = cursor.context.allows_private();
+    let locality = Locality::at(graph, uri_id, own);
     let items = match receiver_for(graph, uri_id, cursor.context, &scope) {
-        Some((receiver, only)) => from_graph(graph, receiver, only, prefix, limit, own),
+        Some((receiver, only)) => {
+            let ranking = Ranking {
+                prefix,
+                distance: Distance::from_receiver(graph, &receiver),
+                locality,
+                private_ok,
+            };
+            from_graph(graph, receiver, only, limit, &ranking)
+        }
         // Only one context arrives here with anything worth saying: a `.` on a receiver whose
         // type is unknown. `foo::` and a receiver that is not a namespace have no honest answer.
         None => match cursor.context {
-            Context::MethodCall { .. } => by_name(graph, prefix, limit, own),
+            Context::MethodCall { .. } => {
+                // No receiver means no chain, so `Locality` is the whole of what ranks this
+                // list. See the note on `Distance::none`.
+                let ranking = Ranking {
+                    prefix,
+                    distance: Distance::none(),
+                    locality,
+                    private_ok,
+                };
+                by_name(graph, limit, &ranking)
+            }
             _ => Vec::new(),
         },
     };
@@ -149,10 +171,11 @@ impl Scope {
         // constructs it is written inside, and the narrowest is the innermost.
         let mut namespace: Option<&Definition> = None;
         let mut method: Option<&Definition> = None;
-        for id in document.definitions() {
-            let Some(definition) = graph.definitions().get(id) else {
-                continue;
-            };
+        for definition in document
+            .definitions()
+            .iter()
+            .filter_map(|id| graph.definitions().get(id))
+        {
             let span = definition.offset();
             if span.start() > offset || offset > span.end() {
                 continue;
@@ -275,7 +298,12 @@ fn receiver_for(
         Context::NamespaceAccess { receiver } => {
             let namespace_decl_id = match receiver {
                 Receiver::Constant(offset) => constant_at(graph, uri_id, offset)?,
-                // `self::CONST` is legal and rare; the nesting is what it means.
+                // `self::CONST` is legal and rare; the nesting is what it means. `caller` is
+                // the singleton in a class or module body, and asking a singleton reaches the
+                // class it is attached to — so this answers the same list `HR::` does, from a
+                // body and from inside a method alike. Pinned by
+                // `every_receiver_that_can_precede_a_double_colon_is_answered`, because the
+                // equivalence is rubydex's and not something this line states.
                 Receiver::SelfObject => scope.caller(graph)?,
                 // `"foo"::Bar` and `Foo.new::Bar` parse, and mean nothing anybody writes on
                 // purpose. An instance is not a namespace.
@@ -390,9 +418,8 @@ fn from_graph(
     graph: &Graph,
     receiver: CompletionReceiver,
     only: Only,
-    prefix: &str,
     limit: usize,
-    own: &HashSet<UriId>,
+    ranking: &Ranking,
 ) -> Vec<Item> {
     let candidates = match query::completion_candidates(graph, CompletionContext::new(receiver)) {
         Ok(candidates) => candidates,
@@ -407,7 +434,7 @@ fn from_graph(
         .iter()
         .filter(|candidate| only.accepts(graph, candidate))
         .enumerate()
-        .filter_map(|(sequence, candidate)| rank(graph, candidate, prefix, sequence, own))
+        .filter_map(|(sequence, candidate)| rank(graph, candidate, sequence, ranking))
         .collect();
     take_best(&mut ranked, limit);
     ranked.into_iter().map(|entry| entry.item).collect()
@@ -432,6 +459,288 @@ impl Only {
     }
 }
 
+/// How far a namespace sits from the receiver, in steps along the chains rubydex walked.
+///
+/// This is the ranking's only term for *relevance*, and without it a list that nothing has been
+/// typed into is not ranked at all: `tier` is 1 for every row, `length` is 0 for every row, and
+/// what decides is the label, alphabetically. Measured, `"hello".` opened on `DelegateClass,
+/// Digest, append_as_bytes, ascii_only?, b, begin, …` — two of the first three are not `String`'s
+/// and one of those two is not a method.
+///
+/// Zero is the receiver's own members, one an included module's, and `Object`, `Kernel` and
+/// `BasicObject` come last because they are the end of every chain. That is also the argument for
+/// doing this before anything about `Object` being the drain that everything rubydex cannot
+/// attribute falls into: whatever is misfiled there is already as far away as a name can be.
+struct Distance {
+    steps: HashMap<DeclarationId, u16>,
+}
+
+/// What an owner that none of the chains reached is worth.
+///
+/// Last, and equally last, so the rest of the key still separates them. Every candidate rubydex
+/// collects comes off one of the chains seeded below, so landing here means the graph disagrees
+/// with itself about who owns a name — not a case to give the benefit of the doubt to.
+const NO_DISTANCE: u16 = u16::MAX;
+
+impl Distance {
+    /// The name-based list has no receiver, so no chain, so nothing to measure. Every row ties
+    /// and the rest of the key decides it, exactly as before.
+    fn none() -> Self {
+        Self {
+            steps: HashMap::new(),
+        }
+    }
+
+    /// Seed from the same walks `query::completion_candidates` is about to make.
+    ///
+    /// Each walk is numbered from zero rather than end to end, because they are different kinds
+    /// of nearness sharing one scale: a sibling constant in the enclosing module is close to the
+    /// cursor and is on nobody's ancestor chain, and `Foo::` reaches `Foo::Bar` and `Foo.build`
+    /// by two routes that both start at `Foo`. Numbering them end to end would sink every method
+    /// in an expression below every constant, or the reverse.
+    ///
+    /// Ancestor chains are seeded first and the nearest of them wins. The lexical walk only
+    /// fills in what they never reached, because it is a shortcut to the same place and taking
+    /// it would be a lie about a method: `Object` is the last rung of every ancestor chain *and*
+    /// the outermost lexical scope, so letting it be scored as the latter would put `Object`'s
+    /// members — which is everything rubydex could not attribute — one step from the cursor.
+    fn from_receiver(graph: &Graph, receiver: &CompletionReceiver) -> Self {
+        let mut distance = Self::none();
+        let mut lexical = None;
+        match receiver {
+            CompletionReceiver::MethodCall {
+                receiver_decl_id, ..
+            } => distance.chain(graph, *receiver_decl_id),
+            CompletionReceiver::NamespaceAccess {
+                namespace_decl_id, ..
+            } => {
+                distance.chain(graph, *namespace_decl_id);
+                if let Some(namespace) = namespace_id(graph, *namespace_decl_id)
+                    && let Some(singleton) = singleton_of(graph, namespace)
+                {
+                    distance.chain(graph, singleton);
+                }
+            }
+            CompletionReceiver::Expression {
+                self_decl_id,
+                nesting_name_id,
+            }
+            | CompletionReceiver::MethodArgument {
+                self_decl_id,
+                nesting_name_id,
+                ..
+            } => {
+                let nesting = graph.name_id_to_declaration_id(*nesting_name_id).copied();
+                // Methods and instance variables come off `self`'s ancestors; constants off the
+                // lexical nesting, which is a walk outwards through owners and not through
+                // ancestors. Both are seeded, so a class's own methods and the constants sitting
+                // beside it in its module are both near.
+                if let Some(id) = self_decl_id.or(nesting) {
+                    distance.chain(graph, id);
+                }
+                if let Some(id) = nesting {
+                    distance.chain(graph, id);
+                    lexical = Some(id);
+                }
+            }
+        }
+        // After every ancestor chain, never before one: see above.
+        if let Some(id) = lexical {
+            distance.lexical(graph, id);
+        }
+        distance
+    }
+
+    /// Number one linearized ancestor chain, outwards from the receiver.
+    fn chain(&mut self, graph: &Graph, id: DeclarationId) {
+        let Some((_, namespace)) = namespace(graph, id) else {
+            return;
+        };
+        for (step, ancestor) in namespace.ancestors().iter().enumerate() {
+            // A rung rubydex could not linearize is still a rung: whatever sits past it is
+            // further away whether or not this one can be named.
+            if let Ancestor::Complete(ancestor_id) = ancestor {
+                self.record(*ancestor_id, step);
+            }
+        }
+    }
+
+    /// Number the lexical nesting outwards: `Billing::Invoice`, then `Billing`, then `Object`.
+    ///
+    /// rubydex's own invariant is that `Object` and `BasicObject` are the only declarations that
+    /// own themselves, so self-ownership is what ends the walk. The bound is there because an
+    /// invariant that is checked is not an invariant that is enforced, and rubydex bounds its
+    /// own owner walks the same way.
+    fn lexical(&mut self, graph: &Graph, id: DeclarationId) {
+        const MAX_NESTING: usize = 64;
+
+        let mut current = id;
+        for step in 0..MAX_NESTING {
+            self.fill(current, step);
+            let Some(declaration) = graph.declarations().get(&current) else {
+                return;
+            };
+            let owner = *declaration.owner_id();
+            if owner == current {
+                return;
+            }
+            current = owner;
+        }
+    }
+
+    /// The nearest of the ancestor chains is the one that counts.
+    fn record(&mut self, id: DeclarationId, step: usize) {
+        let step = Self::bounded(step);
+        self.steps
+            .entry(id)
+            .and_modify(|held| *held = (*held).min(step))
+            .or_insert(step);
+    }
+
+    /// A number for a namespace no ancestor chain reached, and only for one.
+    fn fill(&mut self, id: DeclarationId, step: usize) {
+        self.steps.entry(id).or_insert(Self::bounded(step));
+    }
+
+    fn bounded(step: usize) -> u16 {
+        u16::try_from(step).unwrap_or(NO_DISTANCE)
+    }
+
+    /// How far the namespace that declares this sits from the receiver.
+    ///
+    /// `owner_id` is rubydex's own back-pointer to the namespace a member was collected from,
+    /// which is why nothing here parses a name: `Foo::<Foo>#build()` and a top-level constant
+    /// both answer without a special case.
+    fn of(&self, declaration: &Declaration) -> u16 {
+        self.steps
+            .get(declaration.owner_id())
+            .copied()
+            .unwrap_or(NO_DISTANCE)
+    }
+}
+
+/// How near a declaration sits to the cursor itself, counted in directories.
+///
+/// [`Distance`] measures nearness along a receiver's ancestor chain, and there is no chain when
+/// the receiver is an instance variable or another call's return value. That list is every method
+/// name in the project, and on a Rails app it opened on `account_type, add_row, amount,
+/// attributes, balance` — 512 rows chosen by the alphabet, in 50 ms, telling the user nothing.
+///
+/// So this is the same question asked of what *is* known: not what the receiver is, but where the
+/// cursor is. It ranks the typed list too, where it breaks ties `Distance` leaves — every
+/// top-level constant in a project sits at the same depth on the same chain, and the alphabet was
+/// deciding between them.
+///
+/// **The measure is the path, not the namespace, and that was decided by trying both.** A walk
+/// outwards through the cursor's lexical nesting reads like the more principled answer and works
+/// well on namespaced code — inside `Finance::BankDetails::BankAccounts::Decorator` it found the
+/// sibling service, then the cousins under `Finance::BankDetails`. But a Rails model is
+/// `class Message < ApplicationRecord` at the top level, so its nesting is empty, and half of a
+/// real app got nothing at all. Ruby projects put related code in the same directory whether or
+/// not they nest it, and Zeitwerk makes the directory *be* the namespace, so the path carries
+/// everything the nesting carried and answers for flat code as well.
+struct Locality {
+    /// Every document of the user's own code, and how far its directory sits from the cursor's:
+    /// 0 the file itself, 1 its directory or below, 2 the parent, and so on outwards.
+    ///
+    /// Gems are absent rather than far. They are already below the user's own code on `group`,
+    /// and scoring six thousand documents nobody asked about is work for no answer.
+    documents: HashMap<UriId, u8>,
+}
+
+/// What a declaration in none of those documents is worth: nothing, and equally nothing, so the
+/// rest of the key still separates them.
+const NO_LOCALITY: u8 = u8::MAX;
+
+impl Locality {
+    /// Built once per request, from the user's own documents rather than from the whole graph —
+    /// 161 path comparisons on a real Rails app, against 7,000.
+    fn at(graph: &Graph, here: UriId, own: &HashSet<UriId>) -> Self {
+        let mut documents = HashMap::new();
+        let Some(cursor) = graph.documents().get(&here).map(|document| document.uri()) else {
+            return Self { documents };
+        };
+        let cursor = directory_of(cursor);
+        let depth = segments(cursor);
+
+        // `filter_map`, the way `of` below reads the same table: `own` is built from the
+        // graph's own documents, so a miss has nothing to be done about it.
+        for (id, document) in own
+            .iter()
+            .filter_map(|id| Some((*id, graph.documents().get(id)?)))
+        {
+            let step = if id == here {
+                0
+            } else {
+                let shared = shared_segments(cursor, directory_of(document.uri()));
+                u8::try_from(depth - shared + 1).unwrap_or(NO_LOCALITY)
+            };
+            documents.insert(id, step);
+        }
+        Self { documents }
+    }
+
+    /// The nearest document the declaration was written in.
+    ///
+    /// The nearest, because a class reopened in two places — a Rails concern, a monkey patch —
+    /// should be scored by the copy the cursor can see, not by whichever definition rubydex
+    /// happened to record first.
+    fn of(&self, graph: &Graph, declaration: &Declaration) -> u8 {
+        declaration
+            .definitions()
+            .iter()
+            .filter_map(|id| graph.definitions().get(id))
+            .filter_map(|definition| self.documents.get(definition.uri_id()))
+            .copied()
+            .min()
+            .unwrap_or(NO_LOCALITY)
+    }
+}
+
+/// A URI without its last segment. Both sides come from `Url::from_file_path`, so they are
+/// already canonical and comparing them as text is comparing paths.
+fn directory_of(uri: &str) -> &str {
+    uri.rsplit_once('/').map_or(uri, |(directory, _)| directory)
+}
+
+fn segments(uri: &str) -> usize {
+    uri.split('/').count()
+}
+
+/// How many leading path segments two directories share.
+///
+/// Segment-wise rather than byte-wise, or `app/model` would count as sharing all of `app/models`.
+fn shared_segments(left: &str, right: &str) -> usize {
+    left.split('/')
+        .zip(right.split('/'))
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+/// The namespace a receiver id names, following a constant alias the way rubydex's own walk
+/// does — `Money = Billing::Money` offers what it points at.
+fn namespace_id(graph: &Graph, id: DeclarationId) -> Option<DeclarationId> {
+    namespace(graph, id).map(|(id, _)| id)
+}
+
+/// The same, with the declaration it had to look up anyway.
+///
+/// `chain` runs this once per ancestor of every candidate's receiver, and looking the id back up
+/// to re-establish what this already proved was a second hash lookup on that path — and a
+/// `Declaration` that was known to be a `Namespace` re-checked as though it might not be.
+fn namespace(graph: &Graph, id: DeclarationId) -> Option<(DeclarationId, &Namespace)> {
+    match graph.declarations().get(&id)? {
+        Declaration::Namespace(namespace) => Some((id, namespace)),
+        _ => {
+            let target = graph.resolve_alias(&id)?;
+            match graph.declarations().get(&target) {
+                Some(Declaration::Namespace(namespace)) => Some((target, namespace)),
+                _ => None,
+            }
+        }
+    }
+}
+
 /// The degraded list: every method name in the project, for a receiver with no type.
 ///
 /// Deduplicated by name, because `name` is defined by hundreds of classes in a Rails bundle and
@@ -441,20 +750,20 @@ impl Only {
 /// Deduplication happens *before* the sort, and on a hash of the label rather than the label:
 /// this runs over every method declaration in the graph on every keystroke, so a copy of each
 /// name would be a hundred thousand allocations to throw away.
-fn by_name(graph: &Graph, prefix: &str, limit: usize, own: &HashSet<UriId>) -> Vec<Item> {
+fn by_name(graph: &Graph, limit: usize, ranking: &Ranking) -> Vec<Item> {
     // Every method name contains a `#` and no other declaration's does, so this is rubydex's
     // parallel filter doing the "methods only" pass for free.
-    let query = format!("#{prefix}");
+    let query = format!("#{}", ranking.prefix);
     let mut best: HashMap<u64, Ranked> = HashMap::new();
 
     for id in query::declaration_search(graph, &query, &MatchMode::Fuzzy) {
-        let Some(declaration) = graph.declarations().get(&id) else {
+        // The query leads with `#`, which only a method name contains, so this is rubydex's
+        // parallel filter having already done the "methods only" pass — bound rather than
+        // re-tested, since a second `matches!` over every method in the graph proved nothing.
+        let Some(declaration @ Declaration::Method(_)) = graph.declarations().get(&id) else {
             continue;
         };
-        if !matches!(declaration, Declaration::Method(_)) {
-            continue;
-        }
-        let Some(entry) = ranked_declaration(graph, id, declaration, prefix, own) else {
+        let Some(entry) = ranked_declaration(graph, id, declaration, ranking) else {
             continue;
         };
         let key = StringId::from(&entry.item.label).get();
@@ -475,19 +784,93 @@ fn by_name(graph: &Graph, prefix: &str, limit: usize, own: &HashSet<UriId>) -> V
     ranked.into_iter().map(|entry| entry.item).collect()
 }
 
+/// Everything the ranking needs that is not the candidate itself.
+///
+/// A struct rather than another parameter each time, because `ranked_declaration` is the one
+/// point both the receiver path and the name-based path pass through: every term the ranking
+/// grows lands here, and the two paths cannot drift apart on one.
+struct Ranking<'a> {
+    prefix: &'a str,
+    distance: Distance,
+    locality: Locality,
+    /// Whether Ruby would let a private method be written at the cursor. Decided from the
+    /// syntax alone by [`cursor::Context::allows_private`].
+    private_ok: bool,
+}
+
+/// The five method names Ruby keeps private however they were declared.
+///
+/// `rb_add_method` privatises them by name at the point of definition, so a `def initialize` is
+/// private whatever its class did or did not say — and neither rbs nor rubydex records that.
+/// Measured against Ruby 4.0.1: these five and nothing else. `method_missing` and
+/// `singleton_method_added` look like they belong here and do not; they are private on
+/// `BasicObject` because that is how *those* copies were written, which the graph already knows.
+///
+/// Instance methods only. The same code leaves `def self.initialize` public, and `Bar.initialize`
+/// really does call it — which is why [`reachable`] checks who owns the method before applying
+/// this. `Class#initialize` is caught anyway, because it is an instance method of `Class`.
+const ALWAYS_PRIVATE: [&str; 5] = [
+    "initialize",
+    "initialize_clone",
+    "initialize_copy",
+    "initialize_dup",
+    "respond_to_missing?",
+];
+
+/// Whether Ruby would let this method be called where the cursor is.
+///
+/// Everything reaching here has already passed rubydex's visibility filter, which answers a
+/// slightly different question than Ruby asks. Two gaps follow, and they close together:
+///
+/// - **rubydex passes a private method whenever the caller's `self` is the same class as the
+///   receiver.** Ruby's exemption is for a receiver *written* `self`, so `Vault.new.secret` was
+///   offered from inside `Vault`, where a real interpreter raises `NoMethodError`.
+/// - **The graph believes rbs about the five names above**, and rbs is not consistent about
+///   them: `Kernel#initialize_copy` is marked private and `String#initialize_copy` public, so
+///   `"hi".` offered `initialize` and `initialize_copy` while `count.` offered only the first.
+///
+/// Both are the same question — may this be written *here* — and `private_ok` is the answer.
+fn reachable(graph: &Graph, id: DeclarationId, declaration: &Declaration, label: &str) -> bool {
+    if !matches!(declaration, Declaration::Method(_)) {
+        return true;
+    }
+    if matches!(
+        graph.visibility(&id),
+        // rubydex treats `module_function`'s instance copy as private, and so does Ruby.
+        Some(Visibility::Private | Visibility::ModuleFunction)
+    ) {
+        return false;
+    }
+    !ALWAYS_PRIVATE.contains(&label) || singleton_owned(graph, declaration)
+}
+
+/// Whether a method hangs off a singleton class, which is how rubydex spells `def self.foo`.
+fn singleton_owned(graph: &Graph, declaration: &Declaration) -> bool {
+    matches!(
+        graph.declarations().get(declaration.owner_id()),
+        Some(Declaration::Namespace(Namespace::SingletonClass(_)))
+    )
+}
+
 struct Ranked {
     group: u8,
     tier: u8,
     /// Whether the name is spelled as an internal one — `_fork`, `__send`.
     internal: bool,
+    /// How far the namespace declaring this sits from the receiver. See [`Distance`].
+    distance: u16,
+    /// How near the declaration itself sits to the cursor. See [`Locality`].
+    locality: u8,
     /// Where a keyword argument sits in the signature that declares it, and zero for everything
     /// else.
     ///
-    /// It is tempting to use the emission order for all candidates — rubydex walks the ancestor
-    /// chain outwards, so an earlier one is defined closer to the receiver — but *within* one
-    /// namespace the order is a hash map's, and adding a member reshuffles it. A completion list
-    /// that reorders itself as the file is edited is worse than one that is merely alphabetical.
-    /// A signature is a list, so its order is real and worth keeping.
+    /// It is only ever a signature's own order. rubydex's emission order looks like it would
+    /// serve every candidate — the ancestor chain is walked outwards, so an earlier row is
+    /// declared nearer — but *within* one namespace that order is a hash map's, and adding a
+    /// member reshuffles it. A completion list that rearranges itself as the file is edited is
+    /// worse than one that is merely alphabetical. [`Distance`] takes the half of the emission
+    /// order that is stable and leaves the half that is not. A signature is a list, so its order
+    /// is real and worth keeping.
     sequence: usize,
     /// The label's length, or zero when nothing has been typed yet.
     ///
@@ -509,11 +892,23 @@ struct Ranked {
 /// background. Ruby keywords sit above a gem's declarations for the same reason `end` is more
 /// likely than `Encoding` — but below the user's own code, which is the same call the symbol
 /// picker makes.
+///
+/// [`Distance`] sits below match quality and above everything else. What the user typed is what
+/// they asked for, so it outranks where a name lives; among rows that match it equally, the
+/// nearer owner wins. With nothing typed yet every row ties on quality, and distance is then the
+/// only thing ranking the list at all.
+///
+/// [`Locality`] follows it, and the pair is one question — how near is this — asked of two
+/// different things. Distance is the stronger answer and goes first, but it is silent exactly
+/// twice: where there is no receiver to measure a chain from, and among the rows of one chain
+/// that tie. Locality speaks in both.
 fn order(a: &Ranked, b: &Ranked) -> std::cmp::Ordering {
     a.group
         .cmp(&b.group)
         .then(a.internal.cmp(&b.internal))
         .then(b.tier.cmp(&a.tier))
+        .then(a.distance.cmp(&b.distance))
+        .then(a.locality.cmp(&b.locality))
         .then(a.length.cmp(&b.length))
         .then(a.sequence.cmp(&b.sequence))
         .then(a.item.label.cmp(&b.item.label))
@@ -530,14 +925,14 @@ fn take_best(ranked: &mut Vec<Ranked>, limit: usize) {
 fn rank(
     graph: &Graph,
     candidate: &CompletionCandidate,
-    prefix: &str,
     sequence: usize,
-    own: &HashSet<UriId>,
+    ranking: &Ranking,
 ) -> Option<Ranked> {
+    let prefix = ranking.prefix;
     match candidate {
         CompletionCandidate::Declaration(id) => {
             let declaration = graph.declarations().get(id)?;
-            ranked_declaration(graph, *id, declaration, prefix, own)
+            ranked_declaration(graph, *id, declaration, ranking)
         }
         CompletionCandidate::KeywordArgument(str_id) => {
             let name = graph.strings().get(str_id)?.as_str();
@@ -547,6 +942,11 @@ fn rank(
                 group: 0,
                 tier,
                 internal: is_internal(prefix, &label),
+                // Neither of these is anywhere in particular, and `group` keeps both out of
+                // any comparison where that would matter: keyword arguments lead the list and
+                // Ruby's keywords are a band of their own.
+                distance: 0,
+                locality: 0,
                 sequence,
                 length: sort_length(prefix, &label),
                 item: Item {
@@ -563,6 +963,8 @@ fn rank(
             group: 2,
             tier: tier(prefix, keyword.name())?,
             internal: false,
+            distance: 0,
+            locality: 0,
             sequence: 0,
             length: sort_length(prefix, keyword.name()),
             item: Item {
@@ -581,9 +983,9 @@ fn ranked_declaration(
     graph: &Graph,
     id: DeclarationId,
     declaration: &Declaration,
-    prefix: &str,
-    own: &HashSet<UriId>,
+    ranking: &Ranking,
 ) -> Option<Ranked> {
+    let prefix = ranking.prefix;
     // A `Todo` namespace is a placeholder the resolver invented for a parent it never saw, so
     // it has no definition to jump to and no members to offer.
     if matches!(declaration, Declaration::Namespace(Namespace::Todo(_))) {
@@ -596,16 +998,26 @@ fn ranked_declaration(
         return None;
     }
     let label = render::last_segment(name);
+    // After `tier`, deliberately. This runs once per candidate and there can be a hundred
+    // thousand of them, and `reachable` costs a visibility lookup where the prefix test costs a
+    // string compare — so the cheap filter goes first and most rows never reach the expensive
+    // one. `private_ok` short-circuits the whole thing wherever a receiver was not written.
     let tier = tier(prefix, label)?;
+    if !ranking.private_ok && !reachable(graph, id, declaration, label) {
+        return None;
+    }
+
+    // One walk over the definitions, not two. `Locality` is built from exactly the documents
+    // that are the user's own code, so "is this theirs" is "did any document score at all" —
+    // and this runs over every method declaration in the graph on the name-based path.
+    let locality = ranking.locality.of(graph, declaration);
 
     Some(Ranked {
-        group: if declared_in(graph, declaration, own) {
-            1
-        } else {
-            3
-        },
+        group: if locality == NO_LOCALITY { 3 } else { 1 },
         tier,
         internal: is_internal(prefix, label),
+        distance: ranking.distance.of(declaration),
+        locality,
         sequence: 0,
         length: sort_length(prefix, label),
         item: Item {
@@ -665,15 +1077,6 @@ fn tier(prefix: &str, label: &str) -> Option<u8> {
     subsequence_ci(label, prefix).then_some(0)
 }
 
-fn declared_in(graph: &Graph, declaration: &Declaration, own: &HashSet<UriId>) -> bool {
-    declaration.definitions().iter().any(|id| {
-        graph
-            .definitions()
-            .get(id)
-            .is_some_and(|definition| own.contains(definition.uri_id()))
-    })
-}
-
 /// What icon the editor draws.
 ///
 /// Read off the *declaration*, not a definition: the outline can tell an `attr_reader` from a
@@ -726,4 +1129,105 @@ fn eq_ci(left: char, right: char) -> bool {
         return left.eq_ignore_ascii_case(&right);
     }
     left == right || left.to_lowercase().eq(right.to_lowercase())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An id, uri or name that no graph holds — what a client sends after a config reload
+    /// dropped the graph the list it is looking at was built from.
+    #[test]
+    fn nothing_in_an_empty_graph_is_near_the_cursor_or_encloses_it() {
+        // Every one of these takes an id from outside — the request's uri, the `data` a client
+        // echoes back on `completionItem/resolve` — and rubydex ids are hashes, so "the graph
+        // does not hold this" is a state the server is handed rather than one it creates. The
+        // whole ranking has to degrade to "nothing" rather than to a panic or a wrong answer.
+        let graph = Graph::new();
+        let missing = UriId::from("file:///nowhere/gone.rb");
+
+        let scope = Scope::at(&graph, missing, 0);
+        assert_eq!(
+            scope.nesting,
+            object_name(),
+            "the top level, for want of one"
+        );
+        assert!(scope.self_id.is_none());
+
+        let locality = Locality::at(&graph, missing, &HashSet::new());
+        assert!(
+            locality.documents.is_empty(),
+            "no cursor document, so nothing to measure nearness against"
+        );
+
+        // `Object` is in every real graph — rubydex indexes a built-in one — so this is the
+        // only way to reach a nesting that resolves to no declaration at all.
+        let distance = Distance::from_receiver(
+            &graph,
+            &CompletionReceiver::Expression {
+                self_decl_id: None,
+                nesting_name_id: object_name(),
+            },
+        );
+        assert!(
+            distance.steps.is_empty(),
+            "no nesting to resolve, so no chain to number"
+        );
+    }
+
+    #[test]
+    fn a_name_nobody_reaches_by_typing_its_first_letter_sinks() {
+        // Punctuation and underscores sort before letters, so without this a Rails app opens
+        // `User.` on `__send`, `_fork`, `!` and `%`.
+        for label in ["_internal", "__send", "!", "<=>", "[]", "%"] {
+            assert!(
+                is_internal("", label),
+                "{label} should sink at an empty prefix"
+            );
+        }
+        // A sigil is not punctuation — `@name` is a name.
+        for label in ["@name", "$stdout", "shout", "Person"] {
+            assert!(!is_internal("", label), "{label} should not sink");
+        }
+        // Typing one of these characters lifts them all back: somebody who writes `_` means it.
+        assert!(!is_internal("_", "_internal"));
+        assert!(!is_internal("<", "<=>"));
+        assert!(
+            !is_internal("@_", "@_hidden"),
+            "the sigil is stepped over first"
+        );
+        // A label with nothing left after the sigils has no first character to judge.
+        assert!(is_internal("", ""));
+        assert!(is_internal("", "@"));
+    }
+
+    #[test]
+    fn a_prefix_matches_as_a_subsequence_case_insensitively() {
+        // What a client filters on between keystrokes, and why every list is `isIncomplete`.
+        assert!(subsequence_ci("ApplicationRecord", "aprec"));
+        assert!(subsequence_ci("shout", "SHOUT"));
+        assert!(
+            subsequence_ci("anything", ""),
+            "an empty prefix matches all"
+        );
+        assert!(!subsequence_ci("shout", "shouted"));
+        assert!(!subsequence_ci("shout", "tuohs"), "order matters");
+    }
+
+    #[test]
+    fn non_ascii_identifiers_fold_by_unicode_rather_than_by_byte() {
+        // Ruby allows them. ASCII on either side takes the fast path; two non-ASCII characters
+        // need the full lowercase mapping, which is the only route through `eq_ci`'s last line.
+        assert!(eq_ci('Ä', 'ä'));
+        assert!(
+            eq_ci('Ä', 'Ä'),
+            "the same character needs no mapping at all"
+        );
+        assert!(eq_ci('П', 'п'));
+        assert!(eq_ci('A', 'a'));
+        assert!(!eq_ci('Ä', 'a'), "not a transliteration");
+        assert!(!eq_ci('ä', 'a'));
+        assert!(!eq_ci('П', 'р'));
+    }
 }

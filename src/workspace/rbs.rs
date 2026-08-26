@@ -22,7 +22,7 @@
 //! then fail at the one moment the user asked to see it. So the embedded copy is extracted once
 //! to a cache directory and indexed from there.
 //!
-//! This is not the index cache that §8 of PLAN.md rejected. Nothing is read back that this
+//! This is not the index cache the project rejected. Nothing is read back that this
 //! binary did not just write, the directory is keyed by the version the binary carries, and a
 //! failed extraction falls back to having no signatures rather than to having wrong ones —
 //! none of the invalidation problems that made caching the *graph* a bad trade apply.
@@ -36,6 +36,7 @@ use super::{
     config::{GemsConfig, RbsConfig},
     gems::{self, Env},
 };
+use crate::messages;
 
 /// The vendored signatures, as `(relative path, contents)`, plus the `VERSION` they came from.
 mod embedded {
@@ -131,10 +132,9 @@ pub fn discover(
         signatures.stdlib = rbs_files(&root.join("stdlib"));
     }
     if signatures.core.is_empty() {
-        signatures.problems.push(format!(
-            "no signatures under {}: built-in classes will be missing",
-            root.join("core").display()
-        ));
+        signatures
+            .problems
+            .push(messages::no_core_signatures(&root.join("core")));
     }
     tracing::info!(
         "rbs {version} ({}) at {}: {} core, {} stdlib files",
@@ -263,8 +263,7 @@ fn version_of(root: &Path) -> Option<String> {
 /// The marker file is written last and holds the version, so an extraction killed halfway
 /// through is redone rather than half-trusted.
 fn extract(env: &Env) -> Result<PathBuf, String> {
-    let base = cache_dir(env)
-        .ok_or_else(|| "no cache directory (HOME is unset): no built-in signatures".to_owned())?;
+    let base = cache_dir(env).ok_or_else(messages::no_cache_directory)?;
     let root = base.join(format!("rbs-{}", embedded::VERSION));
     let marker = root.join(".complete");
 
@@ -277,13 +276,13 @@ fn extract(env: &Env) -> Result<PathBuf, String> {
         let path = root.join(relative);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|error| format!("creating {}: {error}", parent.display()))?;
+                .map_err(|error| messages::signatures_not_unpacked(parent, &error))?;
         }
         fs::write(&path, contents)
-            .map_err(|error| format!("writing {}: {error}", path.display()))?;
+            .map_err(|error| messages::signatures_not_unpacked(&path, &error))?;
     }
     fs::write(&marker, embedded::VERSION)
-        .map_err(|error| format!("writing {}: {error}", marker.display()))?;
+        .map_err(|error| messages::signatures_not_unpacked(&marker, &error))?;
 
     tracing::info!(
         "extracted {} vendored rbs {} files to {} in {:.2?}",
@@ -334,9 +333,21 @@ fn walk(directory: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixture workspace, inside the fixture's home.
+    ///
+    /// Inside, because `ruby_version::resolve` walks from the workspace root up to `$HOME`: a
+    /// workspace in a *second* temp directory has no ceiling on that chain and would read
+    /// whatever `/tmp` and `/` happen to hold on the machine running the test.
+    fn fixture() -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = home.path().join("workspace");
+        (home, workspace)
+    }
 
     fn env_with(home: &Path) -> Env {
         Env {
@@ -344,6 +355,45 @@ mod tests {
             xdg_cache_home: Some(home.join("cache")),
             ..Env::default()
         }
+    }
+
+    #[test]
+    fn each_origin_names_itself_the_way_the_log_and_the_docs_spell_it() {
+        // The three rungs of the ladder, and the only place they are given a human name. It is
+        // the string a user greps the startup log for when built-ins are missing, and it is the
+        // one in `ya-lsp.toml`'s documentation — so a renamed variant must not silently rename
+        // what the server says it did.
+        assert_eq!(Origin::Configured.as_str(), "configured");
+        assert_eq!(Origin::Discovered.as_str(), "discovered");
+        assert_eq!(Origin::Vendored.as_str(), "vendored");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_cache_is_reported_rather_than_left_half_extracted() {
+        // The vendored copy is the bottom rung, and it needs to write ~250 files into
+        // `~/.cache`. A cache directory that cannot be written — a read-only home, a container
+        // running as a different user — has to come back as a problem the user can read.
+        // Failing silently here means `String` does not exist and nothing says why.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let env = Env {
+            home: Some(dir.path().to_path_buf()),
+            xdg_cache_home: Some(cache.clone()),
+            ..Env::default()
+        };
+        let result = extract(&env);
+
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.expect_err("an unwritable cache cannot be extracted into");
+        assert!(error.contains("could not be unpacked"), "{error}");
+        assert!(error.contains(&cache.display().to_string()), "{error}");
     }
 
     #[test]
@@ -364,6 +414,180 @@ mod tests {
         assert!(Version::parse("4.1.0.pre1") < Version::parse("4.1.0"));
         // And a platform suffix does not make a gem newer than the plain build.
         assert!(Version::parse("4.1.0-java") < Version::parse("4.1.0"));
+    }
+
+    #[test]
+    fn a_number_after_a_prerelease_segment_is_not_part_of_the_version() {
+        // `4.1-rc.2` is 4.1 with a tag on it, not 4.1.2. Counting the trailing number would
+        // make a release candidate outrank the release.
+        assert_eq!(
+            Version::parse("4.1-rc.2"),
+            Version {
+                numbers: vec![4, 1],
+                release: false,
+            }
+        );
+        assert!(Version::parse("4.1-rc.2") < Version::parse("4.1"));
+        assert!(Version::parse("4.1-rc.2") < Version::parse("4.1.0"));
+    }
+
+    #[test]
+    fn a_cache_directory_is_named_by_each_platforms_own_convention() {
+        // Windows has no XDG variable and `~/.cache` is not where anything looks.
+        let windows = Env {
+            local_app_data: Some(PathBuf::from("C:/Users/x/AppData/Local")),
+            home: Some(PathBuf::from("C:/Users/x")),
+            ..Env::default()
+        };
+        assert_eq!(
+            cache_dir(&windows),
+            Some(PathBuf::from("C:/Users/x/AppData/Local/ya-lsp/cache"))
+        );
+
+        // XDG wins wherever it is set, on any platform.
+        let xdg = Env {
+            xdg_cache_home: Some(PathBuf::from("/x/.cache")),
+            local_app_data: Some(PathBuf::from("C:/never")),
+            home: Some(PathBuf::from("/home/x")),
+            ..Env::default()
+        };
+        assert_eq!(cache_dir(&xdg), Some(PathBuf::from("/x/.cache/ya-lsp")));
+
+        // Not `~/Library/Caches` on macOS: this is developer-tool state someone may want to
+        // `rm -rf`, and every other language server puts it in `~/.cache`.
+        let unix = Env {
+            home: Some(PathBuf::from("/home/x")),
+            ..Env::default()
+        };
+        assert_eq!(
+            cache_dir(&unix),
+            Some(PathBuf::from("/home/x/.cache/ya-lsp"))
+        );
+
+        // Nowhere to put it, which is what makes the vendored copy unusable.
+        assert_eq!(cache_dir(&Env::default()), None);
+    }
+
+    #[test]
+    fn signatures_are_empty_only_when_neither_half_has_a_file() {
+        let mut signatures = Signatures::default();
+        assert!(signatures.is_empty());
+        signatures.stdlib.push(PathBuf::from("stdlib/set.rbs"));
+        assert!(
+            !signatures.is_empty(),
+            "stdlib alone is still signatures to index"
+        );
+        signatures.core.push(PathBuf::from("core/string.rbs"));
+        assert!(!signatures.is_empty());
+    }
+
+    #[test]
+    fn a_configured_root_whose_core_is_empty_is_reported_rather_than_silently_useless() {
+        // `core/` is there, so the ladder stops here — and there is nothing in it, so every
+        // built-in class is about to be missing. Saying so is the only way anyone finds out.
+        let dir = tempfile::tempdir().unwrap();
+        let signatures_root = dir.path().join("signatures");
+        std::fs::create_dir_all(signatures_root.join("core")).unwrap();
+
+        let config = RbsConfig {
+            path: Some(signatures_root.clone()),
+            ..RbsConfig::default()
+        };
+        let found = discover(
+            dir.path(),
+            &config,
+            &GemsConfig::default(),
+            &env_with(dir.path()),
+        );
+
+        assert!(found.core.is_empty());
+        assert_eq!(found.problems.len(), 1, "{:?}", found.problems);
+        assert!(
+            found.problems[0].contains("built-in classes will be missing"),
+            "{:?}",
+            found.problems
+        );
+    }
+
+    #[test]
+    fn an_rbs_gem_without_rubys_signatures_in_it_is_not_the_one() {
+        // The `rbs` gem ships its *own* signatures in `sig/`, which are signatures for rbs
+        // rather than for Ruby. Taking one of those would replace `String` with `RBS::Parser`.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let workspace = home.join("workspace");
+        let root = home.join("gems");
+
+        // The newest one on disk holds only its own `sig/`, so the older one wins — a copy with
+        // no `core/` is not a copy of Ruby's signatures at all.
+        std::fs::create_dir_all(root.join("gems/rbs-4.1.3/sig")).unwrap();
+        std::fs::create_dir_all(root.join("gems/rbs-4.0.2/core")).unwrap();
+
+        let env = Env {
+            gem_home: Some(root.clone()),
+            home: Some(home),
+            ..Env::default()
+        };
+        assert_eq!(
+            newest_installed(&workspace, &GemsConfig::default(), &env),
+            Some((root.join("gems/rbs-4.0.2"), "4.0.2".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_rbs_directory_that_does_not_name_a_version_never_wins() {
+        // `rbs-*` is a glob over directory names and a match is not a promise: a `git`-sourced
+        // rbs unpacks as `rbs-<sha>`, and a half-deleted gem leaves `rbs-` behind. Each of
+        // those still parses — into a `Version` with no numbers in it, which is what sorts them
+        // below every real release rather than above one on a string comparison.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let workspace = home.join("workspace");
+        let root = home.join("gems");
+
+        for name in ["rbs-cafebabe", "rbs-", "rbs-head"] {
+            std::fs::create_dir_all(root.join("gems").join(name).join("core")).unwrap();
+        }
+        std::fs::create_dir_all(root.join("gems/rbs-4.0.2/core")).unwrap();
+
+        let env = Env {
+            gem_home: Some(root.clone()),
+            home: Some(home),
+            ..Env::default()
+        };
+        assert_eq!(
+            newest_installed(&workspace, &GemsConfig::default(), &env),
+            Some((root.join("gems/rbs-4.0.2"), "4.0.2".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_gem_root_that_reads_as_a_glob_pattern_costs_only_itself() {
+        // The pattern is built by joining onto a path we were handed, so a `[` anywhere above
+        // the gems is a `PatternError` rather than a directory listing. Users do have such
+        // paths — a checkout named `feature[2]`, a bundle under a Windows-ish directory — and
+        // the cost of one has to be that root, not every built-in Ruby has.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let workspace = home.join("workspace");
+        let unglobbable = home.join("gems[unclosed");
+        let ordinary = home.join("gems");
+
+        std::fs::create_dir_all(unglobbable.join("gems/rbs-9.9.9/core")).unwrap();
+        std::fs::create_dir_all(ordinary.join("gems/rbs-4.0.2/core")).unwrap();
+
+        let env = Env {
+            // `gem_path` is searched after `gem_home`, so both roots are seen.
+            gem_home: Some(unglobbable),
+            gem_path: vec![ordinary.clone()],
+            home: Some(home),
+            ..Env::default()
+        };
+        assert_eq!(
+            newest_installed(&workspace, &GemsConfig::default(), &env),
+            Some((ordinary.join("gems/rbs-4.0.2"), "4.0.2".to_owned())),
+            "the unglobbable root is skipped, the one beside it is not"
+        );
     }
 
     #[test]
@@ -416,8 +640,7 @@ mod tests {
 
     #[test]
     fn discovery_falls_back_to_the_vendored_copy() {
-        let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
+        let (home, workspace) = fixture();
         let env = env_with(home.path());
 
         // Stated rather than assumed: the rung below is only reached because nothing on the
@@ -425,12 +648,12 @@ mod tests {
         // this reason — when it did, a CI runner with a system `rbs` gem answered `Discovered`
         // and this assertion failed on a machine nobody could see.
         assert!(
-            gems::roots(workspace.path(), &GemsConfig::default(), &env).is_empty(),
+            gems::roots(&workspace, &GemsConfig::default(), &env).is_empty(),
             "gem discovery escaped the fixture"
         );
 
         let signatures = discover(
-            workspace.path(),
+            &workspace,
             &RbsConfig::default(),
             &GemsConfig::default(),
             &env,
@@ -445,14 +668,13 @@ mod tests {
 
     #[test]
     fn stdlib_can_be_turned_off_without_losing_core() {
-        let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
+        let (home, workspace) = fixture();
         let config = RbsConfig {
             stdlib: false,
             ..RbsConfig::default()
         };
         let signatures = discover(
-            workspace.path(),
+            &workspace,
             &config,
             &GemsConfig::default(),
             &env_with(home.path()),
@@ -464,14 +686,13 @@ mod tests {
 
     #[test]
     fn disabled_finds_nothing_at_all() {
-        let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
+        let (home, workspace) = fixture();
         let config = RbsConfig {
             enabled: false,
             ..RbsConfig::default()
         };
         let signatures = discover(
-            workspace.path(),
+            &workspace,
             &config,
             &GemsConfig::default(),
             &env_with(home.path()),
@@ -482,9 +703,38 @@ mod tests {
     }
 
     #[test]
+    fn the_startup_line_says_which_rbs_answered_and_how_much_it_found() {
+        // The one line a user greps when `String` has no methods. It has to name the rung that
+        // answered, the version, and the counts — "vendored 4.1.3, 89 core files" is the
+        // difference between "no Ruby installed, working as designed" and "something is wrong".
+        // A log nobody asserts is a log that quietly stops saying anything useful.
+        let (home, workspace) = fixture();
+        let env = env_with(home.path());
+
+        let (signatures, logged) = crate::testing::captured_logs(tracing::Level::INFO, || {
+            discover(
+                &workspace,
+                &RbsConfig::default(),
+                &GemsConfig::default(),
+                &env,
+            )
+        });
+
+        assert_eq!(signatures.origin, Some(Origin::Vendored));
+        assert!(logged.contains("vendored"), "which rung answered: {logged}");
+        assert!(
+            logged.contains(&format!("rbs {}", signatures.version)),
+            "which version: {logged}"
+        );
+        assert!(
+            logged.contains(&format!("{} core", signatures.core.len())),
+            "how much it found: {logged}"
+        );
+    }
+
+    #[test]
     fn an_installed_gem_outranks_the_vendored_copy() {
-        let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
+        let (home, workspace) = fixture();
 
         // A gem root shaped the way `gems::roots` recognises one, with two rbs versions in it.
         let root = home.path().join("gems/ruby/3.4.0");
@@ -498,7 +748,7 @@ mod tests {
         env.gem_home = Some(root.clone());
 
         let signatures = discover(
-            workspace.path(),
+            &workspace,
             &RbsConfig::default(),
             &GemsConfig::default(),
             &env,
@@ -512,9 +762,8 @@ mod tests {
 
     #[test]
     fn a_configured_path_outranks_everything() {
-        let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let configured = workspace.path().join("sig/rbs-9.9.9");
+        let (home, workspace) = fixture();
+        let configured = workspace.join("sig/rbs-9.9.9");
         fs::create_dir_all(configured.join("core")).unwrap();
         fs::write(configured.join("core/string.rbs"), "class String\nend\n").unwrap();
 
@@ -523,7 +772,7 @@ mod tests {
             ..RbsConfig::default()
         };
         let signatures = discover(
-            workspace.path(),
+            &workspace,
             &config,
             &GemsConfig::default(),
             &env_with(home.path()),
@@ -535,14 +784,13 @@ mod tests {
 
     #[test]
     fn a_configured_path_that_is_not_one_falls_back() {
-        let home = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
+        let (home, workspace) = fixture();
         let config = RbsConfig {
             path: Some(PathBuf::from("nowhere")),
             ..RbsConfig::default()
         };
         let signatures = discover(
-            workspace.path(),
+            &workspace,
             &config,
             &GemsConfig::default(),
             &env_with(home.path()),

@@ -118,6 +118,7 @@ pub fn to_lsp_severity(severity: Severity) -> Option<DiagnosticSeverity> {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,11 +159,23 @@ mod tests {
     }
 
     #[test]
-    fn off_rules_are_dropped_rather_than_downgraded() {
+    fn every_severity_maps_to_the_one_the_client_renders() {
+        // `Off` is the load-bearing one — it has no LSP spelling, so the diagnostic must be
+        // dropped rather than downgraded to a hint nobody asked for. The other four are a
+        // straight table, and a table is exactly the thing that gets a line transposed: an
+        // `Information` rendered as an `Error` puts a red squiggle on working code.
         assert_eq!(to_lsp_severity(Severity::Off), None);
-        assert_eq!(
-            to_lsp_severity(Severity::Error),
-            Some(DiagnosticSeverity::ERROR)
-        );
+        for (configured, rendered) in [
+            (Severity::Error, DiagnosticSeverity::ERROR),
+            (Severity::Warning, DiagnosticSeverity::WARNING),
+            (Severity::Information, DiagnosticSeverity::INFORMATION),
+            (Severity::Hint, DiagnosticSeverity::HINT),
+        ] {
+            assert_eq!(
+                to_lsp_severity(configured),
+                Some(rendered),
+                "{configured:?}"
+            );
+        }
     }
 }
