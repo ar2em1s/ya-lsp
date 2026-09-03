@@ -2,7 +2,7 @@
   "name": "yalsp",
   "displayName": "ya-lsp",
   "description": "A standalone Ruby language server. No Ruby runtime required.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "MIT",
   "icon": "images/logo.png",
   "publisher": "ar2em1s",
@@ -27,103 +27,411 @@
     "onLanguage:ruby"
   ],
   "contributes": {
-    "configuration": {
-      "title": "ya-lsp",
-      "properties": {
-        "ya-lsp.serverPath": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Path to a `ya-lsp` binary to use instead of the one bundled with this extension. Point it at `target/release/ya-lsp` to develop against a local build. `~` and `${workspaceFolder}` are expanded.",
-          "scope": "machine-overridable"
-        },
-        "ya-lsp.logLevel": {
-          "type": "string",
-          "enum": [
-            "off",
-            "error",
-            "warn",
-            "info",
-            "debug",
-            "trace"
-          ],
-          "default": "warn",
-          "markdownDescription": "How much the server writes to the ya-lsp output channel. Read from the environment when the server starts, so changing it restarts the server.",
-          "scope": "machine-overridable"
-        },
-        "ya-lsp.gems.enabled": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "Index the project's gems, so that go-to-definition and completion reach into them. Turning this off makes startup slightly faster and everything else worse."
-        },
-        "ya-lsp.gems.defaultGems": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "Index the gems that ship inside Ruby itself — `json`, `uri`, `forwardable`, `optparse` and about forty others. Their directories under `gems/` are empty placeholders, so without this they resolve to nothing and `require \"json\"` leads nowhere."
-        },
-        "ya-lsp.gems.rubyVersion": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Which Ruby's gems to index, as in `3.3.0`. Leave empty to detect it from `.ruby-version`, `Gemfile.lock`, or `.tool-versions`."
-        },
-        "ya-lsp.rbs.enabled": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "Index Ruby's own core signatures, so `String`, `Array`, `Hash` and `Kernel` have members to complete and documentation to hover. Comes from the `rbs` gem when one is installed, and from a copy inside ya-lsp when none is."
-        },
-        "ya-lsp.rbs.stdlib": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "Also index the standard library's signatures — `CSV`, `URI`, `Logger`, `OptionParser` and ~57 others. Adds about 3.5 ms to every request, so turn it off on a very large project that only needs the core classes."
-        },
-        "ya-lsp.rbs.path": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "An explicit directory of RBS signatures — one holding `core/`, usually an unpacked `rbs` gem. Leave empty to find one automatically."
-        },
-        "ya-lsp.diagnostics.enabled": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "Report problems found while indexing."
-        },
-        "ya-lsp.diagnostics.rules": {
-          "type": "object",
-          "default": {},
-          "additionalProperties": {
+    "configuration": [
+      {
+        "title": "ya-lsp",
+        "order": 1,
+        "properties": {
+          "ya-lsp.serverPath": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "Run a `ya-lsp` binary of your own instead of the one bundled with this extension — point it at `target/release/ya-lsp` to develop against a local build. Leave empty for the bundled one. `~` and `${workspaceFolder}` are expanded. Changing this restarts the server.",
+            "scope": "machine-overridable",
+            "order": 1
+          },
+          "ya-lsp.logLevel": {
             "type": "string",
             "enum": [
               "off",
               "error",
-              "warning",
-              "information",
-              "hint"
-            ]
+              "warn",
+              "info",
+              "debug",
+              "trace"
+            ],
+            "enumDescriptions": [
+              "Nothing at all.",
+              "Only what stopped working.",
+              "Also what was skipped or guessed — an unreadable file, a gem that could not be found.",
+              "Also what it did: which Ruby it picked, how many files it indexed, how long that took.",
+              "Also the work behind each request. Verbose enough to slow a large workspace down.",
+              "Everything, this crate and its libraries. For diagnosing the server itself."
+            ],
+            "default": "info",
+            "markdownDescription": "How much the server writes to the **ya-lsp** output channel. Read from the environment once, when the server starts, so changing it restarts the server. Left unset it does not override a `YA_LSP_LOG` inherited from your shell.",
+            "scope": "machine-overridable",
+            "order": 2
           },
-          "markdownDescription": "How loudly an individual rule reports, keyed by the rule name shown in the problem's `code`. Most rules ship `off` because they fire on correct Ruby; `{ \"dynamic-ancestor\": \"warning\" }` turns one back on.",
-          "examples": [
-            {
-              "parse-error": "error",
-              "dynamic-ancestor": "off"
-            }
-          ]
-        },
-        "ya-lsp.index.maxFiles": {
-          "type": "integer",
-          "default": 50000,
-          "minimum": 1,
-          "markdownDescription": "Refuse to index a workspace larger than this rather than thrashing."
-        },
-        "ya-lsp.trace.server": {
-          "type": "string",
-          "enum": [
-            "off",
-            "messages",
-            "verbose"
-          ],
-          "default": "off",
-          "description": "Log the LSP traffic between VS Code and ya-lsp. For debugging the extension itself."
+          "ya-lsp.trace.server": {
+            "type": "string",
+            "enum": [
+              "off",
+              "messages",
+              "verbose"
+            ],
+            "enumDescriptions": [
+              "No LSP traffic is logged.",
+              "One line per request and notification: the method and how long it took.",
+              "The same, with each message's full JSON payload."
+            ],
+            "default": "off",
+            "markdownDescription": "Log the LSP traffic between VS Code and the server. For debugging this extension — to read what the server itself found, use `#ya-lsp.logLevel#`.",
+            "scope": "window",
+            "order": 3
+          }
+        }
+      },
+      {
+        "title": "Gems",
+        "order": 2,
+        "properties": {
+          "ya-lsp.gems.enabled": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Follow go-to-definition, hover and completion into the project's gems, read straight from `Gemfile.lock` and the gem directories on disk. Off, only your own code is indexed: startup is a little faster and every answer about a gem is missing. Overridden by `[gems] enabled` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 1
+          },
+          "ya-lsp.gems.defaultGems": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Also index the ~40 gems that ship inside Ruby itself — `json`, `uri`, `forwardable`, `optparse`. Their directories under `gems/` are empty placeholders, so with this off `require \"json\"` leads nowhere and `JSON.parse` has nothing to offer. Overridden by `[gems] default_gems` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 2
+          },
+          "ya-lsp.gems.rubyVersion": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "Index the gems belonging to this Ruby, as in `3.3.0`, when detection picks the wrong one. Leave empty to read it from `.ruby-version`, `.tool-versions` or `Gemfile.lock`. Overridden by `[gems] ruby_version` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 3
+          },
+          "ya-lsp.gems.paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "markdownDescription": "Extra gem roots to search *before* the built-in table — each a directory containing `gems/`, which is what `gem env gemdir` prints. The escape hatch for a layout ya-lsp guesses wrong about: a container image, a Nix store path, a hand-rolled install. Relative paths resolve against the workspace folder. Overridden by `[gems] paths` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 4
+          }
+        }
+      },
+      {
+        "title": "Ruby signatures (RBS)",
+        "order": 3,
+        "properties": {
+          "ya-lsp.rbs.enabled": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Complete and hover `String`, `Array`, `Hash`, `Kernel` and the rest of Ruby's core, whose methods are written in C and appear in no Ruby source. Read from the `rbs` gem when one is installed, and from a copy inside ya-lsp when none is. Off, `\"\".upcase` has nothing to offer. Overridden by `[rbs] enabled` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 1
+          },
+          "ya-lsp.rbs.stdlib": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Also the standard library — `CSV`, `URI`, `Logger`, `OptionParser` and ~57 others. Adds about 3.5 ms to every request, so turn it off on a very large project that only needs the core classes. Overridden by `[rbs] stdlib` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 2
+          },
+          "ya-lsp.rbs.path": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "Read signatures from this directory instead of looking for one — a directory holding `core/`, usually an unpacked `rbs` gem. Leave empty to find one automatically, falling back to the copy inside ya-lsp. Overridden by `[rbs] path` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 3
+          }
+        }
+      },
+      {
+        "title": "Problems",
+        "order": 4,
+        "properties": {
+          "ya-lsp.diagnostics.enabled": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Show what ya-lsp finds while indexing in the Problems panel — files that do not parse, and constructs it could not follow. Off, nothing from ya-lsp appears there whatever `#ya-lsp.diagnostics.rules#` says. Overridden by `[diagnostics] enabled` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 1
+          },
+          "ya-lsp.diagnostics.rules": {
+            "type": "object",
+            "default": {},
+            "properties": {
+              "parse-error": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "error",
+                  "warning",
+                  "information",
+                  "hint"
+                ],
+                "enumDescriptions": [
+                  "Not reported at all.",
+                  "Reported as an error.",
+                  "Reported as a warning.",
+                  "Reported as information.",
+                  "Reported as a hint — a faint marker rather than a squiggle."
+                ],
+                "markdownDescription": "The file does not parse — Prism's own syntax error, and the only rule here that is unambiguously a defect in your code. **Default: error.**"
+              },
+              "parse-warning": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "error",
+                  "warning",
+                  "information",
+                  "hint"
+                ],
+                "enumDescriptions": [
+                  "Not reported at all.",
+                  "Reported as an error.",
+                  "Reported as a warning.",
+                  "Reported as information.",
+                  "Reported as a hint — a faint marker rather than a squiggle."
+                ],
+                "markdownDescription": "Prism's warnings about code that *does* parse: `assigned but unused variable`, a duplicated `when`, a literal in a condition. Set this to `off` when RuboCop or Standard already reports them — `Lint/UselessAssignment` covers most of the same ground. **Default: warning.**"
+              },
+              "dynamic-constant-reference": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "error",
+                  "warning",
+                  "information",
+                  "hint"
+                ],
+                "enumDescriptions": [
+                  "Not reported at all.",
+                  "Reported as an error.",
+                  "Reported as a warning.",
+                  "Reported as information.",
+                  "Reported as a hint — a faint marker rather than a squiggle."
+                ],
+                "markdownDescription": "A constant path ya-lsp could not follow, because what is left of the `::` is not itself a constant — `foo::Bar`. Legal Ruby; the rule records why go-to-definition stops there. **Default: off.**"
+              },
+              "dynamic-singleton-definition": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "error",
+                  "warning",
+                  "information",
+                  "hint"
+                ],
+                "enumDescriptions": [
+                  "Not reported at all.",
+                  "Reported as an error.",
+                  "Reported as a warning.",
+                  "Reported as information.",
+                  "Reported as a hint — a faint marker rather than a squiggle."
+                ],
+                "markdownDescription": "`class << expr` or `def expr.name` where the receiver is not a statically known constant, so the singleton methods never enter the index. Legal Ruby. **Default: off.**"
+              },
+              "dynamic-ancestor": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "error",
+                  "warning",
+                  "information",
+                  "hint"
+                ],
+                "enumDescriptions": [
+                  "Not reported at all.",
+                  "Reported as an error.",
+                  "Reported as a warning.",
+                  "Reported as information.",
+                  "Reported as a hint — a faint marker rather than a squiggle."
+                ],
+                "markdownDescription": "A superclass or a mixin argument that is not a constant — `class Foo < base`, `include mixin_for(x)`. Legal Ruby and ordinary in metaprogramming: on one real project this rule alone would have put 384 warnings on working code, which is why it ships off. **Default: off.**"
+              },
+              "top-level-mixin-self": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "error",
+                  "warning",
+                  "information",
+                  "hint"
+                ],
+                "enumDescriptions": [
+                  "Not reported at all.",
+                  "Reported as an error.",
+                  "Reported as a warning.",
+                  "Reported as information.",
+                  "Reported as a hint — a faint marker rather than a squiggle."
+                ],
+                "markdownDescription": "`include self` or `extend self` written at the top level, where there is no enclosing module for `self` to name. **Default: off.**"
+              },
+              "invalid-private-constant": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "error",
+                  "warning",
+                  "information",
+                  "hint"
+                ],
+                "enumDescriptions": [
+                  "Not reported at all.",
+                  "Reported as an error.",
+                  "Reported as a warning.",
+                  "Reported as information.",
+                  "Reported as a hint — a faint marker rather than a squiggle."
+                ],
+                "markdownDescription": "`private_constant` somewhere it cannot take effect: at the top level, on a dynamic receiver, or with a non-symbol argument. Mostly genuine misuse, but the last case is ya-lsp giving up rather than a defect — hence a hint. **Default: hint.**"
+              },
+              "invalid-method-visibility": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "error",
+                  "warning",
+                  "information",
+                  "hint"
+                ],
+                "enumDescriptions": [
+                  "Not reported at all.",
+                  "Reported as an error.",
+                  "Reported as a warning.",
+                  "Reported as information.",
+                  "Reported as a hint — a faint marker rather than a squiggle."
+                ],
+                "markdownDescription": "`private`, `protected`, `public` or `module_function` used in a way Ruby does not accept: at the top level, with `attr_*` arguments, with an explicit receiver, or `module_function` inside a class. Also covers a non-literal argument, which is ya-lsp giving up rather than a defect — hence a hint. **Default: hint.**"
+              },
+              "undefined-method-visibility-target": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "error",
+                  "warning",
+                  "information",
+                  "hint"
+                ],
+                "enumDescriptions": [
+                  "Not reported at all.",
+                  "Reported as an error.",
+                  "Reported as a warning.",
+                  "Reported as information.",
+                  "Reported as a hint — a faint marker rather than a squiggle."
+                ],
+                "markdownDescription": "`private :name` where no such method was indexed. A real bug once the index is complete, and off until it is: every hit measured across three real projects was `private_class_method :new`, which is correct Ruby that rubydex flags only because it does not model `Class#new`. **Default: off.**"
+              },
+              "undefined-constant-visibility-target": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "error",
+                  "warning",
+                  "information",
+                  "hint"
+                ],
+                "enumDescriptions": [
+                  "Not reported at all.",
+                  "Reported as an error.",
+                  "Reported as a warning.",
+                  "Reported as information.",
+                  "Reported as a hint — a faint marker rather than a squiggle."
+                ],
+                "markdownDescription": "`private_constant :NAME` where no such constant was indexed. Off for the same reason as the method rule, and it also fires on a class whose superclass could not be resolved. **Default: off.**"
+              }
+            },
+            "additionalProperties": {
+              "type": "string",
+              "enum": [
+                "off",
+                "error",
+                "warning",
+                "information",
+                "hint"
+              ],
+              "enumDescriptions": [
+                "Not reported at all.",
+                "Reported as an error.",
+                "Reported as a warning.",
+                "Reported as information.",
+                "Reported as a hint — a faint marker rather than a squiggle."
+              ]
+            },
+            "markdownDescription": "How loudly each rule reports, keyed by the name shown in a problem's `code`. Only `parse-error` and `parse-warning` are statements about your code, and they are the only two on by default; the rest describe what the indexer could not follow, fire on legal Ruby, and ship `off` or `hint`. Set one to `off` when another tool already reports it. Overridden by `[diagnostics.rules]` in a workspace `ya-lsp.toml`.",
+            "examples": [
+              {
+                "parse-warning": "off",
+                "dynamic-ancestor": "warning"
+              }
+            ],
+            "scope": "resource",
+            "order": 2
+          }
+        }
+      },
+      {
+        "title": "Indexing",
+        "order": 5,
+        "properties": {
+          "ya-lsp.index.include": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "**/*.rb"
+            ],
+            "markdownDescription": "Globs, relative to the workspace folder, of the files to index. Everything ya-lsp knows about your code comes from these, so narrowing it is the quickest way to make navigation stop working. Overridden by `[index] include` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 1
+          },
+          "ya-lsp.index.exclude": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "vendor/**/*",
+              ".bundle/**/*",
+              "tmp/**/*",
+              "node_modules/**/*"
+            ],
+            "markdownDescription": "Globs to skip, applied after `#ya-lsp.index.include#`. Where vendored or generated Ruby goes when git does not already ignore it. Overridden by `[index] exclude` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 2
+          },
+          "ya-lsp.index.loadPaths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "lib",
+              "app"
+            ],
+            "markdownDescription": "Extra roots to index and to resolve `require \"...\"` against, relative to the workspace folder — the `$LOAD_PATH` ya-lsp assumes. `require \"foo/bar\"` reaches `lib/foo/bar.rb` because of this. Overridden by `[index] load_paths` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 3
+          },
+          "ya-lsp.index.respectGitignore": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Skip anything git ignores. Right for a code indexer by default — it prunes `vendor/bundle`, `node_modules` and `tmp` for free — but a project whose Ruby is generated into an ignored directory needs it off. Overridden by `[index] respect_gitignore` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 4
+          },
+          "ya-lsp.index.maxFiles": {
+            "type": "integer",
+            "default": 50000,
+            "minimum": 1,
+            "markdownDescription": "Refuse to index a workspace with more Ruby files than this, rather than thrashing. Raise it only after ya-lsp has said it stopped. Overridden by `[index] max_files` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 5
+          }
         }
       }
-    },
+    ],
     "commands": [
       {
         "command": "ya-lsp.restart",

@@ -7,7 +7,7 @@
       "request": "launch",
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}/editors/vscode",
-        "${workspaceFolder}/tmp"
+        "${workspaceFolder}/tmp/lobsters"
       ],
       "outFiles": ["${workspaceFolder}/editors/vscode/dist/**/*.js"],
       "preLaunchTask": "build the extension",

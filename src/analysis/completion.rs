@@ -282,7 +282,7 @@ fn receiver_for(
             // Only a receiver rubydex could name gives real keyword arguments. A name-based
             // guess would put another class's parameters into this call, which is worse than
             // offering none: the completion would be syntactically valid and wrong.
-            let receiver = match precise_call(graph, uri_id, name) {
+            let receiver = match locator::precise_call(graph, uri_id, name) {
                 Some(method_decl_id) => CompletionReceiver::MethodArgument {
                     self_decl_id: scope.self_id,
                     nesting_name_id: scope.nesting,
@@ -376,22 +376,6 @@ fn constant_at(graph: &Graph, uri_id: UriId, offset: u32) -> Option<DeclarationI
                 .declarations
                 .into_iter()
                 .next(),
-            _ => None,
-        })
-}
-
-/// The method a call written at `offset` resolves to, only when the resolution was exact.
-fn precise_call(graph: &Graph, uri_id: UriId, offset: u32) -> Option<DeclarationId> {
-    locator::locate(graph, uri_id, offset)
-        .into_iter()
-        .find_map(|located| match located.target {
-            locator::Target::Call(_) => {
-                let resolution = locator::resolve(graph, &located);
-                resolution
-                    .precise
-                    .then(|| resolution.declarations.into_iter().next())
-                    .flatten()
-            }
             _ => None,
         })
 }
@@ -1048,9 +1032,18 @@ fn is_internal(prefix: &str, label: &str) -> bool {
     significant(prefix).is_none_or(char::is_alphabetic)
 }
 
+/// The leading run of sigil characters: `@`, `@@`, `$`, or nothing at all.
+///
+/// `$@` is the awkward one and the reason this is a run rather than a first character: every
+/// character in it is a sigil character, so the whole name comes back — which is the right
+/// answer for the only question asked of it, since nothing but a `$` prefix should reach it.
+fn sigils(name: &str) -> &str {
+    &name[..name.len() - name.trim_start_matches(['@', '$']).len()]
+}
+
 /// The first character of a name that is not its sigil.
 fn significant(name: &str) -> Option<char> {
-    name.trim_start_matches(['@', '$']).chars().next()
+    name[sigils(name).len()..].chars().next()
 }
 
 fn sort_length(prefix: &str, label: &str) -> usize {
@@ -1062,6 +1055,21 @@ fn sort_length(prefix: &str, label: &str) -> usize {
 /// The floor is a case-insensitive subsequence, which is what editors fuzzy-match with — being
 /// stricter here would drop rows the client would have been happy to show.
 fn tier(prefix: &str, label: &str) -> Option<u8> {
+    // Except for the sigil, which is not a letter to fuzzy-match on. `@foo`, `@@foo` and `$foo`
+    // are three different namespaces in Ruby, and a name in one of them is not a candidate for
+    // a prefix in another — so what the prefix asked for has to be what the label carries.
+    //
+    // `starts_with` rather than equality, because `@` is genuinely on the way to `@@`: someone
+    // who has typed one `@` may be about to type the second, and dropping the class variables
+    // there would be the same mistake in the other direction. It does not run backwards — a
+    // prefix of `@@` admits no `@name`.
+    //
+    // Without this, `@` offers `$@`: the subsequence match below reads the sigil as one more
+    // character, and `$@` contains an `@`. Carried through two releases because it is a row at
+    // the bottom of a list rather than a wrong answer at the top.
+    if !sigils(label).starts_with(sigils(prefix)) {
+        return None;
+    }
     if prefix.is_empty() {
         return Some(1);
     }

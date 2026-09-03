@@ -230,6 +230,8 @@ impl TextDocument {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -268,8 +270,17 @@ mod tests {
     ];
 
     /// The `\n` of a `\r\n` is the one byte offset an LSP position cannot name.
+    ///
+    /// The `offset < len` guard is not defensive: `0..=len` is the range every caller here
+    /// walks, and the end of the buffer is a perfectly ordinary offset to ask about. It was
+    /// missing for as long as no fixture ended in a bare `\r`, which is exactly the kind of
+    /// hole a hand-written corpus leaves and `PIECES` does not — the properties below found it
+    /// on their first run.
     fn inside_crlf(text: &str, offset: usize) -> bool {
-        offset > 0 && text.as_bytes()[offset - 1] == b'\r' && text.as_bytes()[offset] == b'\n'
+        offset > 0
+            && offset < text.len()
+            && text.as_bytes()[offset - 1] == b'\r'
+            && text.as_bytes()[offset] == b'\n'
     }
 
     #[test]
@@ -516,5 +527,145 @@ mod tests {
         assert_eq!(doc.text(), "abc!");
         doc.apply(Some(range((9, 9), (9, 9))), "?");
         assert_eq!(doc.text(), "abc!?");
+    }
+
+    // -----------------------------------------------------------------------
+    // Properties
+    //
+    // Everything above is a fixture, and this file was already at 100% of lines and branches
+    // without any of what follows — which says every line ran, not that every *sequence* of
+    // edits produces the right buffer. There is no fixture for that: the input is a list whose
+    // every element is interpreted against the text the one before it left behind, so what
+    // needs enumerating is not a string but a history. The failure mode is the worst this crate
+    // has, worse than a wrong answer — a buffer that quietly stops matching the file the user
+    // is typing in, and every span computed from it thereafter pointing at the wrong bytes.
+    // -----------------------------------------------------------------------
+
+    /// Pieces a generated buffer is built from.
+    ///
+    /// The alphabet is the point rather than the length: an accent (2 bytes, 1 UTF-16 unit), CJK
+    /// (3/1), an emoji (4/2 — a surrogate pair), a combining mark (a character that is not a
+    /// grapheme), and the three line terminators including a lone `\r`, which is what puts a
+    /// `\r\n` next to text that is not one. Concatenating pieces rather than generating
+    /// arbitrary `String`s is also what makes a failure legible: proptest shrinks the *list*,
+    /// so a counterexample arrives as the few pieces that still reproduce it.
+    const PIECES: &[&str] = &[
+        "a",
+        "b",
+        " ",
+        "x = 1",
+        "\t",
+        "\n",
+        "\r\n",
+        "\r",
+        "caf\u{e9}",
+        "\u{65e5}\u{672c}",
+        "\u{1f600}",
+        "e\u{301}",
+    ];
+
+    fn text() -> impl Strategy<Value = String> {
+        prop::collection::vec(prop::sample::select(PIECES), 0..24)
+            .prop_map(|pieces| pieces.concat())
+    }
+
+    fn encoding() -> impl Strategy<Value = PositionEncoding> {
+        prop::sample::select(&ALL[..])
+    }
+
+    /// The nearest offset at or before `at` that an LSP position can actually name.
+    ///
+    /// Two things disqualify one: not being a character boundary, and being the `\n` of a
+    /// `\r\n` — the one byte in a buffer that belongs to no line's content, so `position_at`
+    /// answers with the end of the line it terminates and the trip back lands somewhere else.
+    /// `offset_inside_a_crlf_reports_the_end_of_the_line_it_terminates` is that case pinned;
+    /// here it is excluded, because a model that spliced at an offset with no position would be
+    /// asserting the disagreement rather than the conversion.
+    fn addressable(text: &str, at: usize) -> usize {
+        let mut at = at.min(text.len());
+        while at > 0 && (!text.is_char_boundary(at) || inside_crlf(text, at)) {
+            at -= 1;
+        }
+        at
+    }
+
+    proptest! {
+        /// A change list applied through LSP positions must land exactly where the same splices
+        /// land on a plain `String`.
+        ///
+        /// This is the whole of incremental sync, stated once. The subject converts byte spans
+        /// out to `Range`s and the client's `Range`s back to byte spans, over a line index it
+        /// rebuilds after every edit; the model does `replace_range` and knows nothing about
+        /// lines, columns or encodings. They are allowed to agree only if every one of those
+        /// conversions is exact — and they have to keep agreeing as the text underneath them
+        /// changes, which is what a list buys over a single edit.
+        #[test]
+        fn a_change_list_lands_where_plain_string_splices_land(
+            start in text(),
+            encoding in encoding(),
+            changes in prop::collection::vec((any::<usize>(), any::<usize>(), text()), 0..8),
+        ) {
+            let mut model = start.clone();
+            let mut doc = TextDocument::new(start, encoding);
+
+            for (first, second, replacement) in changes {
+                // Chosen against the text as it stands *now*, which is what makes this a
+                // history rather than a batch: an index generated up front would address a
+                // buffer that the previous change has already moved.
+                let one = addressable(&model, first % (model.len() + 1));
+                let two = addressable(&model, second % (model.len() + 1));
+                let (from, to) = (one.min(two), one.max(two));
+
+                doc.apply(Some(doc.range_at(from as u32, to as u32)), &replacement);
+                model.replace_range(from..to, &replacement);
+
+                prop_assert_eq!(doc.text(), &model);
+            }
+        }
+
+        /// Whatever a client sends, the offset it resolves to is one this crate can slice at.
+        ///
+        /// Positions arrive from outside and are not required to be sane — a line past the end
+        /// of the buffer, a column in the middle of an emoji, `u32::MAX`. Every one of them has
+        /// to come back in range and on a character boundary, because the next thing that
+        /// happens to the answer is `replace_range`, and `String` panics on either mistake.
+        #[test]
+        fn any_position_a_client_can_send_resolves_to_a_sliceable_offset(
+            text in text(),
+            encoding in encoding(),
+            line in any::<u32>(),
+            character in any::<u32>(),
+        ) {
+            let doc = TextDocument::new(text.clone(), encoding);
+            let offset = doc.offset_at(Position { line, character }) as usize;
+
+            prop_assert!(offset <= text.len(), "{offset} is past {:?}", text.len());
+            prop_assert!(text.is_char_boundary(offset), "{offset} splits a character in {text:?}");
+        }
+
+        /// Every offset a position can name survives the trip out and back.
+        ///
+        /// The same property `round_trips_every_addressable_char_boundary` asserts over eleven
+        /// hand-written strings, over generated ones instead — and exhaustively within each, so
+        /// a generated buffer is a whole family of assertions rather than one.
+        #[test]
+        fn every_addressable_offset_round_trips(text in text(), encoding in encoding()) {
+            let doc = TextDocument::new(text.clone(), encoding);
+
+            for offset in 0..=text.len() {
+                if !text.is_char_boundary(offset) || inside_crlf(&text, offset) {
+                    continue;
+                }
+                let position = doc.position_at(offset as u32);
+                prop_assert_eq!(
+                    doc.offset_at(position) as usize,
+                    offset,
+                    "{:?} at {} came back as {:?}",
+                    text,
+                    offset,
+                    position
+                );
+            }
+        }
     }
 }

@@ -13,7 +13,7 @@ paths:
   bad file cannot hide inside a good average — the project sits at 97% over 4,300 lines, and a new
   200-line module landing at 80% would move that by less than a point. `COVERAGE_FLOORS` names the
   modules held to **100**. Regions and functions print off the same profile and are not gated.
-  Currently 97.93% lines and 95.76% branches.
+  Currently 98.46% lines and 96.91% branches.
 - **The per-file bar is deliberately below the project bar, because the denominators are small.**
   `main.rs` is 36 lines, so one uncovered line is five points; `analysis/signatures.rs` is 40 lines
   and sits at exactly 95.00%, one line from failing a bar of 95. A high uniform bar measures file
@@ -22,7 +22,7 @@ paths:
   untaken arm worth seven to ten points. Where a file has to be complete, say so by name in
   `COVERAGE_FLOORS`. Raise `MIN_FILE_LINES` when the weakest file has real margin above it; it is a
   ratchet like the others.
-- **Eleven modules are held to 100% on top of that, and the list is `COVERAGE_FLOORS` in the
+- **Fourteen modules are held to 100% on top of that, and the list is `COVERAGE_FLOORS` in the
   `Makefile`.** Two questions decide membership and both have to answer yes. **Is being wrong here
   silent and wide?** — a visibly broken hover is found in a day; a mis-parsed `Gemfile.lock` is
   not. **Is 100 structurally reachable?** — a file whose gap is `usize::try_from` on a 64-bit build
@@ -37,7 +37,18 @@ paths:
   outline and the picker — and, since v0.2.0, RDoc's markup → markdown, where a swallowed
   `<vowel>` does not look broken but looks like a sentence with a word missing),
   `analysis/references.rs` (a truncated answer looks exactly like a complete one),
-  `messages.rs` (every sentence a user reads).
+  `analysis/ranges.rs` (advertising a folding provider takes the editor's indentation guess *out
+  of play*, so a construct the walk does not recognise is not a visible bug but a chevron that
+  never appears — lines only, because `make coverage-branches F=ranges` finds no untaken arm while
+  the summary reads 98% from two merged regions counted apart),
+  `messages.rs` (every sentence a user reads), `analysis/rename.rs` (the only module in the crate
+  that *writes*, where a rule that stops firing edits the user's files — Ruby 3.1's
+  `{ x:, y: }` renames the hash key along with the value and still parses, which is the widest and
+  quietest failure ya-lsp can have), and `analysis/scopes.rs` (which variable is which, listed for
+  rename rather than for the highlighting it was written for: a scope bug that lights up the wrong
+  occurrences is seen the first time anybody looks, and the same bug behind a rename writes over
+  the wrong one — the second question was already yes, and v0.3.0's item 5 is what turned the
+  first).
 - **`analysis/signatures.rs` and `analysis/symbols.rs` have the highest blast radius in the crate
   and are deliberately *not* on the list.** A `signatures` bug indexed 7 of `Array`'s 197 methods
   through a green suite, and VS Code *throws* on a bad `selectionRange`, discarding a whole
@@ -82,13 +93,36 @@ paths:
   pure function. Both were reached for the same reason: a test that sets an environment variable
   or deletes the working directory changes it for every other test in the binary.
 - **Three things the number cannot see, and none of them is a coverage gap:**
-  the analysis harness is synchronous, so nothing tests a request racing a reload or a cancellation
-  mid-resolve; ranking is pinned by one first-ten fixture and nowhere else; and no automated test
-  ever opens a real Rails app. Do not treat a green gate as covering any of them.
+  **the run loop is covered for order and not for time** — `analysis/threaded_tests.rs` drives the
+  real thread over the real channel, which is what took the last two arms in `analysis/mod.rs`, and
+  every assertion in it is a position in the message stream rather than a duration, so nothing
+  anywhere in this denominator says an answer arrived *quickly*; **ranking and composition are
+  pinned by fixtures and not by the percentage** — `ANCESTRY`, `SIGILS`, `PICKER`, `GALLERY` and
+  the signature-help, highlight and folding lists are whole-answer assertions, and every one of
+  them was written over lines that were already covered, two of them finding a defect as they
+  were written; and **no test in this denominator opens a real Rails app** — `make
+  canary` does, on a pinned public one, and it is a separate target and a separate CI job precisely
+  because it is not part of this number. Do not treat a green gate as covering any of the three.
+  (The canary's own file, `scripts/canary.py`, is Python and never enters the report; `canary.md`
+  is its rule, and `concurrency.md` is the harness's.)
 - **A `tracing::` line is covered only when the run enables its level, and raising the level to
   cover them is gaming the number.** About thirty of the uncovered lines are continuation lines of
   multi-line `info!`/`debug!` calls. `YA_LSP_LOG=trace` would execute every one of them and assert
-  nothing about any of them.
+  nothing about any of them. **In a file being held at 100 the way around it is to compute the
+  arguments into locals first** and leave the macro one line with inline captures — the value is
+  then evaluated whether or not the level is on, which is where it belongs anyway if it is worth
+  logging. Not a reason to reword the other thirty.
+- **A report read over a `target/llvm-cov-target` that has built more than one version of the
+  source is fiction, and it fails in the direction that wastes a day.** `cargo llvm-cov report`
+  reads every test binary left in that directory, so a build from before an edit still
+  contributes its coverage mapping — at *its* line numbers. The symptom is a branch list where
+  every entry appears twice at two different lines, and a total that has quietly lost half a
+  point of branches to arms nothing can take because the code they belong to no longer exists.
+  It cost a wrong conclusion here: item 0 read as a 0.5-point branch regression and was
+  measured, on a clean tree, as a 0.3-point improvement. `make coverage-clean` first whenever a
+  number moves in a direction the diff does not explain — the toolchain stamp in `coverage-run`
+  wipes on a *toolchain* change and nothing wipes on a source one, because always wiping would
+  make every coverage run a full rebuild.
 - **`--ignore-filename-regex` is not needed and should not be added.** llvm-cov reports only files
   compiled into the crate, so a reference clone under `tmp/` never enters the denominator. (This is
   where tarpaulin differed: it walks every `.rs` file under the project root, and a rubydex checkout

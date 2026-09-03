@@ -28,10 +28,15 @@ test('setting names are translated into the server wire format', () => {
   assert.deepEqual(
     serverOptions(
       set({
+        'index.include': ['lib/**/*.rb'],
+        'index.exclude': ['spec/**/*'],
+        'index.loadPaths': ['lib', 'app'],
         'index.maxFiles': 1234,
+        'index.respectGitignore': false,
         'gems.enabled': true,
         'gems.defaultGems': false,
         'gems.rubyVersion': '3.3.0',
+        'gems.paths': ['/opt/gems'],
         'rbs.enabled': true,
         'rbs.stdlib': false,
         'rbs.path': '/opt/rbs',
@@ -40,12 +45,39 @@ test('setting names are translated into the server wire format', () => {
       })
     ),
     {
-      index: { max_files: 1234 },
-      gems: { enabled: true, default_gems: false, ruby_version: '3.3.0' },
+      index: {
+        include: ['lib/**/*.rb'],
+        exclude: ['spec/**/*'],
+        load_paths: ['lib', 'app'],
+        max_files: 1234,
+        respect_gitignore: false,
+      },
+      gems: {
+        enabled: true,
+        default_gems: false,
+        ruby_version: '3.3.0',
+        paths: ['/opt/gems'],
+      },
       rbs: { enabled: true, stdlib: false, path: '/opt/rbs' },
       diagnostics: { enabled: false, rules: { 'dynamic-ancestor': 'warning' } },
     }
   );
+});
+
+test('an empty list is a value, not a setting nobody set', () => {
+  // Unlike the empty string on the two path settings: `[]` means no excludes, no extra load
+  // paths, no extra gem roots. `index.include = []` is the one that indexes nothing, and the
+  // server already reports it out loud — dropping it here would turn a reported mistake into a
+  // setting that quietly does nothing.
+  assert.deepEqual(serverOptions(set({ 'index.exclude': [] })), { index: { exclude: [] } });
+  assert.deepEqual(serverOptions(set({ 'gems.paths': [] })), { gems: { paths: [] } });
+});
+
+test('a list the manifest could not have produced is not forwarded', () => {
+  // `explicit` casts rather than checks, and settings.json is hand-edited. A number among the
+  // globs is a type error the server answers by rejecting the whole layer, not just the key.
+  assert.equal(serverOptions(set({ 'index.include': 'lib/**/*.rb' })), undefined);
+  assert.equal(serverOptions(set({ 'gems.paths': ['/opt/gems', 7] })), undefined);
 });
 
 test('an empty ruby version means detect it, not a Ruby called ""', () => {
@@ -80,9 +112,16 @@ test('an unset log level leaves an inherited one alone', () => {
     serverEnvironment(set({}), { YA_LSP_LOG: 'ya_lsp=trace' }).YA_LSP_LOG,
     'ya_lsp=trace'
   );
+});
+
+test('turning the log off turns it off, rather than to the loudest value in the list', () => {
+  // `off` used to be treated as "the user said nothing", which fell through to the server's own
+  // fallback — `info`, louder than the `error` and `warn` sitting above it in the same drop-down.
+  // It is a perfectly good `EnvFilter` directive; the fix is to send it.
+  assert.equal(serverEnvironment(set({ logLevel: 'off' }), {}).YA_LSP_LOG, 'ya_lsp=off');
   assert.equal(
     serverEnvironment(set({ logLevel: 'off' }), { YA_LSP_LOG: 'ya_lsp=trace' }).YA_LSP_LOG,
-    'ya_lsp=trace'
+    'ya_lsp=off'
   );
 });
 

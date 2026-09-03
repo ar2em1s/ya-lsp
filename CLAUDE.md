@@ -37,12 +37,19 @@ src/
     symbols.rs     documentSymbol, nested and flat
     search.rs      workspace/symbol: rubydex filters, we rank and cap
     references.rs  textDocument/references: exact constants, name-based methods
+    hierarchy.rs   prepareTypeHierarchy: the ancestors, and rubydex's reverse index
+    highlight.rs   documentHighlight: the scope walk first, then the graph, one file
+    scopes.rs      which variable is which; the third direct Prism use
+    signature_help.rs which overload the call fits, and which parameter it is on
+    rename.rs      the only module that writes; what it will not rename, and why
+    ranges.rs      what folds, and what expanding the selection reaches
     hover.rs       hover markdown
     requires.rs    `require "..."` under the cursor
     render.rs      how Ruby constructs are spelled for humans
     progress.rs    $/progress streams (gem indexing)
     signatures.rs  blanks RBS `interface` blocks before a file is indexed
     position.rs    LSP position <-> byte offset, UTF-8/16/32, incremental edits
+    threaded_tests.rs the run loop itself: the real thread, the real channel, order
   workspace/       workspace root, discovery
     config.rs      ya-lsp.toml
     bundler.rs     Gemfile.lock -> sources and specs (pure text, no I/O)
@@ -53,20 +60,25 @@ src/
 Makefile           every command, and the two cargo subcommands' pinned versions
 scripts/
   coverage.sh      the coverage gate: both bars, and every untaken branch arm
+  canary.py        opens a real Rails app the way an editor does; counts, then a ceiling
 build.rs           embeds vendor/rbs into the binary
 vendor/rbs/        Ruby's own RBS signatures, vendored (BSD-2-Clause/Ruby, see its README)
 tests/lifecycle.rs end-to-end against a spawned binary
+tests/vscode_manifest.rs the extension's settings, against the server they configure
 editors/vscode/    the VS Code extension (TypeScript)
   src/extension.ts activation, one client per workspace folder, commands
   src/config.ts    VS Code settings -> the server's wire format; no `vscode` import
   src/server.ts    which binary to run; no `vscode` import
+  src/manifest.test.ts the manifest, against the settings `config.ts` reads
 .github/workflows/ CI, and the per-platform VSIX matrix
 tmp/               directory for temporary files; gitignored
 ```
 
 Settled choices: **`lsp-server` 0.10** (sync, from rust-analyzer) as the transport, **`rubydex`
 pinned at `=0.2.5`** for indexing and static analysis, **`ruby-prism` `=1.9.0`** (must match
-rubydex's exactly or `ruby-prism-sys` links twice), no async runtime.
+rubydex's exactly or `ruby-prism-sys` links twice), no async runtime. The only dev-dependencies
+are `tempfile`, `url` and **`proptest`**, which holds `analysis/position.rs`'s three properties —
+`about.toml` ignores dev-dependencies, so none of them owes a notice in the shipped binary.
 
 ## Rules
 
@@ -78,12 +90,18 @@ frontmatter list so it loads only while you are working on the files it governs.
 |---|---|
 | `core-invariants.md` | `src/**`, `tests/**`, `build.rs` |
 | `navigation.md` | `analysis/` locator, symbols, hover, render, requires, search |
-| `completion.md` | `analysis/completion.rs`, `analysis/cursor.rs` |
+| `completion.md` | `analysis/completion.rs`, `analysis/cursor.rs`, `analysis/signature_help.rs` |
+| `hierarchy.md` | `analysis/hierarchy.rs` |
+| `concurrency.md` | `analysis/threaded_tests.rs`, `analysis/mod.rs` |
+| `highlighting.md` | `analysis/highlight.rs`, `analysis/scopes.rs` |
+| `renaming.md` | `analysis/rename.rs` |
+| `ranges.md` | `analysis/ranges.rs` |
 | `search-references.md` | `analysis/search.rs`, `analysis/references.rs` |
 | `gems.md` | `workspace/` gems, bundler, ruby_version, config, mod |
 | `rbs-signatures.md` | `workspace/rbs.rs`, `analysis/signatures.rs`, `vendor/rbs/`, `build.rs` |
 | `messages.md` | `src/messages.rs` and the five files that raise its messages |
 | `coverage.md` | `Makefile`, `scripts/`, `.github/workflows/` |
+| `canary.md` | `scripts/canary.py`, `Makefile`, `.github/workflows/` |
 | `benchmarking.md` | `tests/`, `src/main.rs`, `src/server/` |
 | `vscode-extension.md` | `editors/vscode/**` |
 | `licensing.md` | `LICENSE.txt`, `NOTICE.txt`, `THIRD-PARTY-NOTICES.txt`, `about.*`, `src/licenses.rs`, `vendor/rbs/`, `CHANGELOG.md` |
@@ -108,7 +126,7 @@ make build             # debug build           make release       # optimized bu
 make test              # the Rust suite        make test-one T=x  # one test, with stdout
 make check             # type-check only       make lint          # clippy, warnings denied
 make fmt               # format                make fmt-check     # fail if unformatted
-make ci                # fmt-check, lint, test, coverage — what CI checks
+make ci                # fmt-check, lint, test, notices-check, coverage — what CI checks
 
 make coverage          # run the suite instrumented, then check all three bars
 make coverage-branches # every branch arm no test took (F=gems to filter)
@@ -116,8 +134,11 @@ make coverage-missing  # every line no test ran
 make coverage-html     # the browsable report
 make coverage-clean    # drop the profiles and the nightly objects
 
+make canary            # open a real Rails app (lobsters, pinned) and check the answers
+make canary-clone      # just fetch the pinned commit
+
 make notices           # regenerate THIRD-PARTY-NOTICES.txt, after any dependency change
-make notices-check     # fail if the committed copy is stale, as CI does
+make notices-check     # fail if the committed copy is stale, as CI and a tag build do
 make ext-install       # the extension's dependencies (yarn 1's `npm ci`)
 make ext-test          # compile, bundle and run the extension's 24 tests
 make ext-lint          # type-check the extension
@@ -127,6 +148,13 @@ make ext-lint          # type-check the extension
 gate), so every other coverage target reads that same run rather than re-running the tests per
 format. `coverage-run` stamps the toolchain that produced `target/llvm-cov-target` and wipes the
 directory when it changes, which is the `rm -rf` rule above automated rather than remembered.
+
+`make canary` is **the one target that needs a network**, which is why it is not in `make ci`: it
+fetches one pinned commit of a real Rails application into `tmp/` and opens it the way an editor
+does. It asserts counts exactly (476 files, zero `parse-error`, 14 `parse-warning` and no other
+code) and time only against a ceiling twenty times the measurement, because the counts are
+properties of the commit and the timing is a property of the runner. It does not cover gems. CI
+runs it as its own job; `canary.md` has the rest.
 
 ```bash
 # The extension, when a target does not cover it (from editors/vscode)

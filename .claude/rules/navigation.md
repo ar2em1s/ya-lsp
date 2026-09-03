@@ -48,6 +48,31 @@ paths:
 - **A definition matches only its name span, never its body.** `Definition::name_offset` is
   `None` for constants, `attr_*`, and aliases — for those, `offset()` is already just the name.
   Widening this to the body makes hover fire over whitespace.
+- **Hover cards are pinned side by side, in one file, whole — and that is the only shape that
+  catches the failure they have.** `every_hover_card_in_one_file_drawn_side_by_side` renders every
+  construct in `GALLERY` with its card under it and asserts the lot. Before it existed each
+  construct had a `contains` somewhere and no two cards were ever read next to each other, which
+  is exactly how `class << Book` came to sit above a `private Shelf::Book#hide`: `attached_name`
+  read the attached class out of rubydex's `Shelf::Book::<Book>`, where it is spelled
+  unqualified, and the one test covering the construct used a *top-level* module, where the
+  qualified and unqualified names are the same string. Take the part before the `::<`, never the
+  part inside it. A new card, or a new construct, goes in that fixture — a card asserted on its
+  own is blind to drifting away from the others, which is the whole of what a reader notices.
+- **`render::signature_label` writes the label and the spans in one pass, and the offsets are
+  UTF-16 code units.** `signatureHelp` highlights a parameter by handing the client a pair of
+  offsets into the label, so the function that writes the string is the function that says where
+  it wrote each piece — nothing downstream counts characters. LSP's other spelling, the parameter
+  as a substring to search for, mis-highlights the moment a label holds the same token twice, and
+  `def each(key, value = key)` already does. The unit is UTF-16 because that is what a client
+  indexes the label by; the protocol ties `Position` to the negotiated encoding and says nothing
+  about these, and `def приветствие(имя)` is legal Ruby, so the two counts genuinely differ.
+- **Which definition of a declaration a *list* points at is `locator::preferred_definition`, and
+  it is one decision.** A class reopened two hundred times has two hundred definitions and every
+  list that mentions it once has to pick the same one, or the same class opens in `app/models` from
+  the outline and in whichever gem reopened it from the type hierarchy. `locator::declared_in` is
+  the other half — whether *any* of them is the user's, which is what both the symbol picker and
+  the subtype list rank by. Both lived in `search.rs` until v0.3.0's item 4 needed them; neither
+  belongs to the feature that happened to want it first.
 - **How a construct is spelled for a human lives in `render`, and is shared.** `split_qualified`
   (symbol lists) and `qualified_name` (hover) both go through `singleton_parts`, and
   `symbols::kind_of` is shared with `search`. A symbol that reads differently in the outline and

@@ -90,6 +90,38 @@ pub enum Receiver {
     Unknown,
 }
 
+/// The call whose argument list the cursor is inside, and which argument that is.
+///
+/// This is what `textDocument/signatureHelp` asks about, and it is deliberately *not* the same
+/// question `Context::Argument` answers. Two differences, each of them a case where the popup
+/// has to stay up while completion has nothing to say: a `.` written inside the parentheses
+/// (`puts(person.`) is still a call the user is passing arguments to, and so is a string
+/// argument being typed (`puts("hel`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Call {
+    /// An offset inside the called method's name, for the caller to resolve. The same
+    /// convention `Context::Argument` uses.
+    pub name: u32,
+    pub active: Active,
+}
+
+/// Which of a method's parameters the cursor is writing an argument for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Active {
+    /// The nth argument, counting from zero — the number of arguments that end before the
+    /// cursor. A keyword hash counts as its own elements rather than as one argument, so
+    /// `f(1, a: 2, ` is the third parameter and not the second.
+    Nth(u32),
+    /// A keyword argument, named. Keywords may be written in any order, so where one sits in
+    /// the call says nothing about which parameter it is: `f(b: 1, a: ` is `a`, not the second.
+    Keyword(String),
+    /// A keyword argument that has not been named yet — the cursor is past one keyword and has
+    /// not begun the next. Which one it will be is unknowable; *that* it is a keyword is not,
+    /// because Ruby forbids a positional argument after one. Counting instead would answer with
+    /// a parameter this call can no longer reach.
+    AnyKeyword,
+}
+
 /// A classified cursor, and the half-typed word it sits at the end of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
@@ -112,15 +144,7 @@ pub fn at(source: &str, offset: u32) -> Option<Cursor> {
         return None;
     }
 
-    let mut finder = Finder {
-        offset,
-        in_literal: false,
-        operator: None,
-        arguments: None,
-        local: None,
-        locals: Vec::new(),
-        source,
-    };
+    let mut finder = Finder::new(source, offset);
     finder.visit(&result.node());
     if finder.in_literal {
         return None;
@@ -131,7 +155,7 @@ pub fn at(source: &str, offset: u32) -> Option<Cursor> {
     // in both, and what it is completing is `bar`'s methods.
     let context = match (finder.operator, finder.arguments) {
         (Some(context), _) => context,
-        (None, Some(name)) => Context::Argument { name },
+        (None, Some(call)) => Context::Argument { name: call.name },
         (None, None) => Context::Expression,
     };
 
@@ -141,6 +165,24 @@ pub fn at(source: &str, offset: u32) -> Option<Cursor> {
         start,
         end,
     })
+}
+
+/// The innermost call whose argument list the cursor sits in, and which argument that is.
+///
+/// Unlike [`at`], neither a comment nor a literal ends the answer, and an operator written
+/// inside the parentheses does not take it over. All three are places where there is nothing to
+/// complete and still a call being written: an editor keeps the signature on screen through
+/// `puts("hel`, through `puts(person.` and through a comment between two arguments, and a
+/// server that answers `null` for those makes it flicker on every keystroke.
+///
+/// `None` when the cursor is not inside an argument list at all, or when the call has no name
+/// to resolve — `foo.()` is `foo.call()` written with none.
+#[must_use]
+pub fn call_at(source: &str, offset: u32) -> Option<Call> {
+    let result = ruby_prism::parse(source.as_bytes());
+    let mut finder = Finder::new(source, offset);
+    finder.visit(&result.node());
+    finder.arguments
 }
 
 /// The half-typed word the cursor is at the end of, as a span.
@@ -200,8 +242,8 @@ struct Finder<'s> {
     in_literal: bool,
     /// The innermost `::` or `.` the cursor is completing after.
     operator: Option<Context>,
-    /// An offset inside the name of the innermost call whose argument list holds the cursor.
-    arguments: Option<u32>,
+    /// The innermost call whose argument list holds the cursor.
+    arguments: Option<Call>,
     /// The span of the innermost operator's receiver, when it is a local the parse could not
     /// type — the only case `type_the_local` has anything to say about.
     ///
@@ -251,7 +293,10 @@ impl<'pr> Visit<'pr> for Finder<'_> {
             && self.offset <= region.1
             && let Some(message) = node.message_loc()
         {
-            self.arguments = Some(message.start_offset() as u32);
+            self.arguments = Some(Call {
+                name: message.start_offset() as u32,
+                active: self.active_argument(node),
+            });
         }
 
         ruby_prism::visit_call_node(self, node);
@@ -311,7 +356,19 @@ impl<'pr> Visit<'pr> for Finder<'_> {
     }
 }
 
-impl Finder<'_> {
+impl<'s> Finder<'s> {
+    fn new(source: &'s str, offset: u32) -> Self {
+        Self {
+            offset,
+            source,
+            in_literal: false,
+            operator: None,
+            arguments: None,
+            local: None,
+            locals: Vec::new(),
+        }
+    }
+
     /// The span between a call's parentheses, or the span of its bare argument list.
     ///
     /// Prism puts a synthetic zero-width closing paren at the last token it managed to read, so
@@ -338,6 +395,71 @@ impl Finder<'_> {
             end += 1;
         }
         Some((start, end as u32))
+    }
+
+    /// Which of the callee's parameters the cursor is writing an argument for.
+    ///
+    /// The count of arguments that *end* before the cursor is the whole rule for positional
+    /// ones — `f(1, ` has finished one, `f(1` has finished none, `f(` none either — with two
+    /// things folded into "an argument". A keyword hash is spread into its elements, because
+    /// `f(a: 1, b: 2` is one Prism node and two arguments written; and a keyword the cursor is
+    /// *inside* beats the count outright, since keywords may be written in any order and the
+    /// position of one then says nothing about which parameter it is.
+    fn active_argument(&self, node: &CallNode<'_>) -> Active {
+        let Some(arguments) = node.arguments() else {
+            return Active::Nth(0);
+        };
+
+        let mut elements: Vec<Node<'_>> = Vec::new();
+        for argument in arguments.arguments().iter() {
+            // Only a hash Prism itself says is keywords. `f("a" => 1, "b" => 2)` is one
+            // argument however many pairs are in it, and spreading it would count two.
+            match argument
+                .as_keyword_hash_node()
+                .filter(ruby_prism::KeywordHashNode::is_symbol_keys)
+            {
+                Some(hash) => elements.extend(hash.elements().iter()),
+                None => elements.push(argument),
+            }
+        }
+
+        let mut written = 0_u32;
+        let mut keywords_began = false;
+        for element in &elements {
+            let location = element.location();
+            let (start, end) = (location.start_offset() as u32, location.end_offset() as u32);
+            if self.holds_cursor(start, end) {
+                return keyword_name(self.source, element)
+                    .map_or(Active::Nth(written), Active::Keyword);
+            }
+            if end < self.offset {
+                written += 1;
+                keywords_began |= element.as_assoc_node().is_some();
+            }
+        }
+        if keywords_began {
+            return Active::AnyKeyword;
+        }
+        Active::Nth(written)
+    }
+
+    /// Whether the cursor belongs to this argument rather than to the next one.
+    ///
+    /// Inside its span, plainly — and also *past* it, up to the comma that ends it, because
+    /// that gap is where the cursor spends most of its time: `create(name: ` has written the
+    /// keyword and not yet its value, and Prism recovers the pair as ending at the colon. The
+    /// comma is what says the user has moved on, so `create(name: "ada", ` belongs to the
+    /// argument after `name` rather than to `name`.
+    ///
+    /// There is no upper bound to check. The caller has already established that the cursor is
+    /// inside the argument list, and no argument's span reaches past it — a heredoc looks as
+    /// though it should and does not: Prism scopes the node to the `<<~SQL` marker and holds
+    /// the body separately, so `execute(<<~SQL, id)` needs no special case.
+    fn holds_cursor(&self, start: u32, end: u32) -> bool {
+        if self.offset < start {
+            return false;
+        }
+        self.offset <= end || !self.source[end as usize..self.offset as usize].contains(',')
     }
 
     /// Give the receiver a type when it is a local we watched being assigned one.
@@ -491,6 +613,18 @@ fn instantiated(node: &Node<'_>) -> Option<u32> {
     is_constant(&receiver).then(|| receiver.location().end_offset() as u32)
 }
 
+/// The name a keyword argument is written under, when the node is one.
+///
+/// Both of Ruby's spellings, because Ruby accepts both: `f(name: "ada")` and `f(:name => "ada")`
+/// pass the same keyword, and `def f(name:)` is satisfied by either. `value_loc` is the name
+/// without whichever colon it was written with. A key that is not a symbol — `f("name" => 1)` —
+/// is a hash entry rather than a keyword, and has no name to give.
+fn keyword_name(source: &str, element: &Node<'_>) -> Option<String> {
+    let key = element.as_assoc_node()?.key();
+    let name = key.as_symbol_node()?.value_loc()?;
+    Some(source[name.start_offset()..name.end_offset()].to_owned())
+}
+
 /// The span of a local variable read, which is the only receiver whose type can be recovered
 /// from somewhere else in the file.
 fn local_span(node: &Node<'_>) -> Option<(u32, u32)> {
@@ -516,6 +650,17 @@ mod tests {
 
     fn context(marked: &str) -> Context {
         at_marker(marked).expect("a cursor").0.context
+    }
+
+    /// The call the `~` is passing an argument to.
+    fn call(marked: &str) -> Option<Call> {
+        let offset = marked.find('~').expect("a ~ marking the cursor") as u32;
+        call_at(&marked.replace('~', ""), offset)
+    }
+
+    /// Which argument the `~` is writing, as `Nth` or the keyword's name.
+    fn active(marked: &str) -> Active {
+        call(marked).expect("a call around the cursor").active
     }
 
     fn word(marked: &str) -> String {
@@ -929,6 +1074,138 @@ mod tests {
                 receiver: Receiver::Constant(5)
             }
         );
+    }
+
+    #[test]
+    fn the_active_argument_is_how_many_have_been_finished() {
+        assert_eq!(active("f(~"), Active::Nth(0), "nothing written yet");
+        assert_eq!(active("f(1~"), Active::Nth(0), "still inside the first");
+        assert_eq!(active("f(1,~"), Active::Nth(1), "the comma finished it");
+        assert_eq!(active("f(1, ~"), Active::Nth(1), "and the space after it");
+        assert_eq!(active("f(1, 2~)"), Active::Nth(1), "inside the second");
+        assert_eq!(active("f(1, 2, ~)"), Active::Nth(2));
+        assert_eq!(active("f(~1, 2)"), Active::Nth(0), "back at the first");
+        assert_eq!(
+            active("f(1, ~2, 3)"),
+            Active::Nth(1),
+            "at the start of the second"
+        );
+        // A block argument is an argument, and a `do ... end` block is not: it is written
+        // outside the parentheses and the cursor in it is outside the call's arguments.
+        assert_eq!(active("f(1, &blk~)"), Active::Nth(1));
+        assert_eq!(call("f(1) do |x|\n  ~\nend\n"), None);
+    }
+
+    #[test]
+    fn a_paren_less_call_still_says_which_argument_it_is_on() {
+        assert_eq!(active("link_to \"x\", ~"), Active::Nth(1));
+        assert_eq!(active("puts ~1, 2"), Active::Nth(0));
+    }
+
+    #[test]
+    fn the_innermost_call_is_the_one_the_cursor_is_passing_to() {
+        // The nested case, and the reason it needs no special handling: the walk is pre-order,
+        // so the innermost call is the last to claim the cursor.
+        let inner = call("outer(1, inner(2, ~))").expect("the inner call");
+        assert_eq!(inner.name, 9, "`inner`, not `outer`");
+        assert_eq!(inner.active, Active::Nth(1));
+
+        let outer = call("outer(1, inner(2, 3), ~)").expect("the outer call");
+        assert_eq!(outer.name, 0);
+        assert_eq!(outer.active, Active::Nth(2));
+    }
+
+    #[test]
+    fn a_keyword_argument_is_named_rather_than_counted() {
+        // Keywords may be written in any order, so counting them answers the wrong parameter
+        // the moment anybody does.
+        assert_eq!(active("f(name: ~)"), Active::Keyword("name".to_owned()));
+        assert_eq!(
+            active("f(name: \"ada~\")"),
+            Active::Keyword("name".to_owned())
+        );
+        assert_eq!(
+            active("f(1, name: \"ada\", age: ~)"),
+            Active::Keyword("age".to_owned())
+        );
+        assert_eq!(
+            active("f(age: 1, name: ~)"),
+            Active::Keyword("name".to_owned()),
+            "written second, and still `name`"
+        );
+        // Ruby accepts both spellings for the same keyword, so both are named.
+        assert_eq!(active("f(:name => ~)"), Active::Keyword("name".to_owned()));
+        // A string key is a hash entry rather than a keyword, and a hash of them is one
+        // argument however many pairs it holds.
+        assert_eq!(active("f(\"name\" => ~)"), Active::Nth(0));
+        assert_eq!(active("f(\"a\" => 1, \"b\" => 2, ~)"), Active::Nth(1));
+    }
+
+    #[test]
+    fn a_keyword_hash_counts_as_its_own_elements() {
+        // One Prism node, two arguments written. Without spreading it, every keyword after a
+        // positional one answers the same parameter.
+        assert_eq!(active("f(1, a: 2, b: ~)"), Active::Keyword("b".to_owned()));
+        // Past a finished keyword and before the next: which one it will be is unknowable,
+        // that it is a keyword is not — Ruby forbids a positional argument after one, so a
+        // count here would answer with a parameter the call can no longer reach.
+        assert_eq!(active("f(a: 1, ~)"), Active::AnyKeyword);
+        assert_eq!(active("f(1, a: 2, ~)"), Active::AnyKeyword);
+        assert_eq!(active("f(a: 1, b: 2, ~)"), Active::AnyKeyword);
+    }
+
+    #[test]
+    fn a_heredoc_argument_ends_at_its_marker_and_not_at_its_body() {
+        // `execute(<<~SQL, user_id)` is how anybody writes SQL, and the argument after the
+        // heredoc is written three lines above the end of it. The counting rule holds anyway,
+        // because Prism scopes the node to the opening marker and keeps the body separately.
+        // Worth a test rather than a comment: the obvious reading of "where the node ends"
+        // would put every later argument inside the first one. (`<<-` rather than `<<~` only
+        // because a squiggly heredoc and this module's cursor marker are the same character.)
+        for body in ["  body\n", "  body #{x}\n"] {
+            let marked = format!("f(<<-TEXT, ~)\n{body}  TEXT\n");
+            assert_eq!(active(&marked), Active::Nth(1), "{body:?}");
+        }
+        // And the cursor on the marker itself is still the first argument.
+        assert_eq!(active("f(<<-TEXT~, 2)\n  body\n  TEXT\n"), Active::Nth(0));
+    }
+
+    #[test]
+    fn a_call_with_nothing_to_resolve_is_not_a_call() {
+        // `foo.()` is `foo.call()` written with no name at all: there is no callee to look up
+        // and so no signature to show. The same shape `a_call_with_no_name_in_it` pins for
+        // completion, from the other side.
+        assert_eq!(call("foo.(~)"), None);
+        assert_eq!(call("~"), None, "nowhere near a call");
+        assert_eq!(call("f(1) ~"), None, "past the closing paren");
+    }
+
+    #[test]
+    fn a_literal_and_a_comment_end_completion_and_not_the_signature() {
+        // The two places `at` deliberately gives up. An editor keeps the signature popup on
+        // screen through both, and a `null` makes it flicker on every keystroke.
+        assert!(
+            at_marker("f(\"hel~\")").is_none(),
+            "nothing to complete in a string"
+        );
+        assert_eq!(
+            active("f(\"hel~\")"),
+            Active::Nth(0),
+            "and still the first argument"
+        );
+
+        assert!(at_marker("f(1, # note~\n  2)").is_none());
+        assert_eq!(active("f(1, # note~\n  2)"), Active::Nth(1));
+    }
+
+    #[test]
+    fn an_operator_inside_the_parentheses_does_not_take_the_call_away() {
+        // `an_operator_beats_the_argument_list_it_is_written_in` is the completion half of
+        // this: what the cursor completes is `Person`'s methods, and what it is passing an
+        // argument to is still `build`.
+        let found = call("build(Person.~").expect("the enclosing call");
+        assert_eq!(found.name, 0);
+        assert_eq!(found.active, Active::Nth(0));
     }
 
     #[test]

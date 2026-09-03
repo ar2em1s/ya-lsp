@@ -8,17 +8,51 @@ use std::path::Path;
 
 use lsp_types::{
     ClientCapabilities, CompletionOptions, CompletionOptionsCompletionItem,
-    DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher, GlobPattern,
-    HoverProviderCapability, OneOf, Registration, RelativePattern, SaveOptions, ServerCapabilities,
+    DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher, FoldingRangeProviderCapability,
+    GlobPattern, HoverProviderCapability, OneOf, Registration, RelativePattern, RenameOptions,
+    SaveOptions, SelectionRangeProviderCapability, ServerCapabilities, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, WorkspaceFileOperationsServerCapabilities,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    TextDocumentSyncSaveOptions, WorkDoneProgressOptions,
+    WorkspaceFileOperationsServerCapabilities, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities,
 };
 
 use crate::{
     analysis::position::PositionEncoding,
-    workspace::{DocUri, config::CONFIG_FILE_NAME},
+    workspace::{
+        DocUri,
+        config::{CONFIG_FILE_NAME, IndexConfig},
+    },
 };
+
+/// The `capabilities` object exactly as it goes out on the wire.
+///
+/// `lsp-types` 0.97 — the latest published version — has a field for `callHierarchyProvider` and
+/// none for `typeHierarchyProvider`, so the one capability the crate cannot spell is flattened in
+/// beside the ones it can. A typed struct rather than a `serde_json::Map` insertion: this module
+/// is the wire contract, and the contract is worth being unable to misspell.
+///
+/// The alternative was `client/registerCapability`, which the protocol does allow for this one.
+/// It would have made the feature depend on a client that takes dynamic registrations — the same
+/// dependency that leaves the file watcher unavailable in several editors — for no reason beyond
+/// a missing struct field.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Advertised {
+    #[serde(flatten)]
+    standard: ServerCapabilities,
+    type_hierarchy_provider: bool,
+}
+
+#[must_use]
+pub fn advertised(encoding: PositionEncoding) -> Advertised {
+    Advertised {
+        standard: server_capabilities(encoding),
+        // v0.3.0. Nothing is taken away by this one: no editor guesses at a type hierarchy, so
+        // the command simply reports that there are no results until a server answers it.
+        type_hierarchy_provider: true,
+    }
+}
 
 #[must_use]
 pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
@@ -49,6 +83,12 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         // exists to avoid reading a file per result; measured here that read is a few
         // milliseconds for a capped result set, and every client understands the eager one.
         references_provider: Some(OneOf::Left(true)),
+        // v0.3.0. Announced with the rest of them and for the same reason: a client told a
+        // server highlights occurrences stops matching words itself, and a word match — which
+        // lights up the name inside a comment, inside a string, and in an unrelated scope — is
+        // better than nothing at all. ya-lsp answers `null` wherever it does not know, which is
+        // what puts the client's own fallback back in play for exactly those positions.
+        document_highlight_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         // M5. `.` and `:` are the two characters that change what a completion *means* rather
         // than just narrowing it, and a client only re-asks mid-word for characters listed
@@ -72,6 +112,33 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
             }),
             ..CompletionOptions::default()
         }),
+        // v0.3.0. `(` and `,` are where a Ruby call gains an argument — the second covers the
+        // paren-less form too, since `link_to "x", ` is where the next one goes. `)` only
+        // re-triggers, which is to say it is asked while the popup is already up: the call it
+        // closes has no further arguments, ya-lsp answers `null`, and the popup goes away
+        // rather than standing there describing a call the cursor has left.
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_owned(), ",".to_owned()]),
+            retrigger_characters: Some(vec![")".to_owned()]),
+            ..SignatureHelpOptions::default()
+        }),
+        // v0.3.0. Expand-selection has nothing to take away — in a Ruby file the command does
+        // nothing at all today — so this one is pure addition.
+        selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+        // v0.3.0. `prepareProvider` is the half of this that matters: it is what lets ya-lsp
+        // answer "not here" *before* the editor asks the user for a new name, which is the only
+        // point at which declining costs the user nothing. A client that does not support it
+        // sends `textDocument/rename` straight off, so every refusal is reachable from both.
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
+        // v0.3.0, and the one capability here that *removes* a fallback rather than replacing
+        // an absence: a client with a folding provider stops guessing from indentation, and on
+        // well-formatted Ruby that guess is decent. So `analysis::ranges` covers the shapes the
+        // guess gets right as well as the ones it cannot see, and answers `null` — never an
+        // empty array — where it found nothing, which is what hands the guess back.
+        folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         workspace: Some(WorkspaceServerCapabilities {
             workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                 supported: Some(true),
@@ -94,40 +161,56 @@ pub fn server_info() -> serde_json::Value {
     })
 }
 
-/// The id the `ya-lsp.toml` watcher is registered under.
+/// The id the watcher registration is made under.
 ///
 /// Fixed rather than generated: the protocol identifies a registration by this string, so
 /// anything that later unregisters it has to be able to name the same one.
-const CONFIG_WATCHER_ID: &str = "ya-lsp-config-watcher";
+const WATCHED_FILES_ID: &str = "ya-lsp-watched-files";
 
-/// Ask the client to watch the project's `ya-lsp.toml`, so a change to it reloads.
+/// Ask the client to watch the project's `ya-lsp.toml` and the files it indexes.
 ///
 /// The protocol has no static form for file watching — `initialize` cannot announce it, which is
 /// why this is not in `server_capabilities` — so `client/registerCapability` is the only way to
 /// ask, and `None` here means the client did not say it accepts one. Until v0.2.0 nothing sent
 /// this at all: the VS Code extension supplied a watcher of its own through
 /// `synchronize.fileEvents`, so reload worked there and in no other editor.
+///
+/// The Ruby patterns are `index.include` itself, so a project that widened it to cover `sig/`
+/// gets its signatures watched too. `index.exclude` has no counterpart here — LSP watchers
+/// cannot say "not this" — so the registration is deliberately the *wider* of the two, and
+/// `Workspace::indexes` narrows it back down on arrival. Watching too much costs notifications
+/// the server drops; watching too little is a file that never refreshes.
 #[must_use]
-pub fn config_watcher(root: &Path, capabilities: &ClientCapabilities) -> Option<Registration> {
-    let watched_files = capabilities
+pub fn watched_files(
+    root: &Path,
+    index: &IndexConfig,
+    capabilities: &ClientCapabilities,
+) -> Option<Registration> {
+    let watched = capabilities
         .workspace
         .as_ref()?
         .did_change_watched_files
         .as_ref()?;
-    if watched_files.dynamic_registration != Some(true) {
+    if watched.dynamic_registration != Some(true) {
         return None;
     }
+    let relative = watched.relative_pattern_support == Some(true);
     let options = DidChangeWatchedFilesRegistrationOptions {
-        watchers: vec![FileSystemWatcher {
-            glob_pattern: config_glob(root, watched_files.relative_pattern_support == Some(true)),
-            // All three kinds, which is what omitting `kind` means. A deleted `ya-lsp.toml` is a
-            // configuration change — it means back to the defaults — and so is one written for
-            // the first time in a project that never had one.
-            kind: None,
-        }],
+        watchers: std::iter::once(CONFIG_FILE_NAME)
+            .chain(index.include.iter().map(String::as_str))
+            .map(|pattern| FileSystemWatcher {
+                glob_pattern: watch_glob(root, pattern, relative),
+                // All three kinds, which is what omitting `kind` means. A deleted `ya-lsp.toml`
+                // is a configuration change — it means back to the defaults — and so is one
+                // written for the first time in a project that never had one; a deleted `.rb`
+                // is the one case the index cannot reach any other way, since nothing else ever
+                // says a declaration has gone.
+                kind: None,
+            })
+            .collect(),
     };
     Some(Registration {
-        id: CONFIG_WATCHER_ID.to_owned(),
+        id: WATCHED_FILES_ID.to_owned(),
         method: "workspace/didChangeWatchedFiles".to_owned(),
         // Infallible for this shape — every field in it is a string — but the type is a
         // `Result`, and a registration whose options went missing asks the client to watch
@@ -136,27 +219,23 @@ pub fn config_watcher(root: &Path, capabilities: &ClientCapabilities) -> Option<
     })
 }
 
-/// The pattern the watcher is registered with.
+/// One pattern the watcher is registered with, relative to `root`.
 ///
 /// Relative when the client says it takes one (LSP 3.17). The base there is a URI rather than
 /// glob syntax, so a root holding `[`, `{`, `*` or `?` — a directory named `[wip]` is enough —
 /// cannot be read as a pattern. The absolute form has no defence against that: LSP's glob
 /// syntax defines no escape. Its separators are `/` on every platform, Windows included, which
 /// is why the path is not simply handed over as the OS spells it.
-fn config_glob(root: &Path, relative_patterns: bool) -> GlobPattern {
+fn watch_glob(root: &Path, pattern: &str, relative_patterns: bool) -> GlobPattern {
     if relative_patterns
         && let Some(base) = DocUri::from_path(root).and_then(|uri| uri.to_lsp().ok())
     {
         return GlobPattern::Relative(RelativePattern {
             base_uri: OneOf::Right(base),
-            pattern: CONFIG_FILE_NAME.to_owned(),
+            pattern: pattern.to_owned(),
         });
     }
-    GlobPattern::String(
-        root.join(CONFIG_FILE_NAME)
-            .to_string_lossy()
-            .replace('\\', "/"),
-    )
+    GlobPattern::String(root.join(pattern).to_string_lossy().replace('\\', "/"))
 }
 
 #[must_use]
@@ -173,6 +252,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_capability_lsp_types_cannot_spell_still_goes_out_with_the_rest() {
+        // `ServerCapabilities` has no `typeHierarchyProvider` field in any published version of
+        // the crate, so this is the one capability that is added on the way to JSON. The second
+        // half of the assertion is the point: a flatten that stopped flattening would announce
+        // *only* the type hierarchy, and every other feature would silently stop being offered.
+        let advertised =
+            serde_json::to_value(advertised(PositionEncoding::Utf8)).expect("plain data");
+        assert_eq!(advertised["typeHierarchyProvider"], serde_json::json!(true));
+        assert_eq!(advertised["hoverProvider"], serde_json::json!(true));
+        assert!(advertised["completionProvider"].is_object());
+        assert!(advertised["textDocumentSync"].is_object());
+    }
+
+    #[test]
+    fn the_v0_3_0_rename_provider_asks_to_be_consulted_before_the_editor_prompts() {
+        // A bare `renameProvider: true` would still work, and would move every refusal to
+        // *after* the user has typed a new name. `prepareProvider` is what buys the earlier
+        // question, and it is the only option this provider has.
+        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        let OneOf::Right(rename) = capabilities.rename_provider.expect("a rename provider") else {
+            panic!("announced without options, so nothing asks before the prompt");
+        };
+        assert_eq!(rename.prepare_provider, Some(true));
+    }
+
+    #[test]
     fn the_m5_provider_is_announced_with_its_triggers() {
         let capabilities = server_capabilities(PositionEncoding::Utf8);
         let completion = capabilities
@@ -184,6 +289,41 @@ mod tests {
         let triggers = completion.trigger_characters.expect("trigger characters");
         assert!(triggers.contains(&".".to_owned()));
         assert!(triggers.contains(&":".to_owned()));
+    }
+
+    #[test]
+    fn the_v0_3_0_highlight_provider_is_announced() {
+        // Announced without options: `documentHighlight` has none, and the whole of the
+        // decision is that a client stops matching words itself the moment it is told.
+        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        assert!(capabilities.document_highlight_provider.is_some());
+    }
+
+    #[test]
+    fn the_v0_3_0_provider_is_announced_with_its_triggers() {
+        // `(` and `,` are where an argument list gains an argument; `)` only re-triggers, so
+        // the popup is asked once more as the call closes and takes ya-lsp's `null` as its cue
+        // to go away. A client is asked nothing at all for a character that is on neither list.
+        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        let help = capabilities
+            .signature_help_provider
+            .expect("a signature help provider");
+        assert_eq!(
+            help.trigger_characters,
+            Some(vec!["(".to_owned(), ",".to_owned()])
+        );
+        assert_eq!(help.retrigger_characters, Some(vec![")".to_owned()]));
+    }
+
+    #[test]
+    fn the_v0_3_0_range_providers_are_announced() {
+        // Neither takes options, and the two are announced for opposite reasons: expand-selection
+        // has nothing to displace in a Ruby file, while folding takes the editor's indentation
+        // guess out of play the moment it is told — which is why `analysis::ranges` covers what
+        // that guess got right as well as what it could not see.
+        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        assert!(capabilities.selection_range_provider.is_some());
+        assert!(capabilities.folding_range_provider.is_some());
     }
 
     #[test]
@@ -242,25 +382,38 @@ mod tests {
     }
 
     #[test]
-    fn the_watcher_is_registered_against_the_project_root() {
-        // The whole point of item 8: without this the server never asks anyone to watch
-        // anything, and `ya-lsp.toml` only reloads in the one editor that brought its own
-        // watcher.
+    fn the_watchers_cover_the_config_and_everything_the_index_includes() {
+        // Without this the server never asks anyone to watch anything: `ya-lsp.toml` reloads
+        // only in the one editor that brought its own watcher, and no editor anywhere notices a
+        // `git checkout`.
         let root = Path::new("/tmp/ya-lsp-watch/project");
-        let registration =
-            config_watcher(root, &watching(Some(true), None)).expect("a watcher is registered");
+        let index = IndexConfig {
+            include: vec!["**/*.rb".to_owned(), "sig/**/*.rbs".to_owned()],
+            ..IndexConfig::default()
+        };
+        let registration = watched_files(root, &index, &watching(Some(true), None))
+            .expect("a watcher is registered");
         assert_eq!(registration.method, "workspace/didChangeWatchedFiles");
-        assert_eq!(registration.id, CONFIG_WATCHER_ID);
+        assert_eq!(registration.id, WATCHED_FILES_ID);
 
         let watchers = watchers(&registration);
-        assert_eq!(watchers.len(), 1);
         // `kind` unset is create|change|delete. A `ya-lsp.toml` that is deleted, or written for
-        // the first time, changes the configuration exactly as much as an edit does.
-        assert_eq!(watchers[0].kind, None);
+        // the first time, changes the configuration exactly as much as an edit does — and a
+        // deleted `.rb` is the only way the index ever hears that a declaration has gone.
+        assert!(watchers.iter().all(|watcher| watcher.kind.is_none()));
         assert_eq!(
-            watchers[0].glob_pattern,
-            GlobPattern::String("/tmp/ya-lsp-watch/project/ya-lsp.toml".to_owned()),
-            "a client without relative patterns gets the absolute one, with `/` separators"
+            watchers
+                .iter()
+                .map(|watcher| watcher.glob_pattern.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                // A client without relative patterns gets absolute ones, with `/` separators.
+                GlobPattern::String("/tmp/ya-lsp-watch/project/ya-lsp.toml".to_owned()),
+                GlobPattern::String("/tmp/ya-lsp-watch/project/**/*.rb".to_owned()),
+                GlobPattern::String("/tmp/ya-lsp-watch/project/sig/**/*.rbs".to_owned()),
+            ],
+            "the config plus index.include verbatim: a project that widened it to cover sig/ \
+             has its signatures watched too"
         );
     }
 
@@ -270,15 +423,25 @@ mod tests {
         // `[wip]` would be read as a character class and match nothing. The relative form's base
         // is a URI, so the only glob in it is the part we wrote.
         let root = Path::new("/tmp/ya-lsp-watch/[wip]/project");
-        let registration = config_watcher(root, &watching(Some(true), Some(true)))
-            .expect("a watcher is registered");
+        let registration = watched_files(
+            root,
+            &IndexConfig::default(),
+            &watching(Some(true), Some(true)),
+        )
+        .expect("a watcher is registered");
         let base = DocUri::from_path(root).expect("an absolute root").to_lsp();
-        assert_eq!(
-            watchers(&registration)[0].glob_pattern,
+        let relative = |pattern: &str| {
             GlobPattern::Relative(RelativePattern {
-                base_uri: OneOf::Right(base.expect("a uri")),
-                pattern: CONFIG_FILE_NAME.to_owned(),
+                base_uri: OneOf::Right(base.clone().expect("a uri")),
+                pattern: pattern.to_owned(),
             })
+        };
+        assert_eq!(
+            watchers(&registration)
+                .iter()
+                .map(|watcher| watcher.glob_pattern.clone())
+                .collect::<Vec<_>>(),
+            vec![relative(CONFIG_FILE_NAME), relative("**/*.rb")]
         );
     }
 
@@ -288,8 +451,12 @@ mod tests {
         // working directory. There is no URI for that, so there is no relative pattern either —
         // and answering `None` here would drop the watcher over a case the absolute form
         // handles.
-        let registration = config_watcher(Path::new("."), &watching(Some(true), Some(true)))
-            .expect("a watcher is registered");
+        let registration = watched_files(
+            Path::new("."),
+            &IndexConfig::default(),
+            &watching(Some(true), Some(true)),
+        )
+        .expect("a watcher is registered");
         assert_eq!(
             watchers(&registration)[0].glob_pattern,
             GlobPattern::String("./ya-lsp.toml".to_owned())
@@ -301,12 +468,14 @@ mod tests {
         // Nothing to fall back on: the protocol has no static form for file watching, so a
         // client that does not take a dynamic registration cannot be given a watcher at all.
         // The server says so in the log rather than leaving the user to discover it by editing
-        // `ya-lsp.toml` and watching nothing happen.
+        // `ya-lsp.toml`, or checking out a branch, and watching nothing happen.
         let root = Path::new("/tmp/ya-lsp-watch/project");
-        assert!(config_watcher(root, &ClientCapabilities::default()).is_none());
+        let index = IndexConfig::default();
+        assert!(watched_files(root, &index, &ClientCapabilities::default()).is_none());
         assert!(
-            config_watcher(
+            watched_files(
                 root,
+                &index,
                 &ClientCapabilities {
                     workspace: Some(lsp_types::WorkspaceClientCapabilities::default()),
                     ..ClientCapabilities::default()
@@ -315,9 +484,9 @@ mod tests {
             .is_none(),
             "a workspace section that says nothing about watched files is still a no"
         );
-        assert!(config_watcher(root, &watching(Some(false), None)).is_none());
+        assert!(watched_files(root, &index, &watching(Some(false), None)).is_none());
         assert!(
-            config_watcher(root, &watching(None, Some(true))).is_none(),
+            watched_files(root, &index, &watching(None, Some(true))).is_none(),
             "relative patterns without dynamic registration are not an offer to watch"
         );
     }

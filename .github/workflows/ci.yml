@@ -23,7 +23,7 @@ jobs:
         with:
           toolchain: "1.93.1"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
@@ -34,12 +34,16 @@ jobs:
       # and a stale notice is one that silently omits a dependency somebody added — so it is
       # regenerated here and the result has to match byte for byte. `about.toml` lists the
       # licences that may appear; an unlisted one fails this step rather than shipping.
+      #
+      # Through the Makefile, like the coverage step below. The tool's version and the
+      # generate-and-diff were both written out here as a second copy, so `make notices` locally
+      # and this step could run different versions of cargo-about over the same tree and neither
+      # would say so — a difference in the generated file is the *only* signal either one has.
       - name: the third-party notices are current
         run: |
-          cargo install cargo-about --locked --features cli --version ^0.9
-          cargo about generate about.hbs -o /tmp/notices.txt
-          diff -u THIRD-PARTY-NOTICES.txt /tmp/notices.txt || {
-            echo "::error::THIRD-PARTY-NOTICES.txt is stale; run: cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt"
+          make setup-notices
+          make notices-check || {
+            echo "::error::THIRD-PARTY-NOTICES.txt does not match a fresh generate; run 'make notices' and commit the result"
             exit 1
           }
 
@@ -76,7 +80,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.93.1"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@v4
         with:
           # One source of truth with the local toolchain; setup-node reads `.tool-versions`.
@@ -137,3 +141,39 @@ jobs:
             echo "::error::the rbs notice is back in LICENSE.txt; it belongs in NOTICE.txt"
             exit 1
           fi
+
+  # The first job in this project's history that opens a **real application**. Every performance
+  # number in three plans came from a driver run by hand against a Rails app that is not public,
+  # so none of them was reproducible by anyone else and none had ever run unattended.
+  #
+  # What it covers: own-code discovery (476 files), parsing (zero `parse-error` across a Rails
+  # app targeting Ruby 4.0.0, under the pinned ruby-prism), the diagnostics that reach a user,
+  # and a generous ceiling on the cold index. It is a canary, not a benchmark — see
+  # `scripts/canary.py`.
+  #
+  # **It does not cover gems.** Nothing runs `bundle install` here: lobsters' bundle needs Ruby
+  # 4.0.0 and a hand-built `sqlite3`, which is a large amount of CI for a project whose headline
+  # is that it needs no Ruby at all. The run finds no gems and asserts nothing about them, and
+  # the gem numbers stay manual (`.claude/rules/benchmarking.md`). A green tick here is not
+  # evidence that gem indexing works.
+  #
+  # lobsters is BSD-3-Clause, (c) 2012-2019 Joshua Stein. It is cloned at test time and never
+  # vendored, so no artifact this project ships contains any of it and no notice is owed. Copy a
+  # file out of it into the repository and that stops being true.
+  canary:
+    name: canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # `make canary` builds the server, fetches the pinned commit and runs the driver with the
+      # numbers from the Makefile, so this step and a local run cannot disagree about any of them.
+      # The release build is not shared with the `extension` job — rust-cache keys per job — and
+      # that is the trade: one more optimized build, for two jobs that run in parallel and neither
+      # of which fails because the other one did. A debug build would be no cheaper to fix, since
+      # the index ceiling means nothing at debug speed.
+      - run: make canary

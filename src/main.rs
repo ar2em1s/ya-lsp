@@ -69,7 +69,8 @@ fn main() -> ExitCode {
 fn init_logging() {
     use tracing_subscriber::{EnvFilter, fmt};
 
-    let filter = EnvFilter::try_from_env("YA_LSP_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_env("YA_LSP_LOG")
+        .unwrap_or_else(|_| EnvFilter::new(ya_lsp::DEFAULT_LOG_FILTER));
 
     fmt()
         .with_env_filter(filter)

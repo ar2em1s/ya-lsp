@@ -63,12 +63,28 @@ MIN_FILE_LINES ?= 90
 #                    it looks like a sentence with a word missing.
 #   references.rs    a truncated find-all-references looks exactly like a complete one, so the
 #                    cap and the synthetic-reference filter are both silent when wrong.
+#   ranges.rs        folding and expand-selection. Advertising a folding provider takes the
+#                    editor's indentation guess *out of play*, so a construct this module fails
+#                    to recognise is not a visible bug — it is folding that quietly stops
+#                    existing for that shape, everywhere, which is the first question answering
+#                    yes. Lines only: `make coverage-branches F=ranges` finds no arm untaken,
+#                    while the summary reports 98% because two merged regions are counted apart.
 #   messages.rs      every sentence a user reads. Pure formatting with no I/O, so like
 #                    bundler.rs there is nothing it cannot be asked. Lines are the whole gate
 #                    here — the file has no branch regions at all — and lines are exactly what
 #                    catches the failure item 6 exists to prevent: an arm of a message that
 #                    ships without one test having read it. The enumeration test guards the set
 #                    of messages; only this guards the insides of one.
+#   rename.rs        the only module in the crate that *writes*. Every other wrong answer shows
+#                    the user something unhelpful; a rule here that stops firing edits their
+#                    files — Ruby 3.1's `{ x:, y: }` renames the hash key along with the value
+#                    and still parses, which is the widest and quietest failure ya-lsp can have.
+#                    Pure decisions over a string and a resolution, so every arm is reachable.
+#   scopes.rs        which variable is which, and listed for rename rather than for the
+#                    highlighting it was written for: a scope bug that lights up the wrong
+#                    occurrences is seen the first time anybody looks, and the same bug behind a
+#                    rename writes over the wrong one. The second question was already yes; this
+#                    release is what turned the first one.
 #
 # Deliberately *not* here, so the next reader does not re-litigate it:
 #   signatures.rs    highest blast radius in the crate — a bug indexed 7 of Array's 197 methods
@@ -80,10 +96,13 @@ MIN_FILE_LINES ?= 90
 #                    wrong answer. Being at 100 is not by itself a reason to be on this list.
 COVERAGE_FLOORS ?= \
   analysis/position.rs=100:100 \
+  analysis/ranges.rs=100 \
   analysis/diagnostics.rs=100 \
   analysis/references.rs=100:100 \
   analysis/render.rs=100:100 \
   messages.rs=100 \
+  analysis/rename.rs=100:100 \
+  analysis/scopes.rs=100:100 \
   workspace/uri.rs=100 \
   workspace/config.rs=100:100 \
   workspace/bundler.rs=100:100 \
@@ -210,6 +229,81 @@ coverage-html:
 coverage-clean:
 	rm -rf $(COV_TARGET) target/llvm-cov
 
+# ---------------------------------------------------------------------------- the canary
+
+# A real Rails application, opened the way an editor opens it. `scripts/canary.py` carries the
+# reasoning; these are the numbers, and they live here for the same reason the coverage bars do
+# — so a local run and the CI run cannot disagree about them.
+#
+# Nothing automated had ever opened a real application before this target existed. Every
+# performance number in three plans came from a private repository, which makes them
+# unreproducible by anyone else and unrunnable by CI, and the behaviours that only appear in a
+# real app were pinned by fixtures imitating their shape.
+#
+# **It does not cover gems**, and the reason is a cost rather than an oversight: resolving
+# lobsters' bundle needs `bundle install`, which needs Ruby 4.0.0 and a hand-built `sqlite3`.
+# That is a large amount of CI for a project whose headline is that it needs no Ruby. The gem
+# numbers stay manual — `.claude/rules/benchmarking.md` — and a green canary does not cover them.
+#
+# lobsters is BSD-3-Clause, (c) 2012-2019 Joshua Stein. It is **cloned, never vendored**: no
+# artifact this project ships contains any of it, so no notice is owed, which is
+# `licensing.md`'s "the rule is per artifact, not per repository". That is a property of how it
+# is used and not of the licence — copy one file out of it into `tests/`, or cache a tarball in
+# this repository, and the obligation attaches.
+#
+# The SHA is pinned because an unpinned target turns a canary into a flake and makes every
+# number it asserts meaningless across runs. The ceiling is an order of magnitude above the
+# 20.99 ms measured on 2026-09-03: a shared runner with a cold page cache is not that machine,
+# and what this catches — the accidental quadratic, the discovery rule that stops matching —
+# moves the number by a factor rather than by a percent.
+CANARY_REPO     ?= https://github.com/lobsters/lobsters.git
+CANARY_SHA      ?= 6d15d8f118e305b1de5190662a9651bf90132784
+CANARY_DIR      ?= tmp/lobsters
+CANARY_FILES    ?= 476
+CANARY_WARNINGS ?= 14
+CANARY_MAX_MS   ?= 500
+
+## canary: open a real Rails app (lobsters, pinned) and check the answers
+.PHONY: canary
+canary: release canary-clone
+	python3 scripts/canary.py \
+	  --repo $(CANARY_DIR) --server target/release/ya-lsp \
+	  --files $(CANARY_FILES) --parse-warnings $(CANARY_WARNINGS) \
+	  --max-index-ms $(CANARY_MAX_MS)
+
+# Fetches one commit rather than cloning a history, and never deletes what is already there: a
+# working tree with local edits fails the checkout instead of losing them. `--depth 1` on a
+# 12 MB repository, and a no-op once the pin is present.
+#
+# **Every question here is asked of `$(CANARY_DIR)/.git` and never of `git -C`'s answer, because
+# the canary workspace lives inside this repository and git searches *upwards*.** `git -C
+# tmp/x rev-parse --git-dir` in an empty `tmp/x` succeeds and answers about **ya-lsp** — so the
+# obvious spelling of "is this a repo yet?" skips the `init`, adds a remote to ya-lsp, fetches
+# lobsters into ya-lsp's object store and then runs `checkout --detach` on the working tree
+# being developed in. It was written that way once; what stopped it was an unrelated dirty tree.
+# The `-e` test cannot walk up, and the toplevel comparison refuses the case where somebody
+# points `CANARY_DIR` at the repository root itself.
+## canary-clone: fetch the pinned commit of the canary workspace
+.PHONY: canary-clone
+canary-clone:
+	@set -e; \
+	dir='$(CANARY_DIR)'; \
+	if [ -e "$$dir/.git" ] \
+	   && [ "$$(git -C "$$dir" rev-parse HEAD 2>/dev/null)" = "$(CANARY_SHA)" ]; then \
+	  echo "canary: $$dir is at $(CANARY_SHA)"; \
+	else \
+	  mkdir -p "$$dir"; \
+	  if [ "$$(cd "$$dir" && pwd -P)" = "$$(pwd -P)" ]; then \
+	    echo "canary: CANARY_DIR is the ya-lsp working tree; refusing"; exit 2; \
+	  fi; \
+	  echo "canary: fetching $(CANARY_SHA) into $$dir"; \
+	  [ -e "$$dir/.git" ] || git -C "$$dir" init -q; \
+	  git -C "$$dir" remote get-url canary >/dev/null 2>&1 \
+	    || git -C "$$dir" remote add canary $(CANARY_REPO); \
+	  git -C "$$dir" fetch -q --depth 1 canary $(CANARY_SHA); \
+	  git -C "$$dir" checkout -q --detach FETCH_HEAD; \
+	fi
+
 # ---------------------------------------------------------------------------- notices
 
 ## notices: regenerate THIRD-PARTY-NOTICES.txt
@@ -220,6 +314,7 @@ notices:
 ## notices-check: fail if the committed notices are stale
 .PHONY: notices-check
 notices-check:
+	@mkdir -p target
 	@$(CARGO) about generate about.hbs -o target/notices.txt
 	@diff -u THIRD-PARTY-NOTICES.txt target/notices.txt \
 	  || { echo "THIRD-PARTY-NOTICES.txt is stale; run: make notices"; exit 1; }
@@ -245,7 +340,16 @@ ext-lint:
 
 ## setup: install the cargo subcommands and the nightly used for coverage
 .PHONY: setup
-setup: setup-coverage
+setup: setup-coverage setup-notices
+
+# Split out for the reason `setup-coverage` is, and it was the one that needed it: `ci.yml` used
+# to spell `cargo install cargo-about --locked --features cli --version ^0.9` itself, beside a
+# hand-written `cargo about generate | diff`. So the pin lived in two places, and the committed
+# notice could be checked against a different tool than the one that wrote it — which is the
+# failure the whole check exists to catch, one level up.
+## setup-notices: install just cargo-about
+.PHONY: setup-notices
+setup-notices:
 	$(CARGO) install cargo-about --locked --features cli --version "$(CARGO_ABOUT_VERSION)"
 
 # Split out so CI installs exactly what a local `make coverage` needs, at exactly the version
@@ -256,9 +360,18 @@ setup-coverage:
 	rustup toolchain install nightly --component llvm-tools-preview
 	$(CARGO) install cargo-llvm-cov --locked --version $(CARGO_LLVM_COV_VERSION)
 
+# `notices-check` is in here because the `server` job runs it, and the header above promises a
+# green `make ci` means a green CI run. It costs `make setup` — cargo-about — the same way
+# `coverage` costs nightly and cargo-llvm-cov, and it is the target most likely to fail on a
+# branch that touched `Cargo.toml`, which is exactly when nobody thinks to run it.
+#
+# `canary` is deliberately not in here. Everything above is hermetic: it needs the source tree
+# and nothing else. The canary clones 12 MB from GitHub, so folding it in would make every local
+# `make ci` need a network — and a target that fails on a plane teaches people to skip it. CI
+# runs it as its own job, where the name in the checks list says what it covers.
 ## ci: everything CI checks about the server
 .PHONY: ci
-ci: fmt-check lint test coverage
+ci: fmt-check lint test notices-check coverage
 
 ## clean: cargo clean
 .PHONY: clean

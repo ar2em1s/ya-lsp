@@ -7,8 +7,19 @@
 
 /** The server's `PartialConfig`. Field names are its wire format, not VS Code's. */
 export interface ServerOptions {
-  index?: { max_files?: number };
-  gems?: { enabled?: boolean; default_gems?: boolean; ruby_version?: string };
+  index?: {
+    include?: string[];
+    exclude?: string[];
+    load_paths?: string[];
+    max_files?: number;
+    respect_gitignore?: boolean;
+  };
+  gems?: {
+    enabled?: boolean;
+    default_gems?: boolean;
+    ruby_version?: string;
+    paths?: string[];
+  };
   rbs?: { enabled?: boolean; stdlib?: boolean; path?: string };
   diagnostics?: { enabled?: boolean; rules?: Record<string, string> };
 }
@@ -28,6 +39,22 @@ export interface Settings {
 }
 
 /**
+ * A list setting, or `undefined` unless the user set one whose shape this file can vouch for.
+ *
+ * There is deliberately no empty-value case here, unlike `gems.rubyVersion` and `rbs.path`:
+ * `""` is how those two spell "work it out yourself", but `[]` is a value — no excludes, no
+ * extra load paths, no extra gem roots. `index.include = []` is the one that indexes nothing,
+ * and the server already says so out loud; dropping it here would turn a reported mistake into
+ * a setting that silently does nothing.
+ */
+function strings(settings: Settings, key: string): string[] | undefined {
+  const value = settings.explicit<unknown>(key);
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string')
+    ? (value as string[])
+    : undefined;
+}
+
+/**
  * The `initializationOptions` for a workspace folder, or `undefined` when there is nothing to
  * say.
  *
@@ -37,9 +64,29 @@ export interface Settings {
 export function serverOptions(settings: Settings): ServerOptions | undefined {
   const options: ServerOptions = {};
 
+  const index: NonNullable<ServerOptions['index']> = {};
+  const include = strings(settings, 'index.include');
+  if (include) {
+    index.include = include;
+  }
+  const exclude = strings(settings, 'index.exclude');
+  if (exclude) {
+    index.exclude = exclude;
+  }
+  const loadPaths = strings(settings, 'index.loadPaths');
+  if (loadPaths) {
+    index.load_paths = loadPaths;
+  }
   const maxFiles = settings.explicit<number>('index.maxFiles');
   if (typeof maxFiles === 'number') {
-    options.index = { max_files: maxFiles };
+    index.max_files = maxFiles;
+  }
+  const respectGitignore = settings.explicit<boolean>('index.respectGitignore');
+  if (typeof respectGitignore === 'boolean') {
+    index.respect_gitignore = respectGitignore;
+  }
+  if (Object.keys(index).length > 0) {
+    options.index = index;
   }
 
   const gems: NonNullable<ServerOptions['gems']> = {};
@@ -56,6 +103,10 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
   const rubyVersion = settings.explicit<string>('gems.rubyVersion');
   if (typeof rubyVersion === 'string' && rubyVersion.trim() !== '') {
     gems.ruby_version = rubyVersion.trim();
+  }
+  const gemPaths = strings(settings, 'gems.paths');
+  if (gemPaths) {
+    gems.paths = gemPaths;
   }
   if (Object.keys(gems).length > 0) {
     options.gems = gems;
@@ -109,11 +160,14 @@ export function serverEnvironment(
   base: NodeJS.ProcessEnv
 ): NodeJS.ProcessEnv {
   const level = settings.explicit<string>('logLevel');
-  if (!level || level === 'off') {
+  if (!level) {
     // Leave an inherited `YA_LSP_LOG` alone when the setting says nothing; someone debugging
     // from a terminal should not have it silently overridden by a default.
     return { ...base };
   }
+  // `off` included, and that is the fix rather than an oversight. It is a valid `EnvFilter`
+  // directive; treating it as "the user said nothing" fell through to the server's own fallback,
+  // which is `info` — louder than the `error` or `warn` the same user could have picked instead.
   return { ...base, YA_LSP_LOG: `ya_lsp=${level}` };
 }
 

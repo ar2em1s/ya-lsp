@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3a59f57908c681d7e1597e27315b6b74314366093b23af079d144f0df6723bc5 # shrinks to text = "\r", encoding = Utf8
+cc 670d2c353b6f4c729d35cbbad47ce9e0641329f0ca6066eef4510d153b8be8de # shrinks to start = "ae\u{301}\r\n\r\naax = 1aaa😀日本acaféax = 1ae\u{301}ax = 1\r\n", encoding = Utf8, changes = [(3758321431429654813, 3647023284003026045, "😀a\t\t日本caféx = 1"), (3707151623099839161, 1897057461737572835, "a\taa\t\r"), (2305712301258067519, 0, "")]

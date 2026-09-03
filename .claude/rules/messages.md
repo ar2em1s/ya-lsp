@@ -23,6 +23,16 @@ paths:
   {method} yet"` and `"request cancelled by the client"` answer one request, are addressed to the
   client rather than to a person, and most editors only log them.
 
+- **The one exception, and it is deliberate: a rename refusal is about a single request.** The
+  rule above would put the seven `rename_*` sentences outside this module, and they are in it
+  anyway, because an LSP error response is the wrong carrier for them — most editors only log
+  those — and a bare `null` makes the editor say only that nothing can be renamed here. The user
+  pressed a key asking for that rename, so they are owed which of the four reasons applies and
+  what to do next, and `window/showMessage` is the only thing that carries it. What earns the
+  exception is the deliberate keystroke: it is not a rule that a per-request message is fine, it
+  is that this request has a user standing behind it. Everything answered `null` because the
+  cursor is simply on nothing says nothing at all.
+
 - **The message is plain text, in both places it lands.** It goes out as `window/showMessage`
   and as a `tracing::warn!` line, and no client renders markdown in a notification: a backtick is
   a backtick on the screen. Name a command as `bundle install` and a setting as `gems.paths`.

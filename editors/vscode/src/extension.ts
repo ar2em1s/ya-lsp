@@ -131,11 +131,12 @@ async function start(folder: vscode.WorkspaceFolder): Promise<void> {
     workspaceFolder: folder,
     outputChannel: channelFor(folder),
     initializationOptions: serverOptions(settings),
-    // No `synchronize.fileEvents`. The server registers its own `ya-lsp.toml` watcher through
-    // `client/registerCapability` as of v0.2.0, which is what makes reload work in editors that
-    // have no extension to bring one — and the client installs that registration itself. Passing
-    // one here as well would mean two watchers on one file, so two `didChangeWatchedFiles` per
-    // save, and a reload drops the whole graph and re-runs the gem index each time.
+    // No `synchronize.fileEvents`. The server registers its own watchers through
+    // `client/registerCapability` — `ya-lsp.toml` as of v0.2.0, and everything `index.include`
+    // covers as of v0.3.0 — which is what makes reload and on-disk freshness work in editors
+    // that have no extension to bring one, and the client installs that registration itself.
+    // Passing one here as well would mean two watchers on every file, so two
+    // `didChangeWatchedFiles` per save and every file indexed twice per `git checkout`.
   };
 
   // The id is also the settings prefix the client reads `trace.server` from.

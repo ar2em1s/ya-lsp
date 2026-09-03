@@ -11,6 +11,12 @@ Driving the binary against a real Ruby repository by hand, and which number matt
 milestone. None of this is needed to edit the crate; it is how a claim about speed or degradation
 gets checked.
 
+**One of these runs is no longer manual.** `make canary` opens a pinned commit of a real Rails
+application and asserts on own-code indexing, diagnostics and a ceiling on the cold index; CI runs
+it on every push. It does *not* cover gems, because that needs a `bundle install` — so everything
+below about gem directories, degraded Ruby versions and the steady resolve is still done by hand,
+and is the part a green canary says nothing about. See `canary.md`.
+
 Manual smoke test against a real Ruby repo — drives the binary over stdio and reports index time:
 
 ```bash

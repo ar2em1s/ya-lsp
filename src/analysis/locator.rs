@@ -11,7 +11,7 @@
 //! inside a method reference (4 bytes), the `shout` definition (70 bytes), and the `Person`
 //! definition (394 bytes) all at once. The innermost one is what the user pointed at.
 
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use rubydex::{
     model::{
@@ -174,6 +174,32 @@ pub fn resolve(graph: &Graph, located: &Located<'_>) -> Resolution {
     }
 }
 
+/// The method a call written at `offset` resolves to, and only when it resolved exactly.
+///
+/// The one gate on everything that shows a *signature* for a call rather than a place to jump
+/// to: completion's keyword arguments and `textDocument/signatureHelp` both fire from here.
+/// A name-based match would put another class's parameters under the cursor, and unlike a wrong
+/// navigation that is a wrong answer the user cannot see is wrong — it is syntactically valid.
+///
+/// The redirect is deliberately kept. `Foo.new(` resolves to `Foo#initialize`, whose parameters
+/// are the ones the call actually takes; `references` is the caller that must not have it, and
+/// it reads [`Resolution`] directly.
+#[must_use]
+pub fn precise_call(graph: &Graph, uri_id: UriId, offset: u32) -> Option<DeclarationId> {
+    locate(graph, uri_id, offset)
+        .into_iter()
+        .find_map(|located| match located.target {
+            Target::Call(_) => {
+                let resolution = resolve(graph, &located);
+                resolution
+                    .precise
+                    .then(|| resolution.declarations.into_iter().next())
+                    .flatten()
+            }
+            _ => None,
+        })
+}
+
 /// Every definition of a declaration, in a stable order.
 ///
 /// The order matters twice over: goto-definition jumps to the first entry, and hover reads the
@@ -199,6 +225,45 @@ pub fn definitions_of(graph: &Graph, declaration_id: DeclarationId) -> Vec<&Defi
         (uri, definition.offset().start(), definition.offset().end())
     });
     definitions
+}
+
+/// Which single definition of a declaration a list should point at.
+///
+/// The user's own code wins when a name is defined in both: opening a Rails app and searching
+/// for `ApplicationRecord` should land in `app/models`, not in whichever gem reopens it.
+/// Otherwise it is the first in [`definitions_of`]'s stable order, so the answer never moves
+/// between runs.
+///
+/// Shared by the symbol picker and by the type hierarchy, because "which of the two hundred
+/// places `ActiveRecord::Base` is reopened does this row mean" is one question, and two answers
+/// to it would put a symbol in a different file depending on which list it was found in.
+#[must_use]
+pub fn preferred_definition<'g>(
+    graph: &'g Graph,
+    declaration_id: DeclarationId,
+    own: &HashSet<UriId>,
+) -> Option<&'g Definition> {
+    let definitions = definitions_of(graph, declaration_id);
+    definitions
+        .iter()
+        .find(|definition| own.contains(definition.uri_id()))
+        .or(definitions.first())
+        .copied()
+}
+
+/// Whether any of a declaration's definitions is in the user's own code.
+///
+/// `any`, not "the first one": a class the project reopens is the project's, even when the gem
+/// that first defined it sorts ahead of it. Both callers rank by it, so it decides where a name
+/// appears in the picker *and* where it appears in a capped list of subtypes.
+#[must_use]
+pub fn declared_in(graph: &Graph, declaration: &Declaration, own: &HashSet<UriId>) -> bool {
+    declaration.definitions().iter().any(|id| {
+        graph
+            .definitions()
+            .get(id)
+            .is_some_and(|definition| own.contains(definition.uri_id()))
+    })
 }
 
 /// Every place a declaration is written, in the same order as [`definitions_of`].
@@ -244,11 +309,21 @@ pub(super) fn spans(definition: &Definition) -> ((u32, u32), (u32, u32)) {
         return (full, full);
     };
     let name = (name.start(), name.end());
-    if name.0 >= full.0 && name.1 <= full.1 {
+    if nests(full, name) {
         (full, name)
     } else {
         (full, full)
     }
+}
+
+/// Whether `inner` sits inside `outer`.
+///
+/// One predicate rather than two: `spans` above needs it for the pair the protocol requires to
+/// nest, and `ranges::selection_chain` needs it for the chain the protocol *defines* as nesting.
+/// Both are guarding against the same parser recovery, and a containment test written twice is a
+/// containment test that will one day disagree with itself.
+pub(super) const fn nests(outer: (u32, u32), inner: (u32, u32)) -> bool {
+    inner.0 >= outer.0 && inner.1 <= outer.1
 }
 
 /// The file a `require "..."` names, if the graph has indexed it.

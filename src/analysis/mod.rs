@@ -14,14 +14,20 @@
 pub mod completion;
 pub mod cursor;
 pub mod diagnostics;
+pub mod hierarchy;
+pub mod highlight;
 pub mod hover;
 pub mod locator;
 pub mod position;
 pub mod progress;
+pub mod ranges;
 pub mod references;
+pub mod rename;
 pub mod render;
 pub mod requires;
+pub mod scopes;
 pub mod search;
+pub mod signature_help;
 pub mod signatures;
 pub mod symbols;
 
@@ -37,9 +43,12 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use lsp_server::{ErrorCode, Message, Request, RequestId, Response};
 use lsp_types::{
     ClientCapabilities, CompletionItem, CompletionItemKind, CompletionItemTag, CompletionList,
-    CompletionResponse, CompletionTextEdit, DiagnosticSeverity, DocumentSymbolResponse,
-    Documentation, GotoDefinitionResponse, Hover, HoverContents, Location, LocationLink,
-    MarkupContent, MarkupKind, SymbolInformation, TextEdit, WorkspaceSymbolResponse,
+    CompletionResponse, CompletionTextEdit, DiagnosticSeverity, DocumentHighlight,
+    DocumentSymbolResponse, Documentation, FoldingRange, GotoDefinitionResponse, Hover,
+    HoverContents, Location, LocationLink, MarkupContent, MarkupKind, OneOf,
+    OptionalVersionedTextDocumentIdentifier, PrepareRenameResponse, SelectionRange, SignatureHelp,
+    SymbolInformation, TextDocumentEdit, TextEdit, TypeHierarchyItem, WorkspaceEdit,
+    WorkspaceSymbolResponse,
 };
 use rubydex::{
     indexing::{self, IndexerBackend, LanguageId},
@@ -102,6 +111,23 @@ const MAX_REFERENCES: usize = 10_000;
 /// reach before the `isIncomplete` flag makes it ask again.
 const MAX_COMPLETION_ITEMS: usize = 512;
 
+/// How many subtypes one `typeHierarchy/subtypes` answers with.
+///
+/// Finding them is free — rubydex maintains the reverse index as it linearizes, so the lookup is
+/// the same work for three descendants as for thirty thousand. What costs is the *rows*: each one
+/// has to be placed in its own file, and that is a read and a line index per file. Measured on
+/// solargraph with Ruby's own signatures in: 0.07 ms median over 899 of the project's own
+/// namespaces, 4.3 ms for `StandardError`'s 458 rows, 25.1 ms for `Object`'s 1,978. So the cap
+/// bounds the response *and* the only part of this request that scales.
+///
+/// The number is the measured worst *legitimate* question plus headroom rather than a guess.
+/// `StandardError`'s 458 is a real question with a real answer and is what ruled out 512;
+/// `Object`, `Kernel` and `BasicObject` come to 1,978, 1,978 and 1,989, and every namespace
+/// solargraph defines itself is at most 65. All of those fit. What does not is a Rails bundle,
+/// where the three roots are an order of magnitude larger and the answer would be megabytes and
+/// a quarter of a second; that is the case this exists for, and reaching it says so out loud.
+const MAX_SUBTYPES: usize = 2048;
+
 /// The `$/progress` token for the gem index. A fixed string is fine — only one runs at a time.
 const GEM_PROGRESS_TOKEN: &str = "ya-lsp/index-gems";
 
@@ -129,6 +155,18 @@ pub enum Task {
         uri: DocUri,
     },
     Request(Request),
+    /// Paths a `workspace/didChangeWatchedFiles` named, deduplicated, with `ya-lsp.toml`
+    /// already split off — that one is [`Task::ReloadConfig`], which is a different order of
+    /// magnitude of work.
+    ///
+    /// No change *kind* is carried. The client sends created, changed and deleted, and all
+    /// three are answered by looking: a file that is there is indexed and a file that is not is
+    /// dropped. That is not a shortcut — during a branch switch the events and the filesystem
+    /// genuinely disagree, and a `Deleted` for a path git has already written back would
+    /// otherwise drop a file that exists.
+    WatchedFiles {
+        uris: Vec<DocUri>,
+    },
     /// `ya-lsp.toml` changed on disk.
     ReloadConfig,
     /// The client changed the settings it sent as `initializationOptions`.
@@ -138,6 +176,17 @@ pub enum Task {
     ChangeConfig {
         options: Option<serde_json::Value>,
     },
+    /// Kill the analysis thread, from a test.
+    ///
+    /// A stand-in in the same sense [`crash_the_next_resolve_if_asked`] is, and for a narrower
+    /// reason: the panic [`AnalysisHandle::join`] reports is by construction the *unforeseen*
+    /// one — everything foreseen here is either handled or caught in [`Analysis::resolve`] — so
+    /// there is no input that provokes it and nothing to reproduce. What the arm is worth
+    /// pinning is ya-lsp's half: that a thread which died is noticed at all rather than joined
+    /// silently, which is the difference between one line in the log and a server that answers
+    /// nothing for the rest of the session with nothing said anywhere.
+    #[cfg(test)]
+    Panic,
 }
 
 /// One content change from `textDocument/didChange`.
@@ -162,6 +211,11 @@ pub struct ClientSupport {
     /// `window/workDoneProgress` — the client will render a progress stream if we open one.
     /// Without it, gem indexing has to happen silently.
     pub work_done_progress: bool,
+    /// A `WorkspaceEdit` may be sent as `documentChanges` rather than as the older `changes`
+    /// map. Worth negotiating rather than always sending the older shape, because the richer
+    /// one carries the version of each file the edit was computed against — so a client can
+    /// reject a rename the user has typed past instead of applying it to moved text.
+    pub versioned_edits: bool,
 }
 
 impl ClientSupport {
@@ -181,6 +235,12 @@ impl ClientSupport {
                 .window
                 .as_ref()
                 .and_then(|it| it.work_done_progress)
+                .unwrap_or(false),
+            versioned_edits: capabilities
+                .workspace
+                .as_ref()
+                .and_then(|it| it.workspace_edit.as_ref())
+                .and_then(|it| it.document_changes)
                 .unwrap_or(false),
         }
     }
@@ -269,6 +329,28 @@ pub fn spawn(
     AnalysisHandle { sender, thread }
 }
 
+// The real trigger for the recovery below is rubydex's, and it needs a couple of hundred files
+// of a real project to fire — solargraph v0.58.2, minus its own
+// `lib/solargraph/yard_map/to_method.rb` — which is not something to vendor into this repository
+// to hold one test up. So what is pinned here is ya-lsp's half of it, which is the half ya-lsp
+// can be wrong about: that the panic is caught, that the user is told, that the graph comes
+// back, and that a rebuild which crashes again stops rather than recurring.
+#[cfg(test)]
+thread_local! {
+    /// How many of the next resolves a test has asked to crash.
+    static RESOLVES_TO_CRASH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn crash_the_next_resolve_if_asked() {
+    let remaining = RESOLVES_TO_CRASH.get();
+    if remaining > 0 {
+        RESOLVES_TO_CRASH.set(remaining - 1);
+        panic!("a stand-in for rubydex resolution.rs:748");
+    }
+}
+
 /// A buffer the editor has open, which shadows whatever is on disk.
 ///
 /// We keep our own copy of the text because rubydex's `Document` exposes a `line_index()` but
@@ -312,6 +394,24 @@ struct Analysis {
     resolve_at: Option<Instant>,
     /// Gem files still waiting to be indexed in the background.
     gem_work: Option<GemIndexing>,
+    /// How many of the user's own files the index holds, against `index.max_files`.
+    ///
+    /// The walk's cap has to keep applying after the walk: a watcher can add files the walk
+    /// stopped before, and the cap exists because a pathological repository exists. Counted as
+    /// files come and go rather than recomputed, because the graph has no cheap answer — by the
+    /// time a bundle is in, asking it means walking tens of thousands of documents, and a
+    /// branch switch would ask once per changed file.
+    workspace_files: usize,
+    /// Whether a rebuild after a resolver panic is already under way.
+    ///
+    /// Guards the one recursion that matters: the rebuild indexes the workspace, indexing
+    /// resolves, and a rebuild that panics again would rebuild again forever.
+    recovering: bool,
+    /// Whether the user has already been told the index is full, since the last reload.
+    ///
+    /// Said once. A `git checkout` in a workspace that is over the cap would otherwise raise
+    /// the same notification on every branch switch for the life of the process.
+    index_full_reported: bool,
     /// Every workspace document URI starts with this. Used to keep gem diagnostics off the
     /// screen without parsing a URL per diagnostic.
     workspace_prefix: String,
@@ -362,6 +462,9 @@ impl Analysis {
             foreign_prefixes: Vec::new(),
             resolve_at: None,
             gem_work: None,
+            workspace_files: 0,
+            recovering: false,
+            index_full_reported: false,
             workspace_prefix,
             published: HashMap::new(),
         }
@@ -379,6 +482,10 @@ impl Analysis {
         }
 
         let count = discovery.files.len();
+        // What the cap is measured against from here on. `truncated` already said its piece;
+        // this is the same budget, carried forward so that a file created later still meets it.
+        self.workspace_files = count;
+        self.index_full_reported = discovery.truncated;
         // `index.include` is `**/*.rb` by default, so this usually finds nothing to do. It is
         // not usually: a project that keeps its own `sig/` and adds `sig/**/*.rbs` to the
         // include reaches this path and no other, and an `interface` there lands its members on
@@ -405,6 +512,19 @@ impl Analysis {
             // Gem indexing runs only in the gaps. Checking the queue first is what makes
             // "background" true rather than aspirational: with work waiting, the editor's
             // request goes first and the bundle waits.
+            //
+            // The `continue` is also why an armed `resolve_at` is not looked at until the
+            // background work runs out. An edit made during a cold start is indexed at once —
+            // it is a task, and tasks come first — but the resolve its debounce armed waits for
+            // the bundle, so the squiggle for what was typed waits with it. That is the same
+            // trade `step_gem_indexing` states, "the next request resolves what is there", and
+            // an editor asks something after nearly every keystroke; the delay is bounded by
+            // the background index, a quarter of a second for a 151-gem bundle. Reversing it —
+            // settling an overdue resolve before the next batch — costs one resolve per 150 ms
+            // of typing against a mid-index resolve measured at ~100 ms p90, so it is a
+            // decision for a measurement on a real bundle rather than a hunch.
+            // `threaded_tests::push_diagnostics_for_an_edit_wait_for_the_background_index`
+            // holds the current answer, so changing it fails there and nowhere else.
             if receiver.is_empty() && self.step_gem_indexing() {
                 continue;
             }
@@ -512,6 +632,7 @@ impl Analysis {
                 // The buffer we already indexed is what got written, so there is nothing to do.
                 tracing::trace!("saved {uri}");
             }
+            Task::WatchedFiles { uris } => self.refresh(uris),
             Task::ChangeConfig { options } => {
                 self.workspace.set_options(options);
                 self.handle(Task::ReloadConfig);
@@ -522,33 +643,11 @@ impl Analysis {
                     self.show_warning(&problem);
                 }
                 tracing::info!("reloaded configuration; re-indexing workspace");
-                self.graph = Graph::new();
-                // Whatever was still queued refers to the old configuration's gem roots, and
-                // the graph it was going to be indexed into no longer exists.
-                if let Some(work) = self.gem_work.take()
-                    && let Some(progress) = work.progress
-                {
-                    progress.end("cancelled".to_owned());
-                }
-                self.foreign_prefixes.clear();
-                self.index_workspace();
-                // Open buffers shadow disk, so replay them over the freshly indexed tree.
-                let buffers: Vec<(DocUri, String)> = self
-                    .open
-                    .iter()
-                    .map(|(uri, document)| (uri.clone(), document.text.text().to_owned()))
-                    .collect();
-                for (uri, text) in buffers {
-                    self.index_buffer(&uri, &text);
-                }
-                // Unconditionally, even with no buffers to replay: the reload may have changed
-                // which rules are on, or dropped files from the index, and both change what the
-                // editor should be showing. Without this a project with no open files keeps
-                // displaying the diagnostics from the previous config forever.
-                self.mark_dirty();
-                self.queue_background_indexing();
+                self.rebuild();
             }
             Task::Request(request) => self.serve(request),
+            #[cfg(test)]
+            Task::Panic => panic!("the analysis thread, because a test asked it to"),
         }
     }
 
@@ -773,6 +872,146 @@ impl Analysis {
         self.mark_dirty();
     }
 
+    /// Throw the graph away and build it again: the workspace, the open buffers, the gems.
+    ///
+    /// Shared by `ReloadConfig` — where the configuration decides what belongs in the index, so
+    /// nothing computed under the old one can be trusted — and by the recovery in
+    /// [`Analysis::resolve`], where the graph is in an unknown state and starting over is the
+    /// only honest answer.
+    fn rebuild(&mut self) {
+        self.graph = Graph::new();
+        // Whatever was still queued refers to the old configuration's gem roots, and the graph
+        // it was going to be indexed into no longer exists.
+        if let Some(work) = self.gem_work.take()
+            && let Some(progress) = work.progress
+        {
+            progress.end("cancelled".to_owned());
+        }
+        self.foreign_prefixes.clear();
+        self.index_workspace();
+        // Open buffers shadow disk, so replay them over the freshly indexed tree.
+        let buffers: Vec<(DocUri, String)> = self
+            .open
+            .iter()
+            .map(|(uri, document)| (uri.clone(), document.text.text().to_owned()))
+            .collect();
+        for (uri, text) in buffers {
+            self.index_buffer(&uri, &text);
+        }
+        // Unconditionally, even with no buffers to replay: a reload may have changed which
+        // rules are on, or dropped files from the index, and both change what the editor should
+        // be showing. Without this a project with no open files keeps displaying the
+        // diagnostics from the previous configuration forever.
+        self.mark_dirty();
+        self.queue_background_indexing();
+    }
+
+    /// Bring the index back in line with what is on disk, for paths a watcher named.
+    ///
+    /// Four rules, and each is a way to be wrong that nothing else would catch:
+    ///
+    /// - **A buffer beats the disk.** A rebase under an open file must not overwrite what the
+    ///   editor is showing. `didClose` already implements exactly this precedence in the other
+    ///   direction — fall back to disk only once the buffer is gone.
+    /// - **A gem is not the user's code.** Watchers are the client's and shared, so a change
+    ///   inside a vendored bundle can arrive; `is_own_code` is the test that is right when the
+    ///   bundle lives inside the workspace root.
+    /// - **The walk decides what belongs.** `Workspace::indexes` is the same rules the startup
+    ///   walk applied, so a file the user excluded stays excluded however it is written.
+    /// - **`index.max_files` still applies**, because a pathological repository exists and the
+    ///   cap is the only thing standing between it and the process.
+    fn refresh(&mut self, uris: Vec<DocUri>) {
+        let started = Instant::now();
+        let max_files = self.workspace.config().index.max_files;
+        let (mut indexed, mut forgotten, mut full) = (0_usize, 0_usize, false);
+
+        for uri in uris {
+            if self.open.contains_key(&uri) {
+                // The editor's copy is newer than anything on disk by definition, and it is
+                // what every answer is already computed against.
+                tracing::trace!(
+                    "{uri} changed on disk but is open in the editor; keeping the buffer"
+                );
+                continue;
+            }
+            if !self.is_own_code(uri.as_str()) {
+                tracing::trace!("{uri} changed, but it is not this project's code to index");
+                continue;
+            }
+
+            // Gone, or never a file — `didClose`'s own test, for the same reason. Whether the
+            // workspace *would* index it is not a question that can be asked of a path that is
+            // not there, and it does not need to be: a document the graph holds is one that was
+            // indexed, so it is one to drop, and one it does not hold is nothing at all.
+            let Some(path) = uri.to_path().filter(|path| path.is_file()) else {
+                if self.forget_indexed(&uri) {
+                    forgotten += 1;
+                }
+                continue;
+            };
+            if !self.workspace.indexes(&path) {
+                tracing::trace!("{uri} changed but is not a file this workspace indexes");
+                continue;
+            }
+            let known = self.indexed(&uri);
+            if !known && self.workspace_files >= max_files {
+                full = true;
+                continue;
+            }
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::warn!(
+                        "could not read {} after a watched change: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if !known {
+                self.workspace_files += 1;
+            }
+            // The same entry point an open buffer takes, so the `.rbs` interface rule is one
+            // rule: a signature file that reaches the graph through the watcher must not put
+            // back the `Object` members the indexing path took out.
+            self.index_buffer(&uri, &text);
+            indexed += 1;
+        }
+
+        if full && !self.index_full_reported {
+            self.index_full_reported = true;
+            let message = messages::index_full(max_files);
+            tracing::warn!("{message}");
+            self.show_warning(&message);
+        }
+        if indexed + forgotten > 0 {
+            tracing::debug!(
+                "re-indexed {indexed} and dropped {forgotten} watched files in {:.2?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    /// Whether the graph currently holds a document for `uri`.
+    ///
+    /// One hash of the URI string, which is what makes it affordable per changed file; the
+    /// alternative — asking the workspace walk — costs a `read_dir` per directory.
+    fn indexed(&self, uri: &DocUri) -> bool {
+        self.graph
+            .documents()
+            .contains_key(&UriId::from(uri.as_str()))
+    }
+
+    /// Drop `uri` from the graph if it holds it, and say whether it did.
+    fn forget_indexed(&mut self, uri: &DocUri) -> bool {
+        if !self.indexed(uri) {
+            return false;
+        }
+        self.forget(uri);
+        self.workspace_files = self.workspace_files.saturating_sub(1);
+        true
+    }
+
     fn forget(&mut self, uri: &DocUri) {
         self.graph.delete_document(uri.as_str());
         self.mark_dirty();
@@ -794,10 +1033,50 @@ impl Analysis {
         self.publish_diagnostics();
     }
 
+    /// Link the graph — and survive rubydex panicking while it does.
+    ///
+    /// rubydex 0.2.5 panics inside `Resolver::resolve` after a document is deleted:
+    /// `Graph::delete_document` invalidates first and untracks the document's strings second, so
+    /// the work the invalidation queued can name a string that is no longer there, and
+    /// `resolution.rs:748` unwraps it. Reproduced by deleting
+    /// `lib/solargraph/yard_map/to_method.rb` from a solargraph v0.58.2 checkout; reachable in
+    /// v0.2.0 already, through `didClose` on a file that is gone, and routine from v0.3.0
+    /// because a `git checkout` that removes a file is an ordinary Tuesday.
+    ///
+    /// There is nothing to upgrade to — `=0.2.5` is the only published crate, which is why the
+    /// v0.3.0 plan's finding 1 says the alternative is a fork — so it is contained here instead.
+    /// Left alone it is the worst failure this server has: the analysis thread dies, the editor
+    /// keeps sending requests, and a language server that answers nothing at all looks exactly
+    /// like one that is thinking. A graph half-way through a resolve is in an unknown state, so
+    /// the only honest recovery is to throw it away and index everything again.
     fn resolve(&mut self) {
         let started = Instant::now();
-        Resolver::new(&mut self.graph).resolve();
-        tracing::debug!("resolved in {:.2?}", started.elapsed());
+        // The panic message itself still reaches stderr through the default hook, which is
+        // where the rubydex file and line a report needs are written.
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            crash_the_next_resolve_if_asked();
+            Resolver::new(&mut self.graph).resolve();
+        }))
+        .is_err();
+        if !crashed {
+            tracing::debug!("resolved in {:.2?}", started.elapsed());
+            return;
+        }
+        if self.recovering {
+            // The rebuild crashed too, so rebuilding again would only crash again. The graph
+            // keeps whatever it managed to link; every feature degrades rather than stopping.
+            tracing::error!(
+                "linking the graph crashed again during recovery; leaving the index as it is"
+            );
+            return;
+        }
+        let message = messages::index_rebuilt();
+        tracing::warn!("{message}");
+        self.show_warning(&message);
+        self.recovering = true;
+        self.rebuild();
+        self.recovering = false;
     }
 
     // -----------------------------------------------------------------------
@@ -1000,7 +1279,12 @@ impl Analysis {
         // Answer against a settled graph: a stale answer is worse than a slightly slower one.
         // This is `dirty`, not `resolve_at`, because background gem indexing deliberately does
         // not arm the timer — but its files are still unlinked until something resolves them.
-        if self.dirty {
+        //
+        // Two requests are exempt, because their answer does not come from the graph at all;
+        // waiting for a resolve they never read is a cost paid on every keystroke. Measured on
+        // solargraph's 1,058-line `api_map.rb`, asking for folding ranges after each character
+        // of a new method as an editor does: 14.3 ms a keystroke while settling, 0.1 ms without.
+        if self.dirty && needs_the_graph(&request.method) {
             self.settle();
         }
 
@@ -1010,7 +1294,20 @@ impl Analysis {
             "textDocument/hover" => reply(&id, self.hover(request.params)),
             "textDocument/definition" => reply(&id, self.goto_definition(request.params)),
             "textDocument/references" => reply(&id, self.references(request.params)),
+            "textDocument/documentHighlight" => {
+                reply(&id, self.document_highlights(request.params))
+            }
+            "textDocument/selectionRange" => reply(&id, self.selection_ranges(request.params)),
+            "textDocument/foldingRange" => reply(&id, self.folding_ranges(request.params)),
             "workspace/symbol" => reply(&id, self.workspace_symbols(request.params)),
+            "textDocument/prepareTypeHierarchy" => {
+                reply(&id, self.prepare_type_hierarchy(request.params))
+            }
+            "typeHierarchy/supertypes" => reply(&id, self.supertypes(request.params)),
+            "typeHierarchy/subtypes" => reply(&id, self.subtypes(request.params)),
+            "textDocument/signatureHelp" => reply(&id, self.signature_help(request.params)),
+            "textDocument/prepareRename" => reply(&id, self.prepare_rename(request.params)),
+            "textDocument/rename" => reply(&id, self.rename(request.params)),
             "textDocument/completion" => reply(&id, self.completion(request.params)),
             "completionItem/resolve" => reply(&id, self.resolve_completion(request.params)),
             method => Response::new_err(
@@ -1070,6 +1367,89 @@ impl Analysis {
                     })
                 })
         })?
+    }
+
+    /// `textDocument/signatureHelp`.
+    ///
+    /// Answered from the buffer rather than from the graph's copy of it, like completion and
+    /// for the same reason: the call under the cursor is half-written by definition, and the
+    /// argument the user is on is a fact about the text as it stands this keystroke.
+    fn signature_help(&self, params: serde_json::Value) -> Option<SignatureHelp> {
+        let params: lsp_types::SignatureHelpParams = parse_params(params)?;
+        let position = params.text_document_position_params.position;
+        let uri = DocUri::from_lsp(&params.text_document_position_params.text_document.uri)?;
+
+        self.with_text(&uri, |text| {
+            let call = cursor::call_at(text.text(), text.offset_at(position))?;
+            let method = locator::precise_call(&self.graph, UriId::from(uri.as_str()), call.name)?;
+            signature_help::help(&self.graph, method, &call.active)
+        })?
+    }
+
+    /// `textDocument/documentHighlight`.
+    ///
+    /// Answered from the buffer rather than from the graph's copy of it, like completion and
+    /// signature help: the half of the answer that comes from `scopes` is a fact about the text
+    /// as it stands this keystroke, and a highlight drawn over stale offsets lands on the wrong
+    /// words rather than on none.
+    fn document_highlights(&self, params: serde_json::Value) -> Option<Vec<DocumentHighlight>> {
+        let params: lsp_types::DocumentHighlightParams = parse_params(params)?;
+        let position = params.text_document_position_params.position;
+        let uri = DocUri::from_lsp(&params.text_document_position_params.text_document.uri)?;
+
+        let found = self.with_text(&uri, |text| {
+            let found = highlight::find(
+                &self.graph,
+                UriId::from(uri.as_str()),
+                text.text(),
+                text.offset_at(position),
+            );
+            found
+                .into_iter()
+                .map(|at| DocumentHighlight {
+                    range: text.range_at(at.start, at.end),
+                    kind: Some(at.kind),
+                })
+                .collect::<Vec<_>>()
+        })?;
+
+        // `null` rather than `[]`, for the same reason completion answers one inside a comment:
+        // it is what tells the client nothing was known here, so it may fall back to matching
+        // words itself.
+        (!found.is_empty()).then_some(found)
+    }
+
+    /// `textDocument/selectionRange`.
+    ///
+    /// One chain per position asked about, in the order asked: the protocol pairs the two arrays
+    /// by index and has no spelling for "not this one", so every position answers — with the
+    /// buffer itself where there was nothing else to say.
+    fn selection_ranges(&self, params: serde_json::Value) -> Option<Vec<SelectionRange>> {
+        let params: lsp_types::SelectionRangeParams = parse_params(params)?;
+        let uri = DocUri::from_lsp(&params.text_document.uri)?;
+
+        let found = self.with_text(&uri, |text| {
+            params
+                .positions
+                .iter()
+                .map(|&position| ranges::selection_range(text, text.offset_at(position)))
+                .collect::<Vec<_>>()
+        })?;
+
+        (!found.is_empty()).then_some(found)
+    }
+
+    /// `textDocument/foldingRange`.
+    ///
+    /// `null` rather than `[]`, and here it matters more than anywhere else: a client that has a
+    /// folding provider stops guessing from indentation, so an empty array would take away the
+    /// fallback *and* put nothing in its place. A `null` can only give it back.
+    fn folding_ranges(&self, params: serde_json::Value) -> Option<Vec<FoldingRange>> {
+        let params: lsp_types::FoldingRangeParams = parse_params(params)?;
+        let uri = DocUri::from_lsp(&params.text_document.uri)?;
+        let found = self.with_text(&uri, ranges::folds)?;
+
+        (!found.is_empty()).then_some(found)
     }
 
     /// `textDocument/definition`.
@@ -1231,6 +1611,286 @@ impl Analysis {
     }
 
     // -----------------------------------------------------------------------
+    // Type hierarchy
+    // -----------------------------------------------------------------------
+
+    /// `textDocument/prepareTypeHierarchy`.
+    ///
+    /// The item this hands back is what the two follow-ups arrive holding, so it carries the
+    /// declaration in `data` — as a decimal string, for `completionItem/resolve`'s reason: a
+    /// `DeclarationId` is a 64-bit hash and JSON numbers are doubles. Unlike a completion item
+    /// this one survives a config reload, because the hash is of the *name*: the graph the client
+    /// was looking at can be gone and the id still finds the class.
+    fn prepare_type_hierarchy(&self, params: serde_json::Value) -> Option<Vec<TypeHierarchyItem>> {
+        let params: lsp_types::TypeHierarchyPrepareParams = parse_params(params)?;
+        let position = params.text_document_position_params.position;
+        let uri = DocUri::from_lsp(&params.text_document_position_params.text_document.uri)?;
+
+        let items = self.with_text(&uri, |text| {
+            hierarchy::prepare(
+                &self.graph,
+                UriId::from(uri.as_str()),
+                text.offset_at(position),
+                &self.own_documents(),
+            )
+        })?;
+        self.hierarchy_items(items)
+    }
+
+    /// `typeHierarchy/supertypes`.
+    fn supertypes(&self, params: serde_json::Value) -> Option<Vec<TypeHierarchyItem>> {
+        let params: lsp_types::TypeHierarchySupertypesParams = parse_params(params)?;
+        let declaration = declaration_in(params.item.data.as_ref())?;
+        let items = hierarchy::supertypes(&self.graph, declaration, &self.own_documents());
+        self.hierarchy_items(items)
+    }
+
+    /// `typeHierarchy/subtypes`.
+    fn subtypes(&self, params: serde_json::Value) -> Option<Vec<TypeHierarchyItem>> {
+        let params: lsp_types::TypeHierarchySubtypesParams = parse_params(params)?;
+        let declaration = declaration_in(params.item.data.as_ref())?;
+        let found = hierarchy::subtypes(
+            &self.graph,
+            declaration,
+            MAX_SUBTYPES,
+            &self.own_documents(),
+        );
+
+        if found.found > MAX_SUBTYPES {
+            // Said out loud, as a truncated `references` is: a short list of subtypes is
+            // indistinguishable from a complete one, and the user is the only one who can decide
+            // what to do about it. It takes asking about something near the root of the object
+            // model to reach, which is a deliberate click rather than something that happens
+            // while typing, so a message here is information rather than noise.
+            let message = messages::subtypes_truncated(found.found, MAX_SUBTYPES);
+            tracing::warn!("{message}");
+            self.show_warning(&message);
+        }
+        self.hierarchy_items(found.items)
+    }
+
+    /// Turn hierarchy rows into the wire shape, reading each file at most once.
+    ///
+    /// A row whose file cannot be read is dropped rather than sent with a made-up range —
+    /// rubydex's synthetic built-in document is the one that reaches here, and `DocUri` rejects
+    /// it for every request alike. `null` for an empty result, never `[]`: an empty array is a
+    /// claim that a class has no ancestors, which is not true of anything in Ruby.
+    fn hierarchy_items(&self, items: Vec<hierarchy::Item>) -> Option<Vec<TypeHierarchyItem>> {
+        let mut ranges = Ranges::new(self);
+        let items: Vec<TypeHierarchyItem> = items
+            .into_iter()
+            .filter_map(|item| {
+                let uri = DocUri::from_uri_str(&item.site.uri)?;
+                Some(TypeHierarchyItem {
+                    name: item.name,
+                    kind: item.kind,
+                    tags: None,
+                    detail: Some(item.detail),
+                    range: ranges.at(&uri, item.site.full.0, item.site.full.1)?,
+                    selection_range: ranges.at(
+                        &uri,
+                        item.site.selection.0,
+                        item.site.selection.1,
+                    )?,
+                    uri: uri.to_lsp().ok()?,
+                    data: item
+                        .declaration
+                        .map(|id| serde_json::Value::String(id.get().to_string())),
+                })
+            })
+            .collect();
+        (!items.is_empty()).then_some(items)
+    }
+
+    // -----------------------------------------------------------------------
+    // Rename
+    // -----------------------------------------------------------------------
+
+    /// `textDocument/prepareRename`.
+    ///
+    /// Answering with a range is a *promise* that the rename will go through, so this runs the
+    /// whole plan and reads every span back before it says yes. That costs a file read per file
+    /// the name is written in, once, on a key the user pressed deliberately — and it is the
+    /// only way the promise is honest. A prepare that said yes and a rename that then refused
+    /// would put the refusal after the user had typed the new name.
+    fn prepare_rename(&self, params: serde_json::Value) -> Option<PrepareRenameResponse> {
+        let params: lsp_types::TextDocumentPositionParams = parse_params(params)?;
+        let uri = DocUri::from_lsp(&params.text_document.uri)?;
+        let offset = self.with_text(&uri, |text| text.offset_at(params.position))?;
+        let renaming = self.renaming(&uri, offset)?;
+
+        // The one replacement the cursor is actually in, out of everything the rename would
+        // make: the editor puts its rename box over exactly this range and pre-fills it with
+        // the text inside. It is not always the span the cursor was *located* in — the name of
+        // `Failure = Class.new(StandardError)` is located as the whole assignment and narrowed
+        // to the word — so a cursor on the `=` of that finds nothing and answers `null`.
+        let here = renaming
+            .files
+            .iter()
+            .filter(|(at, _)| *at == uri)
+            .flat_map(|(_, replacements)| replacements)
+            // A range rather than a pair of comparisons, which is the same test without the
+            // short-circuit arm a `&&` would put in a file this one is measured with.
+            .find(|at| (at.start..=at.end).contains(&offset))?;
+        Some(PrepareRenameResponse::Range(here.range))
+    }
+
+    /// `textDocument/rename`.
+    fn rename(&self, params: serde_json::Value) -> Option<WorkspaceEdit> {
+        let params: lsp_types::RenameParams = parse_params(params)?;
+        let position = params.text_document_position;
+        let uri = DocUri::from_lsp(&position.text_document.uri)?;
+        let offset = self.with_text(&uri, |text| text.offset_at(position.position))?;
+        // The plan is made again rather than remembered from the prepare: `prepareSupport` is a
+        // client capability, and a client without it sends this request on its own, so every
+        // refusal has to be reachable from here too.
+        let renaming = self.renaming(&uri, offset)?;
+
+        if !rename::is_name(&params.new_name, renaming.constant) {
+            let message = messages::rename_needs_a_ruby_name(&params.new_name, renaming.constant);
+            tracing::info!("{message}");
+            self.show_warning(&message);
+            return None;
+        }
+
+        // Nothing left to decide: every range was converted when the plan was confirmed, from
+        // the same read that checked the bytes under it, so there is no second conversion here
+        // to disagree with the first one or to fail on its own.
+        let files: Vec<(DocUri, Vec<TextEdit>)> = renaming
+            .files
+            .iter()
+            .map(|(at, replacements)| {
+                let edits = replacements
+                    .iter()
+                    .map(|at| TextEdit {
+                        range: at.range,
+                        new_text: params.new_name.clone(),
+                    })
+                    .collect();
+                (at.clone(), edits)
+            })
+            .collect();
+        // Counted into locals first: an argument on its own line inside a `tracing::debug!` is
+        // evaluated only when that level is on, so it reads as a line no test ever ran.
+        let edited: usize = files.iter().map(|(_, edits)| edits.len()).sum();
+        let (touched, from, to) = (files.len(), &renaming.name, &params.new_name);
+        tracing::debug!("rename {from:?} -> {to:?}: {edited} edits across {touched} files");
+        Some(self.workspace_edit(files))
+    }
+
+    /// The rename at a position, with every span read back and checked against the name it is
+    /// about to replace.
+    ///
+    /// Both requests go through here, and a refusal is said out loud rather than merely
+    /// answered with `null`: the user pressed a key asking for this one, and an editor's own
+    /// "this cannot be renamed" does not say which of the reasons applies or what to do next.
+    /// That is the one place ya-lsp raises a `window/showMessage` for a single request rather
+    /// than for the state of the workspace, and pressing the key is what earns it.
+    fn renaming(&self, uri: &DocUri, offset: u32) -> Option<Renaming> {
+        // ya-lsp never proposes an edit to a file that is not the user's own. Silently, as
+        // every other request inside a bundle is: a gem is opened to be read, and nobody
+        // pressing rename in one is expecting it to work.
+        if !self.is_own_code(uri.as_str()) {
+            return None;
+        }
+        let own = self.own_documents();
+        let plan = self.with_text(&uri.clone(), |text| {
+            rename::plan(&self.graph, uri.as_str(), text.text(), offset, &own)
+        })?;
+        let (name, constant, edits) = match plan {
+            rename::Plan::Nothing => return None,
+            rename::Plan::Refused(message) => {
+                tracing::info!("{message}");
+                self.show_warning(&message);
+                return None;
+            }
+            rename::Plan::Edits {
+                name,
+                constant,
+                edits,
+            } => (name, constant, edits),
+        };
+
+        // Every span, read back from the text as it stands and confirmed to hold only the name.
+        // This is what stops `Error = Class.new(StandardError)` — whose name span rubydex
+        // records as the entire assignment — from being replaced wholesale, and it is why a
+        // refusal here is whole: a rename that changed most of the places a name is written
+        // would leave code that no longer runs.
+        let mut ranges = Ranges::new(self);
+        let mut files: HashMap<DocUri, Vec<Replacement>> = HashMap::new();
+        for edit in edits {
+            let at = DocUri::from_uri_str(&edit.uri)?;
+            let confirmed = ranges
+                .text_at(&at, edit.start, edit.end)
+                .and_then(|written| rename::narrow(&written, &name));
+            let Some((from, to)) = confirmed else {
+                let message = messages::rename_could_not_confirm(&name, &file_name(&at));
+                tracing::warn!("{message}");
+                self.show_warning(&message);
+                return None;
+            };
+            let (start, end) = (edit.start + from, edit.start + to);
+            files.entry(at.clone()).or_default().push(Replacement {
+                start,
+                end,
+                // Converted here, from the read that just confirmed the bytes: the offsets and
+                // the range are two views of one span, and deriving them apart is how they come
+                // to disagree.
+                range: ranges.at(&at, start, end)?,
+            });
+        }
+
+        // Sorted by URI so that the same rename produces the same edit twice running; the spans
+        // inside a file arrive in order already, from `references` and from the scope walk
+        // alike.
+        let mut files: Vec<(DocUri, Vec<Replacement>)> = files.into_iter().collect();
+        files.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        Some(Renaming {
+            name,
+            constant,
+            files,
+        })
+    }
+
+    /// The edit in whichever of the two shapes the client said it takes.
+    ///
+    /// `documentChanges` is worth negotiating for rather than always sending the older `changes`
+    /// map, because it carries the version each file's edit was computed against — so a client
+    /// can reject a rename the user has typed past instead of applying it to text that has
+    /// moved. The version is the one from `didOpen`/`didChange` where there is a buffer, and
+    /// `null` for a file only on disk, which is what the protocol's *optional* version means.
+    fn workspace_edit(&self, files: Vec<(DocUri, Vec<TextEdit>)>) -> WorkspaceEdit {
+        if !self.client.versioned_edits {
+            return WorkspaceEdit {
+                changes: Some(
+                    files
+                        .into_iter()
+                        .filter_map(|(uri, edits)| Some((uri.to_lsp().ok()?, edits)))
+                        .collect(),
+                ),
+                ..WorkspaceEdit::default()
+            };
+        }
+        WorkspaceEdit {
+            document_changes: Some(lsp_types::DocumentChanges::Edits(
+                files
+                    .into_iter()
+                    .filter_map(|(uri, edits)| {
+                        Some(TextDocumentEdit {
+                            text_document: OptionalVersionedTextDocumentIdentifier {
+                                version: self.open.get(&uri).and_then(|open| open.version),
+                                uri: uri.to_lsp().ok()?,
+                            },
+                            edits: edits.into_iter().map(OneOf::Left).collect(),
+                        })
+                    })
+                    .collect(),
+            )),
+            ..WorkspaceEdit::default()
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Completion
     // -----------------------------------------------------------------------
 
@@ -1313,22 +1973,16 @@ impl Analysis {
     fn resolve_completion(&self, params: serde_json::Value) -> Option<CompletionItem> {
         let mut item: CompletionItem = parse_params(params)?;
 
-        let markdown = item
-            .data
-            .as_ref()
-            .and_then(serde_json::Value::as_str)
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|raw| *raw != 0)
-            .and_then(|raw| {
-                hover::markdown(
-                    &self.graph,
-                    &locator::Resolution {
-                        declarations: vec![DeclarationId::new(raw)],
-                        precise: true,
-                        redirected: false,
-                    },
-                )
-            });
+        let markdown = declaration_in(item.data.as_ref()).and_then(|declaration| {
+            hover::markdown(
+                &self.graph,
+                &locator::Resolution {
+                    declarations: vec![declaration],
+                    precise: true,
+                    redirected: false,
+                },
+            )
+        });
 
         if let Some(value) = markdown {
             item.documentation = Some(Documentation::MarkupContent(MarkupContent {
@@ -1402,6 +2056,42 @@ impl Analysis {
     }
 }
 
+/// A rename that has been checked against the bytes it would replace.
+///
+/// Byte spans rather than ranges, because the two things done with them are a containment test
+/// against the cursor and a conversion — and the first is arithmetic on offsets where it is a
+/// two-field comparison on positions.
+#[derive(Debug)]
+struct Renaming {
+    /// The name every one of these spans currently holds.
+    name: String,
+    /// Whether the replacement has to be a constant name rather than a variable's.
+    constant: bool,
+    /// What to replace, by document, each file's own in order and the files by URI.
+    files: Vec<(DocUri, Vec<Replacement>)>,
+}
+
+/// One confirmed replacement: where it is in bytes, and the range the client is sent.
+///
+/// Both, out of the one read. The offsets are what a cursor position is compared against and
+/// the range is what goes on the wire, and converting the second from the first a second time —
+/// in the other handler, from a file possibly read again — is two chances for them to disagree
+/// about the same span.
+#[derive(Debug)]
+struct Replacement {
+    start: u32,
+    end: u32,
+    range: lsp_types::Range,
+}
+
+/// The last segment of a URI's path, which is what a message about a file names.
+fn file_name(uri: &DocUri) -> String {
+    uri.as_str()
+        .rsplit_once('/')
+        .map_or(uri.as_str(), |(_, name)| name)
+        .to_owned()
+}
+
 /// Byte spans to LSP ranges, reading each document at most once.
 ///
 /// A project-wide answer names hundreds of spans across a handful of files, and converting one
@@ -1424,10 +2114,25 @@ impl<'a> Ranges<'a> {
     }
 
     fn at(&mut self, uri: &DocUri, start: u32, end: u32) -> Option<lsp_types::Range> {
+        self.with(uri, |text| text.range_at(start, end))
+    }
+
+    /// The bytes a span covers, for a caller that has to know what it is about to replace.
+    ///
+    /// `None` for a span that runs past the end of the text as it is *now*, which is what a
+    /// plan made against a file that has since been edited looks like — and one more reason
+    /// `rename` reads every span back rather than trusting the offsets it was given.
+    fn text_at(&mut self, uri: &DocUri, start: u32, end: u32) -> Option<String> {
+        self.with(uri, |text| {
+            Some(text.text().get(start as usize..end as usize)?.to_owned())
+        })?
+    }
+
+    fn with<R>(&mut self, uri: &DocUri, read: impl FnOnce(&TextDocument) -> R) -> Option<R> {
         // An open buffer shadows disk and is already indexed; never cached, because the copy
         // would go stale the moment the user types.
         if let Some(open) = self.analysis.open.get(uri) {
-            return Some(open.text.range_at(start, end));
+            return Some(read(&open.text));
         }
         let encoding = self.analysis.encoding;
         self.read
@@ -1437,7 +2142,7 @@ impl<'a> Ranges<'a> {
                 Some(TextDocument::new(text, encoding))
             })
             .as_ref()
-            .map(|text| text.range_at(start, end))
+            .map(read)
     }
 }
 
@@ -1447,6 +2152,33 @@ impl<'a> Ranges<'a> {
 /// response would be wrong: editors surface those to the user, and "no definition found" is
 /// not something to complain about.
 /// ya-lsp's own suggestion kinds, in LSP's vocabulary.
+/// The declaration an item's `data` field names, as three requests round-trip one.
+///
+/// A decimal string rather than a JSON number, because a `DeclarationId` is a 64-bit hash and
+/// JSON numbers are doubles — the round trip through a client would corrupt it. Everything about
+/// the value is the client's word: it echoes back whatever the list it is looking at carried, and
+/// a config reload drops the graph that list was built from, so nothing here may assume the id
+/// still names anything.
+fn declaration_in(data: Option<&serde_json::Value>) -> Option<DeclarationId> {
+    data?
+        .as_str()?
+        .parse::<u64>()
+        .ok()
+        .filter(|raw| *raw != 0)
+        .map(DeclarationId::new)
+}
+
+/// Whether a request's answer is drawn from the graph, and so has to wait for it to be linked.
+///
+/// `foldingRange` and `selectionRange` are pure functions of one buffer — `analysis::ranges`
+/// never sees a `Graph` — so they are the two that do not.
+fn needs_the_graph(method: &str) -> bool {
+    !matches!(
+        method,
+        "textDocument/foldingRange" | "textDocument/selectionRange"
+    )
+}
+
 fn completion_kind(kind: completion::Kind) -> CompletionItemKind {
     match kind {
         completion::Kind::Class => CompletionItemKind::CLASS,
@@ -1485,6 +2217,11 @@ fn parse_params<T: serde::de::DeserializeOwned>(params: serde_json::Value) -> Op
     }
 }
 
+/// The run loop itself, driven over the real channel by the real thread.
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod threaded_tests;
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
@@ -1501,6 +2238,120 @@ mod tests {
         let line = source[..offset].matches('\n').count();
         let column = offset - source[..offset].rfind('\n').map_or(0, |index| index + 1);
         serde_json::json!({ "line": line, "character": column })
+    }
+
+    /// The LSP position of the `~` in a fixture, which is removed before it is sent.
+    fn marked_position(marked: &str) -> serde_json::Value {
+        let offset = marked.find('~').expect("a ~ marking the cursor");
+        let line = marked[..offset].matches('\n').count();
+        let character = offset - marked[..offset].rfind('\n').map_or(0, |index| index + 1);
+        serde_json::json!({ "line": line, "character": character })
+    }
+
+    /// A `textDocument/signatureHelp` response drawn the way an editor draws it: every
+    /// signature on its own line, the active parameter of the active one underlined beneath it,
+    /// and the documentation last.
+    ///
+    /// Rendering the offsets rather than asserting on them is the point. A span that is off by
+    /// one draws under the wrong text, which is visible at a glance and reads as the bug it is;
+    /// a pair of numbers in an `assert_eq!` shows nobody anything. The underline counts
+    /// characters where the protocol counts UTF-16 code units, which every fixture here is
+    /// ASCII enough for — `render`'s own tests are where the two are made to differ.
+    fn drawn(help: &serde_json::Value) -> String {
+        let Some(signatures) = help["signatures"].as_array() else {
+            return "null".to_owned();
+        };
+        let chosen = help["activeSignature"].as_u64().unwrap_or_default();
+
+        let mut lines: Vec<String> = Vec::new();
+        for (index, signature) in signatures.iter().enumerate() {
+            lines.push(signature["label"].as_str().unwrap_or_default().to_owned());
+            if index as u64 != chosen {
+                continue;
+            }
+            let span = signature["activeParameter"]
+                .as_u64()
+                .and_then(|active| signature["parameters"].as_array()?.get(active as usize))
+                .and_then(|parameter| parameter["label"].as_array());
+            if let Some(span) = span {
+                let start = span[0].as_u64().unwrap_or_default() as usize;
+                let end = span[1].as_u64().unwrap_or_default() as usize;
+                lines.push(format!(
+                    "{}{}",
+                    " ".repeat(start),
+                    "~".repeat(end.saturating_sub(start))
+                ));
+            }
+        }
+        if let Some(documentation) = signatures
+            .first()
+            .and_then(|signature| signature["documentation"]["value"].as_str())
+        {
+            lines.push(documentation.to_owned());
+        }
+        lines.join("\n")
+    }
+
+    /// A type hierarchy answer, one row a line: the Ruby keyword for the kind, the name, and
+    /// the detail column.
+    fn drawn_hierarchy(answer: &serde_json::Value) -> String {
+        let Some(items) = answer.as_array() else {
+            return "null".to_owned();
+        };
+        items
+            .iter()
+            .map(|item| {
+                // LSP numbers `Module` 2 and `Class` 5. Anything else is printed rather than
+                // panicked over, so a wrong kind reads as a wrong row instead of a lost test.
+                let keyword = match item["kind"].as_u64() {
+                    Some(2) => "module".to_owned(),
+                    Some(5) => "class".to_owned(),
+                    other => format!("kind {other:?}"),
+                };
+                format!(
+                    "{keyword} {} — {}",
+                    item["name"].as_str().unwrap_or_default(),
+                    item["detail"].as_str().unwrap_or("(no detail)"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The edits in a `WorkspaceEdit`, by file, in whichever of the two shapes it arrived in.
+    ///
+    /// Both are read here because ya-lsp sends both: `documentChanges` to a client that
+    /// advertised it and the older `changes` map to one that did not, and a test that could only
+    /// read one of them would be blind to half of what ships.
+    fn edits_in(answer: &serde_json::Value) -> Vec<(String, Vec<lsp_types::TextEdit>)> {
+        if let Some(changes) = answer["documentChanges"].as_array() {
+            return changes
+                .iter()
+                .map(|change| {
+                    (
+                        change["textDocument"]["uri"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        serde_json::from_value(change["edits"].clone()).expect("well-formed edits"),
+                    )
+                })
+                .collect();
+        }
+        let mut files: Vec<(String, Vec<lsp_types::TextEdit>)> = answer["changes"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(uri, edits)| {
+                (
+                    uri.clone(),
+                    serde_json::from_value(edits.clone()).expect("well-formed edits"),
+                )
+            })
+            .collect();
+        // A JSON object has no order of its own, and the older shape is one.
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
     }
 
     /// Every symbol in an outline, parents and children alike, in no particular order.
@@ -1610,6 +2461,7 @@ mod tests {
                         hierarchical_symbols: true,
                         definition_links: true,
                         work_done_progress: true,
+                        versioned_edits: true,
                     },
                     sender,
                     Cancellations::default(),
@@ -1704,6 +2556,14 @@ mod tests {
                 .into_iter()
                 .rfind(|(sent, _)| sent == uri.as_str())
                 .map(|(_, items)| items)
+        }
+
+        /// A `workspace/didChangeWatchedFiles`, as a client sends it: the file system changed
+        /// and nothing else did — no `didOpen`, no `didSave`, no buffer anywhere.
+        fn watch(&mut self, uris: &[&DocUri]) {
+            self.run(Task::WatchedFiles {
+                uris: uris.iter().map(|uri| (*uri).clone()).collect(),
+            });
         }
 
         fn open(&mut self, uri: &DocUri, text: &str) {
@@ -1846,17 +2706,229 @@ mod tests {
 
         /// Open a buffer written with a `~` where the cursor is, and ask what completes there.
         fn complete(&mut self, uri: &DocUri, marked: &str) -> serde_json::Value {
-            let offset = marked.find('~').expect("a ~ marking the cursor");
-            let line = marked[..offset].matches('\n').count();
-            let character = offset - marked[..offset].rfind('\n').map_or(0, |index| index + 1);
+            let position = marked_position(marked);
             self.open(uri, &marked.replace('~', ""));
             self.ask(
                 "textDocument/completion",
                 serde_json::json!({
                     "textDocument": { "uri": uri.as_str() },
-                    "position": { "line": line, "character": character },
+                    "position": position,
                 }),
             )
+        }
+
+        /// Open a buffer written with a `~` where the cursor is, and ask what call it is inside.
+        fn signature(&mut self, uri: &DocUri, marked: &str) -> serde_json::Value {
+            let position = marked_position(marked);
+            self.open(uri, &marked.replace('~', ""));
+            self.ask(
+                "textDocument/signatureHelp",
+                serde_json::json!({
+                    "textDocument": { "uri": uri.as_str() },
+                    "position": position,
+                }),
+            )
+        }
+
+        /// The signature card at the `~`, drawn the way an editor does it.
+        fn signature_card(&mut self, uri: &DocUri, marked: &str) -> String {
+            drawn(&self.signature(uri, marked))
+        }
+
+        /// Open a buffer written with a `~` where the cursor is, and ask what expanding the
+        /// selection from it reaches.
+        fn selection(&mut self, uri: &DocUri, marked: &str) -> serde_json::Value {
+            let position = marked_position(marked);
+            self.open(uri, &marked.replace('~', ""));
+            self.ask(
+                "textDocument/selectionRange",
+                serde_json::json!({
+                    "textDocument": { "uri": uri.as_str() },
+                    "positions": [position],
+                }),
+            )
+        }
+
+        /// Open a buffer and ask what folds in it.
+        fn folding(&mut self, uri: &DocUri, source: &str) -> serde_json::Value {
+            self.open(uri, source);
+            self.ask(
+                "textDocument/foldingRange",
+                serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+            )
+        }
+
+        /// Open a buffer written with a `~` where the cursor is, and ask what it highlights.
+        fn highlight(&mut self, uri: &DocUri, marked: &str) -> serde_json::Value {
+            let position = marked_position(marked);
+            self.open(uri, &marked.replace('~', ""));
+            self.ask(
+                "textDocument/documentHighlight",
+                serde_json::json!({
+                    "textDocument": { "uri": uri.as_str() },
+                    "position": position,
+                }),
+            )
+        }
+
+        /// What the editor would paint at the `~`: the file back, with a `w` under every byte
+        /// of a write and an `r` under every byte of a read.
+        ///
+        /// Drawn rather than asserted as ranges for the reason the signature card is: a
+        /// highlight one line or one column out is a bug anybody can see at a glance here, and
+        /// a list of `{line, character}` pairs is a bug nobody can see at all. Lines with
+        /// nothing on them are dropped so the assertion is about what lit up, but the ones that
+        /// remain carry their own text — which is what makes "and not the one in the comment"
+        /// something the fixture *shows* rather than something a test name claims.
+        fn highlight_map(&mut self, uri: &DocUri, marked: &str) -> String {
+            let found = self.highlight(uri, marked);
+            let source = marked.replace('~', "");
+            let Some(spans) = found.as_array() else {
+                return "null".to_owned();
+            };
+
+            let mut masks: Vec<Vec<char>> = source
+                .lines()
+                .map(|line| vec![' '; line.chars().count()])
+                .collect();
+            for span in spans {
+                let line = span["range"]["start"]["line"].as_u64().unwrap_or_default() as usize;
+                let start = span["range"]["start"]["character"]
+                    .as_u64()
+                    .unwrap_or_default() as usize;
+                let end = span["range"]["end"]["character"]
+                    .as_u64()
+                    .unwrap_or_default() as usize;
+                // LSP numbers them `Text` 1, `Read` 2, `Write` 3; `Text` is never answered.
+                let mark = if span["kind"].as_u64() == Some(3) {
+                    'w'
+                } else {
+                    'r'
+                };
+                let Some(mask) = masks.get_mut(line) else {
+                    continue;
+                };
+                for column in start..end {
+                    if let Some(cell) = mask.get_mut(column) {
+                        *cell = mark;
+                    }
+                }
+            }
+
+            let mut drawn = Vec::new();
+            for (line, mask) in source.lines().zip(&masks) {
+                if mask.iter().all(|cell| *cell == ' ') {
+                    continue;
+                }
+                drawn.push(line.to_owned());
+                drawn.push(mask.iter().collect::<String>().trim_end().to_owned());
+            }
+            drawn.join("\n")
+        }
+
+        /// Ask for the type hierarchy at the first occurrence of `needle`.
+        fn prepare_hierarchy(
+            &mut self,
+            uri: &DocUri,
+            source: &str,
+            needle: &str,
+        ) -> serde_json::Value {
+            self.ask(
+                "textDocument/prepareTypeHierarchy",
+                serde_json::json!({
+                    "textDocument": { "uri": uri.as_str() },
+                    "position": position_of(source, needle),
+                }),
+            )
+        }
+
+        /// Prepare at `needle`, then expand the first item the way an editor does.
+        ///
+        /// The item is echoed back verbatim, `data` and all — which is the only way the two
+        /// follow-ups are ever reached, and therefore the only honest way to test them.
+        fn expand(
+            &mut self,
+            method: &str,
+            uri: &DocUri,
+            source: &str,
+            needle: &str,
+        ) -> serde_json::Value {
+            let prepared = self.prepare_hierarchy(uri, source, needle);
+            let item = prepared[0].clone();
+            assert!(item.is_object(), "nothing to expand at {needle:?}");
+            self.ask(method, serde_json::json!({ "item": item }))
+        }
+
+        /// The rows of a hierarchy answer, drawn the way Ruby writes what they are.
+        ///
+        /// The keyword makes the kind visible — `module Comparable` in a list of supertypes is
+        /// the answer's most surprising claim and also its most correct one — and the detail
+        /// column is what separates the project's two rows from the gems' eight. Drawn rather
+        /// than asserted field by field, as the signature card and the highlight map are: a row
+        /// in the wrong place, with the wrong kind, or pointing at the wrong file is one thing
+        /// to read here and three assertions to write otherwise.
+        fn hierarchy_rows(
+            &mut self,
+            method: &str,
+            uri: &DocUri,
+            source: &str,
+            needle: &str,
+        ) -> String {
+            drawn_hierarchy(&self.expand(method, uri, source, needle))
+        }
+
+        fn prepare_rename(
+            &mut self,
+            uri: &DocUri,
+            source: &str,
+            needle: &str,
+        ) -> serde_json::Value {
+            self.ask(
+                "textDocument/prepareRename",
+                serde_json::json!({
+                    "textDocument": { "uri": uri.as_str() },
+                    "position": position_of(source, needle),
+                }),
+            )
+        }
+
+        /// Rename at `needle`, then draw every file the answer would change.
+        ///
+        /// **The assertion is the renamed Ruby**, which is the whole point of drawing it. A span
+        /// one byte out writes code that is visibly broken — a name run into the one beside it,
+        /// a hash key changed along with its value, an `end` eaten — where a list of
+        /// `{line, character}` pairs shows nobody anything. The files no edit touched are not
+        /// drawn, so what an expected block holds is exactly what the rename claims to change.
+        ///
+        /// The edits are applied through `TextDocument::apply`, the same code incremental sync
+        /// uses, and in reverse so that each one lands before anything ahead of it has moved.
+        fn renamed(&mut self, uri: &DocUri, source: &str, needle: &str, to: &str) -> String {
+            let answer = self.ask(
+                "textDocument/rename",
+                serde_json::json!({
+                    "textDocument": { "uri": uri.as_str() },
+                    "position": position_of(source, needle),
+                    "newName": to,
+                }),
+            );
+            if answer.is_null() {
+                return "null".to_owned();
+            }
+            let mut drawn = Vec::new();
+            for (uri, edits) in edits_in(&answer) {
+                let at = DocUri::from_uri_str(&uri).expect("a document URI");
+                let mut text = TextDocument::new(
+                    self.analysis
+                        .with_text(&at, |text| text.text().to_owned())
+                        .expect("readable text"),
+                    self.analysis.encoding,
+                );
+                for edit in edits.iter().rev() {
+                    text.apply(Some(edit.range), &edit.new_text);
+                }
+                drawn.push(format!("--- {} ---\n{}", file_name(&at), text.text()));
+            }
+            drawn.join("")
         }
 
         /// The labels offered at the `~`, in the order they were ranked.
@@ -2033,6 +3105,312 @@ mod tests {
         harness.change(&uri, "class Person\n  def recovered\n  end\nend\n");
 
         assert!(harness.has("Person#recovered()"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The index and the disk
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_file_written_while_the_server_runs_is_indexed_without_the_editor_opening_it() {
+        // `git checkout`, `git pull`, a rebase, `rails g model` — every one of them writes Ruby
+        // the editor never opened. Before this the file did not exist as far as the index was
+        // concerned until someone restarted the server.
+        let mut harness = Harness::new();
+        let source = "Place.new\n";
+        let main = harness.write("app/main.rb", source);
+        harness.index();
+        assert!(
+            harness.definition_at(&main, source, "Place").is_null(),
+            "nothing declares Place yet"
+        );
+
+        let place = harness.write("app/place.rb", "class Place\n  def name\n  end\nend\n");
+        harness.watch(&[&place]);
+
+        assert!(harness.has("Place#name()"));
+        assert!(
+            !harness.definition_at(&main, source, "Place").is_null(),
+            "navigation follows the file that appeared, with no restart and no didOpen"
+        );
+    }
+
+    #[test]
+    fn a_file_rewritten_on_disk_replaces_what_the_index_held() {
+        // The branch-switch case: same path, different declarations. Leaving the old ones in
+        // is worse than not noticing at all, because navigation lands somewhere that is gone.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/person.rb", "class Person\n  def shout\n  end\nend\n");
+        harness.index();
+        assert!(harness.has("Person#shout()"));
+
+        std::fs::write(
+            uri.to_path().unwrap(),
+            "class Person\n  def whisper\n  end\nend\n",
+        )
+        .unwrap();
+        harness.watch(&[&uri]);
+
+        assert!(
+            !harness.has("Person#shout()"),
+            "the old method must be gone"
+        );
+        assert!(harness.has("Person#whisper()"));
+        assert_eq!(
+            harness.document_count(),
+            1,
+            "re-indexing must not fork a second document"
+        );
+    }
+
+    #[test]
+    fn a_file_deleted_on_disk_is_dropped_and_takes_its_diagnostics_with_it() {
+        // A deletion is the one change no other notification can stand in for: nothing else
+        // ever tells a server that a declaration has gone. And `publishDiagnostics` is stateful
+        // per URI, so a file that vanishes with squiggles on it keeps them on screen forever
+        // unless something sends the empty set.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/broken.rb", "class Broken\n  def oops(\nend\n");
+        harness.index();
+        assert!(harness.has("Broken"));
+        assert!(!harness.latest(&uri).unwrap_or_default().is_empty());
+
+        std::fs::remove_file(uri.to_path().unwrap()).unwrap();
+        harness.watch(&[&uri]);
+
+        assert!(!harness.has("Broken"));
+        assert_eq!(harness.document_count(), 0);
+        assert_eq!(
+            harness.latest(&uri),
+            Some(Vec::new()),
+            "an explicit empty publish is the only thing that clears a squiggle"
+        );
+    }
+
+    #[test]
+    fn a_deletion_for_something_the_index_never_held_costs_nothing() {
+        // Watchers are the client's, so a delete can name a path this server never indexed —
+        // and `Workspace::indexes` cannot be asked about a path that is not there. The graph is
+        // the thing that knows, and it answers for both halves of the question at once.
+        let mut harness = Harness::new();
+        harness.write("app/person.rb", "class Person\nend\n");
+        harness.index();
+        let absent = DocUri::from_path(&harness.root.path().join("app/never.rb")).unwrap();
+
+        harness.watch(&[&absent]);
+
+        assert!(harness.has("Person"));
+        assert_eq!(harness.document_count(), 1);
+    }
+
+    #[test]
+    fn an_open_buffer_is_not_clobbered_by_a_change_to_the_same_file_on_disk() {
+        // A rebase under an open file must not overwrite what the editor is showing: the buffer
+        // holds edits the disk has never seen, and the editor is still the authority on them
+        // until it says otherwise. `didClose` already implements this precedence in the other
+        // direction, which is what makes the buffer's disappearance the moment disk takes over.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/person.rb", "class Person\n  def shout\n  end\nend\n");
+        harness.index();
+        harness.open(&uri, "class Person\n  def unsaved\n  end\nend\n");
+        assert!(harness.has("Person#unsaved()"));
+
+        std::fs::write(
+            uri.to_path().unwrap(),
+            "class Person\n  def from_disk\n  end\nend\n",
+        )
+        .unwrap();
+        harness.watch(&[&uri]);
+
+        assert!(
+            harness.has("Person#unsaved()"),
+            "the buffer the editor is showing must survive the disk change"
+        );
+        assert!(!harness.has("Person#from_disk()"));
+
+        // And the moment the buffer goes, disk is the truth again — through the path that
+        // already existed for it.
+        harness.run(Task::DidClose { uri });
+        assert!(harness.has("Person#from_disk()"));
+    }
+
+    #[test]
+    fn a_watched_change_the_workspace_does_not_index_is_ignored() {
+        // A client's watchers are shared across every server it runs and every registration
+        // each one made, so anything can arrive here. Indexing it would put files in the graph
+        // that `index.exclude` says are out — and the walk and this path disagreeing is the one
+        // failure neither the user nor the log would ever show.
+        let mut harness = Harness::new();
+        harness.write("app/person.rb", "class Person\nend\n");
+        harness.index();
+
+        let excluded = harness.write("tmp/generated.rb", "class Generated\nend\n");
+        let not_ruby = harness.write("app/notes.md", "class NotRuby; end\n");
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("other.rb"), "class Other\nend\n").unwrap();
+        let outside = DocUri::from_path(&elsewhere.path().join("other.rb")).unwrap();
+
+        harness.watch(&[&excluded, &not_ruby, &outside]);
+
+        assert!(!harness.has("Generated"), "index.exclude still applies");
+        assert!(!harness.has("NotRuby"), "index.include still applies");
+        assert!(!harness.has("Other"), "another project is not this one");
+        assert_eq!(harness.document_count(), 1);
+    }
+
+    #[test]
+    fn a_file_that_is_there_but_cannot_be_read_keeps_what_the_index_already_had() {
+        // The gap between `is_file` and reading it: a half-written file mid-checkout, a
+        // permission, or — portably testable — bytes that are not UTF-8. Dropping the document
+        // would be the worse answer of the two, since the old declarations are at least the
+        // ones that were true a moment ago, and the next write brings another notification.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/person.rb", "class Person\n  def shout\n  end\nend\n");
+        harness.index();
+
+        std::fs::write(uri.to_path().unwrap(), b"class Person\n  def \xff\nend\n").unwrap();
+        let (_, logged) = crate::testing::captured_logs(tracing::Level::WARN, || {
+            harness.watch(&[&uri]);
+        });
+
+        assert!(harness.has("Person#shout()"), "the last good index is kept");
+        assert!(logged.contains("after a watched change"), "{logged}");
+    }
+
+    #[test]
+    fn a_crash_while_linking_the_graph_rebuilds_instead_of_killing_the_server() {
+        // rubydex 0.2.5 panics in `Resolver::resolve` after a document is deleted, and there is
+        // no published version to upgrade to. Uncaught, the analysis thread dies and the server
+        // answers nothing at all forever — which looks exactly like a server that is thinking,
+        // so nobody restarts it. Reproduced on a real project by deleting one file from a
+        // solargraph v0.58.2 checkout; what this pins is that ya-lsp comes back from it.
+        let mut harness = Harness::new();
+        harness.write("app/person.rb", "class Person\n  def shout\n  end\nend\n");
+        harness.index();
+        assert!(harness.has("Person#shout()"));
+
+        RESOLVES_TO_CRASH.set(1);
+        let uri = harness.write("app/place.rb", "class Place\nend\n");
+        harness.watch(&[&uri]);
+        assert_eq!(RESOLVES_TO_CRASH.get(), 0, "the crash was armed and taken");
+
+        assert!(
+            harness.has("Person#shout()") && harness.has("Place"),
+            "the rebuild has to put the whole workspace back, not only what was asked for"
+        );
+        let said = harness.messages();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].starts_with("something went wrong while linking"),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_that_crashes_again_stops_rather_than_recurring() {
+        // The rebuild indexes the workspace and indexing resolves, so without a guard a project
+        // that cannot be linked at all would rebuild itself forever and never answer anything.
+        // Degrading to whatever was linked is the worse index and the better server.
+        let mut harness = Harness::new();
+        harness.write("app/person.rb", "class Person\nend\n");
+        harness.index();
+
+        RESOLVES_TO_CRASH.set(5);
+        let (_, logged) = crate::testing::captured_logs(tracing::Level::ERROR, || {
+            let uri = harness.write("app/place.rb", "class Place\nend\n");
+            harness.watch(&[&uri]);
+        });
+
+        assert_eq!(
+            RESOLVES_TO_CRASH.replace(0),
+            3,
+            "exactly two resolves should have been attempted: the first, and one rebuild"
+        );
+        assert!(logged.contains("crashed again during recovery"), "{logged}");
+    }
+
+    #[test]
+    fn a_watched_change_inside_a_bundle_is_left_to_the_gem_index() {
+        // `bundle install` rewrites tens of thousands of files at once. Answering that on the
+        // analysis thread, one `index_source` at a time, is exactly the stall the background
+        // gem index exists to avoid — so a gem is not the user's code even when the include
+        // globs would have taken it, which is what a bundle vendored outside `vendor/` does.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("ya-lsp.toml"),
+            "[index]\nexclude = []\n\n[gems]\npaths = [\"bundle\"]\ndefault_gems = false\n\n[rbs]\nenabled = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Gemfile.lock"),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    shouty (1.2.3)\n",
+        )
+        .unwrap();
+        let gem = root.join("bundle/gems/shouty-1.2.3/lib/shouty.rb");
+        std::fs::create_dir_all(gem.parent().unwrap()).unwrap();
+        std::fs::write(&gem, "module Shouty\nend\n").unwrap();
+
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, gems::Env::default());
+        harness.write("app/main.rb", "class Mine\nend\n");
+        harness.index();
+        harness.index_gems();
+        let before = harness.document_count();
+
+        let gem_uri = DocUri::from_path(&gem).unwrap();
+        assert!(
+            harness.analysis.workspace.indexes(&gem),
+            "the globs do take it — otherwise this proves nothing about is_own_code"
+        );
+        std::fs::write(&gem, "module Shouty\n  class Rewritten\n  end\nend\n").unwrap();
+        harness.watch(&[&gem_uri]);
+
+        assert!(
+            !harness.has("Shouty::Rewritten"),
+            "a change under a gem root is the gem index's business, not the watcher's"
+        );
+        assert_eq!(harness.document_count(), before);
+    }
+
+    #[test]
+    fn the_index_cap_still_applies_to_a_file_created_after_the_walk() {
+        // `index.max_files` exists because a pathological repository exists, and a watcher can
+        // add the files the walk stopped before. Said once rather than per branch switch: the
+        // condition does not change between them, and a notification that repeats forever is
+        // one people learn to dismiss without reading.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            "[index]\nmax_files = 1\n\n[gems]\ndefault_gems = false\n\n[rbs]\nenabled = false\n",
+        )
+        .unwrap();
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        harness.write("app/person.rb", "class Person\nend\n");
+        harness.index();
+        assert!(harness.messages().is_empty(), "the walk itself fitted");
+
+        let second = harness.write("app/place.rb", "class Place\nend\n");
+        harness.watch(&[&second]);
+        assert!(!harness.has("Place"));
+        let said = harness.messages();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("index.max_files (1)"), "{said:?}");
+
+        let third = harness.write("app/thing.rb", "class Thing\nend\n");
+        harness.watch(&[&third]);
+        assert!(!harness.has("Thing"));
+        assert!(
+            harness.messages().is_empty(),
+            "said once, not once per file"
+        );
+
+        // And the budget is a count, not a high-water mark: deleting the file that filled it
+        // makes room for the next one.
+        std::fs::remove_file(harness.root.path().join("app/person.rb")).unwrap();
+        let person = DocUri::from_path(&harness.root.path().join("app/person.rb")).unwrap();
+        harness.watch(&[&person, &second]);
+        assert!(!harness.has("Person"));
+        assert!(harness.has("Place"), "the freed slot is usable");
     }
 
     #[test]
@@ -2743,6 +4121,175 @@ end
         assert!(constant.contains("Storage::LIMIT"), "{constant}");
     }
 
+    const GALLERY: &str = "\
+# Everything on a shelf.
+module Shelf
+  LIMIT = 10
+  CAP = LIMIT
+
+  # A thing on it.
+  class Book < Object
+    include Comparable
+
+    @@printed = 0
+
+    def initialize(title)
+      @title = title
+    end
+
+    # What it is called.
+    def title(upcase: false, &block)
+    end
+
+    alias name title
+
+    def self.open(*paths)
+    end
+
+    class << self
+      def shut
+      end
+    end
+
+    private def hide
+    end
+
+    protected def peek
+    end
+  end
+end
+
+$shelf = nil
+";
+
+    /// Every construct in [`GALLERY`], in source order, with its card drawn under it.
+    fn gallery_cards(harness: &mut Harness, uri: &DocUri) -> String {
+        [
+            "Shelf\n",
+            "LIMIT = 10",
+            "CAP",
+            "Book < Object",
+            "@@printed",
+            "@title = title",
+            "title(upcase:",
+            "name title",
+            "open(*paths)",
+            "self\n",
+            "shut",
+            "hide",
+            "peek",
+            "$shelf",
+        ]
+        .into_iter()
+        .map(|needle| {
+            let found = harness.hover_at(uri, GALLERY, needle);
+            let card = found["contents"]["value"].as_str().unwrap_or("null");
+            let drawn: String = card
+                .lines()
+                .map(|line| {
+                    if line.is_empty() {
+                        "\n".to_owned()
+                    } else {
+                        format!("  {line}\n")
+                    }
+                })
+                .collect();
+            format!("{}\n{drawn}", needle.trim_end())
+        })
+        .collect()
+    }
+
+    #[test]
+    fn every_hover_card_in_one_file_drawn_side_by_side() {
+        // The first-ten treatment, for an answer that is not a list. `ANCESTRY` pins ten rows
+        // because a ranking is composition rather than a feature; a hover card is the same kind
+        // of object, and until this existed every construct was checked by a `contains`
+        // somewhere and no two were ever read next to each other. Which is how the singleton
+        // card came to be the only one on this page that drops its namespace — `class << Book`
+        // above a `private Shelf::Book#hide` — through a test that covered the construct, on a
+        // top-level module where the two spellings are the same string.
+        //
+        // Pinned whole, and pinned *together*: the failure this shape catches is one card
+        // drifting away from the others, which every card asserted on its own is blind to.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/shelf.rb", GALLERY);
+        harness.index();
+
+        assert_eq!(
+            gallery_cards(&mut harness, &uri),
+            "\
+Shelf
+  ```ruby
+  module Shelf
+  ```
+
+  ---
+
+  Everything on a shelf.
+LIMIT = 10
+  ```ruby
+  Shelf::LIMIT
+  ```
+CAP
+  ```ruby
+  Shelf::CAP
+  ```
+Book < Object
+  ```ruby
+  class Shelf::Book
+  ```
+
+  ---
+
+  A thing on it.
+@@printed
+  ```ruby
+  Shelf::Book#@@printed
+  ```
+@title = title
+  ```ruby
+  Shelf::Book#@title
+  ```
+title(upcase:
+  ```ruby
+  Shelf::Book#title(upcase: ..., &block)
+  ```
+
+  ---
+
+  What it is called.
+name title
+  ```ruby
+  Shelf::Book#name
+  ```
+open(*paths)
+  ```ruby
+  Shelf::Book.open(*paths)
+  ```
+self
+  ```ruby
+  class << Shelf::Book
+  ```
+shut
+  ```ruby
+  Shelf::Book.shut
+  ```
+hide
+  ```ruby
+  private Shelf::Book#hide
+  ```
+peek
+  ```ruby
+  protected Shelf::Book#peek
+  ```
+$shelf
+  ```ruby
+  $shelf
+  ```
+"
+        );
+    }
+
     #[test]
     fn hover_on_a_reopened_class_says_there_is_more_of_it() {
         let (mut harness, uri) = library();
@@ -2779,6 +4326,17 @@ class String
 end
 ";
 
+    /// A class with an overloaded constructor, which is how RBS spells a method that can be
+    /// called more than one way — and, since only a constant receiver resolves exactly, the
+    /// shape of overload a signature card can actually be asked for.
+    const OVERLOAD_RBS: &str = "\
+class Coordinate
+  # A point, from a pair or from text.
+  def initialize: (String text) -> void
+                | (Integer x, Integer y) -> void
+end
+";
+
     const STDLIB_RBS: &str = "\
 class OptionParser
   # <!--
@@ -2797,6 +4355,7 @@ end
         std::fs::create_dir_all(signatures.join("core")).unwrap();
         std::fs::create_dir_all(signatures.join("stdlib/optparse/0")).unwrap();
         std::fs::write(signatures.join("core/string.rbs"), CORE_RBS).unwrap();
+        std::fs::write(signatures.join("core/coordinate.rbs"), OVERLOAD_RBS).unwrap();
         std::fs::write(
             signatures.join("stdlib/optparse/0/optparse.rbs"),
             STDLIB_RBS,
@@ -4628,6 +6187,168 @@ end
         );
     }
 
+    const PICKER: &str = "\
+class User
+end
+
+class UserSerializer
+end
+
+class SuperUserPolicy
+end
+
+module Admin
+  class User
+  end
+end
+
+class Ultra
+  def send_error(u)
+  end
+end
+
+class Account
+  USER_LIMIT = 10
+
+  def user
+  end
+
+  def user_name
+  end
+end
+";
+
+    /// The picker's rows the way it draws them: the name, the container the client shows beside
+    /// it, and the file it would jump to.
+    ///
+    /// The file is here because `own` — the user's code before a gem's — is the first field the
+    /// ranking sorts on and the decision the feature stands on, and it is invisible in a list of
+    /// names.
+    fn picker_rows(harness: &mut Harness, query: &str) -> Vec<String> {
+        let found = harness.symbol_search(query);
+        let Some(symbols) = found.as_array() else {
+            return Vec::new();
+        };
+        symbols
+            .iter()
+            .map(|symbol| {
+                let file = symbol["location"]["uri"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default();
+                format!(
+                    "{}  {}  {file}",
+                    symbol["name"].as_str().unwrap_or_default(),
+                    symbol["containerName"].as_str().unwrap_or("-"),
+                )
+            })
+            .collect()
+    }
+
+    /// A project and a gem, opened by `picker` below.
+    ///
+    /// Every name here matches `user`, and they are chosen so that each is the *only* one that
+    /// separates two of the ranking's fields: `User` and `Admin::User` differ only in qualified
+    /// length, `Account#user` and `#user_name` only in simple length, `USER_LIMIT` only in case,
+    /// `SuperUserPolicy` only in where the match falls, and `Ultra#send_error` matches nothing
+    /// but a subsequence. The gem's `UserAgent` is an exact match on a name the project does not
+    /// have, so its position is the whole of what `own` decides.
+    /// The gem home comes back with the harness because dropping it deletes the gem, and the
+    /// harness holds only the project's own directory.
+    fn picker() -> (Harness, tempfile::TempDir) {
+        let (dir, gem_home, env) =
+            project_with_gem("class User\nend\n\nmodule Shouty\n  class UserAgent\n  end\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/accounts.rb", PICKER);
+        harness.index();
+        harness.index_gems();
+        (harness, gem_home)
+    }
+
+    #[test]
+    fn the_rows_of_a_symbol_search_in_the_order_the_picker_draws_them() {
+        // `ANCESTRY`'s treatment for the other ranked list in the crate. Every field of `rank`
+        // is separated by exactly one adjacent pair here, so the whole list is the ordering
+        // stated once: `own` before everything (the gem's exact `UserAgent` is last, under a
+        // subsequence match in the project), then match quality, then the shorter simple name,
+        // then the shorter qualified one, then alphabetical.
+        //
+        // Four of these rows were asserted nowhere before — the constant, the nested class, the
+        // second method and the gem — and a ranking is not a set of rows, it is their order.
+        let (mut harness, _gem_home) = picker();
+
+        assert_eq!(
+            picker_rows(&mut harness, "user"),
+            [
+                "User  -  accounts.rb",
+                "User  Admin  accounts.rb",
+                "user  Account  accounts.rb",
+                "user_name  Account  accounts.rb",
+                "USER_LIMIT  Account  accounts.rb",
+                "UserSerializer  -  accounts.rb",
+                "SuperUserPolicy  -  accounts.rb",
+                "send_error  Ultra  accounts.rb",
+                "UserAgent  Shouty  shouty.rb",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_one_letter_query_ranks_rather_than_gives_up() {
+        // The query a picker actually receives first, and the one every ordering decision was
+        // made for: on a Rails bundle a single letter subsequence-matches most of a hundred and
+        // fifty thousand declarations. Here it adds `Ultra`, `Account` and `Shouty` to the list
+        // above — and puts none of them above a name the letter actually starts.
+        let (mut harness, _gem_home) = picker();
+
+        assert_eq!(
+            picker_rows(&mut harness, "u"),
+            [
+                "User  -  accounts.rb",
+                "User  Admin  accounts.rb",
+                "user  Account  accounts.rb",
+                "Ultra  -  accounts.rb",
+                "user_name  Account  accounts.rb",
+                "USER_LIMIT  Account  accounts.rb",
+                "UserSerializer  -  accounts.rb",
+                "Account  -  accounts.rb",
+                "SuperUserPolicy  -  accounts.rb",
+                "send_error  Ultra  accounts.rb",
+                "UserAgent  Shouty  shouty.rb",
+                "Shouty  -  shouty.rb",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_query_that_spells_a_path_is_matched_on_the_path() {
+        // `rank`'s tier 1: the query matched nothing in the simple name and everything in the
+        // qualified one, which is what somebody typing `Account#user` means and the only tier
+        // that cannot be reached by typing a name.
+        let (mut harness, _gem_home) = picker();
+
+        assert_eq!(
+            picker_rows(&mut harness, "Account#user"),
+            [
+                "user  Account  accounts.rb",
+                "user_name  Account  accounts.rb",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_symbol_search_answers_the_same_list_however_the_query_is_cased() {
+        // Every comparison in `tier` is case-insensitive, and a picker that reordered itself
+        // when the user pressed shift would be worse than one that did not rank at all.
+        let (mut harness, _gem_home) = picker();
+
+        let typed = picker_rows(&mut harness, "user");
+        assert_eq!(picker_rows(&mut harness, "User"), typed);
+        assert_eq!(picker_rows(&mut harness, "USER"), typed);
+    }
+
     #[test]
     fn a_symbol_search_prefers_the_users_own_code_to_a_gem() {
         // A gem reopening a class the project also defines is one declaration with definitions
@@ -5750,6 +7471,1977 @@ end
         assert!(
             harness.definition_at(&main, source, "Person").is_null(),
             "and answers nothing once it is not"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.3.0 — signature help
+    // -----------------------------------------------------------------------
+
+    /// One class carrying every parameter kind, for the one request that is *about* parameters.
+    ///
+    /// `initialize` rather than an ordinary method, so that `Person.new(` — the call a user
+    /// makes far more often than any other — is pinned by the same fixture that pins the
+    /// rendering. `shout` exists to be called on a receiver nothing can type, which is the
+    /// answer that has to be `null`.
+    const CALLS: &str = "\
+class Person
+  # Make one.
+  def initialize(name, age = 18, *nicknames, admin: false, **extra, &block)
+  end
+
+  # Build one.
+  def self.build(name, sep:)
+  end
+
+  def self.locate(x, y)
+  end
+
+  def self.tag(**attributes)
+  end
+
+  class << self
+    attr_reader :registry
+  end
+
+  def shout(volume)
+  end
+end
+";
+
+    fn calling(marked: &str) -> String {
+        format!("{CALLS}{marked}")
+    }
+
+    #[test]
+    fn a_call_shows_the_method_it_reaches_with_the_argument_being_written_underlined() {
+        // The whole card, drawn: the label, the span under the parameter, and the comment. Two
+        // separate things are pinned by the underline sitting where it does — that `render`
+        // spells each parameter kind the way Ruby writes it, and that the offsets it hands back
+        // land on the piece of the label they were computed for. Asserting the numbers instead
+        // would pass just as happily with the underline three characters to the left.
+        //
+        // And `Person.new` is answered with `Person#initialize`. `Class#new` is the exact
+        // answer and a useless one — the parameters the call actually takes are the
+        // constructor's — which is the redirect `locator` already makes for hover and
+        // navigation, reaching signature help through the same door.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", CALLS);
+        harness.index();
+
+        assert_eq!(
+            harness.signature_card(&uri, &calling("Person.new(~)\n")),
+            "Person#initialize(name, age = ..., *nicknames, admin: ..., **extra, &block)\n\
+             \u{20}                 ~~~~\n\
+             Make one."
+        );
+    }
+
+    #[test]
+    fn the_underline_follows_the_cursor_from_one_argument_to_the_next() {
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", CALLS);
+        harness.index();
+
+        let underline = |harness: &mut Harness, call: &str| {
+            harness
+                .signature_card(&uri, &calling(call))
+                .lines()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        // `(name, age = ..., *nicknames, admin: ..., **extra, &block)` from column 17.
+        assert_eq!(
+            underline(&mut harness, "Person.new(~)\n"),
+            " ".repeat(18) + "~~~~"
+        );
+        assert_eq!(
+            underline(&mut harness, "Person.new(\"ada\", ~)\n"),
+            " ".repeat(24) + "~~~~~~~~~",
+            "the second argument is `age = ...`"
+        );
+        assert_eq!(
+            underline(&mut harness, "Person.new(\"ada\", 30, ~)\n"),
+            " ".repeat(35) + "~~~~~~~~~~",
+            "and the third is the splat"
+        );
+        // The rule the splat exists for: everything positional after it goes into it, so
+        // counting straight through would walk off the end of a method that cannot be
+        // over-called. This is the fifth argument and it is still `*nicknames`.
+        assert_eq!(
+            underline(&mut harness, "Person.new(\"ada\", 30, \"a\", \"b\", ~)\n"),
+            " ".repeat(35) + "~~~~~~~~~~",
+            "and so is the fifth"
+        );
+    }
+
+    #[test]
+    fn a_keyword_argument_is_found_by_name_and_an_unknown_one_lands_in_the_splat() {
+        // Keywords are written in any order, so the count that answers a positional argument
+        // answers the wrong parameter for a keyword the moment anybody reorders two. The name
+        // is the only thing that identifies one — and a name the method does not declare is
+        // what `**extra` is for, which is where it is shown going.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", CALLS);
+        harness.index();
+
+        let underline = |harness: &mut Harness, call: &str| {
+            harness
+                .signature_card(&uri, &calling(call))
+                .lines()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        assert_eq!(
+            underline(&mut harness, "Person.new(\"ada\", admin: ~)\n"),
+            " ".repeat(47) + "~~~~~~~~~~",
+            "`admin: ...`"
+        );
+        assert_eq!(
+            underline(&mut harness, "Person.new(admin: true, ~)\n"),
+            " ".repeat(47) + "~~~~~~~~~~",
+            "still `admin:`, one argument later"
+        );
+        assert_eq!(
+            underline(&mut harness, "Person.new(\"ada\", nickname: ~)\n"),
+            " ".repeat(59) + "~~~~~~~",
+            "a keyword the method never declared is `**extra`'s"
+        );
+        // With no `**opts` to fall into, an undeclared keyword still belongs to the keyword
+        // half of the signature rather than to a positional parameter it cannot be passed as.
+        assert_eq!(
+            harness.signature_card(&uri, &calling("Person.build(\"ada\", bogus: ~)\n")),
+            "Person.build(name, sep:)\n\u{20}                  ~~~~\nBuild one."
+        );
+        // And a method whose only keyword is the splat is where an unnamed one lands too.
+        assert_eq!(
+            harness.signature_card(&uri, &calling("Person.tag(id: 1, ~)\n")),
+            "Person.tag(**attributes)\n\u{20}          ~~~~~~~~~~~~"
+        );
+    }
+
+    #[test]
+    fn a_singleton_method_is_named_the_way_it_is_called() {
+        // `Person::<Person>#build()` is rubydex's spelling and nobody's Ruby. Signature help
+        // goes through `render::qualified_name` for the same reason hover and the outline do:
+        // a construct that reads one way in one card and another way in the next is a bug.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", CALLS);
+        harness.index();
+
+        assert_eq!(
+            harness.signature_card(&uri, &calling("Person.build(~)\n")),
+            "Person.build(name, sep:)\n\
+             \u{20}            ~~~~\n\
+             Build one."
+        );
+    }
+
+    #[test]
+    fn the_innermost_call_is_the_one_being_written() {
+        // A cursor inside a nested call's parentheses belongs to the inner call — the case
+        // ruby-lsp carries an `adjust_for_nested_target` for. Here it costs nothing: the walk
+        // that finds the enclosing argument list is pre-order, so the innermost claimant is
+        // the last to write itself down.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", CALLS);
+        harness.index();
+
+        assert_eq!(
+            harness.signature_card(&uri, &calling("Person.new(Person.build(~))\n")),
+            "Person.build(name, sep:)\n\
+             \u{20}            ~~~~\n\
+             Build one."
+        );
+        // And back out again, with the inner call now one finished argument.
+        assert_eq!(
+            harness
+                .signature_card(
+                    &uri,
+                    &calling("Person.new(Person.build(\"ada\", sep: \",\"), ~)\n")
+                )
+                .lines()
+                .next()
+                .unwrap_or_default(),
+            "Person#initialize(name, age = ..., *nicknames, admin: ..., **extra, &block)"
+        );
+    }
+
+    #[test]
+    fn a_receiver_nothing_can_name_is_answered_with_nothing() {
+        // The rule keyword-argument completion already applies, for the reason the README
+        // states: `person.shout` matches on the name alone, and another class's parameter list
+        // under the cursor while the user types into it is a syntactically valid wrong answer.
+        // Absent beats wrong here — the editor falls back to showing nothing at all.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", CALLS);
+        harness.index();
+
+        for marked in [
+            "person = whatever\nperson.shout(~)\n",
+            // The graph names a *constant* receiver and nothing else, so an instance of one is
+            // not a name either — the same line keyword-argument completion has always drawn,
+            // reached through the same `locator::precise_call`. Widening it means typing an
+            // expression, which §2's finding 2 puts outside this release.
+            "person = Person.new(\"ada\")\nperson.shout(~)\n",
+            "Person.new(\"ada\").shout(~)\n",
+        ] {
+            assert!(
+                harness.signature(&uri, &calling(marked)).is_null(),
+                "{marked:?} has no receiver the graph can name"
+            );
+        }
+        // The guard, so this cannot pass by never answering anything: the same file, the same
+        // method, through a receiver that is a constant.
+        assert_eq!(
+            harness.signature_card(&uri, &calling("Person.build(~)\n")),
+            "Person.build(name, sep:)\n\u{20}            ~~~~\nBuild one."
+        );
+    }
+
+    #[test]
+    fn a_keyword_a_method_has_nowhere_to_put_underlines_nothing() {
+        // `locate` takes two positionals and no keywords at all, so there is no parameter a
+        // keyword argument could be. The signature is still worth showing — it is what tells
+        // the user why the call is wrong — and highlighting a positional parameter would be
+        // claiming a keyword can be passed as one.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", CALLS);
+        harness.index();
+
+        for marked in [
+            "Person.locate(1, missing: ~)\n",
+            "Person.locate(missing: 1, ~)\n",
+        ] {
+            assert_eq!(
+                harness.signature_card(&uri, &calling(marked)),
+                "Person.locate(x, y)",
+                "{marked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reader_with_no_parameters_to_show_is_answered_with_nothing() {
+        // `attr_reader` declares a method rubydex records as an attribute rather than as a
+        // `def`, so it carries no parameter list — and a getter takes no arguments, so there
+        // is nothing a signature card could say about the call. `null` closes the popup, which
+        // is the right thing for a call that should not have parentheses at all.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", CALLS);
+        harness.index();
+
+        assert!(
+            harness
+                .signature(&uri, &calling("Person.registry(~)\n"))
+                .is_null()
+        );
+        // The guard: the same receiver and a method that does have one.
+        assert!(
+            !harness
+                .signature(&uri, &calling("Person.locate(~)\n"))
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn a_cursor_outside_every_argument_list_is_answered_with_nothing() {
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", CALLS);
+        harness.index();
+
+        for marked in [
+            "Person.new(\"ada\")~\n",
+            "x = 1~\n",
+            "Person~.new\n",
+            "# a note about Person.new(~)\n",
+        ] {
+            assert!(
+                harness.signature(&uri, &calling(marked)).is_null(),
+                "{marked:?} is not inside a call"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parameter_span_is_counted_the_way_the_client_indexes_the_label() {
+        // The offsets are into a string the client holds as UTF-16, and a Ruby parameter can
+        // be spelled in any script — `def приветствие(имя)` is legal Ruby. Counting bytes
+        // would put the span three times too far along for Cyrillic and twice for an emoji,
+        // and the drawing every other test here asserts on cannot see the difference because
+        // every other fixture is ASCII. So this one asserts the numbers.
+        let source = "class Greeter\n  def self.hello(имя, sep)\n  end\nend\n";
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/greeter.rb", source);
+        harness.index();
+
+        let help = harness.signature(&uri, &format!("{source}Greeter.hello(\"a\", ~)\n"));
+        let parameters = help["signatures"][0]["parameters"]
+            .as_array()
+            .expect("a parameter list")
+            .clone();
+        assert_eq!(
+            help["signatures"][0]["label"].as_str(),
+            Some("Greeter.hello(имя, sep)")
+        );
+        // `Greeter#hello(` is 14 UTF-16 units, `имя` is 3 of them however many bytes it takes.
+        assert_eq!(parameters[0]["label"], serde_json::json!([14, 17]));
+        assert_eq!(parameters[1]["label"], serde_json::json!([19, 22]));
+        assert_eq!(help["activeParameter"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn every_overload_is_offered_and_the_one_being_written_is_chosen() {
+        // `Signatures::Overloaded` is real — RBS declares three arms for `String#gsub` and 65
+        // in `core/string.rbs` altogether — and LSP has `activeSignature` for exactly this.
+        // Flattening them to the first would be a choice to know less than the signatures do.
+        //
+        // The arity-1 arm is written first on purpose: with the shorter arm second, every
+        // cursor position fits the first one and a broken choice would pass.
+        let (mut harness, uri) = with_signatures("");
+        assert_eq!(
+            harness.signature_card(&uri, "Coordinate.new(1, ~)\n"),
+            "Coordinate#initialize(text)\n\
+             Coordinate#initialize(x, y)\n\
+             \u{20}                        ~\n\
+             A point, from a pair or from text."
+        );
+        // Nothing written yet, so both arms still fit and the first is the answer — an
+        // argument count cannot tell an arity-1 call from an arity-2 one before there is one.
+        assert_eq!(
+            harness.signature_card(&uri, "Coordinate.new(~)\n"),
+            "Coordinate#initialize(text)\n\
+             \u{20}                     ~~~~\n\
+             Coordinate#initialize(x, y)\n\
+             A point, from a pair or from text."
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.3.0 — document highlight
+    // -----------------------------------------------------------------------
+
+    /// One spelling — `name` — used every way a Ruby file uses one.
+    ///
+    /// A parameter in two methods, a block parameter shadowing one of them, a method and a call
+    /// to it, an instance variable in two different objects, and the same six letters in a
+    /// comment and in a string. That last pair is not decoration: matching words is what an
+    /// editor does when no server answers, and lighting up the comment is exactly how it is
+    /// wrong. `MAX` is here so the exact half — a constant the resolver linked — is pinned by
+    /// the same file as the half that is a scope walk.
+    const OCCURRENCES: &str = "\
+class Person
+  MAX = 10
+
+  # A name in a comment is only a word.
+  def initialize(name)
+    @name = name.strip
+    @limit = MAX
+  end
+
+  def greet(name)
+    label = \"name\"
+    [name].each { |name| label = name }
+    name + label
+  end
+
+  def name
+    @name
+  end
+
+  def shout
+    name.upcase
+  end
+
+  def self.rename(name)
+    @name = name
+  end
+end
+";
+
+    /// `OCCURRENCES` with the cursor at the end of `needle`, which must occur in it exactly once.
+    ///
+    /// Naming a position by the text around it rather than by an index is what keeps these
+    /// readable while the fixture grows: `on("def greet(name")` says which of the seven `name`s
+    /// it means, and `on("(name", 2)` would not.
+    fn on(needle: &str) -> String {
+        let at = OCCURRENCES
+            .find(needle)
+            .expect("the needle is in the fixture");
+        assert!(
+            !OCCURRENCES[at + 1..].contains(needle),
+            "{needle:?} has to name one position, and names more than one"
+        );
+        let end = at + needle.len();
+        format!("{}~{}", &OCCURRENCES[..end], &OCCURRENCES[end..])
+    }
+
+    #[test]
+    fn a_local_is_highlighted_in_its_own_scope_and_in_no_other() {
+        // The whole file's answer, drawn. Four things are pinned by what is *not* marked here,
+        // and every one of them is a way the editor's own word matching is wrong: the `name` in
+        // the comment, the `name` inside the string, the `name` that is a method, and the two
+        // `name`s belonging to other scopes — `initialize`'s parameter above and the block
+        // parameter that shadows this one on the line in between.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", OCCURRENCES);
+        harness.index();
+
+        assert_eq!(
+            harness.highlight_map(&uri, &on("def greet(name")),
+            "  def greet(name)\n\
+             \u{20}           wwww\n\
+             \u{20}   [name].each { |name| label = name }\n\
+             \u{20}    rrrr\n\
+             \u{20}   name + label\n\
+             \u{20}   rrrr"
+        );
+    }
+
+    #[test]
+    fn a_block_parameter_shadows_the_local_it_is_spelled_like() {
+        // Prism resolved these, not us: the block parameter and the read beside it are one
+        // variable at depth 0, and the `[name]` three characters to their left is another at
+        // depth 1. Nothing in `scopes` says the word "shadow".
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", OCCURRENCES);
+        harness.index();
+
+        assert_eq!(
+            harness.highlight_map(&uri, &on("{ |name")),
+            "    [name].each { |name| label = name }\n\
+             \u{20}                  wwww          rrrr"
+        );
+    }
+
+    #[test]
+    fn each_method_keeps_its_own_parameter() {
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", OCCURRENCES);
+        harness.index();
+
+        assert_eq!(
+            harness.highlight_map(&uri, &on("def initialize(name")),
+            "  def initialize(name)\n\
+             \u{20}                wwww\n\
+             \u{20}   @name = name.strip\n\
+             \u{20}           rrrr"
+        );
+    }
+
+    #[test]
+    fn a_method_is_highlighted_where_it_is_defined_and_where_it_is_called() {
+        // The graph's half, and the one place the two halves could have disagreed about who
+        // owns a name: `name` in `shout` is a call because no local is spelled that way there,
+        // and a parameter named `name` two methods up must not join it.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", OCCURRENCES);
+        harness.index();
+
+        assert_eq!(
+            harness.highlight_map(&uri, &on("  def shout\n    name")),
+            "  def name\n\
+             \u{20}     wwww\n\
+             \u{20}   name.upcase\n\
+             \u{20}   rrrr"
+        );
+    }
+
+    /// One name in every sigil namespace Ruby has, chosen so each would answer the others'
+    /// prefixes if a sigil were fuzzy-matched like a letter.
+    ///
+    /// `entry` is in all five names on purpose: it is the substring that makes every list below
+    /// a real question rather than a coincidence of spelling. `$@` is here because it is the
+    /// bug this fixture exists for — a global whose whole name after the sigil *is* an `@`, so
+    /// a subsequence match on `@` reaches it and nothing else in Ruby does.
+    ///
+    /// `CURSOR` is where the cursor goes; `sigils_at` writes the line in.
+    const SIGILS: &str = "\
+$@ = nil
+$entry_log = []
+
+class Ledger
+  ENTRY_LIMIT = 100
+
+  @@entry_total = 0
+
+  def initialize
+    @entries = []
+    @entry_note = \"\"
+  end
+
+  def record
+    entry = 1
+    CURSOR
+  end
+end
+";
+
+    /// [`SIGILS`] with `line` written into `#record`'s body, where the `~` marks the cursor.
+    ///
+    /// One buffer rather than two, unlike `ANCESTRY`: an instance variable belongs to the
+    /// `self` it was assigned on, so the cursor has to be inside the same class that assigns it.
+    fn sigils_at(line: &str) -> String {
+        SIGILS.replace("CURSOR", line)
+    }
+
+    #[test]
+    fn an_instance_variable_prefix_reaches_no_other_namespace() {
+        // The whole list, and what is not in it: no `$@`, which is what shipped through two
+        // releases. Nor `$entry_log`, `ENTRY_LIMIT` or either method — every one of them holds
+        // `entry`, and none of them is something `@` can be the start of.
+        //
+        // `@@entry_total` *is* here, and belongs here: one `@` is on the way to two.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/ledger.rb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.first_rows(&uri, &sigils_at("@~"), 10),
+            [
+                "@entries  Ledger#@entries",
+                "@entry_note  Ledger#@entry_note",
+                "@@entry_total  Ledger#@@entry_total",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_class_variable_prefix_does_not_reach_back_to_the_instance_variables() {
+        // The other direction, which is the half that must not be symmetric: `@` admits `@@`
+        // because the second character may still be coming, and `@@` admits no `@name` because
+        // nothing can be typed that turns one into the other.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/ledger.rb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.first_rows(&uri, &sigils_at("@@~"), 10),
+            ["@@entry_total  Ledger#@@entry_total"]
+        );
+    }
+
+    #[test]
+    fn a_global_prefix_is_the_only_thing_that_reaches_a_global() {
+        // And `$@` is a perfectly good answer *here*. The rule is not that it is a bad row, it
+        // is that it belongs to one prefix.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/ledger.rb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.first_rows(&uri, &sigils_at("$~"), 10),
+            ["$entry_log  $entry_log", "$@  $@"]
+        );
+    }
+
+    #[test]
+    fn a_prefix_with_no_sigil_still_reaches_every_namespace() {
+        // Deliberately unchanged, and pinned so it stays deliberate. Someone who has typed no
+        // sigil has not said which namespace they mean, and a client filters as they keep
+        // typing — so `entr` offers the constant, both instance variables, the class variable
+        // and the global, and accepting one of them writes the sigil in.
+        //
+        // What it does not offer is `entry`, the local variable one line above the cursor:
+        // rubydex's graph holds no locals, which is why `scopes.rs` walks Prism itself. That is
+        // a missing feature rather than a wrong answer, and it is written here because a
+        // first-ten list is where an absence is visible at all.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/ledger.rb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.first_rows(&uri, &sigils_at("entr~"), 10),
+            [
+                "ENTRY_LIMIT  Ledger::ENTRY_LIMIT",
+                "@entries  Ledger#@entries",
+                "@entry_note  Ledger#@entry_note",
+                "@@entry_total  Ledger#@@entry_total",
+                "$entry_log  $entry_log",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_instance_variable_belongs_to_whatever_self_is() {
+        // `@name` in an instance method and `@name` in `def self.rename` are two variables —
+        // one hangs off an instance of `Person` and the other off `Person` itself — and Ruby
+        // will happily let a file use both. Joining them is the kind of wrong that reads as
+        // right, which is why `scopes` tracks what `self` is rather than only the class body.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", OCCURRENCES);
+        harness.index();
+
+        assert_eq!(
+            harness.highlight_map(&uri, &on("initialize(name)\n    @name")),
+            "    @name = name.strip\n\
+             \u{20}   wwwww\n\
+             \u{20}   @name\n\
+             \u{20}   rrrrr"
+        );
+        assert_eq!(
+            harness.highlight_map(&uri, &on("rename(name)\n    @name")),
+            "    @name = name\n\
+             \u{20}   wwwww"
+        );
+    }
+
+    #[test]
+    fn a_constant_is_highlighted_exactly() {
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", OCCURRENCES);
+        harness.index();
+
+        assert_eq!(
+            harness.highlight_map(&uri, &on("@limit = MAX")),
+            "  MAX = 10\n\
+             \u{20} www\n\
+             \u{20}   @limit = MAX\n\
+             \u{20}            rrr"
+        );
+    }
+
+    #[test]
+    fn a_name_in_a_comment_or_a_string_is_not_an_occurrence_of_anything() {
+        // The bar the whole item is measured against. Both of these are positions where an
+        // editor matching words lights the file up, and both answer `null` — which is also what
+        // hands the fallback back to the client for exactly the positions ya-lsp cannot speak
+        // for, rather than replacing it with an empty list everywhere.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", OCCURRENCES);
+        harness.index();
+
+        assert_eq!(harness.highlight_map(&uri, &on("# A name")), "null");
+        assert_eq!(harness.highlight_map(&uri, &on("label = \"name")), "null");
+    }
+
+    #[test]
+    fn a_selection_chain_arrives_as_a_nest_of_parents() {
+        // The half `ranges` own tests cannot see: LSP spells a chain as one range carrying its
+        // parent rather than as a list, the innermost is the one at the top, and the outermost
+        // carries no `parent` key at all.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/a.rb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.selection(&uri, "puts \"he~llo\"\n"),
+            serde_json::json!([{
+                "range": { "start": { "line": 0, "character": 6 },
+                           "end": { "line": 0, "character": 11 } },
+                "parent": {
+                    "range": { "start": { "line": 0, "character": 5 },
+                               "end": { "line": 0, "character": 12 } },
+                    "parent": {
+                        "range": { "start": { "line": 0, "character": 0 },
+                                   "end": { "line": 0, "character": 12 } },
+                        "parent": {
+                            "range": { "start": { "line": 0, "character": 0 },
+                                       "end": { "line": 1, "character": 0 } }
+                        }
+                    }
+                }
+            }])
+        );
+    }
+
+    #[test]
+    fn one_chain_comes_back_per_position_asked_about_in_the_order_asked() {
+        // The protocol pairs the two arrays by index and has no spelling for "not this one", so
+        // a position that resolved to nothing still has to answer — with the buffer, which is
+        // what the second of these is.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/a.rb", "");
+        harness.index();
+        harness.open(&uri, "call(1)\n\n");
+
+        let found = harness.ask(
+            "textDocument/selectionRange",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "positions": [
+                    { "line": 0, "character": 5 },
+                    { "line": 1, "character": 0 },
+                ],
+            }),
+        );
+
+        let chains = found.as_array().expect("one chain per position");
+        assert_eq!(chains.len(), 2);
+        assert_eq!(chains[0]["range"]["end"]["character"], 6);
+        assert_eq!(
+            chains[1]["range"]["end"],
+            serde_json::json!({ "line": 2, "character": 0 })
+        );
+        assert_eq!(chains[1]["parent"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn folding_ranges_are_whole_lines_and_carry_no_characters() {
+        // `lineFoldingOnly` is what every client that matters sends, and a character offset it
+        // has been told to ignore is a field that can only ever be wrong. The `kind` is absent
+        // for the same reason: syntax folds have none, and `null` is not one of LSP's three.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/a.rb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.folding(&uri, "# note\n# more\ndef foo\n  1\nend\n"),
+            serde_json::json!([
+                { "startLine": 0, "endLine": 1, "kind": "comment" },
+                { "startLine": 2, "endLine": 3 },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_file_with_nothing_to_fold_answers_null_rather_than_an_empty_list() {
+        // The one place `null`-versus-`[]` costs the user something they had: a client with a
+        // folding provider stops guessing folds from indentation, so an empty array would take
+        // the guess away *and* put nothing in its place. A `null` hands it back.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/a.rb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.folding(&uri, "x = 1\ny = 2\n"),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_file_the_editor_never_opened_still_folds_and_still_expands() {
+        // Both read through `with_text`, so both answer from disk for a file no `didOpen` ever
+        // named — which is what an editor does when it asks about a file it is only previewing.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/b.rb", "def foo\n  1\nend\n");
+        harness.index();
+
+        assert_eq!(
+            harness.ask(
+                "textDocument/foldingRange",
+                serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+            ),
+            serde_json::json!([{ "startLine": 0, "endLine": 1 }])
+        );
+        let found = harness.ask(
+            "textDocument/selectionRange",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "positions": [{ "line": 1, "character": 2 }],
+            }),
+        );
+        assert_eq!(
+            found[0]["range"]["start"],
+            serde_json::json!({ "line": 1, "character": 2 })
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.3.0 — type hierarchy
+    // -----------------------------------------------------------------------
+
+    /// A three-deep chain, a module included halfway up it, a module prepended at the bottom, a
+    /// sibling, and a superclass nothing can resolve.
+    ///
+    /// Written as one file so the fixture and the answers can be read against each other. The
+    /// prepend is not decoration: it is the one shape where the class is *not* the first entry
+    /// of its own ancestor chain, so dropping "the head of the list" instead of "the entry that
+    /// is this class" would pass every other test here.
+    const HIERARCHY: &str = "\
+module Greet
+end
+
+module Loud
+end
+
+class Base
+end
+
+class Middle < Base
+  include Greet
+end
+
+class Leaf < Middle
+  prepend Loud
+end
+
+class Other < Base
+end
+
+class Orphan < Missing::Thing
+end
+";
+
+    /// The fixture indexed, with signatures and gems off — so the rows are the project's own.
+    fn hierarchy_harness() -> (Harness, DocUri) {
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/hierarchy.rb", HIERARCHY);
+        harness.index();
+        (harness, uri)
+    }
+
+    #[test]
+    fn the_supertypes_of_a_class_are_its_ruby_ancestors_in_ruby_order() {
+        // The whole list, not a `contains`: this is `Module#ancestors` and the interesting thing
+        // about it is its *composition*. `Loud` above `Leaf` because a prepended module wins
+        // method lookup, `Greet` between `Middle` and `Base` because that is where it was
+        // included, and `Leaf` itself nowhere — a class is in its own ancestors and is not its
+        // own supertype.
+        let (mut harness, uri) = hierarchy_harness();
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/supertypes", &uri, HIERARCHY, "Leaf <"),
+            "module Loud — hierarchy.rb\n\
+             class Middle — hierarchy.rb\n\
+             module Greet — hierarchy.rb\n\
+             class Base — hierarchy.rb"
+        );
+    }
+
+    #[test]
+    fn object_and_kernel_are_in_the_chain_only_when_there_is_a_file_to_point_at() {
+        // Every Ruby class inherits from `Object`, `Kernel` and `BasicObject`, and rubydex knows
+        // it without any signatures — it carries the five of them as a built-in document called
+        // `rubydex:built-in`, which has no file behind it. `DocUri` rejects that URI for every
+        // request alike, so the rows are dropped here rather than sent as somewhere an editor
+        // cannot open. With signatures indexed they come back, out of `core/*.rbs`, which is the
+        // test below.
+        let (mut harness, uri) = hierarchy_harness();
+        let rows = harness.hierarchy_rows("typeHierarchy/supertypes", &uri, HIERARCHY, "Base\nend");
+        assert!(!rows.contains("Object"), "{rows}");
+        assert!(!rows.contains("Kernel"), "{rows}");
+    }
+
+    #[test]
+    fn the_subtypes_of_a_class_are_every_class_below_it_and_not_just_the_next_one() {
+        // The mirror of the supertypes above, and deliberately transitive to match them: `Leaf`
+        // is two levels under `Base` and is listed, because a chain answered one way and a
+        // single generation answered the other would be a tree whose two directions disagree
+        // about what a level means. `Base` itself is not in it, and neither is `Orphan`, which
+        // inherits from something else.
+        let (mut harness, uri) = hierarchy_harness();
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/subtypes", &uri, HIERARCHY, "Base\nend"),
+            "class Leaf — hierarchy.rb\n\
+             class Middle — hierarchy.rb\n\
+             class Other — hierarchy.rb"
+        );
+    }
+
+    #[test]
+    fn a_module_lists_the_classes_that_mix_it_in() {
+        // `include` and `prepend` both put a class into a module's descendants, which is what
+        // makes "who uses this concern" a question the hierarchy answers. `Greet` is included by
+        // `Middle` and reaches `Leaf` through it.
+        let (mut harness, uri) = hierarchy_harness();
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/subtypes", &uri, HIERARCHY, "Greet\nend"),
+            "class Leaf — hierarchy.rb\n\
+             class Middle — hierarchy.rb"
+        );
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/subtypes", &uri, HIERARCHY, "Loud\nend"),
+            "class Leaf — hierarchy.rb"
+        );
+    }
+
+    #[test]
+    fn an_ancestor_that_did_not_resolve_is_a_row_that_says_so() {
+        // The silent-degradation case, and the reason the partial arm is not simply dropped: a
+        // superclass in a gem that did not install would otherwise leave a chain that reads as
+        // complete and is short by everything above the gap. The row is spelled as it was
+        // written, its kind comes from having been written as a superclass rather than a mixin,
+        // and it carries no `data` — there is nothing to expand.
+        let (mut harness, uri) = hierarchy_harness();
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/supertypes", &uri, HIERARCHY, "Orphan <"),
+            "class Missing::Thing — not found"
+        );
+
+        let expanded = harness.expand("typeHierarchy/supertypes", &uri, HIERARCHY, "Orphan <");
+        assert!(
+            expanded[0]["data"].is_null(),
+            "a row for a name that resolved to nothing has nothing behind it"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_ancestor_is_placed_where_it_is_written_even_when_that_is_another_class() {
+        // A partial propagates down the chain: `Cursed`'s ancestors carry the `Missing::Thing`
+        // that `Orphan` inherits from, and it is written in `Orphan`. So the whole chain is
+        // searched for the mention rather than only the class being expanded — otherwise the row
+        // is either missing or pointing at the wrong line, and the row exists to be clicked.
+        //
+        // `Cursed` carries an unresolved mixin of its own so that the chain holds *two* names
+        // that resolved to nothing. That is what makes the search step over one partial on its
+        // way to the mention of another, which is the ordinary case in a project with a gem
+        // missing and the one a single unresolved name never reaches.
+        let source = "class Orphan < Missing::Thing\nend\n\nclass Cursed < Orphan\n  \
+                      include AlsoMissing\nend\n";
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/cursed.rb", source);
+        harness.index();
+
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/supertypes", &uri, source, "Cursed <"),
+            "module AlsoMissing — not found\n\
+             class Orphan — cursed.rb\n\
+             class Missing::Thing — not found"
+        );
+        let expanded = harness.expand("typeHierarchy/supertypes", &uri, source, "Cursed <");
+        assert_eq!(
+            expanded[2]["selectionRange"]["start"],
+            serde_json::json!({ "line": 0, "character": 15 }),
+            "the span of `Missing::Thing` on `class Orphan`'s own line"
+        );
+        assert_eq!(
+            expanded[0]["selectionRange"]["start"],
+            serde_json::json!({ "line": 4, "character": 10 }),
+            "and `AlsoMissing` where `Cursed` writes it"
+        );
+    }
+
+    #[test]
+    fn a_module_says_which_of_its_own_mixins_did_not_resolve() {
+        // A module's ancestors are its mixins, and rubydex keeps `include`d names on the module
+        // definition rather than on the enum — so a module in the chain is a case of its own,
+        // and the concern that includes a missing concern is a shape Rails code has.
+        let source = "module Bag\n  include Gone::Bits\nend\n\nclass Holder\n  \
+                      include Bag\nend\n";
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/bag.rb", source);
+        harness.index();
+
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/supertypes", &uri, source, "Bag\n  include"),
+            "module Gone::Bits — not found"
+        );
+        // And through the class that includes it, which is where the propagation and the module
+        // case meet.
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/supertypes", &uri, source, "Holder"),
+            "module Bag — bag.rb\n\
+             module Gone::Bits — not found"
+        );
+    }
+
+    #[test]
+    fn a_mixin_that_did_not_resolve_is_a_module_and_a_superclass_is_a_class() {
+        // Nothing in the graph says what a name that resolved to nothing *was*, but the source
+        // does: `include` takes a module and `<` takes a class. Both rows would otherwise have to
+        // guess, and a guess here shows the user the wrong icon on the only row on the screen
+        // that is about something being missing.
+        let source = "class Odd < Gone::Parent\n  include Gone::Concern\nend\n";
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/odd.rb", source);
+        harness.index();
+
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/supertypes", &uri, source, "Odd <"),
+            "module Gone::Concern — not found\n\
+             class Gone::Parent — not found"
+        );
+    }
+
+    #[test]
+    fn an_explicit_root_is_kept_in_the_name_of_a_row_that_could_not_be_found() {
+        // `::Foo` failing where `Foo` would have resolved is frequently the reason, and this row
+        // is read rather than clicked, so the name is the whole of what it has to offer.
+        let source = "class Rooted < ::Nowhere\nend\n";
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/rooted.rb", source);
+        harness.index();
+
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/supertypes", &uri, source, "Rooted <"),
+            "class ::Nowhere — not found"
+        );
+    }
+
+    #[test]
+    fn the_hierarchy_is_prepared_from_a_use_of_a_name_as_well_as_from_its_definition() {
+        // Two of `locator`'s three targets reach here: the `class Leaf` definition and the
+        // `Middle` written after the `<`, which is a constant reference. Both are things a user
+        // right-clicks, and both have to answer with the class rather than with nothing.
+        let (mut harness, uri) = hierarchy_harness();
+        let from_definition = harness.prepare_hierarchy(&uri, HIERARCHY, "Leaf <");
+        assert_eq!(from_definition[0]["name"], serde_json::json!("Leaf"));
+
+        let from_reference = harness.prepare_hierarchy(&uri, HIERARCHY, "Middle\n  prepend");
+        assert_eq!(from_reference[0]["name"], serde_json::json!("Middle"));
+        assert_eq!(
+            from_reference[0]["selectionRange"]["start"]["line"],
+            serde_json::json!(9),
+            "the `class Middle` line, not the line the reference is on"
+        );
+    }
+
+    #[test]
+    fn nothing_that_is_not_a_class_or_a_module_is_offered_a_hierarchy() {
+        // `null`, not an empty list, which is what makes the editor say there are no results
+        // rather than open an empty tree. A method is the case that matters: `references` matches
+        // a method by name, so a cursor on `shout` resolves to declarations — they are simply
+        // not types, and the rejection falls out of asking the resolution for a namespace.
+        let source = "class Person\n  MAX = 3\n  def shout\n    total = MAX\n  end\nend\n";
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", source);
+        harness.index();
+
+        for needle in ["shout", "MAX = 3", "total"] {
+            assert_eq!(
+                harness.prepare_hierarchy(&uri, source, needle),
+                serde_json::Value::Null,
+                "{needle:?} is not a type"
+            );
+        }
+    }
+
+    #[test]
+    fn a_singleton_class_is_not_a_type_anybody_asked_about() {
+        // rubydex models `class << self` as a namespace called `Person::<Person>`, and it has a
+        // real ancestor chain — `Class`, `Module`, `Object`. It is not a name a person wrote, so
+        // it is turned away on the same two tests the symbol picker uses, and a cursor on
+        // `self` there answers `null` rather than opening a tree over ya-lsp's own spelling.
+        let source = "class Person\n  class << self\n    def build; end\n  end\nend\n";
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/person.rb", source);
+        harness.index();
+
+        assert_eq!(
+            harness.prepare_hierarchy(&uri, source, "<< self"),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn an_item_the_client_hands_back_without_a_usable_declaration_answers_nothing() {
+        // Both follow-ups take their subject from the client, which echoes back whatever the row
+        // it is expanding carried. A row for an unresolved name has no `data` at all, a client
+        // may send one that is not a number, and a rubydex id is a 64-bit hash — so a stale one
+        // is indistinguishable from a live one and has to answer "nothing" rather than resolve
+        // against whatever it collides with.
+        let (mut harness, _) = hierarchy_harness();
+        for data in [
+            serde_json::Value::Null,
+            serde_json::json!("not a number"),
+            serde_json::json!("0"),
+            serde_json::json!(1_234_567_890_123_456_789_u64),
+            serde_json::json!("1234567890123456789"),
+        ] {
+            let item = serde_json::json!({
+                "name": "Ghost",
+                "kind": 5,
+                "uri": "file:///nowhere.rb",
+                "range": { "start": { "line": 0, "character": 0 },
+                           "end": { "line": 0, "character": 0 } },
+                "selectionRange": { "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 0 } },
+                "data": data,
+            });
+            for method in ["typeHierarchy/supertypes", "typeHierarchy/subtypes"] {
+                assert_eq!(
+                    harness.ask(method, serde_json::json!({ "item": item })),
+                    serde_json::Value::Null,
+                    "{method} on {:?}",
+                    item["data"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_hierarchy_params_are_answered_with_null_rather_than_a_panic() {
+        // Client input, like every other handler's params. All three arms, because each parses a
+        // different shape and the two follow-ups do not take a position at all.
+        let (mut harness, _) = hierarchy_harness();
+        for method in [
+            "textDocument/prepareTypeHierarchy",
+            "typeHierarchy/supertypes",
+            "typeHierarchy/subtypes",
+        ] {
+            assert_eq!(
+                harness.ask(method, serde_json::json!({ "nonsense": true })),
+                serde_json::Value::Null
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_list_of_subtypes_says_so() {
+        // A short list of subtypes is indistinguishable from a complete one, so reaching the cap
+        // is said out loud rather than only logged. Reached here by asking about a class with
+        // more subtypes than the answer holds, which in a real project takes asking about
+        // something near the root of the object model.
+        let mut source = String::from("class Root\nend\n");
+        for index in 0..(MAX_SUBTYPES + 3) {
+            source.push_str(&format!("class Sub{index} < Root\nend\n"));
+        }
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/many.rb", &source);
+        harness.index();
+
+        let found = harness.expand("typeHierarchy/subtypes", &uri, &source, "Root\nend");
+        assert_eq!(found.as_array().map(Vec::len), Some(MAX_SUBTYPES));
+        assert_eq!(
+            harness.messages(),
+            vec![format!(
+                "{} subtypes found: only the first {MAX_SUBTYPES} are shown.",
+                MAX_SUBTYPES + 3
+            )]
+        );
+    }
+
+    #[test]
+    fn the_users_own_code_is_ranked_above_the_bundle_and_the_rest_alphabetically() {
+        // `search::rank`'s decision, for `search::rank`'s reason: asking a widely-subclassed
+        // class for its subtypes in a real project finds hundreds in gems and a handful that are
+        // the user's, and an alphabetical list would bury the handful below whatever the bundle
+        // happens to spell with an `A`. Within each half the order is the name, never the
+        // `DeclarationId` — that is a hash, and a tree that reshuffles between runs is
+        // unreadable.
+        let (dir, _gem_home, env) = project_with_gem(
+            "module Shouty\n  class Base\n  end\n\n  class Middle < Base\n  end\nend\n",
+        );
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "class ZLocal < Shouty::Base\nend\n";
+        let uri = harness.write("lib/z_local.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/subtypes", &uri, source, "Base\nend"),
+            "class ZLocal — z_local.rb\n\
+             class Shouty::Middle — shouty.rb",
+            "the project's own class first, though it sorts last"
+        );
+    }
+
+    #[test]
+    fn signatures_put_rubys_own_classes_and_modules_in_the_chain() {
+        // The plan's "a superclass in a gem" criterion, met with the mechanism that actually
+        // delivers it: with signatures indexed, `Object` and `Comparable` come out of real
+        // `.rbs` files and the chain reaches all the way up. `module Comparable` in a list of
+        // supertypes is the answer's most surprising claim and its most correct one — a
+        // linearized chain is what Ruby means by `ancestors`, and filtering modules out to make
+        // it look like single inheritance would make it wrong.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let signatures = dir.path().join("sig");
+        std::fs::create_dir_all(signatures.join("core")).unwrap();
+        std::fs::write(
+            signatures.join("core/object.rbs"),
+            "class BasicObject\nend\n\nmodule Kernel\nend\n\nclass Object < BasicObject\n  \
+             include Kernel\nend\n\nmodule Comparable\nend\n\nclass Numeric < Object\n  \
+             include Comparable\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            format!(
+                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
+                signatures.display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        let source = "class Money < Numeric\nend\n";
+        let uri = harness.write("lib/money.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/supertypes", &uri, source, "Money <"),
+            "class Numeric — object.rbs\n\
+             module Comparable — object.rbs\n\
+             class Object — object.rbs\n\
+             module Kernel — object.rbs\n\
+             class BasicObject — object.rbs"
+        );
+        // And the other direction across the same boundary: Ruby's own class knows about the
+        // project's, because the reverse index is filled as the chain is linearized.
+        assert_eq!(
+            harness.hierarchy_rows("typeHierarchy/subtypes", &uri, source, "Numeric"),
+            "class Money — money.rb"
+        );
+    }
+
+    #[test]
+    fn a_class_reopened_in_two_files_is_one_row_pointing_at_the_users_own_copy() {
+        // One row per declaration, not one per definition: `ActiveRecord::Base` is reopened
+        // hundreds of times and a chain listing each would be unreadable. Which of them the row
+        // points at is `locator::preferred_definition`, shared with the symbol picker so a class
+        // cannot open in one file from the outline and in another from the hierarchy.
+        let (dir, _gem_home, env) = project_with_gem("module Shouty\n  class Base\n  end\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "module Shouty\n  class Base\n    def extra; end\n  end\nend\n";
+        let uri = harness.write("lib/reopen.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        let prepared = harness.prepare_hierarchy(&uri, source, "Base");
+        assert_eq!(
+            prepared.as_array().map(Vec::len),
+            Some(1),
+            "reopened in two files, listed once: {prepared}"
+        );
+        assert!(
+            prepared[0]["uri"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("/lib/reopen.rb"),
+            "the project's copy, not the gem's: {}",
+            prepared[0]["uri"]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.3.0 — rename
+    // -----------------------------------------------------------------------
+
+    /// One spelling, `name`, used as five different variables in one file.
+    ///
+    /// The point of the fixture is that a word search cannot tell any of them apart. `name` is a
+    /// method parameter, a block parameter shadowing it, a lambda parameter shadowing it again,
+    /// a local in an unrelated method, and a word inside a comment and a string. A rename of any
+    /// one of them must leave the other four exactly as they were, and the drawing is where that
+    /// is read.
+    const LOCALS: &str = "\
+def greet(name)
+  greeting = \"Hi #{name}\" # the name goes here
+  [1, 2].each { |name| puts name }
+  shout = ->(name) { name.upcase }
+  \"name\" + greeting + shout.call(name)
+end
+
+def unrelated
+  name = 1
+  name + 1
+end
+";
+
+    #[test]
+    fn renaming_a_local_changes_its_own_scope_and_nothing_that_merely_spells_it() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+
+        // The parameter of `greet`, which is read twice: inside the interpolation, and in the
+        // last line's argument. Everything else spelled `name` belongs to something else.
+        assert_eq!(
+            harness.renamed(&uri, LOCALS, "name)", "person"),
+            "\
+--- greet.rb ---
+def greet(person)
+  greeting = \"Hi #{person}\" # the name goes here
+  [1, 2].each { |name| puts name }
+  shout = ->(name) { name.upcase }
+  \"name\" + greeting + shout.call(person)
+end
+
+def unrelated
+  name = 1
+  name + 1
+end
+"
+        );
+    }
+
+    #[test]
+    fn renaming_a_block_parameter_stops_at_the_block() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+
+        // The block's own `name`, which shadows the parameter. Prism resolves the two to
+        // different scopes and that indexing is the whole of the rule — nothing here knows the
+        // word "shadow".
+        assert_eq!(
+            harness.renamed(&uri, LOCALS, "name| puts", "each_one"),
+            "\
+--- greet.rb ---
+def greet(name)
+  greeting = \"Hi #{name}\" # the name goes here
+  [1, 2].each { |each_one| puts each_one }
+  shout = ->(name) { name.upcase }
+  \"name\" + greeting + shout.call(name)
+end
+
+def unrelated
+  name = 1
+  name + 1
+end
+"
+        );
+    }
+
+    #[test]
+    fn a_word_in_a_comment_or_a_string_is_not_a_position_a_rename_answers_for() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+
+        // The two places an editor's own word matching would offer to rename. `null` from
+        // `prepareRename` is what stops the box from opening at all, and nothing is said about
+        // it: the cursor is on prose, and there is no refusal to explain.
+        for needle in ["name goes here", "\"name\" +"] {
+            assert!(
+                harness.prepare_rename(&uri, LOCALS, needle).is_null(),
+                "{needle:?} is not renameable"
+            );
+        }
+        assert!(harness.messages().is_empty());
+    }
+
+    /// A constant in a namespace, used four ways across two files, with a second constant of the
+    /// same name in another namespace that must not move.
+    const HR: &str = "\
+module HR
+  class Person
+    ROLE = \"staff\"
+
+    def self.build
+      Person.new
+    end
+  end
+
+  class Boss < Person
+    def peer
+      HR::Person.new
+    end
+  end
+end
+";
+
+    const ADMIN: &str = "\
+class Admin
+  def hire
+    HR::Person.build
+  end
+end
+
+module Other
+  class Person
+  end
+end
+
+def elsewhere
+  Other::Person.new
+end
+";
+
+    #[test]
+    fn renaming_a_constant_follows_the_resolution_across_files_and_namespaces() {
+        let mut harness = Harness::new();
+        let hr = harness.write("app/hr.rb", HR);
+        harness.write("app/admin.rb", ADMIN);
+        harness.index();
+
+        // Every spelling of the one constant changes: the `class` line, the bare `Person`
+        // inside its own namespace, the superclass of `Boss`, and the qualified `HR::Person` in
+        // both files. Only the last segment of a qualified reference moves, which is a fact
+        // about how rubydex records them rather than anything this had to arrange.
+        //
+        // `Other::Person` and the `class Person` inside `module Other` are the control, and
+        // they are in the drawing rather than in a second assertion: `admin.rb` is shown whole,
+        // so the two names that did not change are as visible as the one that did.
+        assert_eq!(
+            harness.renamed(&hr, HR, "Person\n", "Employee"),
+            "\
+--- admin.rb ---
+class Admin
+  def hire
+    HR::Employee.build
+  end
+end
+
+module Other
+  class Person
+  end
+end
+
+def elsewhere
+  Other::Person.new
+end
+--- hr.rb ---
+module HR
+  class Employee
+    ROLE = \"staff\"
+
+    def self.build
+      Employee.new
+    end
+  end
+
+  class Boss < Employee
+    def peer
+      HR::Employee.new
+    end
+  end
+end
+"
+        );
+    }
+
+    #[test]
+    fn renaming_a_constant_from_a_use_of_it_answers_the_same_as_from_where_it_is_written() {
+        let mut harness = Harness::new();
+        let hr = harness.write("app/hr.rb", HR);
+        let admin = harness.write("app/admin.rb", ADMIN);
+        harness.index();
+
+        let from_the_class_line = harness.renamed(&hr, HR, "Person\n", "Employee");
+        // The `Person` in `HR::Person` in the *other* file: a constant reference rather than a
+        // definition, which reaches the plan down a different arm of `locate`.
+        let from_a_qualified_use = harness.renamed(&admin, ADMIN, "Person.build", "Employee");
+        assert_eq!(from_a_qualified_use, from_the_class_line);
+    }
+
+    #[test]
+    fn a_constant_assigned_rather_than_declared_moves_with_its_namespace() {
+        let mut harness = Harness::new();
+        let source = "\
+module HR
+  MAX_STAFF = 10
+
+  def self.room?
+    HR::MAX_STAFF > 1 && MAX_STAFF < 100
+  end
+end
+";
+        let uri = harness.write("app/limits.rb", source);
+        harness.index();
+
+        // `MAX_STAFF = 10` is a constant rather than a namespace, and rubydex records no name
+        // span for one — `locator::spans` falls back to the whole construct, which for this
+        // kind is exactly the name and nothing else. Worth a test rather than a comment,
+        // because the *next* fixture is the kind where that fallback is not the name.
+        assert_eq!(
+            harness.renamed(&uri, source, "MAX_STAFF = ", "MAX_HEADCOUNT"),
+            "\
+--- limits.rb ---
+module HR
+  MAX_HEADCOUNT = 10
+
+  def self.room?
+    HR::MAX_HEADCOUNT > 1 && MAX_HEADCOUNT < 100
+  end
+end
+"
+        );
+    }
+
+    #[test]
+    fn a_class_made_with_class_new_is_narrowed_to_its_name_rather_than_replaced_whole() {
+        let mut harness = Harness::new();
+        let source = "\
+module HR
+  Failure = Class.new(StandardError)
+  Shim = Module.new
+
+  def self.fail!
+    raise Failure
+  end
+end
+";
+        let uri = harness.write("app/errors.rb", source);
+        harness.index();
+
+        // The case that makes the confirmation step load-bearing rather than defensive.
+        // rubydex promotes `Failure = Class.new(StandardError)` to a class, and the *name* span
+        // it records for it is the whole assignment — so a rename that trusted the span would
+        // write `raise BuildFailed` and, on the line above, replace the entire
+        // `Failure = Class.new(StandardError)` with `BuildFailed`, deleting the class.
+        //
+        // `StandardError` is in the drawing on purpose: it ends in the very name being narrowed
+        // to, and it is why the search inside the span is for a whole word.
+        assert_eq!(
+            harness.renamed(&uri, source, "Failure = ", "BuildFailed"),
+            "\
+--- errors.rb ---
+module HR
+  BuildFailed = Class.new(StandardError)
+  Shim = Module.new
+
+  def self.fail!
+    raise BuildFailed
+  end
+end
+"
+        );
+        assert!(harness.messages().is_empty(), "nothing to explain");
+    }
+
+    #[test]
+    fn a_name_written_twice_inside_one_span_refuses_rather_than_guessing_which_is_which() {
+        let mut harness = Harness::new();
+        let source = "\
+Registry = Class.new { include Registry }
+";
+        let uri = harness.write("app/registry.rb", source);
+        harness.index();
+
+        // The other side of the narrowing rule. Two whole-word occurrences inside the one span
+        // rubydex hands back, either of which could be the one being defined, so nothing is
+        // changed and the sentence says which file to look at.
+        assert_eq!(
+            harness.renamed(&uri, source, "Registry = ", "Catalogue"),
+            "null"
+        );
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_could_not_confirm(
+                "Registry",
+                "registry.rb"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_method_is_refused_out_loud_rather_than_renamed_by_a_name_match() {
+        let mut harness = Harness::new();
+        let source = "\
+class Person
+  def shout
+    :loud
+  end
+end
+
+class Siren
+  def shout
+    :louder
+  end
+end
+
+Person.new.shout
+";
+        let uri = harness.write("app/shout.rb", source);
+        harness.index();
+
+        // Two classes define `shout`, which is the ordinary reason a method rename would go
+        // wrong: `references` matches a method by name, so a rename built on it would edit
+        // `Siren#shout` and the call below along with the one asked about, and would look as
+        // though it had worked.
+        //
+        // From the `def` line and from the call site alike, since those reach the plan down
+        // different arms of `locate`.
+        for needle in ["shout\n    :loud", "shout\n"] {
+            assert!(harness.prepare_rename(&uri, source, needle).is_null());
+            assert_eq!(harness.messages(), vec![messages::rename_refuses_methods()]);
+        }
+    }
+
+    #[test]
+    fn an_instance_variable_is_refused_because_a_subclass_can_share_it() {
+        let mut harness = Harness::new();
+        let source = "\
+class Person
+  def initialize
+    @name = \"anon\"
+  end
+
+  def name
+    @name
+  end
+end
+";
+        let uri = harness.write("app/person.rb", source);
+        harness.index();
+
+        // The scope walk answers for `@name` — `documentHighlight` lights both of these up —
+        // and the refusal is the plan's rather than a limit of the walk: what makes it unsafe
+        // is a subclass or an included module in another file writing the same name, which one
+        // file cannot see.
+        assert!(harness.prepare_rename(&uri, source, "@name = ").is_null());
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_refuses_instance_variables()]
+        );
+    }
+
+    #[test]
+    fn a_parameter_ruby_supplies_has_nowhere_to_put_a_new_name() {
+        let mut harness = Harness::new();
+        let source = "\
+[1, 2].each { it + 1 }
+[3, 4].each { _1 * 2 }
+";
+        let uri = harness.write("app/implicit.rb", source);
+        harness.index();
+
+        // `it` and `_1` are read everywhere and written nowhere, because the block declares
+        // them rather than the file naming them. Renaming one would mean writing a parameter
+        // list that is not there, which is a refactoring rather than a rename.
+        for (needle, name) in [("it +", "it"), ("_1 *", "_1")] {
+            assert!(harness.prepare_rename(&uri, source, needle).is_null());
+            assert_eq!(
+                harness.messages(),
+                vec![messages::rename_refuses_implicit_parameters(name)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_variable_that_is_also_a_keyword_or_a_hash_key_is_refused() {
+        let mut harness = Harness::new();
+        let source = "\
+def call(host:, port:)
+  config = { host:, port: port }
+  connect(host:)
+  config
+end
+
+def other(host)
+  host.to_s
+end
+";
+        let uri = harness.write("app/call.rb", source);
+        harness.index();
+
+        // Three ordinary Ruby spellings put a name somewhere it means more than the variable,
+        // and all three are in this fixture. `host:` in the parameter list is the method's
+        // interface, so renaming it changes what every caller writes; `{ host:, ... }` and
+        // `connect(host:)` are Ruby 3.1's shorthand, where the one word is the key *and* a read
+        // of the local — replacing the span renames the key with it, which changes the hash and
+        // still parses.
+        for needle in ["host:, port:)", "host:, port: port", "host:)"] {
+            assert!(
+                harness.prepare_rename(&uri, source, needle).is_null(),
+                "{needle:?}"
+            );
+            assert_eq!(
+                harness.messages(),
+                vec![messages::rename_refuses_shorthand("host")]
+            );
+        }
+
+        // `port` is written out in full at its one read, and refused all the same: the keyword
+        // parameter that declares it is the interface either way.
+        assert!(harness.prepare_rename(&uri, source, "port }").is_null());
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_refuses_shorthand("port")]
+        );
+
+        // And the control: the same spelling in a method that takes it positionally renames,
+        // because nothing about a positional parameter's name reaches a caller.
+        assert_eq!(
+            harness.renamed(&uri, source, "host)", "hostname"),
+            "\
+--- call.rb ---
+def call(host:, port:)
+  config = { host:, port: port }
+  connect(host:)
+  config
+end
+
+def other(hostname)
+  hostname.to_s
+end
+"
+        );
+    }
+
+    #[test]
+    fn a_local_before_a_double_colon_renames_because_that_colon_is_a_lookup() {
+        let mut harness = Harness::new();
+        let source = "\
+def read
+  source = Object
+  source::NAME
+end
+";
+        let uri = harness.write("app/read.rb", source);
+        harness.index();
+
+        // The reason the shorthand test is for one colon rather than for a colon. `source` here
+        // is a local with a constant looked up on it, which is the commonest legitimate
+        // spelling of a name followed by a colon and must not be caught by the rule above.
+        assert_eq!(
+            harness.renamed(&uri, source, "source =", "holder"),
+            "\
+--- read.rb ---
+def read
+  holder = Object
+  holder::NAME
+end
+"
+        );
+    }
+
+    #[test]
+    fn a_new_name_ruby_would_not_read_as_a_name_changes_nothing() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+
+        // The prepare said yes, so the position is fine and it is the *name* that is not. LSP
+        // has nowhere to put a validation rule, so the client asks with whatever was typed and
+        // this is the only place it can be answered.
+        assert!(harness.prepare_rename(&uri, LOCALS, "name)").is_object());
+        for candidate in ["Person", "nil", "shout!", "two words", ""] {
+            assert_eq!(
+                harness.renamed(&uri, LOCALS, "name)", candidate),
+                "null",
+                "{candidate:?}"
+            );
+            assert_eq!(
+                harness.messages(),
+                vec![messages::rename_needs_a_ruby_name(candidate, false)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_constant_cannot_be_renamed_to_something_that_is_not_one() {
+        let mut harness = Harness::new();
+        let hr = harness.write("app/hr.rb", HR);
+        harness.write("app/admin.rb", ADMIN);
+        harness.index();
+
+        // The other half of the rule, and the reason the plan carries which kind it is: a
+        // constant renamed to a lowercase name is not a constant any more, and every reference
+        // to it would stop resolving. `HR::Employee` is refused too — it is a path rather than
+        // a name, and only the last segment of a reference is ever replaced, so splicing one in
+        // would write `HR::HR::Employee` at the qualified use sites.
+        for candidate in ["employee", "HR::Employee", "@Employee"] {
+            assert_eq!(
+                harness.renamed(&hr, HR, "Person\n", candidate),
+                "null",
+                "{candidate:?}"
+            );
+            assert_eq!(
+                harness.messages(),
+                vec![messages::rename_needs_a_ruby_name(candidate, true)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_defined_in_a_gem_is_refused_from_the_project_that_uses_it() {
+        let (dir, _gem_home, env) =
+            project_with_gem("module Shouty\n  class Megaphone\n  end\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "Shouty::Megaphone.new\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        // Renaming this would edit the gem, or edit the project and leave the gem defining the
+        // old name. Both are wrong, and the sentence says which it is rather than leaving the
+        // editor to report that nothing can be renamed here.
+        assert!(harness.prepare_rename(&uri, source, "Megaphone").is_null());
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_refuses_foreign("Megaphone")]
+        );
+    }
+
+    #[test]
+    fn a_class_the_project_reopens_from_a_gem_is_refused_along_with_it() {
+        let (dir, _gem_home, env) =
+            project_with_gem("module Shouty\n  class Megaphone\n  end\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "\
+module Shouty
+  class Megaphone
+    def blast
+      :loud
+    end
+  end
+end
+";
+        let uri = harness.write("lib/reopen.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        // The case the rule is really about, and the one a "is any of it mine?" test would get
+        // wrong: the project reopens a class the gem defines, so one of the two places the name
+        // is written is a file ya-lsp will not edit. Renaming the project's half alone would
+        // leave the gem defining `Megaphone` and the project defining something else.
+        assert!(harness.prepare_rename(&uri, source, "Megaphone").is_null());
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_refuses_foreign("Megaphone")]
+        );
+    }
+
+    #[test]
+    fn nothing_inside_a_gem_is_renameable_even_from_a_position_that_would_be_exact() {
+        let (dir, gem_home, env) = project_with_gem(
+            "module Shouty\n  def self.blast(volume)\n    volume * 2\n  end\nend\n",
+        );
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/main.rb", "Shouty.blast(1)\n");
+        harness.index();
+        harness.index_gems();
+
+        // `volume` is a local, which is exact wherever it is written — so the refusal is not
+        // about precision, it is that ya-lsp never proposes an edit to a file that is not the
+        // user's own. Silently, as every other request inside a bundle is: a gem is opened to
+        // be read, and nobody pressing rename in one expects it to work.
+        let inside = DocUri::from_path(&gem_home.path().join("gems/shouty-1.2.3/lib/shouty.rb"))
+            .expect("a gem file");
+        let source = "module Shouty\n  def self.blast(volume)\n    volume * 2\n  end\nend\n";
+        assert!(harness.prepare_rename(&inside, source, "volume)").is_null());
+        assert!(harness.messages().is_empty(), "nothing said, deliberately");
+    }
+
+    #[test]
+    fn an_edit_carries_the_version_it_was_computed_against_when_the_client_takes_one() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+        harness.open(&uri, LOCALS);
+
+        let answer = harness.ask(
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": position_of(LOCALS, "name)"),
+                "newName": "person",
+            }),
+        );
+        // The richer shape, and the reason it is worth negotiating for: the version pins the
+        // text the edit was computed against, so a client can reject a rename the user has
+        // typed past rather than applying it to text that has moved.
+        assert_eq!(answer["changes"], serde_json::Value::Null);
+        assert_eq!(answer["documentChanges"][0]["textDocument"]["version"], 1);
+        assert_eq!(
+            answer["documentChanges"][0]["textDocument"]["uri"],
+            serde_json::json!(uri.to_lsp().expect("an LSP uri")),
+        );
+    }
+
+    #[test]
+    fn a_client_that_did_not_ask_for_document_changes_gets_the_older_map() {
+        let mut harness = Harness::new();
+        harness.analysis.client.versioned_edits = false;
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+
+        // A client that did not advertise `documentChanges` may not merely ignore the shape it
+        // did not ask for; it can fail to apply the edit at all. The older map has no version
+        // in it, which is exactly what advertising the newer one buys.
+        let answer = harness.ask(
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": position_of(LOCALS, "name)"),
+                "newName": "person",
+            }),
+        );
+        assert_eq!(answer["documentChanges"], serde_json::Value::Null);
+        let edits = &answer["changes"][uri.to_lsp().expect("an LSP uri").as_str()];
+        assert_eq!(edits.as_array().map(Vec::len), Some(3), "{answer}");
+    }
+
+    #[test]
+    fn the_prepare_range_is_the_word_under_the_cursor_and_not_the_span_it_was_found_in() {
+        let mut harness = Harness::new();
+        let source = "Failure = Class.new(StandardError)\n";
+        let uri = harness.write("app/errors.rb", source);
+        harness.index();
+
+        // The editor puts its rename box over exactly this range and pre-fills it with the text
+        // inside, so the range has to be the name rather than the span rubydex recorded — which
+        // for this shape is the whole assignment.
+        assert_eq!(
+            harness.prepare_rename(&uri, source, "Failure"),
+            serde_json::json!({
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 7 },
+            })
+        );
+        // And a cursor inside the recorded span but outside the name answers `null` rather than
+        // offering to rename something the cursor is not on. Here it lands on the `=`.
+        assert!(harness.prepare_rename(&uri, source, "= Class").is_null());
+    }
+
+    #[test]
+    fn a_singleton_class_is_not_a_name_anybody_typed() {
+        let mut harness = Harness::new();
+        let source = "\
+class Person
+  class << self
+    def build
+      new
+    end
+  end
+end
+";
+        let uri = harness.write("app/person.rb", source);
+        harness.index();
+
+        // A cursor on `class << self` resolves to the singleton, whose name the graph spells
+        // `Person::<Person>`. Asked of the *old* name, the same check that vets a new one rules
+        // that out — and silently, because nobody meant to rename it.
+        // The name span rubydex records for `class << self` is the `self`, which is where a
+        // cursor has to be for this to be reached at all.
+        assert!(harness.prepare_rename(&uri, source, "self\n").is_null());
+        assert!(harness.messages().is_empty());
+    }
+
+    #[test]
+    fn a_constant_that_resolves_to_nothing_is_nothing_to_rename() {
+        let mut harness = Harness::new();
+        let source = "Missing::Gone.new
+";
+        let uri = harness.write("app/typo.rb", source);
+        harness.index();
+
+        // Both halves of a name nothing in the graph defines — a typo, or a gem that did not
+        // resolve. There is no set of places it is written to change, so there is nothing to
+        // refuse either: the answer is the same `null` a comment gets.
+        for needle in ["Missing", "Gone"] {
+            assert!(harness.prepare_rename(&uri, source, needle).is_null());
+        }
+        assert!(harness.messages().is_empty());
+    }
+
+    #[test]
+    fn a_namespace_nothing_writes_down_is_refused_and_what_it_holds_is_not() {
+        let mut harness = Harness::new();
+        let source = "\
+Ghost::Thing = 1
+
+def read
+  Ghost::Thing
+end
+";
+        let uri = harness.write("app/ghost.rb", source);
+        harness.index();
+
+        // `Ghost::Thing = 1` with no `module Ghost` anywhere leaves rubydex holding a `Ghost`
+        // that is written down in no file at all. Renaming it would change every use of a name
+        // whose one definition is somewhere ya-lsp cannot see — an excluded file, a gem that
+        // did not resolve, a constant some metaprogramming makes — so it is refused for the
+        // same reason a gem's name is, and with the same sentence.
+        assert!(harness.prepare_rename(&uri, source, "Ghost").is_null());
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_refuses_foreign("Ghost")]
+        );
+
+        // And the control, which is what makes that a rule about the namespace rather than
+        // about the line: the constant inside it is written down here, so it renames.
+        assert_eq!(
+            harness.renamed(&uri, source, "Thing = ", "Wraith"),
+            "\
+--- ghost.rb ---
+Ghost::Wraith = 1
+
+def read
+  Ghost::Wraith
+end
+"
         );
     }
 }

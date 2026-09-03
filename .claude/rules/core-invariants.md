@@ -38,6 +38,36 @@ paths:
   workspace prefix — go through `is_own_code` rather than writing another one. That list holds
   the gem roots, the RBS root, and Ruby's own library directory; it was called `gem_prefixes`
   until M7 made the name untrue.
+- **rubydex's resolver panics after a deletion, and `analysis::resolve` is where that is
+  contained.** `Graph::delete_document` invalidates before it untracks the deleted document's
+  strings, so the work the invalidation queued can name a string that has gone, and
+  `resolution.rs:748` unwraps it. Reproduced by deleting `lib/solargraph/yard_map/to_method.rb`
+  from a solargraph v0.58.2 checkout; not reproducible under about two hundred files. There is
+  no published version to upgrade to. `resolve` catches the unwind, says one sentence, and
+  rebuilds the graph from scratch, guarded by `recovering` so a rebuild that crashes again
+  stops. **Never call `Resolver::resolve` from anywhere else** — a second call site is a second
+  way for the analysis thread to die, and a dead analysis thread is a server that answers
+  nothing at all with nothing said anywhere.
+- **`Workspace::indexes` and `Workspace::discover` are one set of rules with two entry points.**
+  The predicate the file watcher asks and the walk that built the index must agree on every
+  path: one that the walk indexes and the predicate rejects never refreshes again, and the
+  reverse indexes what the user excluded. Neither is visible for the life of the process. They
+  share the compiled globs and the `ignore::WalkBuilder`, and
+  `the_predicate_answers_exactly_what_the_walk_collected` asserts them against each other over
+  every file in a fixture tree — never each against a hand-written list, which can be wrong in
+  the same way twice.
+- **`analysis/position.rs` is the one module held by properties rather than only by fixtures, and
+  the reason is the shape of its input.** A change list is a *history* — every element is
+  interpreted against the text the one before it left behind — so what would need enumerating is
+  not a string but a sequence, and the file sat at 100% of lines and branches with none of that
+  asked. `proptest` (a dev-dependency; `about.toml` ignores those, so it owes no notice) generates
+  buffers by concatenating pieces from a fixed alphabet — an accent, CJK, an emoji, a combining
+  mark, and all three line terminators including a lone `\r` — which is what makes a shrunk
+  counterexample legible. Three properties: a change list lands where plain `String::replace_range`
+  lands, any `Position` a client can send resolves to an offset that is in range and on a character
+  boundary, and every addressable offset round-trips. Adding a fourth is cheap; **weakening the
+  generator is not** — its first run found an out-of-bounds in the test corpus helper that eleven
+  hand-written strings had never reached, because none of them ended in a bare `\r`.
 - **`didChange` carries every change, in order.** Ranges are expressed against the text the
   previous change produced, so they cannot be reordered or coalesced — full sync's "keep only
   the last one" shortcut silently corrupts the buffer under incremental sync.

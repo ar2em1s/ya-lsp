@@ -20,7 +20,6 @@ use lsp_types::{SymbolKind, SymbolTag};
 use rubydex::{
     model::{
         declaration::{Declaration, Namespace},
-        definitions::Definition,
         graph::Graph,
         ids::{DeclarationId, UriId},
     },
@@ -75,7 +74,7 @@ pub fn search(graph: &Graph, query: &str, limit: usize, own: &HashSet<UriId>) ->
             }
             let name = declaration.name();
             Some(Ranked {
-                own: declared_in(graph, declaration, own),
+                own: locator::declared_in(graph, declaration, own),
                 tier: tier(query, name),
                 simple_len: render::last_segment(name).len(),
                 name,
@@ -99,7 +98,7 @@ pub fn search(graph: &Graph, query: &str, limit: usize, own: &HashSet<UriId>) ->
     ranked
         .into_iter()
         .filter_map(|entry| {
-            let definition = pick_definition(graph, entry.id, own)?;
+            let definition = locator::preferred_definition(graph, entry.id, own)?;
             let (name, container) = render::split_qualified(entry.name);
             Some(Hit {
                 name,
@@ -142,25 +141,6 @@ fn rank(a: &Ranked<'_>, b: &Ranked<'_>) -> std::cmp::Ordering {
         .then(a.name.cmp(b.name))
 }
 
-/// Which definition of a declaration the picker should jump to.
-///
-/// The user's own code wins when a name is defined in both: opening a Rails app and searching
-/// for `ApplicationRecord` should land in `app/models`, not in whichever gem reopens it.
-/// Otherwise it is the first in `definitions_of`'s stable order, so the answer never moves
-/// between runs.
-fn pick_definition<'g>(
-    graph: &'g Graph,
-    id: DeclarationId,
-    own: &HashSet<UriId>,
-) -> Option<&'g Definition> {
-    let definitions = locator::definitions_of(graph, id);
-    definitions
-        .iter()
-        .find(|definition| own.contains(definition.uri_id()))
-        .or(definitions.first())
-        .copied()
-}
-
 /// How well `query` matches `name`, from 4 (the name *is* the query) down to 0.
 ///
 /// Zero is reachable only for a name rubydex matched by subsequence, which is the floor of what
@@ -179,19 +159,6 @@ fn tier(query: &str, name: &str) -> u8 {
     } else {
         0
     }
-}
-
-/// Whether any of a declaration's definitions is in the user's own code.
-///
-/// `any`, not "the first one": a class the project reopens is the project's, even when the gem
-/// that first defined it sorts ahead of it.
-fn declared_in(graph: &Graph, declaration: &Declaration, own: &HashSet<UriId>) -> bool {
-    declaration.definitions().iter().any(|id| {
-        graph
-            .definitions()
-            .get(id)
-            .is_some_and(|definition| own.contains(definition.uri_id()))
-    })
 }
 
 /// What belongs in a project-wide symbol list.

@@ -121,34 +121,86 @@ pub fn last_segment(name: &str) -> &str {
 #[must_use]
 pub fn parameter_list(graph: &Graph, signatures: &Signatures) -> String {
     // Ruby has exactly one signature per method; overloads only come from RBS.
-    let Some(signature) = signatures.as_slice().first() else {
-        return String::new();
-    };
+    signatures
+        .as_slice()
+        .first()
+        .map_or_else(String::new, |signature| {
+            signature_label(graph, "", signature).label
+        })
+}
+
+/// A method's signature as Ruby, and where inside it each parameter was written.
+///
+/// The two are produced together on purpose. `signatureHelp` highlights a parameter by handing
+/// the client a pair of offsets into this very string, and LSP's other spelling — the parameter
+/// as a substring to search for — mis-highlights the moment a label holds the same token twice,
+/// which `def each(key, value = key)` already does. So the function that writes the label is
+/// the function that says where it wrote each piece, and nothing downstream counts characters.
+///
+/// **The offsets are UTF-16 code units**, which is what a client indexes the label by: the
+/// protocol ties `Position` to the negotiated encoding and says nothing about these, and every
+/// client that renders them is holding the label as a UTF-16 string. Ruby names can be
+/// non-ASCII — `def приветствие(имя)` is legal — so the two counts genuinely differ.
+#[must_use]
+pub fn signature_label(graph: &Graph, name: &str, signature: &[Parameter]) -> Signature {
+    let mut label = name.to_owned();
+    let mut at = utf16_len(name);
     if signature.is_empty() {
-        return String::new();
+        return Signature {
+            label,
+            parameters: Vec::new(),
+        };
     }
 
-    let rendered: Vec<String> = signature
-        .iter()
-        .map(|parameter| {
-            let name = graph
-                .strings()
-                .get(parameter.inner().str())
-                .map_or_else(String::new, |string| string.as_str().to_owned());
-            match parameter {
-                Parameter::RequiredPositional(_) | Parameter::Post(_) => name,
-                Parameter::OptionalPositional(_) => format!("{name} = ..."),
-                Parameter::RestPositional(_) => sigil("*", &name),
-                Parameter::RequiredKeyword(_) => format!("{name}:"),
-                Parameter::OptionalKeyword(_) => format!("{name}: ..."),
-                Parameter::RestKeyword(_) => sigil("**", &name),
-                Parameter::Block(_) => sigil("&", &name),
-                Parameter::Forward(_) => "...".to_owned(),
-            }
-        })
-        .collect();
+    let mut parameters = Vec::with_capacity(signature.len());
+    label.push('(');
+    at += 1;
+    for (index, parameter) in signature.iter().enumerate() {
+        if index > 0 {
+            label.push_str(", ");
+            at += 2;
+        }
+        let written = spell(graph, parameter);
+        let width = utf16_len(&written);
+        parameters.push((at, at + width));
+        label.push_str(&written);
+        at += width;
+    }
+    label.push(')');
 
-    format!("({})", rendered.join(", "))
+    Signature { label, parameters }
+}
+
+/// One rendered signature: the whole line, and one span per parameter inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature {
+    pub label: String,
+    /// Start and end of each parameter in `label`, in UTF-16 code units, in signature order.
+    pub parameters: Vec<(u32, u32)>,
+}
+
+/// One parameter, as Ruby writes it.
+fn spell(graph: &Graph, parameter: &Parameter) -> String {
+    let name = graph
+        .strings()
+        .get(parameter.inner().str())
+        .map_or_else(String::new, |string| string.as_str().to_owned());
+    match parameter {
+        Parameter::RequiredPositional(_) | Parameter::Post(_) => name,
+        Parameter::OptionalPositional(_) => format!("{name} = ..."),
+        Parameter::RestPositional(_) => sigil("*", &name),
+        Parameter::RequiredKeyword(_) => format!("{name}:"),
+        Parameter::OptionalKeyword(_) => format!("{name}: ..."),
+        Parameter::RestKeyword(_) => sigil("**", &name),
+        Parameter::Block(_) => sigil("&", &name),
+        Parameter::Forward(_) => "...".to_owned(),
+    }
+}
+
+/// How long a string is to a client that holds it as UTF-16, saturating rather than wrapping —
+/// a label long enough to overflow a `u32` is not one anybody is reading.
+fn utf16_len(text: &str) -> u32 {
+    u32::try_from(text.encode_utf16().count()).unwrap_or(u32::MAX)
 }
 
 /// A rest, keyword-rest or block parameter, written once.

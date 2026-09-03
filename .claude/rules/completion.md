@@ -2,9 +2,10 @@
 paths:
   - "src/analysis/completion.rs"
   - "src/analysis/cursor.rs"
+  - "src/analysis/signature_help.rs"
 ---
 
-# Completion
+# Completion and signature help
 
 - **A literal's class is read off the parse, never from the text.** `Receiver::Literal` maps a
   Prism node kind to a core class name, so `4.2.` is a `Float` rather than an `Integer` with a
@@ -35,6 +36,16 @@ paths:
   only for `Expression`; the receiver contexts use it purely as the caller in their visibility
   check, and `None` there means "outsider" — a class would stop seeing its own private class
   methods. `Scope::caller` is the one place that decides.
+- **A sigil is not a letter, and `tier` refuses before it scores.** `@foo`, `@@foo` and `$foo` are
+  three namespaces, so the leading run of `@`/`$` a label carries has to start with the one the
+  prefix asked for. `starts_with` rather than equality, and deliberately asymmetric: `@` admits
+  `@@count` because the second `@` may be the next keystroke, and `@@` admits no `@name` because
+  nothing typed turns one into the other. Without it the subsequence match reads the sigil as one
+  more character and `@` offers `$@` — shipped through two releases, because it is a row at the
+  bottom of a list rather than a wrong answer at the top. `significant` (which decides `internal`)
+  is defined in terms of the same `sigils`, so the two cannot disagree about where a name starts.
+  The no-sigil case is **left alone on purpose and pinned**: `entr` still reaches all five
+  namespaces, because somebody who typed no sigil has not said which one they meant.
 - **Ranking is `(group, internal, tier, distance, locality, length, sequence, label)` and every
   field earns its place.** `internal` sinks names starting with punctuation or `_`, without which a Rails app
   opens `User.` on `__send` and `_fork`. `sequence` is *only* a keyword argument's position in
@@ -101,6 +112,42 @@ paths:
   otherwise.
 - **`completionItem/resolve` carries the `DeclarationId` as a string.** It is a 64-bit hash and
   JSON numbers are doubles, so a round trip through a client silently corrupts a number.
+- **`locator::precise_call` is the one gate on every answer that shows a *signature*, and both
+  callers go through it.** Keyword-argument completion and `textDocument/signatureHelp` ask the
+  same question and must get the same answer: only a receiver rubydex could name. A name-based
+  match under the cursor while the user types into it is not a wrong navigation they can see is
+  wrong, it is a parameter list that is syntactically valid and belongs to another class. It
+  keeps the `Foo.new` -> `Foo#initialize` redirect, because a constructor's parameters really
+  are what `Foo.new(` takes; `references` is the caller that must not, and reads `Resolution`
+  itself.
+- **`cursor::at` and `cursor::call_at` answer different questions and the difference is
+  deliberate.** Three places have nothing to complete and a call still being written: a `.`
+  inside the parentheses (`puts(person.`), a string argument (`puts("hel`), and a comment
+  between two arguments. `at` gives up on all three — that is what stops completion firing
+  inside a string — and `call_at` does not, because an editor keeps the signature popup up
+  through every one of them and a `null` makes it flicker on each keystroke.
+- **The active argument is `Active`, a three-way answer, and never a bare number.** `Nth` is the
+  count of arguments that end before the cursor, with a keyword hash spread into its own
+  elements first (`f(1, a: 2, ` is the third parameter and not the second). `Keyword` is by
+  *name*, because Ruby writes them in any order and a position then means nothing — both
+  spellings, since `f(a: 1)` and `f(:a => 1)` satisfy the same `def f(a:)`. `AnyKeyword` is the
+  gap after a finished keyword: which one comes next is unknowable, that it is a keyword is not,
+  because Ruby forbids a positional argument after one — and counting there answers with a
+  parameter the call can no longer reach.
+- **An argument's claim on the cursor runs past its own span, to the comma.** `create(name: `
+  has written the keyword and not its value, and Prism recovers the pair as ending at the colon,
+  so the cursor is outside every node. The comma is what says the user has moved on.
+- **The parameter a signature highlights is ceilinged at `*rest`, not at the end of the list.**
+  A splat absorbs every positional argument after it, so the fifth argument to
+  `def new(name, age = 18, *nicknames)` is still `*nicknames`; counting straight through walks
+  one parameter further along per argument typed. Where there is no splat the ceiling is the last
+  parameter, because **LSP 3.17 cannot say that no parameter is active** — an index outside the
+  list and an omitted one both mean zero, so running off the end would silently point at the
+  first parameter.
+- **Overloads stay overloads.** `Signatures::Overloaded` is real (RBS declares three arms for
+  `String#gsub`) and LSP has `activeSignature` for exactly this. The arm chosen is the first one
+  that *has* the parameter being written; flattening to the first would be choosing to know less
+  than the signatures do.
 - **`render::is_nameable` is the one test for "rubydex invented this name".** Angle brackets are
   its only punctuation for them — `Foo::<Foo>` and `<uri>:<offset><anonymous>` — and both
   completion and `workspace/symbol` go through it. A 17,557-file workspace answered `::` with a

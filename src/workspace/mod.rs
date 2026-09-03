@@ -146,6 +146,22 @@ impl Workspace {
     pub fn discover(&self) -> Discovery {
         discover(&self.root, &self.config.index)
     }
+
+    /// Whether [`Workspace::discover`]'s walk would have collected `path`.
+    ///
+    /// The question a file watcher asks: a change arrives as a path, and the server has to
+    /// decide whether it is one this workspace indexes at all. Two answers that disagree is the
+    /// failure this exists to prevent — a file the walk indexes and this rejects is a file that
+    /// never refreshes, and the reverse indexes something the user excluded — so it is the same
+    /// globs and the same walker, restricted to the directories between the root and `path`
+    /// rather than a second reading of what `.gitignore` means.
+    ///
+    /// `index.max_files` is deliberately not consulted: it is a budget over the whole index
+    /// rather than a property of one path, and only the caller knows how much of it is spent.
+    #[must_use]
+    pub fn indexes(&self, path: &Path) -> bool {
+        indexes(&self.root, &self.config.index, path)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -165,12 +181,41 @@ const MATCH_OPTIONS: MatchOptions = MatchOptions {
     require_literal_leading_dot: false,
 };
 
-fn discover(root: &Path, index: &config::IndexConfig) -> Discovery {
-    let mut problems = Vec::new();
+/// `index.include` and `index.exclude`, compiled.
+///
+/// One compiled set with two entry points — [`discover`]'s walk and [`indexes`]' one path —
+/// rather than two implementations of the same globs, which is the half of the predicate that
+/// could drift silently.
+struct Globs {
+    include: Vec<Pattern>,
+    exclude: Vec<Pattern>,
+}
 
-    let include = compile(&index.include, "index.include", &mut problems);
-    let exclude = compile(&index.exclude, "index.exclude", &mut problems);
+impl Globs {
+    fn compile(index: &config::IndexConfig, problems: &mut Vec<String>) -> Self {
+        Self {
+            include: compile(&index.include, "index.include", problems),
+            exclude: compile(&index.exclude, "index.exclude", problems),
+        }
+    }
 
+    /// Whether a path *relative to the workspace root* passes both lists.
+    fn admits(&self, relative: &Path) -> bool {
+        if !matches_any(&self.include, relative) {
+            return false;
+        }
+        !matches_any(&self.exclude, relative)
+    }
+}
+
+fn matches_any(patterns: &[Pattern], relative: &Path) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| pattern.matches_path_with(relative, MATCH_OPTIONS))
+}
+
+/// The ignore rules, spelled once. The other half of what both entry points share.
+fn walker(root: &Path, index: &config::IndexConfig) -> ignore::WalkBuilder {
     let mut walker = ignore::WalkBuilder::new(root);
     walker
         .hidden(true)
@@ -191,11 +236,17 @@ fn discover(root: &Path, index: &config::IndexConfig) -> Discovery {
         // indexed?" answerable from the repository alone.
         .parents(false)
         .git_global(false);
+    walker
+}
+
+fn discover(root: &Path, index: &config::IndexConfig) -> Discovery {
+    let mut problems = Vec::new();
+    let globs = Globs::compile(index, &mut problems);
 
     let mut files = Vec::new();
     let mut truncated = false;
 
-    for entry in walker.build() {
+    for entry in walker(root, index).build() {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -212,16 +263,7 @@ fn discover(root: &Path, index: &config::IndexConfig) -> Discovery {
             continue;
         };
 
-        if !include
-            .iter()
-            .any(|p| p.matches_path_with(relative, MATCH_OPTIONS))
-        {
-            continue;
-        }
-        if exclude
-            .iter()
-            .any(|p| p.matches_path_with(relative, MATCH_OPTIONS))
-        {
+        if !globs.admits(relative) {
             continue;
         }
 
@@ -267,6 +309,31 @@ fn discover(root: &Path, index: &config::IndexConfig) -> Discovery {
         truncated,
         problems,
     }
+}
+
+/// Whether [`discover`] would have collected `path`. See [`Workspace::indexes`].
+fn indexes(root: &Path, index: &config::IndexConfig, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    // A pattern that does not compile drops itself and is reported by the walk, which has
+    // already run by the time anything asks this. Reporting it again, once per changed file,
+    // would say nothing new and say it hundreds of times during a branch switch.
+    let mut reported_by_the_walk = Vec::new();
+    if !Globs::compile(index, &mut reported_by_the_walk).admits(relative) {
+        return false;
+    }
+
+    // `.gitignore`, `.ignore`, `.git/info/exclude` and the hidden-file rule are the walker's,
+    // and the walker is where they stay: this descends only the directories between the root
+    // and `path`, which is a handful of `read_dir` calls rather than a second implementation of
+    // git's ignore semantics to keep in step with the first.
+    let wanted = path.to_path_buf();
+    walker(root, index)
+        .filter_entry(move |entry| wanted.starts_with(entry.path()))
+        .build()
+        .filter_map(Result::ok)
+        .any(|entry| entry.path() == path && entry.file_type().is_some_and(|kind| kind.is_file()))
 }
 
 fn compile(patterns: &[String], field: &str, problems: &mut Vec<String>) -> Vec<Pattern> {
@@ -547,6 +614,153 @@ mod tests {
             "{:?}",
             discovery.problems
         );
+    }
+
+    // ------------------------------------------------------- the walk and the predicate
+
+    /// Every file in a tree, ignoring nothing.
+    ///
+    /// Deliberately not `ignore::Walk`: the list the predicate is checked against must come
+    /// from something the walker had no part in producing, or the two agree by construction
+    /// and the assertion is vacuous.
+    fn every_file(dir: &Path, into: &mut Vec<PathBuf>) {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                every_file(&path, into);
+            } else {
+                into.push(path);
+            }
+        }
+    }
+
+    /// A tree holding one of every rule that decides whether a file is indexed.
+    fn rule_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        write(root, "app/models/user.rb", "class User; end");
+        write(root, "lib/thing.rb", "module Thing; end");
+        write(root, "lib/deep/a/b/c.rb", "module C; end");
+        write(root, "README.md", "not ruby");
+        write(root, "sig/thing.rbs", "class Thing end");
+        // `index.exclude`, both a default entry and the depth `*` must not reach.
+        write(
+            root,
+            "vendor/bundle/ruby/3.4.0/gems/rails/lib/rails.rb",
+            "x",
+        );
+        write(root, "tmp/cache/thing.rb", "x");
+        // `.gitignore` at the root, and a second one *below* it — the case a single compiled
+        // ignore file at the workspace root gets wrong, silently and only for that directory.
+        write(root, ".gitignore", "generated/\n*.gen.rb\n!keep.gen.rb\n");
+        write(root, "generated/out.rb", "x");
+        write(root, "lib/thing.gen.rb", "x");
+        write(root, "lib/keep.gen.rb", "x");
+        write(root, "app/.gitignore", "secret.rb\n");
+        write(root, "app/secret.rb", "x");
+        write(root, "app/models/secret.rb", "x");
+        // Hidden, which the walker prunes at the directory.
+        write(root, ".hidden/thing.rb", "x");
+
+        dir
+    }
+
+    /// The predicate and the walk are one set of rules, asserted against each other.
+    ///
+    /// This is the invariant the file watcher rests on. A file the walk indexes and the
+    /// predicate rejects is a file that never refreshes once it changes on disk; a file the
+    /// predicate admits and the walk skips is one the user excluded and gets indexed anyway.
+    /// Neither shows up as an error — both are silent for the life of the process — so the two
+    /// are checked against each other over every path in a tree rather than each against a
+    /// hand-written list that could be wrong in the same way twice.
+    #[test]
+    fn the_predicate_answers_exactly_what_the_walk_collected() {
+        let dir = rule_fixture();
+        let root = dir.path();
+        let index = config::IndexConfig::default();
+
+        let collected = discover(root, &index).files;
+        assert!(
+            collected.len() > 1,
+            "a fixture the walk finds nothing in proves nothing: {collected:?}"
+        );
+
+        let mut present = Vec::new();
+        every_file(root, &mut present);
+        for path in &present {
+            assert_eq!(
+                indexes(root, &index, path),
+                collected.contains(path),
+                "{} is on one side and not the other",
+                path.strip_prefix(root).unwrap().display()
+            );
+        }
+
+        // And the fixture really does exercise each rule, rather than passing because
+        // everything answered `false`.
+        let indexed: Vec<String> = collected
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            indexed,
+            vec![
+                "app/models/user.rb",
+                "lib/deep/a/b/c.rb",
+                "lib/keep.gen.rb",
+                "lib/thing.rb",
+            ],
+            "include, exclude, both .gitignore files, the negation and the hidden directory"
+        );
+    }
+
+    /// A path the walk could never have produced is not indexed.
+    ///
+    /// The watcher is the client's, shared across every server it runs, so a change from
+    /// another project or a directory rather than a file can arrive here. Both have to answer
+    /// `false` from the rules rather than from a walk that happens to find nothing.
+    #[test]
+    fn the_predicate_refuses_what_is_not_a_file_under_this_root() {
+        let dir = rule_fixture();
+        let root = dir.path();
+        let index = config::IndexConfig::default();
+
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "lib/other.rb", "x");
+        assert!(!indexes(root, &index, &outside.path().join("lib/other.rb")));
+
+        // A directory named like an included file. `**/*.rb` matches its path, so only the
+        // walk's file test keeps it out.
+        std::fs::create_dir_all(root.join("lib/directory.rb")).unwrap();
+        assert!(!indexes(root, &index, &root.join("lib/directory.rb")));
+
+        // A file that is not there. The watcher's deletions come through this shape, and the
+        // caller has to decide them from the graph rather than from here.
+        assert!(!indexes(root, &index, &root.join("lib/deleted.rb")));
+    }
+
+    /// An unreadable glob is reported by the walk, once, and not again per changed file.
+    #[test]
+    fn the_predicate_does_not_re_report_what_the_walk_already_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "lib/thing.rb", "x");
+        let index = config::IndexConfig {
+            include: vec!["**/*.rb".to_owned(), "lib/[".to_owned()],
+            ..config::IndexConfig::default()
+        };
+
+        // The bad pattern drops itself here exactly as it does in the walk, so the good one
+        // still answers — and a branch switch does not push one notification per file.
+        assert!(indexes(
+            dir.path(),
+            &index,
+            &dir.path().join("lib/thing.rb")
+        ));
     }
 
     #[test]

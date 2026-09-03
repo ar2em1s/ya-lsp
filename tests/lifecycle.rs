@@ -180,6 +180,8 @@ fn modern_client(root: &std::path::Path) -> serde_json::Value {
     params["capabilities"]["textDocument"]["definition"] =
         serde_json::json!({ "linkSupport": true });
     params["capabilities"]["window"] = serde_json::json!({ "workDoneProgress": true });
+    params["capabilities"]["workspace"] =
+        serde_json::json!({ "workspaceEdit": { "documentChanges": true } });
     params
 }
 
@@ -247,10 +249,28 @@ fn full_lifecycle_over_stdio() {
         true
     );
     assert_eq!(result["capabilities"]["referencesProvider"], true);
+    assert_eq!(result["capabilities"]["documentHighlightProvider"], true);
+    assert_eq!(result["capabilities"]["selectionRangeProvider"], true);
+    assert_eq!(result["capabilities"]["foldingRangeProvider"], true);
     assert_eq!(result["capabilities"]["workspaceSymbolProvider"], true);
+    // The one capability `lsp-types` has no field for, so it is added on the way to JSON.
+    // Asserted here as well as in `capabilities::tests` because the flatten that carries it also
+    // carries every provider above, and a flatten that stopped flattening would look like this
+    // line passing and the rest of them failing.
+    assert_eq!(result["capabilities"]["typeHierarchyProvider"], true);
+    // `prepareProvider` is the load-bearing half: it is what lets the server decline a position
+    // before the editor has asked the user to type a new name for it.
+    assert_eq!(
+        result["capabilities"]["renameProvider"]["prepareProvider"],
+        true
+    );
     assert_eq!(
         result["capabilities"]["completionProvider"]["resolveProvider"],
         true
+    );
+    assert_eq!(
+        result["capabilities"]["signatureHelpProvider"]["triggerCharacters"],
+        serde_json::json!(["(", ","])
     );
     assert_eq!(result["serverInfo"]["name"], "ya-lsp");
 
@@ -770,6 +790,390 @@ fn completion_over_stdio() {
     );
     assert_eq!(
         server.response(&id).response_result.expect("completion"),
+        serde_json::Value::Null
+    );
+
+    shut_down(server);
+}
+
+#[test]
+fn signature_help_over_stdio() {
+    // The end-to-end claim of v0.3.0's first item: an editor asking what a half-written call
+    // takes gets the method's real parameters, with the one being typed marked — over the wire,
+    // from a buffer the disk has never seen, and with the offsets in the encoding the client
+    // negotiated rather than in bytes.
+    let root = fixture();
+    std::fs::write(
+        root.path().join("lib/office.rb"),
+        "module HR\n  class Person\n    # Build one.\n    def self.build(name, title = nil, \
+         *tags, remote: false)\n    end\n  end\nend\n",
+    )
+    .unwrap();
+    let mut server = started(root.path(), modern_client(root.path()));
+
+    let scratch = uri_of(root.path(), "lib/scratch.rb");
+    server.notify(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": {
+                "uri": scratch,
+                "languageId": "ruby",
+                "version": 1,
+                "text": "HR::Person.build(\n"
+            }
+        }),
+    );
+
+    let ask = |server: &mut Server, character: u32| {
+        let id = server.request(
+            "textDocument/signatureHelp",
+            serde_json::json!({
+                "textDocument": { "uri": scratch },
+                "position": { "line": 0, "character": character }
+            }),
+        );
+        server
+            .response(&id)
+            .response_result
+            .expect("signature help")
+    };
+
+    let help = ask(&mut server, 17);
+    assert_eq!(
+        help["signatures"][0]["label"], "HR::Person.build(name, title = ..., *tags, remote: ...)",
+        "{help}"
+    );
+    assert_eq!(help["activeSignature"], 0, "{help}");
+    assert_eq!(help["activeParameter"], 0, "{help}");
+    assert_eq!(
+        help["signatures"][0]["parameters"][0]["label"],
+        serde_json::json!([17, 21]),
+        "the span covers `name` in the label: {help}"
+    );
+    assert!(
+        help["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Build one."),
+        "{help}"
+    );
+
+    // Two arguments in, and the answer follows the cursor rather than the request.
+    server.notify(
+        "textDocument/didChange",
+        serde_json::json!({
+            "textDocument": { "uri": scratch, "version": 2 },
+            "contentChanges": [{ "text": "HR::Person.build(\"ada\", \"lead\", \n" }]
+        }),
+    );
+    let help = ask(&mut server, 32);
+    assert_eq!(help["activeParameter"], 2, "`*tags`: {help}");
+
+    // A keyword is found by its name, not by where it was written.
+    server.notify(
+        "textDocument/didChange",
+        serde_json::json!({
+            "textDocument": { "uri": scratch, "version": 3 },
+            "contentChanges": [{ "text": "HR::Person.build(\"ada\", remote: \n" }]
+        }),
+    );
+    assert_eq!(ask(&mut server, 32)["activeParameter"], 3, "`remote:`");
+
+    // And outside a call there is nothing to say, which is what closes the popup.
+    server.notify(
+        "textDocument/didChange",
+        serde_json::json!({
+            "textDocument": { "uri": scratch, "version": 4 },
+            "contentChanges": [{ "text": "HR::Person\n" }]
+        }),
+    );
+    assert_eq!(ask(&mut server, 10), serde_json::Value::Null);
+
+    shut_down(server);
+}
+
+#[test]
+fn document_highlight_over_stdio() {
+    // The end-to-end claim of v0.3.0's second item, and the one that needs a real server to
+    // make: the two halves of the answer come from different places — a Prism walk of the
+    // buffer for the local, the graph for the method — and an editor cannot tell, because both
+    // arrive as ranges in the encoding it negotiated over a buffer the disk has never seen.
+    let root = fixture();
+    let mut server = started(root.path(), modern_client(root.path()));
+
+    let scratch = uri_of(root.path(), "lib/scratch.rb");
+    server.notify(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": {
+                "uri": scratch,
+                "languageId": "ruby",
+                "version": 1,
+                // `total` is a local in one method and a different local in the other; `sum` is
+                // a method with a call. The comment is the word match this replaces.
+                "text": "class Till\n  # total is a word here\n  def sum(total)\n    total + 1\n  end\n\n  def other\n    total = 2\n    sum(total)\n  end\nend\n"
+            }
+        }),
+    );
+
+    let ask = |server: &mut Server, line: u32, character: u32| {
+        let id = server.request(
+            "textDocument/documentHighlight",
+            serde_json::json!({
+                "textDocument": { "uri": scratch },
+                "position": { "line": line, "character": character }
+            }),
+        );
+        server.response(&id).response_result.expect("a response")
+    };
+
+    // The parameter on line 2 and its use on line 3, and nothing on lines 7 and 8 where the
+    // other method spells the same six letters.
+    let found = ask(&mut server, 2, 12);
+    assert_eq!(found.as_array().map(Vec::len), Some(2), "{found}");
+    assert_eq!(
+        found[0]["range"]["start"],
+        serde_json::json!({ "line": 2, "character": 10 })
+    );
+    assert_eq!(found[0]["kind"], 3, "the parameter is a write: {found}");
+    assert_eq!(
+        found[1]["range"]["start"],
+        serde_json::json!({ "line": 3, "character": 4 })
+    );
+    assert_eq!(found[1]["kind"], 2, "and its use is a read: {found}");
+
+    // The other scope's `total`, which is the assignment and the argument beside it.
+    let found = ask(&mut server, 7, 6);
+    assert_eq!(found.as_array().map(Vec::len), Some(2), "{found}");
+    assert_eq!(
+        found[0]["range"]["start"],
+        serde_json::json!({ "line": 7, "character": 4 })
+    );
+    assert_eq!(
+        found[1]["range"]["start"],
+        serde_json::json!({ "line": 8, "character": 8 })
+    );
+
+    // The graph's half: the method's own name, and the call to it.
+    let found = ask(&mut server, 8, 5);
+    assert_eq!(found.as_array().map(Vec::len), Some(2), "{found}");
+    assert_eq!(
+        found[0]["range"]["start"],
+        serde_json::json!({ "line": 2, "character": 6 })
+    );
+    assert_eq!(found[0]["kind"], 3, "the definition is a write: {found}");
+    assert_eq!(
+        found[1]["range"]["start"],
+        serde_json::json!({ "line": 8, "character": 4 })
+    );
+
+    // And `null` in the comment, which is what hands the word matching back to the client for
+    // the positions ya-lsp cannot speak for.
+    assert_eq!(ask(&mut server, 1, 6), serde_json::Value::Null);
+
+    shut_down(server);
+}
+
+#[test]
+fn type_hierarchy_over_stdio() {
+    // Three requests and one round trip, which is why this needs a real server: the item the
+    // client expands is the item the server sent, `data` and all, and nothing in-process can
+    // check that the field survives serialisation both ways. The capability is here too, because
+    // it is the one `lsp-types` has no field for and is added on the way to JSON.
+    let root = fixture();
+    let mut server = started(root.path(), modern_client(root.path()));
+
+    let scratch = uri_of(root.path(), "lib/scratch.rb");
+    server.notify(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": {
+                "uri": scratch,
+                "languageId": "ruby",
+                "version": 1,
+                "text": "module Greet\nend\n\nclass Base\nend\n\nclass Middle < Base\n  include Greet\nend\n\nclass Leaf < Middle\nend\n"
+            }
+        }),
+    );
+
+    let ask = |server: &mut Server, method: &str, params: serde_json::Value| {
+        let id = server.request(method, params);
+        server.response(&id).response_result.expect("a response")
+    };
+
+    // The cursor on the `Leaf` in `class Leaf`.
+    let prepared = ask(
+        &mut server,
+        "textDocument/prepareTypeHierarchy",
+        serde_json::json!({
+            "textDocument": { "uri": scratch },
+            "position": { "line": 10, "character": 6 }
+        }),
+    );
+    assert_eq!(prepared.as_array().map(Vec::len), Some(1), "{prepared}");
+    assert_eq!(prepared[0]["name"], "Leaf");
+    assert_eq!(prepared[0]["kind"], 5, "SymbolKind::Class: {prepared}");
+    assert!(prepared[0]["data"].is_string(), "{prepared}");
+
+    // Expanded upwards with the item exactly as it arrived, which is what an editor sends.
+    let supertypes = ask(
+        &mut server,
+        "typeHierarchy/supertypes",
+        serde_json::json!({ "item": prepared[0] }),
+    );
+    assert_eq!(
+        supertypes
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| item["name"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["Middle", "Greet", "Base"],
+        "{supertypes}"
+    );
+
+    // And downwards from the top of the chain, two generations at once.
+    let base = ask(
+        &mut server,
+        "textDocument/prepareTypeHierarchy",
+        serde_json::json!({
+            "textDocument": { "uri": scratch },
+            "position": { "line": 3, "character": 6 }
+        }),
+    );
+    let subtypes = ask(
+        &mut server,
+        "typeHierarchy/subtypes",
+        serde_json::json!({ "item": base[0] }),
+    );
+    assert_eq!(
+        subtypes
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| item["name"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["Leaf", "Middle"],
+        "{subtypes}"
+    );
+
+    // A method is not a type, and the editor is told so with a `null` rather than an empty tree.
+    assert_eq!(
+        ask(
+            &mut server,
+            "textDocument/prepareTypeHierarchy",
+            serde_json::json!({
+                "textDocument": { "uri": scratch },
+                "position": { "line": 7, "character": 4 }
+            }),
+        ),
+        serde_json::Value::Null
+    );
+
+    shut_down(server);
+}
+
+#[test]
+fn rename_over_stdio() {
+    // Through the shipped binary because this is the one request that *writes*: the edit has to
+    // survive serialisation and arrive as something an editor can apply, and the version it
+    // carries comes from the `didOpen` rather than from anything in-process.
+    let root = fixture();
+    let mut server = started(root.path(), modern_client(root.path()));
+
+    let scratch = uri_of(root.path(), "lib/scratch.rb");
+    let source = "class Ledger
+  def total(amount)
+    amount * 2
+  end
+end
+
+Ledger.new
+";
+    server.notify(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": {
+                "uri": scratch,
+                "languageId": "ruby",
+                "version": 7,
+                "text": source
+            }
+        }),
+    );
+
+    let ask = |server: &mut Server, method: &str, params: serde_json::Value| {
+        let id = server.request(method, params);
+        server.response(&id).response_result.expect("a response")
+    };
+
+    // The cursor on the `Ledger` in `class Ledger`.
+    let at_the_class = serde_json::json!({
+        "textDocument": { "uri": scratch },
+        "position": { "line": 0, "character": 6 }
+    });
+    assert_eq!(
+        ask(
+            &mut server,
+            "textDocument/prepareRename",
+            at_the_class.clone()
+        ),
+        serde_json::json!({
+            "start": { "line": 0, "character": 6 },
+            "end": { "line": 0, "character": 12 },
+        })
+    );
+
+    let mut params = at_the_class.clone();
+    params["newName"] = serde_json::json!("Journal");
+    let edit = ask(&mut server, "textDocument/rename", params);
+    let changes = &edit["documentChanges"][0];
+    assert_eq!(changes["textDocument"]["uri"], scratch);
+    // The version the buffer was opened at, which is what lets the client refuse an edit the
+    // user has typed past.
+    assert_eq!(changes["textDocument"]["version"], 7);
+    assert_eq!(
+        changes["edits"],
+        serde_json::json!([
+            {
+                "range": {
+                    "start": { "line": 0, "character": 6 },
+                    "end": { "line": 0, "character": 12 }
+                },
+                "newText": "Journal"
+            },
+            {
+                "range": {
+                    "start": { "line": 6, "character": 0 },
+                    "end": { "line": 6, "character": 6 }
+                },
+                "newText": "Journal"
+            }
+        ]),
+        "{edit}"
+    );
+
+    // A method is refused, and the refusal reaches the user as a message rather than only as a
+    // `null` the editor turns into its own generic sentence. The message goes out ahead of the
+    // response, so it is read first — `response` steps over notifications and would drop it.
+    let id = server.request(
+        "textDocument/prepareRename",
+        serde_json::json!({
+            "textDocument": { "uri": scratch },
+            "position": { "line": 1, "character": 7 }
+        }),
+    );
+    let mut said = String::new();
+    while !said.contains("renaming a method") {
+        // Stepping over whatever startup said: this client takes no dynamic registrations, so
+        // it has already been told that files cannot be watched.
+        said = server.notification("window/showMessage")["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+    }
+    assert_eq!(
+        server.response(&id).response_result.expect("a response"),
         serde_json::Value::Null
     );
 
@@ -1323,6 +1727,153 @@ fn a_client_without_progress_support_is_sent_no_progress() {
 }
 
 #[test]
+fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
+    // v0.3.0's item 0, through the shipped binary. Until this landed the watcher covered
+    // `ya-lsp.toml` and nothing else, so a `git checkout`, a `git pull`, a rebase or a
+    // `rails g model` changed Ruby under a running server and nothing re-indexed it — a
+    // deleted file kept its declarations until someone restarted. Every step here happens with
+    // no `didOpen` anywhere, because that is the situation: the editor never touched the file.
+    let root = fixture();
+    let mut server = Server::start(root.path());
+    let mut params = initialize_params(root.path());
+    params["capabilities"]["workspace"] =
+        serde_json::json!({ "didChangeWatchedFiles": { "dynamicRegistration": true } });
+    let id = server.request("initialize", params);
+    server.response(&id).response_result.expect("initialize");
+    server.notify("initialized", serde_json::json!({}));
+
+    // The registration covers the project's Ruby now, not only its configuration.
+    let registration = server.server_request("client/registerCapability");
+    let watchers = registration.params["registrations"][0]["registerOptions"]["watchers"]
+        .as_array()
+        .expect("watchers")
+        .iter()
+        .map(|watcher| {
+            watcher["globPattern"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let spelled = |relative: &str| {
+        root.path()
+            .join(relative)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    assert_eq!(
+        watchers,
+        vec![spelled("ya-lsp.toml"), spelled("**/*.rb")],
+        "the config, and index.include verbatim"
+    );
+    server.send(Message::Response(Response::new_ok(
+        registration.id,
+        serde_json::Value::Null,
+    )));
+
+    let main = uri_of(root.path(), "lib/main.rb");
+    let place_path = root.path().join("lib/place.rb");
+    let place = uri_of(root.path(), "lib/place.rb");
+
+    let definition_of_place = |server: &mut Server| {
+        let id = server.request(
+            "textDocument/definition",
+            // `Place` on the fourth line of lib/main.rb, once it is written below.
+            serde_json::json!({
+                "textDocument": { "uri": main },
+                "position": { "line": 3, "character": 0 }
+            }),
+        );
+        server.response(&id).response_result.expect("definition")
+    };
+
+    // A file appears, and the file that uses it is rewritten — one `git pull` in miniature.
+    std::fs::write(&place_path, "class Place\n  def name\n  end\nend\n").unwrap();
+    std::fs::write(
+        root.path().join("lib/main.rb"),
+        "require \"person\"\n\nPerson.new\nPlace.new\n",
+    )
+    .unwrap();
+    server.notify(
+        "workspace/didChangeWatchedFiles",
+        serde_json::json!({
+            "changes": [
+                { "uri": place, "type": 1 },
+                { "uri": main, "type": 2 },
+            ]
+        }),
+    );
+
+    // Definition follows.
+    let targets = definition_of_place(&mut server);
+    assert_eq!(targets[0]["uri"], serde_json::json!(place), "{targets}");
+
+    // The outline follows, for a document no editor ever opened.
+    let id = server.request(
+        "textDocument/documentSymbol",
+        serde_json::json!({ "textDocument": { "uri": place } }),
+    );
+    let symbols = server
+        .response(&id)
+        .response_result
+        .expect("documentSymbol");
+    assert_eq!(symbols[0]["name"], "Place", "{symbols}");
+    assert_eq!(symbols[1]["name"], "name", "{symbols}");
+
+    // And references, which is the half that reads the *other* file the change touched.
+    let id = server.request(
+        "textDocument/references",
+        serde_json::json!({
+            "textDocument": { "uri": place },
+            "position": { "line": 0, "character": 6 },
+            "context": { "includeDeclaration": false }
+        }),
+    );
+    let found = server.response(&id).response_result.expect("references");
+    assert_eq!(found.as_array().map(Vec::len), Some(1), "{found}");
+    assert_eq!(found[0]["uri"], serde_json::json!(main), "{found}");
+
+    // The same file, rewritten: the declarations it used to hold have to go with it.
+    std::fs::write(&place_path, "class Place\n  def label\n  end\nend\n").unwrap();
+    server.notify(
+        "workspace/didChangeWatchedFiles",
+        serde_json::json!({ "changes": [{ "uri": place, "type": 2 }] }),
+    );
+    let id = server.request(
+        "textDocument/documentSymbol",
+        serde_json::json!({ "textDocument": { "uri": place } }),
+    );
+    let rewritten = server
+        .response(&id)
+        .response_result
+        .expect("documentSymbol");
+    assert_eq!(rewritten[1]["name"], "label", "{rewritten}");
+    assert!(
+        !rewritten
+            .as_array()
+            .expect("a flat outline")
+            .iter()
+            .any(|symbol| symbol["name"] == "name"),
+        "the method the rewrite removed is still in the index: {rewritten}"
+    );
+
+    // And gone: the one change nothing else in the protocol can stand in for. Before item 0 a
+    // deleted file kept every declaration it had for the life of the process.
+    std::fs::remove_file(&place_path).unwrap();
+    server.notify(
+        "workspace/didChangeWatchedFiles",
+        serde_json::json!({ "changes": [{ "uri": place, "type": 3 }] }),
+    );
+    let targets = definition_of_place(&mut server);
+    assert!(
+        targets.is_null(),
+        "a deleted file must stop answering: {targets}"
+    );
+
+    shut_down(server);
+}
+
+#[test]
 fn the_config_file_reloads_without_a_restart() {
     // Item 8's whole claim, through the shipped binary rather than an in-process connection:
     // an editor that takes a dynamic registration is asked to watch `ya-lsp.toml`, and the
@@ -1405,6 +1956,155 @@ fn the_config_file_reloads_without_a_restart() {
         .find(|item| item["code"] == "parse-error")
         .expect("the rule the reload turned on");
     assert_eq!(error["severity"], 1); // DiagnosticSeverity::ERROR
+
+    shut_down(server);
+}
+
+#[test]
+fn the_editor_can_switch_one_rule_off_and_leave_the_others_loud() {
+    // Item 6's diagnostics half, through the shipped binary and through the layer the *editor*
+    // sends — `ya-lsp.toml` is what `the_config_file_reloads_without_a_restart` drives, and it is
+    // the editor's view that item 6 is about. The rule is `parse-warning` because that is the one
+    // a project may already be linting for itself: the public Rails app measured for this release
+    // switches off exactly its ground (`Lint/UselessAssignment`) in `.standard.yml` while a file
+    // that does not parse is still worth a squiggle. One file carries both, so the assertion is
+    // that the warning goes and the errors beside it stay.
+    let root = fixture();
+    std::fs::write(
+        root.path().join("lib/unused.rb"),
+        "class Unused\n  def call\n    total = 1\n  end\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("lib/broken.rb"),
+        "class Broken\n  def call\n    total = 1\n  end\n",
+    )
+    .unwrap();
+    let unused = uri_of(root.path(), "lib/unused.rb");
+    let broken = uri_of(root.path(), "lib/broken.rb");
+
+    let mut server = started(root.path(), initialize_params(root.path()));
+    let reported = published_codes(&mut server, &[&unused, &broken]);
+    assert_eq!(reported[0], ["parse-warning"]);
+    assert_eq!(reported[1], ["parse-error", "parse-error", "parse-warning"]);
+    shut_down(server);
+
+    // The same workspace, started with the one thing the extension sends for
+    // `ya-lsp.diagnostics.rules`. `lib/unused.rb` now has nothing left to report and so is never
+    // published at all, which is why the assertion is made on the file that still has errors.
+    let mut params = initialize_params(root.path());
+    params["initializationOptions"] =
+        serde_json::json!({ "diagnostics": { "rules": { "parse-warning": "off" } } });
+    let mut server = started(root.path(), params);
+    assert_eq!(
+        published_codes(&mut server, &[&broken])[0],
+        ["parse-error", "parse-error"],
+        "the rule was switched off, and only that rule"
+    );
+    shut_down(server);
+}
+
+/// The rule names published for each of `uris`, sorted, waiting until every one has been seen.
+///
+/// Sorted rather than pinned in order: which end of a broken file rubydex reports first is not
+/// something this test is entitled to an opinion about.
+fn published_codes(server: &mut Server, uris: &[&str]) -> Vec<Vec<String>> {
+    let mut found: Vec<Option<Vec<String>>> = vec![None; uris.len()];
+    while found.iter().any(Option::is_none) {
+        let params = server.notification("textDocument/publishDiagnostics");
+        let Some(index) = uris
+            .iter()
+            .position(|uri| params["uri"] == serde_json::json!(uri))
+        else {
+            continue;
+        };
+        let mut codes: Vec<String> = params["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .map(|item| {
+                item["code"]
+                    .as_str()
+                    .expect("every diagnostic names the rule that raised it")
+                    .to_owned()
+            })
+            .collect();
+        codes.sort();
+        found[index] = Some(codes);
+    }
+    found.into_iter().map(Option::unwrap).collect()
+}
+
+#[test]
+fn selection_and_folding_ranges_over_stdio() {
+    // The end-to-end claim of v0.3.0's third item. Both are pure functions of one buffer, so what
+    // a real server adds over the unit tests is the wire: a chain arrives as a nest of `parent`
+    // objects rather than a list, a fold arrives as two line numbers with no characters on it,
+    // and both are measured against a buffer the disk has never seen.
+    let root = fixture();
+    let mut server = started(root.path(), modern_client(root.path()));
+
+    let scratch = uri_of(root.path(), "lib/scratch.rb");
+    server.notify(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": {
+                "uri": scratch,
+                "languageId": "ruby",
+                "version": 1,
+                "text": "# a note\n# and more\nclass Till\n  def sum(total)\n    puts \"got #{total}\"\n  end\nend\n"
+            }
+        }),
+    );
+
+    let id = server.request(
+        "textDocument/foldingRange",
+        serde_json::json!({ "textDocument": { "uri": scratch } }),
+    );
+    let found = server.response(&id).response_result.expect("a response");
+    assert_eq!(
+        found,
+        serde_json::json!([
+            { "startLine": 0, "endLine": 1, "kind": "comment" },
+            { "startLine": 2, "endLine": 5 },
+            { "startLine": 3, "endLine": 4 },
+        ]),
+        "{found}"
+    );
+
+    // The cursor inside `total` in the interpolation on line 4.
+    let id = server.request(
+        "textDocument/selectionRange",
+        serde_json::json!({
+            "textDocument": { "uri": scratch },
+            "positions": [{ "line": 4, "character": 18 }]
+        }),
+    );
+    let found = server.response(&id).response_result.expect("a response");
+    // Innermost first: the name, then the interpolation, then what is inside the quotes.
+    assert_eq!(
+        found[0]["range"],
+        serde_json::json!({
+            "start": { "line": 4, "character": 16 },
+            "end": { "line": 4, "character": 21 }
+        }),
+        "{found}"
+    );
+    assert_eq!(
+        found[0]["parent"]["range"]["start"],
+        serde_json::json!({ "line": 4, "character": 14 }),
+        "{found}"
+    );
+    // And the last link is the whole buffer, which is what makes every position answerable.
+    let mut outermost = &found[0];
+    while outermost["parent"].is_object() {
+        outermost = &outermost["parent"];
+    }
+    assert_eq!(
+        outermost["range"]["start"],
+        serde_json::json!({ "line": 0, "character": 0 }),
+        "{found}"
+    );
 
     shut_down(server);
 }

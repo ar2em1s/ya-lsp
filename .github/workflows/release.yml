@@ -20,7 +20,7 @@ jobs:
     name: the tag matches the manifests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # No `if:` on the job — a skipped job skips everything that `needs` it, which would quietly
       # disable the whole matrix on `workflow_dispatch`. The check opts out from the inside.
       - name: the tag, the extension and the crate all name one version
@@ -53,9 +53,38 @@ jobs:
           fi
           exit $status
 
+  # Every artifact below carries a copy of `THIRD-PARTY-NOTICES.txt`: six VSIXs through the
+  # extension's `stage-shared`, six archives through the `cp` in `archive the server`. It is
+  # committed rather than generated at build time, and `ci.yml` regenerates and diffs it — but
+  # `ci.yml` runs on pushes to main/master and on pull requests, and **a tag push is neither**.
+  # So nothing on this path had ever checked it. A tag cut from a commit CI never saw — an older
+  # commit, a branch, a force-push landing after the run — ships twelve artifacts reproducing a
+  # notice that omits whatever dependency arrived with it, which is the one licence failure
+  # `licensing.md` is written to prevent, in the one place it cannot be corrected afterwards.
+  #
+  # Its own job rather than a step in `guard`, which is meant to fail in seconds: building
+  # cargo-about takes minutes. Running in parallel with `guard` it costs the release nothing,
+  # since `vsix` was waiting anyway. Through the Makefile so the version of the tool matches the
+  # one `make notices` uses locally.
+  notices:
+    name: the third-party notices are current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: make setup-notices
+      - run: |
+          make notices-check || {
+            echo "::error::THIRD-PARTY-NOTICES.txt does not match a fresh generate; run 'make notices' and commit the result before tagging"
+            exit 1
+          }
+
   vsix:
     name: ${{ matrix.vscode }}
-    needs: guard
+    needs: [guard, notices]
     runs-on: ${{ matrix.runner }}
     strategy:
       # One platform failing must not cancel the others: a missing runner label is far more
@@ -80,7 +109,7 @@ jobs:
         with:
           toolchain: "1.93.1"
           targets: ${{ matrix.rust }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@v4
         with:
           # One source of truth with the local toolchain; setup-node reads `.tool-versions`.
@@ -110,7 +139,7 @@ jobs:
         working-directory: editors/vscode
         run: yarn vsce package --target ${{ matrix.vscode }} --out "ya-lsp-${{ matrix.vscode }}.vsix"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ya-lsp-${{ matrix.vscode }}
           path: editors/vscode/*.vsix
@@ -183,7 +212,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true

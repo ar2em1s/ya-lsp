@@ -1,6 +1,6 @@
 [package]
 name = "ya-lsp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -40,6 +40,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 # Integration tests spell URIs the way a client would.
 url = "2.5"
+# `analysis::position`'s properties. A generated corpus rather than a hand-written one, and
+# shrinking, because the failure mode there is a buffer that silently stops matching the file
+# the user is typing in — and the input that produces it is a *sequence* of edits, which is not
+# something a fixture can enumerate. Dev-only: `about.toml` ignores dev-dependencies, so it owes
+# no notice in the shipped binary.
+proptest = "1"
 
 # `coverage_nightly` is set by cargo-llvm-cov when it builds on a nightly compiler, and is what
 # gates `#[coverage(off)]` on the test modules. Declaring it here is what keeps `cargo check` quiet

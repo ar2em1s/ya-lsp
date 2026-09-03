@@ -35,10 +35,15 @@ function findBinary(): string | undefined {
 const everything: Settings = {
   explicit<T>(key: string): T | undefined {
     const values: Record<string, unknown> = {
+      'index.include': ['lib/**/*.rb'],
+      'index.exclude': ['spec/**/*'],
+      'index.loadPaths': ['lib', 'app'],
       'index.maxFiles': 4321,
+      'index.respectGitignore': false,
       'gems.enabled': false,
       'gems.defaultGems': false,
       'gems.rubyVersion': '3.3.0',
+      'gems.paths': ['/opt/gems'],
       'rbs.enabled': true,
       'rbs.stdlib': false,
       'rbs.path': '/opt/rbs',

@@ -18,7 +18,12 @@ use lsp_types::{
 
 use crate::{
     analysis::{self, Cancellations, ClientSupport, Task, TextChange, position::PositionEncoding},
-    workspace::{DocUri, Workspace, config::CONFIG_FILE_NAME, uri::workspace_root},
+    messages,
+    workspace::{
+        DocUri, Workspace,
+        config::{CONFIG_FILE_NAME, IndexConfig},
+        uri::workspace_root,
+    },
 };
 
 /// Run the server over stdio until the client shuts it down.
@@ -81,7 +86,7 @@ fn serve(connection: Connection) -> anyhow::Result<()> {
         .initialize_finish(
             initialize_id,
             serde_json::json!({
-                "capabilities": capabilities::server_capabilities(encoding),
+                "capabilities": capabilities::advertised(encoding),
                 "serverInfo": capabilities::server_info(),
             }),
         )
@@ -91,7 +96,12 @@ fn serve(connection: Connection) -> anyhow::Result<()> {
     // so the response cannot announce it and `client/registerCapability` is the only way to ask.
     // `initialize_finish` is what waits for `initialized`, which is the point a server is
     // allowed to send requests of its own.
-    register_config_watcher(&connection, &params.capabilities, &root);
+    register_file_watchers(
+        &connection,
+        &params.capabilities,
+        &root,
+        &workspace.config().index,
+    );
 
     // The one file the watcher above covers, spelled the way an incoming notification will be.
     // Held here rather than on the analysis thread because the routing decision is the main
@@ -123,20 +133,18 @@ fn serve(connection: Connection) -> anyhow::Result<()> {
     outcome
 }
 
-/// Ask the client to watch `ya-lsp.toml`, or say why it will not be watched.
-fn register_config_watcher(
+/// Ask the client to watch `ya-lsp.toml` and the project's Ruby, or say why it will not.
+fn register_file_watchers(
     connection: &Connection,
     capabilities: &ClientCapabilities,
     root: &Path,
+    index: &IndexConfig,
 ) {
-    let Some(registration) = capabilities::config_watcher(root, capabilities) else {
+    let Some(registration) = capabilities::watched_files(root, index, capabilities) else {
         // Not a warning — plenty of clients are like this and it is nobody's mistake — but not
-        // silence either. The alternative is an edit to `ya-lsp.toml` that does nothing at all,
-        // with nothing anywhere connecting the two.
-        tracing::info!(
-            "this editor cannot be asked to watch files, so an edit to {CONFIG_FILE_NAME} \
-             takes effect the next time ya-lsp starts"
-        );
+        // silence either. The alternative is a `git checkout` that changes nothing the server
+        // can see, with nothing anywhere connecting the two.
+        tracing::info!("{}", messages::cannot_watch_files());
         return;
     };
     // A string id in the server's own id space, as `Progress::begin` uses: client and server
@@ -168,11 +176,15 @@ fn main_loop(
                 {
                     return Ok(());
                 }
-                send(analysis, Task::Request(request));
+                if !send(analysis, Task::Request(request)) {
+                    anyhow::bail!("the analysis thread stopped");
+                }
             }
             Message::Notification(notification) => {
-                if let Some(task) = route_notification(notification, cancellations, config) {
-                    send(analysis, task);
+                if let Some(task) = route_notification(notification, cancellations, config)
+                    && !send(analysis, task)
+                {
+                    anyhow::bail!("the analysis thread stopped");
                 }
             }
             // Responses to server-initiated requests — `window/workDoneProgress/create` and
@@ -250,24 +262,37 @@ fn route_notification(
             })
         }
         "workspace/didChangeWatchedFiles" => {
-            // A reload drops the whole graph and re-runs the gem index, so the change has to be
-            // the config file and not merely *a* file the client happens to watch. Watchers are
-            // the client's, shared across every server it runs and every registration each one
-            // made, and nothing stops a client delivering all of them here: answering this
-            // unconditionally — which it did until v0.2.0 — turns one broad watcher into a
-            // full re-index per saved file.
+            // Split, not widened. A reload drops the whole graph and re-runs the gem index, so
+            // it stays reserved for the one file that decides what the whole index is; every
+            // other path re-indexes itself and nothing else. Watchers are the client's, shared
+            // across every server it runs and every registration each one made, and nothing
+            // stops a client delivering all of them here — so the third case, ignoring the
+            // change, is the common one and the analysis thread is where it is decided, since
+            // that is where the workspace lives.
             let params: lsp_types::DidChangeWatchedFilesParams = parse(notification)?;
-            let ours = config.is_some_and(|config| {
-                params
-                    .changes
-                    .iter()
-                    .any(|change| DocUri::from_lsp(&change.uri).as_ref() == Some(config))
-            });
-            if !ours {
-                tracing::trace!("no watched change named {CONFIG_FILE_NAME}; not reloading");
+            let mut seen = std::collections::HashSet::with_capacity(params.changes.len());
+            let mut uris = Vec::with_capacity(params.changes.len());
+            for change in &params.changes {
+                let Some(uri) = DocUri::from_lsp(&change.uri) else {
+                    continue;
+                };
+                if config == Some(&uri) {
+                    // The reload re-indexes the whole workspace from disk, so whatever else
+                    // this notification carried is covered by it and by more than it asked for.
+                    return Some(Task::ReloadConfig);
+                }
+                // A create and a change for one path in one notification is ordinary — a
+                // generator writes a file, a checkout rewrites it — and indexing it twice is
+                // work the debounce cannot coalesce because it is not the resolve.
+                if seen.insert(uri.clone()) {
+                    uris.push(uri);
+                }
+            }
+            if uris.is_empty() {
+                tracing::trace!("nothing in the watched change has a path this server can read");
                 return None;
             }
-            Some(Task::ReloadConfig)
+            Some(Task::WatchedFiles { uris })
         }
         "workspace/didChangeConfiguration" => {
             // LSP wraps the payload in `settings`, and its content is whatever the server said
@@ -323,10 +348,20 @@ fn request_id(id: lsp_types::NumberOrString) -> lsp_server::RequestId {
     }
 }
 
-fn send(analysis: &crossbeam_channel::Sender<Task>, task: Task) {
+/// Hand work to the analysis thread. `false` means the thread is no longer there.
+///
+/// The caller ends the loop on `false`, and that is the whole point of the return value. A
+/// language server whose analysis thread has died answers nothing, and answering nothing is
+/// indistinguishable from thinking: no error reaches the editor, no process exits, and the
+/// user waits for a hover that is never coming. Exiting is the one thing that gets noticed —
+/// every editor restarts a server that stops, and none restarts one that goes quiet.
+#[must_use]
+fn send(analysis: &crossbeam_channel::Sender<Task>, task: Task) -> bool {
     if analysis.send(task).is_err() {
-        tracing::error!("analysis thread is gone; dropping work");
+        tracing::error!("the analysis thread is gone; nothing can be answered from here");
+        return false;
     }
+    true
 }
 
 fn show_warning(connection: &Connection, message: &str) {
@@ -539,41 +574,86 @@ mod tests {
     }
 
     #[test]
-    fn a_watched_change_to_anything_else_does_not_reload() {
+    fn a_watched_change_to_anything_else_is_a_file_to_re_index_and_not_a_reload() {
         // A reload drops the whole graph and re-runs the gem index. Watchers belong to the
         // client and are shared across every server it runs, so a client is free to deliver
         // changes this server never asked for — and until v0.2.0 every one of them cost a full
         // re-index. A same-named file in a subdirectory is here for the same reason: it is not
-        // the file this workspace is configured by.
+        // the file this workspace is configured by, so it is an ordinary path like any other.
+        //
+        // Whether an ordinary path is one this workspace indexes at all is decided on the
+        // analysis thread, which is where the workspace and its globs live. Routing's job is
+        // only to keep it away from the expensive arm.
         for uri in [
             "file:///tmp/ya-lsp-route/lib/person.rb",
             "file:///tmp/ya-lsp-route/Gemfile.lock",
             "file:///tmp/ya-lsp-route/vendor/thing/ya-lsp.toml",
-            "untitled:Untitled-1",
+        ] {
+            match route(
+                "workspace/didChangeWatchedFiles",
+                serde_json::json!({ "changes": [{ "uri": uri, "type": 2 }] }),
+            ) {
+                Some(Task::WatchedFiles { uris }) => {
+                    assert_eq!(uris.len(), 1);
+                    assert_eq!(uris[0].as_str(), uri);
+                }
+                other => panic!("a change to {uri} routed to {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_watched_change_with_no_file_behind_it_queues_nothing() {
+        // Same rule as `didOpen` on an untitled buffer: a URI with no path is a document
+        // nothing else in the process can key, so there is no work to queue for it. The empty
+        // notification is here because a client that sends one must not cost a task either.
+        for changes in [
+            serde_json::json!([{ "uri": "untitled:Untitled-1", "type": 2 }]),
+            serde_json::json!([]),
         ] {
             assert!(
                 route(
                     "workspace/didChangeWatchedFiles",
-                    serde_json::json!({ "changes": [{ "uri": uri, "type": 2 }] })
+                    serde_json::json!({ "changes": changes })
                 )
                 .is_none(),
-                "a change to {uri} queued a reload"
+                "{changes} queued work"
             );
         }
-        assert!(
-            route(
-                "workspace/didChangeWatchedFiles",
-                serde_json::json!({ "changes": [] })
-            )
-            .is_none(),
-            "a notification carrying no changes queued a reload"
-        );
+    }
+
+    #[test]
+    fn one_path_named_twice_in_a_notification_is_indexed_once() {
+        // A save arrives as create-then-change, and a branch switch names the same path more
+        // than once often enough to matter. Indexing is per file and the resolve debounce
+        // cannot coalesce it, so the duplicate is dropped here where it is cheap to see.
+        match route(
+            "workspace/didChangeWatchedFiles",
+            serde_json::json!({
+                "changes": [
+                    { "uri": "file:///tmp/ya-lsp-route/lib/person.rb", "type": 1 },
+                    { "uri": "file:///tmp/ya-lsp-route/lib/person.rb", "type": 2 },
+                    { "uri": "file:///tmp/ya-lsp-route/lib/place.rb", "type": 3 },
+                ]
+            }),
+        ) {
+            Some(Task::WatchedFiles { uris }) => assert_eq!(
+                uris.iter().map(DocUri::as_str).collect::<Vec<_>>(),
+                vec![
+                    "file:///tmp/ya-lsp-route/lib/person.rb",
+                    "file:///tmp/ya-lsp-route/lib/place.rb",
+                ]
+            ),
+            other => panic!("routed to {other:?}"),
+        }
     }
 
     #[test]
     fn one_notification_reloads_once_however_many_changes_it_carries() {
         // A save can arrive as create-then-change, and a reload is expensive enough that two of
-        // them for one edit is worth ruling out here rather than trusting the client.
+        // them for one edit is worth ruling out here rather than trusting the client. The `.rb`
+        // beside them is dropped rather than queued as well: the reload re-indexes the whole
+        // workspace from disk, so re-indexing that one file too would be work already done.
         let task = route(
             "workspace/didChangeWatchedFiles",
             serde_json::json!({
@@ -584,7 +664,10 @@ mod tests {
                 ]
             }),
         );
-        assert!(matches!(task, Some(Task::ReloadConfig)));
+        assert!(
+            matches!(task, Some(Task::ReloadConfig)),
+            "routed to {task:?}"
+        );
     }
 
     #[test]
@@ -592,7 +675,8 @@ mod tests {
         // `workspace_root` ends at `.` when the client sent no folder and the process has no
         // working directory, and there is no URI for that — so no watcher was registered and
         // there is no file to recognise. Reloading on whatever arrives would be a re-index
-        // triggered by a request nobody made.
+        // triggered by a request nobody made; the change goes down the per-file arm instead,
+        // where a root that strips off nothing rejects it.
         let task = route_notification(
             notification(
                 "workspace/didChangeWatchedFiles",
@@ -603,7 +687,10 @@ mod tests {
             &Cancellations::default(),
             None,
         );
-        assert!(task.is_none());
+        assert!(
+            matches!(task, Some(Task::WatchedFiles { .. })),
+            "routed to {task:?}"
+        );
     }
 
     #[test]
@@ -705,12 +792,40 @@ mod tests {
     }
 
     #[test]
-    fn work_is_dropped_when_the_analysis_thread_is_gone() {
-        // Shutdown races: the analysis thread can be joined while the main loop still holds a
-        // message. Sending must not panic.
+    fn work_for_a_gone_analysis_thread_is_reported_rather_than_dropped() {
+        // Sending must not panic — the analysis thread can be joined while the main loop still
+        // holds a message — but it must not shrug either. The thread is the only thing that
+        // answers anything, so once it is gone the loop has nothing left to do but stop, and
+        // stopping is what an editor can see. Dropping the work in silence leaves a server that
+        // reads its input forever and replies to none of it.
         let (sender, receiver) = crossbeam_channel::unbounded::<Task>();
         drop(receiver);
-        send(&sender, Task::ReloadConfig);
+        assert!(!send(&sender, Task::ReloadConfig));
+    }
+
+    #[test]
+    fn the_loop_stops_once_the_analysis_thread_is_gone() {
+        // The end-to-end shape of the rule above: a request arrives, there is nobody to answer
+        // it, and `serve` fails rather than looping. rubydex 0.2.5 panics in its resolver after
+        // a document is deleted, so this is a real way to arrive here and not a hypothetical.
+        let (client, server) = Connection::memory();
+        let (analysis, receiver) = crossbeam_channel::unbounded::<Task>();
+        drop(receiver);
+
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(1),
+                method: "textDocument/hover".to_owned(),
+                params: serde_json::json!({}),
+            }))
+            .unwrap();
+
+        let outcome = main_loop(&server, &analysis, &Cancellations::default(), None);
+        assert!(
+            outcome.is_err(),
+            "the loop kept running with nothing behind it"
+        );
     }
 
     // ------------------------------------------------------------------ the loop itself

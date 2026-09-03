@@ -114,12 +114,19 @@ fn signature(graph: &Graph, declaration: &Declaration, definitions: &[&Definitio
     }
 }
 
-/// `Person::<Person>` -> `Person`, `<Person>` -> `Person`.
+/// `Person::<Person>` -> `Person`, `Shelf::Book::<Book>` -> `Shelf::Book`, `<Person>` ->
+/// `Person`.
+///
+/// The part *before* the `::<`, not the part inside it: rubydex writes the attached name
+/// unqualified there, so reading it out of the brackets gives `class << Book` for a class every
+/// other card on the same page calls `Shelf::Book`. Nothing was wrong with the old spelling
+/// until a fixture put the cards side by side — the one test that covered this construct used a
+/// top-level module, where the two spellings are the same string.
 fn attached_name(name: &str) -> &str {
-    name.rsplit_once("::<")
-        .map_or(name, |(_, singleton)| singleton)
-        .trim_end_matches('>')
-        .trim_start_matches('<')
+    match name.rsplit_once("::<") {
+        Some((attached, _)) => attached,
+        None => name.trim_start_matches('<').trim_end_matches('>'),
+    }
 }
 
 fn candidate_list(graph: &Graph, declarations: &[DeclarationId]) -> String {

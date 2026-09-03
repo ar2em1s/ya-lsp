@@ -20,7 +20,7 @@
 //! Rails bundle spells `name` tens of thousands of times and not one of those is an answer. For
 //! constants the reason is that the result is a work list: nobody is going to edit a gem.
 
-use std::collections::HashSet;
+use std::{cmp::Reverse, collections::HashSet};
 
 use rubydex::model::{
     declaration::Declaration,
@@ -37,6 +37,12 @@ pub struct Reference {
     pub uri: String,
     pub start: u32,
     pub end: u32,
+    /// `true` where this is the place the name is *declared* rather than used.
+    ///
+    /// `textDocument/references` has no use for the distinction — a work list is a work list —
+    /// but `documentHighlight` draws a write differently from a read, and where a name is
+    /// written down is already decided here rather than being worth deciding twice.
+    pub write: bool,
 }
 
 /// Every reference to whatever the cursor is on, inside `scope`.
@@ -79,8 +85,24 @@ pub fn find(
     // References arrive per declaration and per document, in hash order. Sorting makes the list
     // read down the file, and adjacent duplicates — the same span reached through two
     // declarations of one reopened class — collapse.
-    found.sort_unstable();
-    found.dedup();
+    //
+    // `write` is sorted on but deliberately not compared by the dedup: one span reached both as
+    // a declaration and as a reference is one place, not two, and the place it is declared is
+    // what it is. Leaving it in the comparison would have emitted the same location twice for
+    // every caller, `textDocument/references` included.
+    found.sort_unstable_by(|left, right| {
+        (&left.uri, left.start, left.end, Reverse(left.write)).cmp(&(
+            &right.uri,
+            right.start,
+            right.end,
+            Reverse(right.write),
+        ))
+    });
+    // Compared as one tuple rather than as a chain of `&&`: the same comparison, without
+    // three short-circuit arms in a file held at 100% of branches for a reason.
+    found.dedup_by(|left, right| {
+        (&left.uri, left.start, left.end) == (&right.uri, right.start, right.end)
+    });
     found
 }
 
@@ -159,6 +181,7 @@ fn declaration_sites(
             uri: site.uri,
             start: site.selection.0,
             end: site.selection.1,
+            write: true,
         })
         .collect()
 }
@@ -207,6 +230,7 @@ fn at(graph: &Graph, uri_id: UriId, offset: &rubydex::offset::Offset) -> Option<
         uri: graph.documents().get(&uri_id)?.uri().to_owned(),
         start: offset.start(),
         end: offset.end(),
+        write: false,
     })
 }
 

@@ -124,6 +124,47 @@ pub fn index_truncated(max_files: usize) -> String {
     )
 }
 
+/// The index is at `index.max_files` and a file created since startup cannot be added.
+///
+/// Distinct from [`index_truncated`], which is the walk stopping: this is the cap still
+/// applying *after* the walk, to a file the user has just written. Reaching one says nothing
+/// about the other — a workspace that fitted at startup can be added to until it does not.
+#[must_use]
+pub fn index_full(max_files: usize) -> String {
+    format!(
+        "the index is full at index.max_files ({max_files}), so files created since ya-lsp \
+         started are not indexed: navigation and completion will miss them. Raise \
+         index.max_files, or narrow index.include."
+    )
+}
+
+/// The client takes no dynamic registrations, so nothing can be asked to watch the project.
+///
+/// Logged rather than shown. It is nobody's mistake and there are plenty of clients like this,
+/// so a notification at every start would be a nag — but silence here is expensive, because
+/// every symptom of it looks like the server being wrong rather than the server being blind.
+#[must_use]
+pub fn cannot_watch_files() -> String {
+    "this editor cannot be asked to watch files, so a git checkout, a rebase or an edit to \
+     ya-lsp.toml made outside it is not noticed: navigation, completion and diagnostics keep \
+     answering against the files as they were when ya-lsp started. Restart ya-lsp after \
+     changing files outside the editor."
+        .to_owned()
+}
+
+/// Linking the graph crashed, and everything is being indexed again.
+///
+/// rubydex 0.2.5 panics inside its resolver after a document is deleted, and there is no
+/// version to upgrade to — so this is a real thing a user meets, and the alternative to saying
+/// it is a server that has quietly stopped answering.
+#[must_use]
+pub fn index_rebuilt() -> String {
+    "something went wrong while linking this project, so it is being indexed again from \
+     scratch: navigation and completion may answer nothing for a moment. Report it if it keeps \
+     happening."
+        .to_owned()
+}
+
 // ---------------------------------------------------------------------------- signatures
 
 /// The rbs root that answered has an empty (or absent) `core/`.
@@ -250,6 +291,100 @@ pub fn references_truncated(found: usize, shown: usize) -> String {
     format!("{found} references found: only the first {shown} are shown.")
 }
 
+/// `typeHierarchy/subtypes` found more than it will send.
+///
+/// Same shape and same reason as the sentence above it, and reachable for a different one: this
+/// one is hit by asking about a class near the root of the object model rather than by working in
+/// an enormous project. `Object` has one subtype per class in the project and its bundle.
+#[must_use]
+pub fn subtypes_truncated(found: usize, shown: usize) -> String {
+    format!("{found} subtypes found: only the first {shown} are shown.")
+}
+
+// ---------------------------------------------------------------------------- rename
+
+/// `textDocument/rename` on a method.
+///
+/// The one refusal on this list that is a limit of the whole product rather than of one module:
+/// without type inference a method's uses can only be matched by name, which the README says in
+/// those words, and every other answer built on that matching presents itself as a guess. A
+/// rename cannot.
+#[must_use]
+pub fn rename_refuses_methods() -> String {
+    "renaming a method is not something ya-lsp can do safely: the uses of a method are found by \
+     name alone, so the rename would change every unrelated method spelled the same way as \
+     well. Use your editor's search and replace for this one."
+        .to_owned()
+}
+
+/// `textDocument/rename` on an instance variable.
+#[must_use]
+pub fn rename_refuses_instance_variables() -> String {
+    "renaming an instance variable is not something ya-lsp can do safely: a subclass or an \
+     included module that writes the same name is writing the same variable, and those are not \
+     found. Use your editor's search and replace for this one."
+        .to_owned()
+}
+
+/// `textDocument/rename` on `it` or `_1`.
+#[must_use]
+pub fn rename_refuses_implicit_parameters(name: &str) -> String {
+    format!(
+        "renaming {name} is not something ya-lsp can do: nothing in the file gives it that name, \
+         because Ruby supplies it to the block. Write a parameter list for the block first."
+    )
+}
+
+/// `textDocument/rename` on a variable that is also written as a keyword or a hash key.
+#[must_use]
+pub fn rename_refuses_shorthand(name: &str) -> String {
+    format!(
+        "renaming {name} would change more than a variable: somewhere it is written as a keyword \
+         or a hash key, where the one word stands for both the name and the value. Write those \
+         out in full first."
+    )
+}
+
+/// `textDocument/rename` on a name defined outside the user's own code.
+#[must_use]
+pub fn rename_refuses_foreign(name: &str) -> String {
+    format!(
+        "renaming {name} is not something ya-lsp will do: it is defined outside your own code, \
+         in a gem or in Ruby itself, and those files are never edited. Rename your own name for \
+         it instead, if there is one."
+    )
+}
+
+/// A place a rename would have written could not be shown to hold only the old name.
+///
+/// Nothing has been changed when this is said, and that is the half worth saying: a rename that
+/// edited most of the places a name is written would leave code that no longer runs.
+#[must_use]
+pub fn rename_could_not_confirm(name: &str, file: &str) -> String {
+    format!(
+        "renaming {name} was stopped before any file was changed: ya-lsp could not confirm that \
+         what it would replace in {file} is only {name}. Change that one by hand first."
+    )
+}
+
+/// The new name the client sent is not one Ruby would read as the kind of name being renamed.
+#[must_use]
+pub fn rename_needs_a_ruby_name(candidate: &str, constant: bool) -> String {
+    if constant {
+        format!(
+            "the new name {candidate:?} cannot be a constant in Ruby: a constant starts with a \
+             capital letter and holds nothing but letters, digits and underscores. Choose \
+             another name."
+        )
+    } else {
+        format!(
+            "the new name {candidate:?} cannot be a local variable in Ruby: a variable starts \
+             with a lowercase letter or an underscore, holds nothing but letters, digits and \
+             underscores, and is not one of Ruby's keywords. Choose another name."
+        )
+    }
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
@@ -331,6 +466,9 @@ mod tests {
                 false,
             ),
             ("index_truncated", index_truncated(50_000), false),
+            ("index_full", index_full(50_000), false),
+            ("index_rebuilt", index_rebuilt(), false),
+            ("cannot_watch_files", cannot_watch_files(), false),
             (
                 "no_core_signatures",
                 no_core_signatures(Path::new("/w/sig/core")),
@@ -368,6 +506,47 @@ mod tests {
             (
                 "references_truncated",
                 references_truncated(35_733, 200),
+                false,
+            ),
+            (
+                "subtypes_truncated",
+                subtypes_truncated(24_918, 2_048),
+                false,
+            ),
+            ("rename_refuses_methods", rename_refuses_methods(), false),
+            (
+                "rename_refuses_instance_variables",
+                rename_refuses_instance_variables(),
+                false,
+            ),
+            (
+                "rename_refuses_implicit_parameters",
+                rename_refuses_implicit_parameters("it"),
+                false,
+            ),
+            (
+                "rename_refuses_shorthand",
+                rename_refuses_shorthand("name"),
+                false,
+            ),
+            (
+                "rename_refuses_foreign",
+                rename_refuses_foreign("ActiveRecord::Base"),
+                false,
+            ),
+            (
+                "rename_could_not_confirm",
+                rename_could_not_confirm("Error", "errors.rb"),
+                false,
+            ),
+            (
+                "rename_needs_a_ruby_name/constant",
+                rename_needs_a_ruby_name("person", true),
+                false,
+            ),
+            (
+                "rename_needs_a_ruby_name/variable",
+                rename_needs_a_ruby_name("Person", false),
                 false,
             ),
         ]
