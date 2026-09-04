@@ -4,7 +4,7 @@ The server and the VS Code extension ship as one version, so one file covers bot
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — 2026-09-04
 
 ### Added
 
@@ -405,6 +405,7 @@ name wherever the receiver cannot be named. The README says which side of it eac
   place ya-lsp can be confidently wrong rather than merely absent.
 - **A Ruby file outside every workspace folder gets no server**, because there is no root to index.
 
-[Unreleased]: https://github.com/ar2em1s/ya-lsp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ar2em1s/ya-lsp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.1.0
