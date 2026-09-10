@@ -2906,6 +2906,13 @@ end
             "class Story\n  with_options dependent: :destroy do |s|\n    other.has_many :tags\n  end\nend\n",
             // …and a host with no parameter at all does not make a receiver mean nothing.
             "class Story\n  with_options dependent: :destroy do\n    s.has_many :tags\n  end\nend\n",
+            // The three parameter lists this reader cannot take a name out of: an empty one, one
+            // with no required parameter, and one whose first is destructured rather than named.
+            // Each yields a receiver nothing can be attributed to, so a call on any name inside
+            // declines exactly as a call on the wrong name does.
+            "class Story\n  with_options dependent: :destroy do ||\n    s.has_many :tags\n  end\nend\n",
+            "class Story\n  with_options dependent: :destroy do |*rest|\n    rest.has_many :tags\n  end\nend\n",
+            "class Story\n  with_options dependent: :destroy do |(a, b)|\n    a.has_many :tags\n  end\nend\n",
             "has_many :tags\n",
             "class Story\n  self.has_many :tags\nend\n",
             "class Story\n  has_many\nend\n",

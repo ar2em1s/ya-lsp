@@ -1231,6 +1231,12 @@ mount Sidekiq::Web, at: "/sidekiq"
             ),
             ["a", "new_a"]
         );
+        // `on: :collection` is the third level a route can be moved to, and its join puts the
+        // collection name last where `:member` puts the member name.
+        assert_eq!(
+            named("resources :as, only: [] do\n  get :recent, on: :collection\nend\n"),
+            ["recent_as"]
+        );
         assert_eq!(named("get \"show\", to: \"p#a\"\n"), ["show"]);
         // A route written directly in a `resources` block with no `on:` is *nested*: the
         // parent's member name joins the prefix and the action follows it, which is the one
@@ -1263,6 +1269,39 @@ mount Sidekiq::Web, at: "/sidekiq"
         assert_eq!(named("get \"\" => \"p#a\"\n"), Vec::<String>::new());
         assert_eq!(named("get \"_x\", to: \"p#a\"\n"), ["_x"]);
         assert_eq!(named("match \"x\" => \"p#a\", via: :all\n"), ["x"]);
+    }
+
+    /// The three level blocks say what `on:` says, and the reader has to agree with itself.
+    ///
+    /// `member do … end`, `collection do … end` and `new do … end` set the same scope level that
+    /// `on: :member`, `on: :collection` and `on: :new` set on one route, so each pair has to name
+    /// its helper identically. Rails writes both spellings — the block for a run of routes, `on:`
+    /// for a single one — and a reader that drifted between them would answer one and not the
+    /// other on the same application.
+    #[test]
+    fn a_level_block_names_what_the_same_level_on_a_route_names() {
+        for (block, inline) in [
+            (
+                "resources :as, only: [] do\n  member do\n    post :upvote\n  end\nend\n",
+                "resources :as, only: [] do\n  post :upvote, on: :member\nend\n",
+            ),
+            (
+                "resources :as, only: [] do\n  collection do\n    get :recent\n  end\nend\n",
+                "resources :as, only: [] do\n  get :recent, on: :collection\nend\n",
+            ),
+            (
+                "resources :as, only: [] do\n  new do\n    get :preview\n  end\nend\n",
+                "resources :as, only: [] do\n  get :preview, on: :new\nend\n",
+            ),
+        ] {
+            assert_eq!(named(block), named(inline), "{block:?}");
+        }
+        // And the names themselves, so the pair agreeing is not the two of them agreeing on
+        // nothing: `new`'s join is the one that puts a word between the prefix and the member.
+        assert_eq!(
+            named("resources :as, only: [] do\n  new do\n    get :preview\n  end\nend\n"),
+            ["preview_new_a"]
+        );
     }
 
     /// The first route to claim a name keeps it — `has_named_route?` — and this is what makes a
