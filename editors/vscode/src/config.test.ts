@@ -40,6 +40,7 @@ test('setting names are translated into the server wire format', () => {
         'rbs.enabled': true,
         'rbs.stdlib': false,
         'rbs.path': '/opt/rbs',
+        'types.guessFromNames': false,
         'diagnostics.enabled': false,
         'diagnostics.rules': { 'dynamic-ancestor': 'warning' },
       })
@@ -59,6 +60,7 @@ test('setting names are translated into the server wire format', () => {
         paths: ['/opt/gems'],
       },
       rbs: { enabled: true, stdlib: false, path: '/opt/rbs' },
+      types: { guess_from_names: false },
       diagnostics: { enabled: false, rules: { 'dynamic-ancestor': 'warning' } },
     }
   );
@@ -115,9 +117,9 @@ test('an unset log level leaves an inherited one alone', () => {
 });
 
 test('turning the log off turns it off, rather than to the loudest value in the list', () => {
-  // `off` used to be treated as "the user said nothing", which fell through to the server's own
-  // fallback — `info`, louder than the `error` and `warn` sitting above it in the same drop-down.
-  // It is a perfectly good `EnvFilter` directive; the fix is to send it.
+  // Treating `off` as "the user said nothing" falls through to the server's own fallback —
+  // `info`, louder than the `error` and `warn` sitting above it in the same drop-down. It is a
+  // perfectly good `EnvFilter` directive, so it is sent as one.
   assert.equal(serverEnvironment(set({ logLevel: 'off' }), {}).YA_LSP_LOG, 'ya_lsp=off');
   assert.equal(
     serverEnvironment(set({ logLevel: 'off' }), { YA_LSP_LOG: 'ya_lsp=trace' }).YA_LSP_LOG,

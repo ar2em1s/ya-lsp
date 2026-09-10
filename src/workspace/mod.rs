@@ -3,6 +3,7 @@
 pub mod bundler;
 pub mod config;
 pub mod gems;
+pub mod rails;
 pub mod rbs;
 pub mod ruby_version;
 pub mod uri;
@@ -124,7 +125,7 @@ impl Workspace {
     /// Absolute load paths to resolve `require` against, workspace first.
     ///
     /// Order is Ruby's: the project's own `$LOAD_PATH` entries shadow a gem of the same name,
-    /// which is what `require "version"` inside an app has always meant.
+    /// which is what `require "version"` inside an app means.
     #[must_use]
     pub fn load_paths(&self) -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = self
@@ -161,6 +162,31 @@ impl Workspace {
     #[must_use]
     pub fn indexes(&self, path: &Path) -> bool {
         indexes(&self.root, &self.config.index, path)
+    }
+
+    /// Whether the project has ruled `path` out, for a file `index.include` can never name.
+    ///
+    /// [`Workspace::indexes`] without its include half, and it exists because that half is a
+    /// list of the shapes **Ruby** is written in: a `db/structure.sql` cannot be on it however
+    /// the user spells it, so asking `indexes` about one is asking a question whose answer is
+    /// always no. What is still a real question is whether the user wants that directory looked
+    /// at, and `index.exclude`, `.gitignore` and the hidden-file rule are where they said —
+    /// which is why this is the same walk and the same compiled globs rather than a second
+    /// predicate that could drift from them.
+    ///
+    /// The one caller is the `db/*structure.sql` reader, and it is deliberately narrow: this is
+    /// not a licence to read anything, it is the gate on the one non-Ruby file the generator
+    /// pass knows about.
+    #[must_use]
+    pub fn admits(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let mut reported_by_the_walk = Vec::new();
+        !matches_any(
+            &Globs::compile(&self.config.index, &mut reported_by_the_walk).exclude,
+            relative,
+        ) && visible(&self.root, &self.config.index, path)
     }
 }
 
@@ -324,10 +350,16 @@ fn indexes(root: &Path, index: &config::IndexConfig, path: &Path) -> bool {
         return false;
     }
 
-    // `.gitignore`, `.ignore`, `.git/info/exclude` and the hidden-file rule are the walker's,
-    // and the walker is where they stay: this descends only the directories between the root
-    // and `path`, which is a handful of `read_dir` calls rather than a second implementation of
-    // git's ignore semantics to keep in step with the first.
+    visible(root, index, path)
+}
+
+/// Whether the walk would reach `path` at all, ignoring both glob lists.
+///
+/// `.gitignore`, `.ignore`, `.git/info/exclude` and the hidden-file rule are the walker's, and
+/// the walker is where they stay: this descends only the directories between the root and
+/// `path`, which is a handful of `read_dir` calls rather than a second implementation of git's
+/// ignore semantics to keep in step with the first.
+fn visible(root: &Path, index: &config::IndexConfig, path: &Path) -> bool {
     let wanted = path.to_path_buf();
     walker(root, index)
         .filter_entry(move |entry| wanted.starts_with(entry.path()))
@@ -489,9 +521,9 @@ mod tests {
 
     #[test]
     fn gitignore_files_above_the_workspace_root_are_not_applied() {
-        // Regression: a checkout under a directory that an outer repo ignores used to index
-        // zero files, silently. Discovered by running the real binary against `tmp/<repo>`,
-        // which this repo's own .gitignore excludes.
+        // A checkout under a directory an outer repo ignores must still index: applying the
+        // outer .gitignore would index zero files, silently. Reachable with any clone under a
+        // path the parent repository excludes — this repo's own `tmp/` is one.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), ".gitignore", "/checkout/**/*\n");
         let root = dir.path().join("checkout");
@@ -523,9 +555,9 @@ mod tests {
 
     /// Globs written by hand that match nothing are still reported.
     ///
-    /// This is the case the warning has always been for, and the one the test above must not
-    /// take down with it: the user asked for something specific, got an index of nothing, and
-    /// every feature answering nothing reads as a broken server rather than an empty index.
+    /// This is the case the warning is for, and the one the test above must not take down with
+    /// it: the user asked for something specific, got an index of nothing, and every feature
+    /// answering nothing reads as a broken server rather than an empty index.
     #[test]
     fn globs_that_were_narrowed_by_hand_and_matched_nothing_are_reported() {
         let dir = tempfile::tempdir().unwrap();
@@ -647,7 +679,13 @@ mod tests {
         write(root, "lib/thing.rb", "module Thing; end");
         write(root, "lib/deep/a/b/c.rb", "module C; end");
         write(root, "README.md", "not ruby");
+        // Ruby that is not `.rb`, and the project's own signatures. All five shapes the default
+        // include gained: an extension at the root, an extension nested, and three fixed names.
         write(root, "sig/thing.rbs", "class Thing end");
+        write(root, "Rakefile", "task :default");
+        write(root, "config.ru", "run App");
+        write(root, "thing.gemspec", "Gem::Specification.new");
+        write(root, "lib/tasks/build.rake", "task :build");
         // `index.exclude`, both a default entry and the depth `*` must not reach.
         write(
             root,
@@ -666,8 +704,69 @@ mod tests {
         write(root, "app/models/secret.rb", "x");
         // Hidden, which the walker prunes at the directory.
         write(root, ".hidden/thing.rb", "x");
+        // The one shape `index.include` can never name, in each of the four positions
+        // `Workspace::admits` has to answer differently about. None of these changes what the
+        // walk collects, because none of them is Ruby.
+        write(root, "db/structure.sql", "CREATE TABLE t (id bigint);");
+        write(root, "tmp/db/structure.sql", "x");
+        write(root, "vendor/db/structure.sql", "x");
+        write(root, "db/ignored_structure.sql", "x");
 
         dir
+    }
+
+    /// `Workspace::admits` is `indexes` without its include half, and strictly wider.
+    ///
+    /// The property is the one that matters, because the failure it prevents is the same one
+    /// `the_predicate_answers_exactly_what_the_walk_collected` prevents one layer up: a second
+    /// predicate that drifts from the first is silent for the life of the process. Anything the
+    /// walk collects has to be admitted here too, or a rule would apply to Ruby and not to the
+    /// one non-Ruby file this server reads.
+    #[test]
+    fn what_the_project_excluded_is_excluded_for_a_file_the_include_cannot_name() {
+        let dir = rule_fixture();
+        let root = dir.path();
+        // Through the real loader, so the exclude list this asserts about is one a user could
+        // have written rather than one constructed past the parser.
+        std::fs::write(
+            root.join("ya-lsp.toml"),
+            "[index]\nexclude = [\"vendor/**/*\", \"tmp/**/*\", \"db/ignored_*\"]\n",
+        )
+        .unwrap();
+        let (workspace, problems) = Workspace::load(root.to_path_buf(), None);
+        assert!(problems.is_empty(), "{problems:?}");
+        let index = workspace.config().index.clone();
+
+        let rows = [
+            // `index.include` says no to every one of these, which is why `indexes` cannot be
+            // the gate: it is a list of the shapes Ruby is written in.
+            ("db/structure.sql", true),
+            ("tmp/db/structure.sql", false),
+            ("vendor/db/structure.sql", false),
+            ("db/ignored_structure.sql", false),
+            // Not there at all, and outside the root, which a watcher can send.
+            ("db/absent_structure.sql", false),
+        ];
+        let answers: Vec<(&str, bool)> = rows
+            .iter()
+            .map(|(path, _)| (*path, workspace.admits(&root.join(path))))
+            .collect();
+        assert_eq!(answers, rows.to_vec());
+        assert!(!workspace.admits(Path::new("/somewhere/else/db/structure.sql")));
+        for path in &rows {
+            assert!(!workspace.indexes(&root.join(path.0)), "{}", path.0);
+        }
+
+        // Wider, over every file in the tree: what the walk collects, this admits.
+        let mut present = Vec::new();
+        every_file(root, &mut present);
+        for path in &present {
+            assert!(
+                !indexes(root, &index, path) || workspace.admits(path),
+                "{} is indexed and not admitted",
+                path.strip_prefix(root).unwrap().display()
+            );
+        }
     }
 
     /// The predicate and the walk are one set of rules, asserted against each other.
@@ -710,10 +809,15 @@ mod tests {
         assert_eq!(
             indexed,
             vec![
+                "Rakefile",
                 "app/models/user.rb",
+                "config.ru",
                 "lib/deep/a/b/c.rb",
                 "lib/keep.gen.rb",
+                "lib/tasks/build.rake",
                 "lib/thing.rb",
+                "sig/thing.rbs",
+                "thing.gemspec",
             ],
             "include, exclude, both .gitignore files, the negation and the hidden directory"
         );

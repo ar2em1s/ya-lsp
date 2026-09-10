@@ -1,10 +1,10 @@
 //! Ruby's own signatures: where they come from, and how they reach the graph as files.
 //!
-//! Ruby's core classes are written in C, so there is no Ruby source anywhere on disk that
-//! defines `String#upcase`. What exists instead is RBS — the signature language `ruby/rbs`
-//! maintains — and rubydex indexes it natively: `LanguageId::Rbs`, dispatched off the `.rbs`
-//! extension by `index_files`. So the work here is not indexing. It is deciding *which* copy of
-//! the signatures to index, and making sure there is always one.
+//! Ruby's core classes are written in C, so no Ruby source on disk defines `String#upcase`. What
+//! exists instead is RBS — the signature language `ruby/rbs` maintains — and rubydex indexes it
+//! natively: `LanguageId::Rbs`, dispatched off the `.rbs` extension by `index_files`. So the work
+//! here is not indexing. It is deciding *which* copy of the signatures to index, and making sure
+//! there is always one.
 //!
 //! # The ladder
 //!
@@ -12,8 +12,8 @@
 //! 2. **On disk** — the highest-versioned `rbs-*` gem holding a `core/`, in the gem roots gem
 //!    discovery already knows how to find. This is the copy that matches the Ruby the project
 //!    actually runs, so it wins whenever it exists.
-//! 3. **Vendored** — the copy `build.rs` embedded. The only rung that survives `PATH` pointing
-//!    at an empty directory, which is the situation this whole server is built for.
+//! 3. **Vendored** — the copy `build.rs` embedded. The only rung that survives `PATH` pointing at
+//!    an empty directory, which is the situation this whole server is built for.
 //!
 //! # Why the vendored copy is written to disk
 //!
@@ -22,10 +22,10 @@
 //! then fail at the one moment the user asked to see it. So the embedded copy is extracted once
 //! to a cache directory and indexed from there.
 //!
-//! This is not the index cache the project rejected. Nothing is read back that this
-//! binary did not just write, the directory is keyed by the version the binary carries, and a
-//! failed extraction falls back to having no signatures rather than to having wrong ones —
-//! none of the invalidation problems that made caching the *graph* a bad trade apply.
+//! That is not an index cache. Nothing is read back that this binary did not just write, the
+//! directory is keyed by the version the binary carries, and a failed extraction falls back to
+//! having no signatures rather than to having wrong ones — so none of the invalidation problems
+//! that make caching the *graph* a bad trade apply.
 
 use std::{
     fs,
@@ -107,8 +107,8 @@ impl Signatures {
 /// Find the signatures to index.
 ///
 /// Never fails. Every way this can go wrong ends in an empty result plus a line in `problems`:
-/// a server that will not start because it could not find `String` is worse than one that
-/// starts without it, which is exactly what every release before this one did.
+/// a server that will not start because it could not find `String` is worse than one that starts
+/// without it.
 #[must_use]
 pub fn discover(
     workspace_root: &Path,

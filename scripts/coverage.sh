@@ -3,8 +3,7 @@
 #
 # `cargo llvm-cov` can fail a build on lines, regions, functions and per-file lines. It cannot
 # fail one on branches — there is no `--fail-under-branches` — and branches are the number that
-# tells the truth about this suite: they sat twelve points below lines when the bar was first
-# measured. This script is the missing gate.
+# tells the truth about this suite, running well below lines. This script is the missing gate.
 #
 # It reads llvm-cov's own report on stdin rather than recomputing anything, so the figures here
 # and the ones in the text report are the same figures. Nothing but `sh`, `awk` and `sort` is

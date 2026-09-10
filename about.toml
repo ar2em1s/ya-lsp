@@ -31,3 +31,19 @@ targets = [
 # Neither ships in the binary, so neither owes a notice in it.
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
+
+# rubydex publishes no licence file of its own — only `license = "MIT"` in its manifest — so
+# `cargo about` files it under the unfilled SPDX template and **Shopify is named nowhere in any
+# shipped artifact**, which is exactly the gap `NOTICE.txt` closes for rbs. A git checkout carries
+# the whole repository, so the root `LICENSE.txt` is there to harvest; the `../../` escapes the
+# package directory, which means an upstream move of the crate inside its repository breaks this
+# *silently* and `make notices-check`'s byte diff is what catches it. That is an argument for the
+# check rather than against the clarification. Against a crates.io source it fails open — a
+# warning and the template, at exit 0 — so it costs nothing if the pin ever goes back.
+[rubydex.clarify]
+license = "MIT"
+
+[[rubydex.clarify.files]]
+path = "../../LICENSE.txt"
+license = "MIT"
+checksum = "d0636642cb7067953580a81350106e9bcead7f4e13bb4a65652ca8d9d690002e"

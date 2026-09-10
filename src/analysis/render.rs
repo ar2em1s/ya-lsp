@@ -18,7 +18,7 @@ use rubydex::model::{
 ///
 /// `Person::<Person>#build()` is how rubydex says `Person.build`, because it models singleton
 /// methods as members of a synthetic singleton class. Instance methods keep the `#` spelling,
-/// which is what Ruby documentation has always used.
+/// which is Ruby documentation's own spelling.
 #[must_use]
 pub fn qualified_name(name: &str) -> String {
     let Some((owner, method)) = name.rsplit_once('#') else {
@@ -270,30 +270,109 @@ pub fn documentation(comments: &[Comment]) -> Option<String> {
 /// is inside them is Ruby, and `Hash<Symbol, untyped>` in an example must not grow a backslash.
 fn to_markdown(text: &str) -> String {
     let mut chunks: Vec<String> = Vec::new();
-    let mut prose: Vec<&str> = Vec::new();
+    let mut prose: Vec<String> = Vec::new();
     let mut fenced = false;
+    // Whether the indented lines below belong to a list item rather than to an example. RDoc
+    // says the same two spaces mean both, and which one is decided by what opened above them —
+    // see [`list_item`]. It survives a blank line, because a labelled list item with two
+    // paragraphs is ordinary and the second is still the item's.
+    let mut listing = false;
 
     for line in text.lines() {
         let fence = line.trim_start().starts_with("```");
         if fence {
             fenced = !fenced;
         }
-        // A blank line is prose, so a verbatim block broken by one stays two blocks and the
-        // run that gets converted stays as long as the sentence a link is written across.
-        if fenced || fence || line.starts_with("    ") || line.starts_with('\t') {
-            if !prose.is_empty() {
-                chunks.push(converted(&prose.join("\n")));
-                prose.clear();
-            }
+        if fenced || fence {
+            flush(&mut chunks, &mut prose);
             chunks.push(line.to_owned());
-        } else {
-            prose.push(line);
+            continue;
         }
+        if let Some(heading) = heading(line) {
+            flush(&mut chunks, &mut prose);
+            chunks.push(heading);
+            listing = false;
+            continue;
+        }
+        if let Some(label) = list_item(line) {
+            flush(&mut chunks, &mut prose);
+            chunks.push(format!("- **{}**", converted(label)));
+            listing = true;
+            continue;
+        }
+        if line.trim().is_empty() {
+            prose.push(line.to_owned());
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent >= 2 && !line.starts_with('\t') {
+            if listing {
+                // The item's own text, and it keeps its indentation: markdown reads an indented
+                // line under a `-` as a continuation of it, which is what RDoc means by it too.
+                prose.push(line.to_owned());
+            } else {
+                // A verbatim block, which is RDoc's **two** spaces and markdown's four. Every
+                // example in Rails' own comments is written this way, and reading one as prose
+                // is the whole of the report's "examples are plain text".
+                flush(&mut chunks, &mut prose);
+                let pad = " ".repeat(4_usize.saturating_sub(indent));
+                chunks.push(format!("{pad}{line}"));
+            }
+            continue;
+        }
+        if line.starts_with('\t') {
+            flush(&mut chunks, &mut prose);
+            chunks.push(line.to_owned());
+            continue;
+        }
+        // Back at the margin with something on the line: whatever list was open is closed.
+        listing = false;
+        prose.push(line.to_owned());
     }
+    flush(&mut chunks, &mut prose);
+    chunks.join("\n")
+}
+
+/// Convert whatever prose has accumulated and put it in `chunks`.
+fn flush(chunks: &mut Vec<String>, prose: &mut Vec<String>) {
     if !prose.is_empty() {
         chunks.push(converted(&prose.join("\n")));
+        prose.clear();
     }
-    chunks.join("\n")
+}
+
+/// `== Options` -> `## Options`, and nothing for a line that is not a heading.
+///
+/// RDoc's heading is a run of `=` at the margin followed by a space, which is the one spelling
+/// markdown does not share — markdown's own underline form never appears in these comments.
+/// Six levels, because that is where markdown stops.
+fn heading(line: &str) -> Option<String> {
+    let level = line.len() - line.trim_start_matches('=').len();
+    if level == 0 || level > 6 {
+        return None;
+    }
+    let rest = line[level..].strip_prefix(' ')?;
+    Some(format!("{} {rest}", "#".repeat(level)))
+}
+
+/// The label of an RDoc labelled list item — `[+:autosave+]` or `autosave::` — at the margin.
+///
+/// The one construct that has to be recognised before the indentation is read, because it is
+/// what makes the two spaces below it mean *description* rather than *example*. Rails writes 26
+/// of these in `has_many`'s comment alone, and read as verbatim every option's description
+/// became a code block.
+fn list_item(line: &str) -> Option<&str> {
+    if line.starts_with(' ') || line.starts_with('\t') {
+        return None;
+    }
+    if let Some(inner) = line
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        return (!inner.is_empty() && !inner.contains(']')).then_some(inner);
+    }
+    let label = line.strip_suffix("::")?;
+    (!label.is_empty() && !label.contains(' ')).then_some(label)
 }
 
 /// One run of prose, converted. Takes whole lines, because RDoc wraps its links across them.
@@ -310,6 +389,15 @@ fn converted(prose: &str) -> String {
             at += span.len();
         } else if let Some((label, taken)) = rdoc_link(rest) {
             out.push_str(&converted(label));
+            at += taken;
+        } else if let Some((rendered, taken)) = braced_link(rest) {
+            out.push_str(&rendered);
+            at += taken;
+        } else if let Some((code, taken)) = plus_code(rest, out.chars().last()) {
+            out.push_str(&code);
+            at += taken;
+        } else if let Some(taken) = suppressed(rest) {
+            out.push_str(&rest[1..taken]);
             at += taken;
         } else if let Some((rendered, taken)) = inline_tag(rest) {
             out.push_str(&rendered);
@@ -354,6 +442,63 @@ fn rdoc_link(rest: &str) -> Option<(&str, usize)> {
     target
         .starts_with("rdoc-ref:")
         .then(|| (&rest[1..separator], separator + 2 + end + 1))
+}
+
+/// `{text}[url]` — RDoc's own link, which is the spelling a `.rb` file uses.
+///
+/// [`rdoc_link`] handles `[text](url)`, which is what the *vendored signatures* carry because
+/// RDoc generated them; a gem's own source is written in RDoc itself and needs this one. An
+/// `rdoc-ref:` target points into a documentation tree the editor has never seen, so it goes
+/// the way the other one goes — the words stay and the dead link does not; a
+/// real URL is kept, because an editor can follow it.
+fn braced_link(rest: &str) -> Option<(String, usize)> {
+    let end = rest.strip_prefix('{')?.find("}[")?;
+    let text = &rest[1..=end];
+    let target = &rest[end + 3..];
+    let close = target.find(']')?;
+    let url = &target[..close];
+    let taken = end + 3 + close + 1;
+    if url.starts_with("rdoc-ref:") || url.contains(' ') {
+        return Some((converted(text), taken));
+    }
+    Some((format!("[{}]({url})", converted(text)), taken))
+}
+
+/// `+word+` as a code span, RDoc's own emphasis for code.
+///
+/// The same thing `<tt>` means, and the report saw them treated differently in one card:
+/// `<tt>:autosave</tt>` came out as code and `+:autosave+` as three literal characters and a
+/// word. RDoc's rule is that the `+` must open at a non-word boundary and close before one, and
+/// that nothing inside may be whitespace — which is what keeps `1 + 2` and `a+b` prose.
+fn plus_code(rest: &str, previous: Option<char>) -> Option<(String, usize)> {
+    if previous.is_some_and(|ch| ch.is_alphanumeric() || ch == '_') {
+        return None;
+    }
+    let inner = rest.strip_prefix('+')?;
+    let end = inner.find('+')?;
+    let word = &inner[..end];
+    if word.is_empty() || word.chars().any(char::is_whitespace) {
+        return None;
+    }
+    // A word character straight after the closing `+` means it never closed a span.
+    if inner[end + 1..]
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some((fenced_code(word), end + 2))
+}
+
+/// `\Word` — RDoc's escape, which asks for the word and no link. The backslash is not text.
+///
+/// Only before a letter, because `\n` inside a sentence about escapes is the thing itself and
+/// markdown would eat the backslash anyway.
+fn suppressed(rest: &str) -> Option<usize> {
+    let word = rest.strip_prefix('\\')?;
+    let first = word.chars().next()?;
+    first.is_alphabetic().then(|| 1 + first.len_utf8())
 }
 
 /// An inline HTML tag as the markdown that means the same thing, and how much it accounted for.
@@ -437,13 +582,36 @@ fn strip_marker(comment: &str) -> &str {
     body.strip_prefix(' ').unwrap_or(body)
 }
 
-/// A magic comment, a linter pragma, or a shebang — never documentation.
+/// RDoc's own visibility directives, which are not prose and are the whole comment where they
+/// are the whole comment.
+///
+/// `:nodoc:` above a `def` means "there is no documentation here", and the card was printing the
+/// word — which is worse than the empty card it is asking for, because a reader takes a card
+/// with something in it as an answer.
+const RDOC_DIRECTIVES: [&str; 6] = [
+    ":nodoc:",
+    ":doc:",
+    ":startdoc:",
+    ":stopdoc:",
+    ":enddoc:",
+    ":yields:",
+];
+
+/// A magic comment, a linter pragma, an RDoc directive, or a shebang — never documentation.
 ///
 /// The test is deliberately narrow: an all-lowercase word followed immediately by a colon.
 /// `TODO: rewrite` and `Note: this is fine` are prose and survive.
 fn is_directive(line: &str) -> bool {
     let line = line.trim_start();
     if line.starts_with('!') || line.starts_with("-*-") {
+        return true;
+    }
+    // `:nodoc: all` is the spelling with an argument; both are the directive and neither is
+    // documentation.
+    if RDOC_DIRECTIVES
+        .iter()
+        .any(|directive| line == *directive || line.starts_with(&format!("{directive} ")))
+    {
         return true;
     }
     let Some((word, _)) = line.split_once(':') else {
@@ -464,8 +632,150 @@ mod tests {
     fn comments(lines: &[&str]) -> Vec<Comment> {
         lines
             .iter()
-            .map(|line| Comment::new(Offset::new(0, 0), (*line).to_owned()))
+            .map(|line| Comment::new(Offset::new(0, 0), (*line).into()))
             .collect()
+    }
+
+    /// The fixture is `ActiveRecord::Associations::ClassMethods#has_many`'s own
+    /// comment: a labelled list of options, a paragraph under each label, and then a run of
+    /// examples. All three are two spaces in RDoc and mean two different things.
+    #[test]
+    fn rdoc_written_in_a_gems_own_source_renders_as_rdoc() {
+        let card = documentation(&comments(&[
+            "# == Options",
+            "#",
+            "# [+:autosave+]",
+            "#   If true, always save the associated objects. This option is implemented as a",
+            "#   +before_save+ callback.",
+            "# [+:inverse_of+]",
+            "#   Specifies the name of the association.",
+            "#   See {Bi-directional}[rdoc-ref:Associations::ClassMethods@Bi] for more detail.",
+            "#",
+            "# Option examples:",
+            "#   has_many :comments, -> { order(\"posted_on\") }",
+            "#   has_many :tags, as: :taggable",
+        ]))
+        .expect("a card");
+        assert_eq!(
+            card,
+            "\
+## Options
+
+- **`:autosave`**
+  If true, always save the associated objects. This option is implemented as a
+  `before_save` callback.
+- **`:inverse_of`**
+  Specifies the name of the association.
+  See Bi-directional for more detail.
+
+Option examples:
+    has_many :comments, -> { order(\"posted_on\") }
+    has_many :tags, as: :taggable"
+        );
+    }
+
+    /// The inconsistency the report actually saw: one card, two spellings of the same thing,
+    /// and only one of them read.
+    #[test]
+    fn plus_and_tt_are_the_same_markup() {
+        let plus = documentation(&comments(&["# Set +:autosave+ to true."]));
+        let tt = documentation(&comments(&["# Set <tt>:autosave</tt> to true."]));
+        assert_eq!(plus.as_deref(), Some("Set `:autosave` to true."));
+        assert_eq!(plus, tt);
+    }
+
+    /// What a `+` is when it is arithmetic, a word, or one of a pair with a space in it.
+    #[test]
+    fn a_plus_that_is_not_markup_stays_a_plus() {
+        for line in [
+            "# The sum of 1 + 2 is 3.",
+            "# Written a+b+c in the source.",
+            "# Use + to add and + to concatenate.",
+        ] {
+            let rendered = documentation(&comments(&[line])).expect("a card");
+            assert_eq!(rendered, strip_marker(line), "{line}");
+        }
+    }
+
+    /// `:nodoc:` is RDoc saying there is nothing here, and a card with the word in it is worse
+    /// than no card: a reader takes something in a card as an answer.
+    #[test]
+    fn a_nodoc_comment_is_no_documentation_at_all() {
+        assert_eq!(documentation(&comments(&["# :nodoc:"])), None);
+        assert_eq!(documentation(&comments(&["# :nodoc: all"])), None);
+        assert_eq!(documentation(&comments(&["# :stopdoc:"])), None);
+        // And it only leads. A `:nodoc:` written *after* prose is somebody discussing the
+        // directive, and the prose above it is documentation.
+        assert_eq!(
+            documentation(&comments(&["# Marks it hidden.", "# :nodoc:"])).as_deref(),
+            Some("Marks it hidden.\n:nodoc:")
+        );
+    }
+
+    /// The guarantee that must not move: what is inside a verbatim block is Ruby, and a
+    /// generic in an example must not grow a backslash.
+    #[test]
+    fn a_verbatim_block_is_never_escaped_however_it_is_indented() {
+        let card = documentation(&comments(&[
+            "# Returns a hash:",
+            "#   Hash<Symbol, untyped>",
+            "# and a Array<Integer> in prose.",
+        ]))
+        .expect("a card");
+        assert!(card.contains("    Hash<Symbol, untyped>"), "{card}");
+        assert!(card.contains("a Array\\<Integer> in prose"), "{card}");
+    }
+
+    /// The shapes each RDoc reader declines, one per way of not being the thing.
+    #[test]
+    fn the_rdoc_spellings_that_are_not_markup() {
+        let card = |lines: &[&str]| documentation(&comments(lines)).expect("a card");
+
+        // A heading deeper than markdown has, and a run of `=` with no space after it.
+        assert_eq!(card(&["# ======= Too deep"]), "======= Too deep");
+        assert_eq!(card(&["# ==nospace"]), "==nospace");
+        // A tab-indented block is verbatim and is left exactly as it was written, at one tab
+        // and at two — the second is the one that gets past the two-space test first.
+        assert_eq!(card(&["# Prose.", "#\tstill_code"]), "Prose.\n\tstill_code");
+        assert_eq!(card(&["# Prose.", "#\t\tdeeper"]), "Prose.\n\t\tdeeper");
+        // `[a]b]` is not a label: RDoc's label runs to the *first* `]`, so a line holding two
+        // is prose that happens to start with a bracket.
+        assert_eq!(card(&["# [a]b]"]), "[a]b]");
+        // The other spelling of a labelled list, which `is_directive` would eat if it led.
+        assert_eq!(
+            card(&["# Options.", "# autosave::", "#   If true."]),
+            "Options.\n- **autosave**\n  If true."
+        );
+        // A label with a space in it is a sentence ending in a colon pair, not a list; and
+        // neither empty spelling of either form is one either.
+        assert_eq!(card(&["# Prose.", "# see also::"]), "Prose.\nsee also::");
+        assert_eq!(card(&["# Prose.", "# []"]), "Prose.\n[]");
+        assert_eq!(card(&["# Prose.", "# ::"]), "Prose.\n::");
+        // A link with a real target keeps it, and one whose target is not a URL at all keeps
+        // only its words.
+        assert_eq!(
+            card(&["# See {the guide}[https://example.com/g] for more."]),
+            "See [the guide](https://example.com/g) for more."
+        );
+        assert_eq!(
+            card(&["# See {the guide}[not a url] for more."]),
+            "See the guide for more."
+        );
+        // `++` has nothing between the pluses, and `+a+b` never closed: both are prose.
+        assert_eq!(card(&["# An empty ++ pair."]), "An empty ++ pair.");
+        assert_eq!(
+            card(&["# Written +a+b in the source."]),
+            "Written +a+b in the source."
+        );
+    }
+
+    /// A `\\Word` is RDoc asking for the word without a link.
+    #[test]
+    fn a_suppressed_link_keeps_its_word_and_loses_its_backslash() {
+        assert_eq!(
+            documentation(&comments(&["# See \\Array for more."])).as_deref(),
+            Some("See Array for more.")
+        );
     }
 
     #[test]

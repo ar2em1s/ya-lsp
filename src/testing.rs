@@ -27,7 +27,7 @@ thread_local! {
 /// thread with a sink captures and a thread without one does not. That second half is not an
 /// optimisation, it is the honest part. Enabling the level process-wide would execute every
 /// `info!` argument in the crate and mark ~30 lines covered that nothing asserts — which is the
-/// gaming this milestone's rules forbid. Here a `tracing::` line is covered exactly when some
+/// gaming `coverage.md` forbids. Here a `tracing::` line is covered exactly when some
 /// test asked to read it.
 struct Capture;
 
@@ -86,8 +86,7 @@ impl Visit for Recorder<'_> {
 ///
 /// The log **is** an interface. When a user asks why they have no completions, stderr is the
 /// only thing that answers: which rbs was used, how many gems resolved, which `ya-lsp.toml` was
-/// read. Those lines are as much a product as a hover card, and none of them was asserted
-/// anywhere before this existed.
+/// read. Those lines are as much a product as a hover card, and this is what asserts them.
 pub fn captured_logs<T>(level: Level, body: impl FnOnce() -> T) -> (T, String) {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {

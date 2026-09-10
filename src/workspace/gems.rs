@@ -1,8 +1,8 @@
 //! Finding a project's gems on disk, without Bundler and without Ruby.
 //!
-//! This is the moat. `Bundler.locked_gems.specs` and `Gem::Specification#full_gem_path` — what
-//! every other Ruby language server calls — require a Ruby runtime inside the project's bundle.
-//! Reimplementing them means knowing the filesystem shape each version manager installs into,
+//! This is the moat. The usual answer — `Bundler.locked_gems.specs` and
+//! `Gem::Specification#full_gem_path` — needs a Ruby runtime inside the project's bundle.
+//! Reimplementing it means knowing the filesystem shape each version manager installs into,
 //! which is exactly the kind of knowledge that rots: a layout that changes upstream degrades us
 //! to "no gem intelligence" with no error anywhere.
 //!
@@ -130,13 +130,23 @@ pub struct Gems {
     /// This is where the *default gems* actually live. Their entries under `gems/` are empty
     /// placeholder directories: `gems/json-2.18.0/` exists and holds nothing, while the code is
     /// in `lib/ruby/4.0.0/json.rb`. So resolution "succeeds" and then finds no load path, and
-    /// `require "json"` has always led nowhere. Held once rather than per gem, because one
+    /// `require "json"` leads nowhere without this. Held once rather than per gem, because one
     /// directory holds all forty of them and attaching it to each would walk it forty times.
     pub ruby_lib: Vec<PathBuf>,
     pub ruby_version: Option<Resolved>,
     /// Locked gems with no directory on disk — usually default gems that ship inside Ruby
     /// itself, or a platform-specific gem this machine never installed.
     pub unresolved: Vec<String>,
+    /// `.gem_rbs_collection/` under the workspace root, when `rbs collection install` has been
+    /// run. The community's curated signatures for gems that ship none of their own — including
+    /// Rails — and therefore the one directory here that could type a framework with no framework
+    /// knowledge in this crate at all.
+    ///
+    /// `None` is the common case and, on the one real application this project measures against,
+    /// the only case. It is found here rather than by the workspace walk because that walk skips
+    /// hidden directories, and because these are somebody else's signatures: the same reason a
+    /// vendored bundle is not the user's own code.
+    pub rbs_collection: Option<PathBuf>,
     pub problems: Vec<String>,
 }
 
@@ -154,7 +164,83 @@ impl Gems {
             .chain(self.ruby_lib.iter().cloned())
             .collect()
     }
+
+    /// Every directory of RBS the bundle already has on disk, in gem order, curated last.
+    ///
+    /// **Deliberately not load paths.** `require "widget"` never resolves against `sig/`, so
+    /// putting these on [`Gem::load_paths`] would make go-to-definition on a `require` land on a
+    /// signature — and `load_paths` is what `require` resolution reads. They are a second list
+    /// because they answer a second question.
+    ///
+    /// `sig/` is rbs's own convention for a gem's signatures and is checked per gem rather than
+    /// stored, one `is_dir` on a list this pass then spends seconds indexing. **Measured over
+    /// lobsters' 180 resolved gems: 9 ship `sig/`, 52 files and 306 KiB** — a twentieth of the
+    /// bundle, and none of them a gem an application writes chains through. The item is worth its
+    /// walk because the walk is one stat per gem, not because the corpus flatters it.
+    #[must_use]
+    pub fn signature_paths(&self) -> Vec<PathBuf> {
+        self.gems
+            .iter()
+            .map(|gem| gem.path.join(SIGNATURE_DIR))
+            .filter(|path| path.is_dir())
+            .chain(self.rbs_collection.clone())
+            .collect()
+    }
+
+    /// Every gem's `app/`, in gem order — the half of a Rails engine that is not on its load
+    /// path.
+    ///
+    /// **Deliberately not load paths, for exactly [`Gems::signature_paths`]' reason.**
+    /// `require "active_storage"` resolves to `lib/active_storage.rb` and must never resolve to
+    /// something under `app/`, and `load_paths` is the list `require` resolution reads. A third
+    /// list is what keeps "where a constant is defined" and "what a `require` names" from being
+    /// the same question.
+    ///
+    /// An engine ships its models, mailers, jobs and controllers under `app/` and declares
+    /// `require_paths = ["lib"]` all the same — checked in the serialised gemspecs of
+    /// `activestorage`, `actionmailbox`, `devise`, `solid_queue`, `turbo-rails` and
+    /// `activeadmin` — so without this list `ActiveStorage::Blob` is not a constant this crate
+    /// has ever seen, while `ActiveStorage::Service` in the file next door answers. That gap
+    /// measured it: **417 files under `app/` against 24,425 under `lib/`** across the 479 gems
+    /// installed for one Ruby, of which 18 are engines.
+    ///
+    /// `config/` is here for exactly one file, and contributes no constant at all. Across the
+    /// 479 gems installed for one Ruby there are **9 distinct `.rb` files** under any `config/` —
+    /// seven `routes.rb` and two `importmap.rb` — and **none of them defines a class or a
+    /// module**. It is walked because an engine's `config/routes.rb` may name helpers that really
+    /// are the *host application's*: four of the seven engines that ship one open with
+    /// `Rails.application.routes.draw`, and three — blazer, pghero and mission_control-jobs —
+    /// draw into their own `Engine.routes`, whose helpers are reached as `blazer.queries_path`
+    /// after a `mount` and are not the application's at all. Telling those two apart is
+    /// [`crate::workspace::rails::Whose`]'s job, not this walk's.
+    ///
+    /// Two `is_dir` per gem, on the same argument `sig/` gets: a stat per gem is not a cost, and
+    /// the walk that follows is over the gems that really are engines.
+    #[must_use]
+    pub fn engine_paths(&self) -> Vec<PathBuf> {
+        self.gems
+            .iter()
+            .flat_map(|gem| ENGINE_DIRS.map(|dir| gem.path.join(dir)))
+            .filter(|path| path.is_dir())
+            .collect()
+    }
 }
+
+/// Where a Rails engine keeps the Ruby that is not on its load path.
+///
+/// `app/` for the models, mailers, jobs and controllers; `config/` for the routes file, and for
+/// nothing else — see [`Gems::engine_paths`].
+const ENGINE_DIRS: [&str; 2] = ["app", "config"];
+
+/// Where a gem keeps the signatures it ships, by rbs's own convention.
+const SIGNATURE_DIR: &str = "sig";
+
+/// Where `rbs collection install` writes the curated signatures for a project's gems.
+///
+/// The path is configurable in `rbs_collection.yaml`, which is YAML this crate has no parser for
+/// and no dependency to gain one. The default is honoured and a moved collection is not, which is
+/// the same trade `[gems] paths` exists to unstick.
+const RBS_COLLECTION_DIR: &str = ".gem_rbs_collection";
 
 /// The gem roots on this machine, without cataloguing what is inside them.
 ///
@@ -205,12 +291,16 @@ pub fn discover(workspace_root: &Path, config: &GemsConfig, env: &Env) -> Gems {
 
     let version = gems.ruby_version.as_ref().map(|it| it.version.as_str());
     gems.roots = gem_roots(workspace_root, config, env, version);
+    // Before the lockfile check below, and cheap either way: one stat. A project can have run
+    // `rbs collection install` and this costs nothing at all when it has not.
+    gems.rbs_collection =
+        Some(workspace_root.join(RBS_COLLECTION_DIR)).filter(|path| path.is_dir());
     if config.default_gems {
         gems.ruby_lib = ruby_lib_dirs(&gems.roots, version);
         // The silent cliff. `ruby_lib_dirs` refuses to guess a Ruby, and it is right to —
         // guessing once put Apple's vestigial 2.6 stdlib into the graph and answered
         // `"hello".u` with `unspace`. But refusing costs the whole of Ruby's own library, 727
-        // files on a 3.4 install, and until v0.2.0 it cost it in silence: `require "json"`
+        // files on a 3.4 install, and doing so in silence is worse: `require "json"`
         // answered `null`, `JSON.parse` hovered as nothing, and the only trace anywhere was a
         // `DEBUG` line about the *bundle*, which is not what went missing.
         if gems.ruby_lib.is_empty() {
@@ -805,17 +895,25 @@ fn require_paths_from_gemspec(text: &str) -> Option<Vec<String>> {
     (!paths.is_empty()).then_some(paths)
 }
 
-/// Every `.rb` file under `load_paths`.
+/// Every `.rb` and `.rbs` file under `paths`.
+///
+/// One walk for both lists, because a signature directory and a load path differ in where they
+/// are and not in how they are read: `analysis::Analysis::index_edited_signatures` sorts the two
+/// extensions apart on the batch, and it is the only place that rule may live — a file indexed
+/// differently depending on which walk found it is worse than one that is not filtered at all.
+/// `.rbs` is taken under a load path too, for the handful of gems that put signatures beside the
+/// code rather than in `sig/`. Measured over lobsters' bundle: zero, and it costs a comparison.
 ///
 /// Deliberately not the `ignore` crate's default filters: a gem is not a git checkout we should
 /// be second-guessing, and for a git source the repository's own `.gitignore` can hide generated
 /// files that are genuinely part of the shipped gem. Hidden directories are skipped because no
-/// gem puts its library code in one.
+/// gem puts its library code in one — `.gem_rbs_collection/` is hidden and is reached as a path
+/// in its own right, never by descending into it.
 #[must_use]
-pub fn ruby_files(load_paths: &[PathBuf]) -> Vec<PathBuf> {
+pub fn source_files(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    for load_path in load_paths {
-        let mut walker = ignore::WalkBuilder::new(load_path);
+    for path in paths {
+        let mut walker = ignore::WalkBuilder::new(path);
         walker
             .standard_filters(false)
             .hidden(true)
@@ -824,7 +922,11 @@ pub fn ruby_files(load_paths: &[PathBuf]) -> Vec<PathBuf> {
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
             }
-            if entry.path().extension().is_some_and(|ext| ext == "rb") {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "rb" || ext == "rbs")
+            {
                 files.push(entry.into_path());
             }
         }
@@ -876,8 +978,8 @@ mod tests {
     fn rubys_own_library_is_a_load_path_so_default_gems_are_not_invisible() {
         // The layout that makes this necessary, and it is not a hypothetical: a default gem's
         // directory under `gems/` exists and is *empty*, while its code sits in Ruby's own
-        // library beside it. Resolution therefore succeeds and finds nothing, which is why
-        // `require "json"` has always led nowhere.
+        // library beside it. Resolution therefore succeeds and finds nothing, so without this
+        // `require "json"` leads nowhere.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let project = dir.path().join("project");
@@ -1402,7 +1504,211 @@ mod tests {
     }
 
     #[test]
-    fn a_load_path_yields_ruby_files_and_nothing_else() {
+    fn a_gems_own_signatures_are_found_and_are_not_a_load_path() {
+        // Two halves, and only both together find anything: `sig/` has to be admitted by
+        // extension *and* by directory, since the walk runs over `require_paths` and no gem
+        // puts `sig` in one.
+        //
+        // The second assertion is the one with teeth. `load_paths` is what `require "..."`
+        // resolves against, so a `sig/` that leaked into it would make go-to-definition on
+        // `require "thing"` land on a signature rather than on the code.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("home");
+        let project = dir.path().join("project");
+        install(&root, "thing-1.0.0", &["lib"]);
+        std::fs::create_dir_all(root.join("gems/thing-1.0.0/sig")).unwrap();
+        std::fs::write(
+            root.join("gems/thing-1.0.0/sig/thing.rbs"),
+            "class Thing
+  def shout: () -> String
+end
+",
+        )
+        .unwrap();
+        lockfile(
+            &project,
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    thing (1.0.0)\n",
+        );
+
+        let env = Env {
+            gem_home: Some(root.clone()),
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+
+        assert_eq!(
+            gems.signature_paths(),
+            vec![root.join("gems/thing-1.0.0/sig")]
+        );
+        assert_eq!(gems.load_paths(), vec![root.join("gems/thing-1.0.0/lib")]);
+        assert_eq!(
+            source_files(&gems.signature_paths()),
+            vec![root.join("gems/thing-1.0.0/sig/thing.rbs")]
+        );
+    }
+
+    #[test]
+    fn an_engines_own_directories_are_found_and_are_not_load_paths() {
+        // The same two halves as `sig/` above. An engine declares
+        // `require_paths = ["lib"]` — every one of the six checked does — so its models are
+        // outside the walk, and the fix is a third list rather than a fourth require path.
+        //
+        // The second assertion is again the one with teeth, and here it is sharper than it was
+        // for `sig/`: this gem ships `app/thing.rb` *and* `lib/thing.rb`, so an `app/` that
+        // leaked into `load_paths` would silently change what `require "thing"` means rather
+        // than merely pointing it somewhere odd.
+        //
+        // `config/` is on the list for exactly one file — the routes file — and for no constant:
+        // nothing under any installed gem's `config/` defines a class or a module.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("home");
+        let project = dir.path().join("project");
+        install(&root, "thing-1.0.0", &["lib"]);
+        std::fs::create_dir_all(root.join("gems/thing-1.0.0/app/models/thing")).unwrap();
+        std::fs::write(
+            root.join("gems/thing-1.0.0/app/thing.rb"),
+            "class Thing; end\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("gems/thing-1.0.0/app/models/thing/blob.rb"),
+            "class Thing::Blob; end\n",
+        )
+        .unwrap();
+        // The directory that is deliberately not walked: an engine's routes are the engine's.
+        std::fs::create_dir_all(root.join("gems/thing-1.0.0/config")).unwrap();
+        std::fs::write(
+            root.join("gems/thing-1.0.0/config/routes.rb"),
+            "Rails.application.routes.draw do\n  resources :blobs\nend\n",
+        )
+        .unwrap();
+        lockfile(
+            &project,
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    thing (1.0.0)\n",
+        );
+
+        let env = Env {
+            gem_home: Some(root.clone()),
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+
+        assert_eq!(
+            gems.engine_paths(),
+            vec![
+                root.join("gems/thing-1.0.0/app"),
+                root.join("gems/thing-1.0.0/config"),
+            ]
+        );
+        assert_eq!(gems.load_paths(), vec![root.join("gems/thing-1.0.0/lib")]);
+        assert_eq!(
+            source_files(&gems.engine_paths()),
+            vec![
+                root.join("gems/thing-1.0.0/app/models/thing/blob.rb"),
+                root.join("gems/thing-1.0.0/app/thing.rb"),
+                root.join("gems/thing-1.0.0/config/routes.rb"),
+            ]
+        );
+        // And `config/` is on the engine list rather than the load path, for the same reason
+        // `app/` is: `require "thing"` must not start meaning `config/thing.rb` either.
+        assert!(
+            !gems
+                .load_paths()
+                .iter()
+                .any(|path| path.ends_with("config") || path.ends_with("app")),
+            "neither engine directory is a load path"
+        );
+    }
+
+    #[test]
+    fn a_gem_that_is_not_an_engine_contributes_no_engine_path() {
+        // 18 of 479 installed gems are engines, so this is the common case by an order of
+        // magnitude and it has to cost the one stat `signature_paths` costs, not a walk.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("home");
+        let project = dir.path().join("project");
+        install(&root, "thing-1.0.0", &["lib"]);
+        lockfile(
+            &project,
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    thing (1.0.0)\n",
+        );
+
+        let env = Env {
+            gem_home: Some(root),
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+
+        assert!(gems.engine_paths().is_empty(), "{gems:?}");
+    }
+
+    #[test]
+    fn a_gem_without_signatures_contributes_no_signature_path() {
+        // Nine gems in one hundred and eighty, so this is the common case and it has to cost a
+        // stat rather than a walk of a directory that is not there.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("home");
+        let project = dir.path().join("project");
+        install(&root, "thing-1.0.0", &["lib"]);
+        lockfile(
+            &project,
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    thing (1.0.0)\n",
+        );
+
+        let env = Env {
+            gem_home: Some(root),
+            ..Env::default()
+        };
+        let gems = discover(&project, &GemsConfig::default(), &env);
+
+        assert_eq!(gems.gems.len(), 1, "{gems:?}");
+        assert!(gems.signature_paths().is_empty(), "{gems:?}");
+    }
+
+    #[test]
+    fn the_curated_collection_is_found_when_present_and_is_nothing_when_absent() {
+        // lobsters has none, and one application is not a survey — so what is
+        // pinned here is that the directory is read when it is there and costs one stat when it
+        // is not, and no claim at all about how often that is.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        lockfile(&project, "GEM\n  specs:\n\nBUNDLED WITH\n   2.6.2\n");
+
+        let absent = discover(&project, &GemsConfig::default(), &Env::default());
+        assert_eq!(absent.rbs_collection, None);
+        assert!(absent.signature_paths().is_empty());
+
+        let collection = project.join(".gem_rbs_collection/activesupport/8.0");
+        std::fs::create_dir_all(&collection).unwrap();
+        std::fs::write(
+            collection.join("activesupport.rbs"),
+            "class Object
+  def blank?: () -> bool
+end
+",
+        )
+        .unwrap();
+
+        let present = discover(&project, &GemsConfig::default(), &Env::default());
+        assert_eq!(
+            present.rbs_collection,
+            Some(project.join(".gem_rbs_collection"))
+        );
+        // Last in the list, after every gem's own — a curated signature is the fallback for a
+        // gem that ships none, not a replacement for one that does.
+        assert_eq!(
+            present.signature_paths(),
+            vec![project.join(".gem_rbs_collection")]
+        );
+        assert_eq!(
+            source_files(&present.signature_paths()),
+            vec![collection.join("activesupport.rbs")],
+            "the walk reaches into a hidden directory it was handed, and never descends into one"
+        );
+    }
+
+    #[test]
+    fn a_walked_directory_yields_ruby_and_signatures_and_nothing_else() {
         // A gem ships its README, its licence and often a compiled `.bundle` beside its code.
         // Handing any of them to the indexer is a parse error per file and no declarations.
         let dir = tempfile::tempdir().unwrap();
@@ -1410,17 +1716,24 @@ mod tests {
         std::fs::create_dir_all(lib.join("thing")).unwrap();
         std::fs::write(lib.join("thing.rb"), "class Thing; end\n").unwrap();
         std::fs::write(lib.join("thing/version.rb"), "").unwrap();
+        // A gem that puts its signatures beside the code rather than in `sig/`. Zero of
+        // lobsters' 180, and taking them costs one comparison.
+        std::fs::write(lib.join("thing.rbs"), "class Thing\nend\n").unwrap();
         std::fs::write(lib.join("README.md"), "# thing\n").unwrap();
         std::fs::write(lib.join("thing.bundle"), "").unwrap();
         std::fs::write(lib.join("noextension"), "").unwrap();
 
-        let files = ruby_files(std::slice::from_ref(&lib));
+        let files = source_files(std::slice::from_ref(&lib));
 
         assert_eq!(
             files,
             // Sorted as paths, so the `thing/` directory comes before `thing.rb` itself.
-            vec![lib.join("thing/version.rb"), lib.join("thing.rb")],
-            "only `.rb`"
+            vec![
+                lib.join("thing/version.rb"),
+                lib.join("thing.rb"),
+                lib.join("thing.rbs"),
+            ],
+            "only `.rb` and `.rbs`"
         );
     }
 
@@ -1686,7 +1999,7 @@ mod tests {
 
         assert_eq!(gems.gems.len(), 1, "{gems:?}");
         assert_eq!(gems.gems[0].name, "telegram-bot");
-        assert_eq!(ruby_files(&gems.gems[0].load_paths).len(), 1);
+        assert_eq!(source_files(&gems.gems[0].load_paths).len(), 1);
     }
 
     #[test]

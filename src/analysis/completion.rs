@@ -6,35 +6,58 @@
 //!
 //! # What is exact and what is a guess
 //!
-//! Three of the four contexts are exact, because in each of them the receiver is something the
-//! graph resolved: `Foo::`, `Foo.`, `self.`, and a bare word (whose receiver is the enclosing
-//! `self`). rubydex walks the real ancestor chain, applies real visibility — a `private` method
-//! is offered inside the class and not outside it — and for an argument list it hands back the
-//! called method's keyword parameters.
+//! Three of the four contexts are exact, because in each the receiver is something the graph
+//! resolved: `Foo::`, `Foo.`, `self.`, and a bare word (whose receiver is the enclosing `self`).
+//! rubydex walks the real ancestor chain, applies real visibility — a `private` method is offered
+//! inside the class and not outside it — and for an argument list hands back the called method's
+//! keyword parameters.
 //!
 //! The fourth is `foo.` where `foo` is a local, an instance variable, or the result of another
-//! call. Knowing what that is takes type inference, which ya-lsp does not have, so the list falls
-//! back to every method name in the project. That is a guess and it is presented as one: names
-//! only, deduplicated, the user's own code first. It is still better than the editor's own
-//! word-list, which cannot see a method defined in a file that is not open.
+//! call. [`types`](super::types) answers what it can there, and where every rung comes back empty
+//! one is left: the receiver's own spelling, read as a class name. That list is a real class's
+//! members and is offered as one, with [`Completion::guess`] saying which letters it came from.
 //!
-//! # Why the list is always `isIncomplete`
+//! When even that finds nothing, the list falls back to every method name in the project — a
+//! guess of a different kind, presented as one: names only, deduplicated, the user's own code
+//! first. It still beats the editor's word-list, which cannot see a method defined in a file that
+//! is not open.
+//!
+//! **The two guesses are not the same and a row must not conflate them.** `precise` says whether
+//! the rows are one class's members; `guess` says whether that class was inferred from a name. A
+//! guessed receiver is `precise` *and* guessed — a better list than the name-based one and a
+//! worse answer than a resolved type — and the card has to be able to say both.
+//!
+//! # When the list is `isIncomplete`
 //!
 //! Completion is filtered here rather than in the client, because the alternative is shipping a
-//! Rails bundle's hundred thousand candidates on the first keystroke and letting the editor sort
-//! it out. Filtering server-side means the answer is only correct for the prefix it was asked
-//! with, and `isIncomplete` is exactly the flag that tells the client to ask again rather than
-//! narrow what it already has.
+//! Rails bundle's hundred thousand candidates on the first keystroke. Filtering server-side means
+//! the answer is only correct for the prefix it was asked with, and `isIncomplete` is what tells
+//! the client to ask again rather than narrow what it already has.
+//!
+//! **It is set when the cap dropped rows, and not on every list.** Dropping a row is the only way
+//! this answer can fail to hold something a longer prefix would reach, because every filter on
+//! the way here is a *subsequence* match — [`tier`], and rubydex's `MatchMode::Fuzzy` under
+//! [`by_name`]. A longer prefix therefore admits a subset of what a shorter one admitted, so an
+//! untruncated list is a superset of what a fresh query would return and the client can narrow it
+//! safely. What the client does not keep is this module's *ranking*: it scores rows against the
+//! longer prefix itself and falls back to `sort_text` only as a tiebreak, which is the right way
+//! round for a list it is holding — that score is the one that knows what has been typed since.
+//!
+//! The distinction is worth drawing because the flag costs a request per keystroke and each
+//! repeats the whole lookup.
+//!
+//! **An empty list stays incomplete**, which is a separate statement rather than the same one
+//! read twice. Every route that answers with no rows does so because there was nothing to say — a
+//! receiver that turned out not to be a namespace, a `::` on something that cannot hold one — and
+//! "the complete answer is nothing" would have the client stop asking as the word grows.
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use rubydex::{
     model::{
         declaration::{Ancestor, Declaration, Namespace},
-        definitions::{Definition, Receiver as DefinitionReceiver},
         graph::Graph,
-        ids::{DeclarationId, NameId, StringId, UriId},
-        name::{Name, ParentScope},
+        ids::{DeclarationId, StringId, UriId},
         visibility::Visibility,
     },
     query::{self, CompletionCandidate, CompletionContext, CompletionReceiver, MatchMode},
@@ -42,7 +65,11 @@ use rubydex::{
 
 use super::{
     cursor::{self, Context, Receiver},
-    locator, render,
+    locator,
+    position::Rebase,
+    render,
+    types::{self, Derivation, Scope, Sources, constant_at, object_name, singleton_of},
+    views,
 };
 
 /// One suggestion, before it is dressed up as an LSP item.
@@ -78,10 +105,27 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     pub items: Vec<Item>,
-    /// Always true. See the module docs.
+    /// Whether the cap dropped rows, so the client has to ask again rather than narrow this.
+    ///
+    /// Below the cap the list is complete and a client may filter it itself; see the module
+    /// docs for why that is sound. An empty list is always incomplete — it means there was
+    /// nothing to say, not that the answer is nothing.
     pub incomplete: bool,
     pub start: u32,
     pub end: u32,
+    /// Whether the receiver these were offered for was one ya-lsp could name.
+    ///
+    /// A property of the *list* rather than of a row, because it is a property of the receiver
+    /// and every row was offered for the same one. `false` is the name-based fallback: every
+    /// method in the project, matched on its name, and the card for any of them has to say so.
+    pub precise: bool,
+    /// The receiver's own spelling, when the class these were offered for was guessed from it.
+    ///
+    /// The third tier, on a list rather than on a card: `precise` says the rows are a real
+    /// class's members and this says the class itself was a guess. Both, together, are the only
+    /// way a row can be honest about `@user.` — the methods are `User`'s, and `User` is six
+    /// letters of inference.
+    pub guess: Option<String>,
 }
 
 /// What can be written at `offset`.
@@ -90,33 +134,87 @@ pub struct Completion {
 /// never seen.
 #[must_use]
 pub fn complete(
-    graph: &Graph,
+    sources: &Sources<'_>,
     uri_id: UriId,
     source: &str,
     offset: u32,
     limit: usize,
     own: &HashSet<UriId>,
+    rebase: &Rebase,
 ) -> Option<Completion> {
+    let graph = sources.graph;
     let cursor = cursor::at(source, offset)?;
     let prefix = &source[cursor.start as usize..cursor.end as usize];
 
-    let scope = Scope::at(graph, uri_id, offset);
+    // **The coordinate change, and this is the only place completion needs one.** Everything
+    // above reads `source`, which is the buffer; everything below keys the graph, whose offsets
+    // index the text the indexer was last handed. On a document nobody is typing in the two
+    // are one string and `rebase` is the identity — see `Rebase`.
+    //
+    // Completion is deferrable precisely because it never hands a graph span back: `Completion::start`/`end` come off the cursor and stay in the buffer's
+    // coordinates. `hover` and `definition` answer with spans that came *out* of the graph and
+    // need `Rebase::to_buffer` as well, which is why they are not deferred here.
+    let (lo, hi) = match rebase.to_graph(offset) {
+        Some(at) => (at, at),
+        // The cursor is inside what was typed since the index, which is the ordinary case while
+        // typing rather than an edge one. A scope survives it — see `Scope::covering` — and a
+        // receiver lookup may not, which the `rebased` below decides.
+        None => rebase.changed_in_graph(),
+    };
+    // `None` where the changed region runs out of a body: the graph can no longer say which
+    // `class` or `def` the caret is in, so the request declines and is retried against a settled
+    // graph rather than answered from the wrong side of `self`.
+    //
+    // Logged rather than counted on a field: how often this fires during real editing is a
+    // property of how somebody edits, so the number worth having is one a probe collects over a
+    // session rather than one the server carries.
+    let Some(scope) = Scope::covering(graph, uri_id, lo, hi) else {
+        tracing::debug!("completion declined: the changed region leaves the body the caret is in");
+        return None;
+    };
+    // A receiver written in text the graph has never held cannot be looked up in it. Refusing
+    // is the whole safety argument: answering anyway offers another class's members, which is a
+    // wrong answer and not a missing one — reproduced as `Alpha.new.` offering `Gamma`'s.
+    let Some(context) = cursor.context.rebased(rebase) else {
+        tracing::debug!("completion declined: the receiver is inside text the graph has not seen");
+        return None;
+    };
     // Pure syntax, and decided before anything is looked up: see `Context::allows_private`.
-    let private_ok = cursor.context.allows_private();
+    let private_ok = context.allows_private();
     let locality = Locality::at(graph, uri_id, own);
-    let items = match receiver_for(graph, uri_id, cursor.context, &scope) {
-        Some((receiver, only)) => {
+    let mut precise = true;
+    let mut guess = None;
+    let (items, incomplete) = match receiver_for(sources, uri_id, &context, &scope) {
+        Some((receiver, only, derivation)) => {
+            // The tier travels with the list, because it is a property of the *receiver* and
+            // every row was offered for the same one. A guessed receiver still offers a real
+            // class's members — which is a better list than matching every method in the
+            // project by name — and the card on any of them still has to say where the class
+            // came from.
+            guess = derivation.guess;
+            // Built once and read twice, because the walk answers both questions at once: what
+            // a concern extends onto a class object, and how far out it sits. See [`Extended`].
+            let extended = Extended::at(graph, &receiver);
+            let view = in_view(sources, uri_id, &cursor.context);
             let ranking = Ranking {
                 prefix,
-                distance: Distance::from_receiver(graph, &receiver),
+                distance: Distance::from_receiver(graph, &receiver, extended.as_ref(), &view),
                 locality,
                 private_ok,
             };
-            from_graph(graph, receiver, only, limit, &ranking)
+            from_graph(
+                graph,
+                receiver,
+                only,
+                limit,
+                &ranking,
+                extended.as_ref(),
+                &view,
+            )
         }
         // Only one context arrives here with anything worth saying: a `.` on a receiver whose
         // type is unknown. `foo::` and a receiver that is not a namespace have no honest answer.
-        None => match cursor.context {
+        None => match &cursor.context {
             Context::MethodCall { .. } => {
                 // No receiver means no chain, so `Locality` is the whole of what ranks this
                 // list. See the note on `Distance::none`.
@@ -126,130 +224,23 @@ pub fn complete(
                     locality,
                     private_ok,
                 };
+                precise = false;
                 by_name(graph, limit, &ranking)
             }
-            _ => Vec::new(),
+            // Nothing to say, which is not the same as an answer that is empty: telling the
+            // client this list is complete would have it stop asking as the word grows.
+            _ => (Vec::new(), true),
         },
     };
 
     Some(Completion {
         items,
-        incomplete: true,
+        incomplete,
         start: cursor.start,
         end: cursor.end,
+        precise,
+        guess,
     })
-}
-
-/// The lexical scope and the `self` type at an offset.
-struct Scope {
-    /// The innermost `class`/`module`/`class << self` the offset is inside, as rubydex names it.
-    /// Top-level code is inside `Object`, which is what Ruby says too.
-    nesting: NameId,
-    /// Set only where `self` is not the nesting: `def self.build` and `def Foo.build`.
-    self_id: Option<DeclarationId>,
-}
-
-/// rubydex's name for the top-level scope.
-///
-/// Ruby's top level *is* `Object`, and rubydex indexes a built-in `class Object` so the name
-/// exists in every graph. Building the id rather than looking it up costs a hash and no lookup.
-fn object_name() -> NameId {
-    Name::new(StringId::from("Object"), ParentScope::None, None).id()
-}
-
-impl Scope {
-    fn at(graph: &Graph, uri_id: UriId, offset: u32) -> Self {
-        let object = object_name();
-        let Some(document) = graph.documents().get(&uri_id) else {
-            return Self {
-                nesting: object,
-                self_id: None,
-            };
-        };
-
-        // Definitions span their whole body, so the ones covering the cursor are exactly the
-        // constructs it is written inside, and the narrowest is the innermost.
-        let mut namespace: Option<&Definition> = None;
-        let mut method: Option<&Definition> = None;
-        for definition in document
-            .definitions()
-            .iter()
-            .filter_map(|id| graph.definitions().get(id))
-        {
-            let span = definition.offset();
-            if span.start() > offset || offset > span.end() {
-                continue;
-            }
-            let target = match definition {
-                Definition::Class(_) | Definition::Module(_) | Definition::SingletonClass(_) => {
-                    &mut namespace
-                }
-                Definition::Method(_) => &mut method,
-                _ => continue,
-            };
-            if target.is_none_or(|held| wider(held.offset(), span)) {
-                *target = Some(definition);
-            }
-        }
-
-        let nesting = namespace
-            .and_then(|definition| definition.name_id().copied())
-            .unwrap_or(object);
-
-        Self {
-            nesting,
-            self_id: self_of(graph, namespace.is_some(), method, nesting),
-        }
-    }
-
-    /// The declaration the nesting names, if the graph resolved it.
-    fn nesting_id(&self, graph: &Graph) -> Option<DeclarationId> {
-        graph.name_id_to_declaration_id(self.nesting).copied()
-    }
-
-    /// Who is calling, for a receiver context to check visibility against.
-    ///
-    /// `Expression` may leave this `None` — rubydex derives `self` from the nesting there. The
-    /// two receiver contexts derive nothing: an unstated `self` is treated as an outsider, and
-    /// a class would stop being able to see its own private methods.
-    fn caller(&self, graph: &Graph) -> Option<DeclarationId> {
-        self.self_id.or_else(|| self.nesting_id(graph))
-    }
-}
-
-/// `self`, where it is not the enclosing class.
-///
-/// Two places it is not, and both matter:
-///
-/// - **A class or module body.** `self` there is the class *object*, so what can be called is
-///   `Foo`'s singleton methods — which is the entire Rails DSL. `validates`, `has_many`, `scope`
-///   and `belongs_to` are all class methods, and completing a model's body against the instance
-///   side offers `valid?` and `validate` while silently omitting every macro anyone writes
-///   there. Measured on a real app: 49 suggestions for `valid`, not one of them `validates`.
-/// - **`def self.build` and `def Foo.build`.** The lexical scope stays the class while `self`
-///   moves to the singleton, and constants follow the first while methods follow the second.
-///
-/// The top level is not one of them: `self` is `main`, an ordinary `Object`, so what rubydex
-/// derives from the nesting is already right and `None` says so.
-fn self_of(
-    graph: &Graph,
-    in_namespace: bool,
-    method: Option<&Definition>,
-    nesting: NameId,
-) -> Option<DeclarationId> {
-    let Some(Definition::Method(method)) = method else {
-        return in_namespace
-            .then(|| singleton_of_name(graph, nesting))
-            .flatten();
-    };
-    match method.receiver().as_ref()? {
-        DefinitionReceiver::SelfReceiver(_) => singleton_of_name(graph, nesting),
-        DefinitionReceiver::ConstantReceiver(name_id) => singleton_of_name(graph, *name_id),
-    }
-}
-
-fn singleton_of_name(graph: &Graph, name: NameId) -> Option<DeclarationId> {
-    singleton_of(graph, *graph.name_id_to_declaration_id(name)?)
 }
 
 /// Which candidates a context can accept.
@@ -265,39 +256,45 @@ enum Only {
 /// `None` means there is no exact question to ask: an unknown receiver, or a `::` on something
 /// that is not a namespace.
 fn receiver_for(
-    graph: &Graph,
+    sources: &Sources<'_>,
     uri_id: UriId,
-    context: Context,
+    context: &Context,
     scope: &Scope,
-) -> Option<(CompletionReceiver, Only)> {
+) -> Option<(CompletionReceiver, Only, Derivation)> {
+    let graph = sources.graph;
     match context {
+        // `caller` and not `scope.self_id`, and it is not a choice: rubydex's
+        // `expression_completion` requires a `self` type, so a `None` there collects no methods
+        // and no instance variables at all — the commonest completion there is. The nesting's
+        // own declaration is what has to be passed.
         Context::Expression => Some((
             CompletionReceiver::Expression {
-                self_decl_id: scope.self_id,
+                self_decl_id: scope.caller(graph),
                 nesting_name_id: scope.nesting,
             },
             Only::Everything,
+            Derivation::default(),
         )),
         Context::Argument { name } => {
             // Only a receiver rubydex could name gives real keyword arguments. A name-based
             // guess would put another class's parameters into this call, which is worse than
             // offering none: the completion would be syntactically valid and wrong.
-            let receiver = match locator::precise_call(graph, uri_id, name) {
+            let receiver = match locator::precise_call(graph, uri_id, *name) {
                 Some(method_decl_id) => CompletionReceiver::MethodArgument {
-                    self_decl_id: scope.self_id,
+                    self_decl_id: scope.caller(graph),
                     nesting_name_id: scope.nesting,
                     method_decl_id,
                 },
                 None => CompletionReceiver::Expression {
-                    self_decl_id: scope.self_id,
+                    self_decl_id: scope.caller(graph),
                     nesting_name_id: scope.nesting,
                 },
             };
-            Some((receiver, Only::Everything))
+            Some((receiver, Only::Everything, Derivation::default()))
         }
         Context::NamespaceAccess { receiver } => {
             let namespace_decl_id = match receiver {
-                Receiver::Constant(offset) => constant_at(graph, uri_id, offset)?,
+                Receiver::Constant(offset) => constant_at(graph, uri_id, *offset)?,
                 // `self::CONST` is legal and rare; the nesting is what it means. `caller` is
                 // the singleton in a class or module body, and asking a singleton reaches the
                 // class it is attached to — so this answers the same list `HR::` does, from a
@@ -305,9 +302,18 @@ fn receiver_for(
                 // `every_receiver_that_can_precede_a_double_colon_is_answered`, because the
                 // equivalence is rubydex's and not something this line states.
                 Receiver::SelfObject => scope.caller(graph)?,
-                // `"foo"::Bar` and `Foo.new::Bar` parse, and mean nothing anybody writes on
-                // purpose. An instance is not a namespace.
-                Receiver::Instance(_) | Receiver::Literal(_) => return None,
+                // `"foo"::Bar`, `Foo.new::Bar` and `foo.bar::Baz` all parse, and mean nothing
+                // anybody writes on purpose. An instance is not a namespace.
+                //
+                // `Receiver::Named` joins them: a name is at best an instance, and the two
+                // rungs that read one both answer with a class rather than with a namespace.
+                Receiver::Instance(_)
+                | Receiver::Literal(_)
+                | Receiver::Returned { .. }
+                | Receiver::Yielded { .. }
+                | Receiver::Assigned { .. }
+                | Receiver::Spelled { .. }
+                | Receiver::Named(_) => return None,
                 // `::Foo` asks for the top level, which is `Object` — but rubydex's namespace
                 // walk deliberately stops *before* Object's own members, to keep `String::` from
                 // listing every top-level constant in the project. Asking the same question as
@@ -317,9 +323,10 @@ fn receiver_for(
                     return Some((
                         CompletionReceiver::Expression {
                             self_decl_id: None,
-                            nesting_name_id: object_name(),
+                            nesting_name_id: object_name(graph),
                         },
                         Only::Constants,
+                        Derivation::default(),
                     ));
                 }
                 Receiver::Unknown => return None,
@@ -330,87 +337,45 @@ fn receiver_for(
                     namespace_decl_id,
                 },
                 Only::Everything,
+                Derivation::default(),
             ))
         }
+        // Every arm of this one lives in `types::method_receiver`, because navigation asks the
+        // same question and the two must not answer it differently: what `person.` is cannot
+        // depend on whether the user pressed a key or hovered.
         Context::MethodCall { receiver } => {
-            let receiver_decl_id = match receiver {
-                // `Foo.bar` calls a *singleton* method, so the receiver is `Foo`'s singleton
-                // class. A constant that is not a namespace — `MAX.times` — has a type we
-                // cannot name, and falls through to the name-based list.
-                Receiver::Constant(offset) => {
-                    singleton_of(graph, constant_at(graph, uri_id, offset)?)?
-                }
-                Receiver::SelfObject => scope.caller(graph)?,
-                // An instance, so the receiver is the class itself rather than its singleton.
-                Receiver::Instance(offset) => constant_at(graph, uri_id, offset)?,
-                // A literal's class is named, not resolved — `String` means `String` in every
-                // file. `declared` is what makes turning `[rbs]` off degrade rather than break:
-                // with no core signatures in the graph there is no such declaration, and
-                // falling through here reaches the name-based list instead of answering with
-                // nothing at all.
-                Receiver::Literal(class) => declared(graph, class)?,
-                // `::Foo.bar` reaches here as an ordinary constant; a bare `::` never does.
-                Receiver::TopLevel | Receiver::Unknown => return None,
-            };
+            let typed = types::method_receiver(sources, uri_id, receiver, scope)?;
             Some((
                 CompletionReceiver::MethodCall {
                     self_decl_id: scope.caller(graph),
-                    receiver_decl_id,
+                    receiver_decl_id: typed.declaration,
                 },
                 Only::Everything,
+                typed.derivation,
             ))
         }
-    }
-}
-
-/// The declaration a constant written at `offset` resolves to.
-///
-/// This goes through the locator rather than re-deriving Ruby's constant lookup: the reference
-/// under the cursor was resolved by rubydex against the real nesting and the real ancestors,
-/// which is a great deal more than a name match would be.
-fn constant_at(graph: &Graph, uri_id: UriId, offset: u32) -> Option<DeclarationId> {
-    locator::locate(graph, uri_id, offset)
-        .into_iter()
-        .find_map(|located| match located.target {
-            locator::Target::Constant(_) => locator::resolve(graph, &located)
-                .declarations
-                .into_iter()
-                .next(),
-            _ => None,
-        })
-}
-
-/// The declaration a name refers to, when the graph holds one.
-///
-/// A `DeclarationId` is a hash of the name, so this builds the key without a lookup — but the
-/// lookup still has to happen, because an id for a declaration that was never indexed is a
-/// perfectly well-formed id that answers nothing.
-fn declared(graph: &Graph, name: &str) -> Option<DeclarationId> {
-    let id = DeclarationId::from(name);
-    graph.declarations().contains_key(&id).then_some(id)
-}
-
-fn singleton_of(graph: &Graph, id: DeclarationId) -> Option<DeclarationId> {
-    match graph.declarations().get(&id)? {
-        Declaration::Namespace(namespace) => namespace.singleton_class().copied(),
-        _ => None,
     }
 }
 
 /// Everything rubydex offers for a receiver, filtered to the prefix and capped.
+///
+/// The flag is `Completion::incomplete`: true where the cap dropped rows, and true where there
+/// was nothing to say at all, which is not the same statement as "the answer is empty".
 fn from_graph(
     graph: &Graph,
     receiver: CompletionReceiver,
     only: Only,
     limit: usize,
     ranking: &Ranking,
-) -> Vec<Item> {
+    extended: Option<&Extended>,
+    view: &[views::Reached],
+) -> (Vec<Item>, bool) {
     let candidates = match query::completion_candidates(graph, CompletionContext::new(receiver)) {
         Ok(candidates) => candidates,
         Err(error) => {
             // A receiver that is not a namespace after all. Nothing to say, and nothing broken.
             tracing::debug!("no completion candidates: {error}");
-            return Vec::new();
+            return (Vec::new(), true);
         }
     };
 
@@ -420,8 +385,177 @@ fn from_graph(
         .enumerate()
         .filter_map(|(sequence, candidate)| rank(graph, candidate, sequence, ranking))
         .collect();
-    take_best(&mut ranked, limit);
-    ranked.into_iter().map(|entry| entry.item).collect()
+    // Before the cap and never after it: these rows compete with the graph's own on one key,
+    // and appending past `take_best` would answer with `limit` + however many a concern holds.
+    if let Some(extended) = extended {
+        ranked.extend(
+            extended
+                .candidates(graph, ranking.prefix)
+                .into_iter()
+                .filter_map(|id| {
+                    ranked_declaration(graph, id, graph.declarations().get(&id)?, ranking)
+                }),
+        );
+    }
+    // The view context's rows, added the same way and in the same place for the same
+    // reason: before the cap, so that they compete with the graph's own on one key rather than
+    // being appended past it.
+    add_view(graph, &mut ranked, ranking, view);
+    let truncated = take_best(&mut ranked, limit);
+    (
+        ranked.into_iter().map(|entry| entry.item).collect(),
+        truncated,
+    )
+}
+
+/// What a bare word in a **template** can complete to.
+///
+/// `None` for every other document and for every context with a receiver written in it, which
+/// is [`views::Views::reachable`]'s own gate plus one syntactic test: a template's view context
+/// is what an *implicit* receiver answers, and `person.` in a template is still `person`'s.
+///
+/// The walk is [`views`]', shared with [`locator::resolve_typed`] so that a jump and a list
+/// cannot disagree about what a template can call — the same seam the concern edge shares
+/// through [`locator::extended_class_methods`], and for the same reason: resolution takes the
+/// first answer and completion collects all of them.
+fn in_view(sources: &Sources<'_>, uri_id: UriId, context: &Context) -> Vec<views::Reached> {
+    if !matches!(context, Context::Expression | Context::Argument { .. }) {
+        return Vec::new();
+    }
+    sources
+        .views
+        .reachable(sources.graph, uri_id)
+        .map(|reachable| reachable.members(sources.graph))
+        .unwrap_or_default()
+}
+
+/// Put the view context's rows into the list, taking a name away from `Object` where they share
+/// one.
+///
+/// **The shadowing is Ruby's rather than a preference.** A helper module is `include`d into the
+/// view class and `Kernel` is at the end of every chain, so an application that writes
+/// `def format` in `ApplicationHelper` really has replaced `Kernel#format` for every template —
+/// and a row that kept the graph's answer would complete the word and then jump to the wrong
+/// one. It costs a pass over the ranked rows and is only paid where a template offered a name
+/// the view context also holds.
+fn add_view(graph: &Graph, ranked: &mut Vec<Ranked>, ranking: &Ranking, view: &[views::Reached]) {
+    if view.is_empty() {
+        return;
+    }
+    let rows: Vec<Ranked> = view
+        .iter()
+        .filter_map(|reached| {
+            let declaration = graph.declarations().get(&reached.declaration)?;
+            ranked_declaration(graph, reached.declaration, declaration, ranking)
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let shadowed: HashSet<u64> = rows
+        .iter()
+        .map(|entry| StringId::from(&entry.item.label).get())
+        .collect();
+    ranked.retain(|entry| !shadowed.contains(&StringId::from(&entry.item.label).get()));
+    ranked.extend(rows);
+}
+
+/// The class methods a Rails concern extends onto a class object, which rubydex's walk cannot
+/// see — the collecting half of the edge [`locator`] resolves.
+///
+/// `ActiveSupport::Concern` ends `append_features` with `base.extend const_get(:ClassMethods)`,
+/// which no file writes, so `query::completion_candidates` correctly offers nothing for it and
+/// `valid` in a model body would complete to an empty list. Resolution can ask a second
+/// question after the first fails — it takes one answer — and completion cannot, because it
+/// *collects*; so the edge is walked here and the rows join the list before it is ranked and
+/// capped.
+///
+/// The walk itself is [`locator::extended_class_methods`], shared so that the gate
+/// — the nested `module ClassMethods`, argued there against the corpus — is stated once.
+struct Extended {
+    /// The singleton the concerns were found from, and the receiver rubydex answered for.
+    ///
+    /// Kept because it is also the dedup question: a name this already offers must not be
+    /// offered a second time by the edge, and asking it is the same ancestor walk resolution
+    /// makes.
+    on: DeclarationId,
+    modules: Vec<locator::Extends>,
+}
+
+impl Extended {
+    /// `None` where there is no edge to walk: a receiver that is not a class object — every
+    /// instance method call, and every cursor inside a `def` — or a chain with no concern in it.
+    fn at(graph: &Graph, receiver: &CompletionReceiver) -> Option<Self> {
+        let on = class_object(graph, receiver)?;
+        let modules = locator::extended_class_methods(graph, on);
+        (!modules.is_empty()).then_some(Self { on, modules })
+    }
+
+    /// Every member the edge adds, nearest concern first.
+    ///
+    /// Deduplicated the way rubydex's own walk deduplicates and for the same reason: the
+    /// nearest declaration of a name is the one that answers, so a second concern spelling a
+    /// name the first already spelled is not a second row. **And a name the ordinary walk
+    /// already offers is not added at all** — the resolution's own rule, per member rather than
+    /// per request: a class that writes its own `def self.validates` keeps it, and what a
+    /// concern extends is only ever what nothing else answered.
+    ///
+    /// The prefix is tested **before** that question and not after, which is the rule
+    /// [`ranked_declaration`] already holds between `tier` and `reachable`: the ancestor walk
+    /// costs a hundred hash lookups on a Rails model's singleton chain and the prefix test
+    /// costs a string compare, so the cheap filter goes first and a keystroke pays for the
+    /// handful of rows it could actually offer rather than for all 476 of them.
+    fn candidates(&self, graph: &Graph, prefix: &str) -> Vec<DeclarationId> {
+        let mut seen: HashSet<StringId> = HashSet::new();
+        let mut found = Vec::new();
+        for extends in &self.modules {
+            let Some((_, class_methods)) = namespace(graph, extends.class_methods) else {
+                continue;
+            };
+            for (name, member) in class_methods.members() {
+                // `extend` installs methods and nothing else: a constant nested in a
+                // `ClassMethods` module is not reachable through the singleton at all.
+                let Some(declaration @ Declaration::Method(_)) = graph.declarations().get(member)
+                else {
+                    continue;
+                };
+                if tier(prefix, render::last_segment(declaration.name())).is_none() {
+                    continue;
+                }
+                if !seen.insert(*name)
+                    || query::find_member_in_ancestors(graph, self.on, *name, false).is_ok()
+                {
+                    continue;
+                }
+                found.push(*member);
+            }
+        }
+        found
+    }
+}
+
+/// The receiver's own declaration, where the receiver is a **class object**.
+///
+/// The one shape the concern edge applies to, and it is rubydex's answer rather than a
+/// syntactic test: a bare call in a class body and an explicit `Foo.` both arrive here as the
+/// singleton class, and the same call inside an instance `def` arrives as the class — which is
+/// exactly the discriminator the concern edge turns on, reached from the other side.
+///
+/// `extended_class_methods` declines anything that is not a singleton, so this hands over what
+/// the receiver holds rather than testing it twice. `NamespaceAccess` is the one arm that has
+/// to look: `Foo::` names the class and rubydex collects its *singleton's* methods, which is
+/// also why [`Distance::from_receiver`] seeds that chain there.
+fn class_object(graph: &Graph, receiver: &CompletionReceiver) -> Option<DeclarationId> {
+    match receiver {
+        CompletionReceiver::MethodCall {
+            receiver_decl_id, ..
+        } => Some(*receiver_decl_id),
+        CompletionReceiver::Expression { self_decl_id, .. }
+        | CompletionReceiver::MethodArgument { self_decl_id, .. } => *self_decl_id,
+        CompletionReceiver::NamespaceAccess {
+            namespace_decl_id, ..
+        } => singleton_of(graph, *namespace_decl_id),
+    }
 }
 
 impl Only {
@@ -488,7 +622,12 @@ impl Distance {
     /// it would be a lie about a method: `Object` is the last rung of every ancestor chain *and*
     /// the outermost lexical scope, so letting it be scored as the latter would put `Object`'s
     /// members — which is everything rubydex could not attribute — one step from the cursor.
-    fn from_receiver(graph: &Graph, receiver: &CompletionReceiver) -> Self {
+    fn from_receiver(
+        graph: &Graph,
+        receiver: &CompletionReceiver,
+        extended: Option<&Extended>,
+        view: &[views::Reached],
+    ) -> Self {
         let mut distance = Self::none();
         let mut lexical = None;
         match receiver {
@@ -528,6 +667,21 @@ impl Distance {
                 }
             }
         }
+        // The concern edge, at the step the class that installed it sits at. Before the
+        // lexical walk for the same reason every ancestor chain is: these are members, and
+        // `Object` must not be able to claim them at one step from the cursor.
+        if let Some(extended) = extended {
+            distance.extended(extended);
+        }
+        // The view context's rows, at the step [`views::Reached`] carries — which is the chain Rails
+        // builds `_helpers` from and not one of rubydex's. Before the lexical walk for the
+        // reason the concern edge is: these are members, and `Object` must not be able to claim
+        // them at one step from the cursor.
+        for reached in view {
+            if let Some(declaration) = graph.declarations().get(&reached.declaration) {
+                distance.record(*declaration.owner_id(), reached.step as usize);
+            }
+        }
         // After every ancestor chain, never before one: see above.
         if let Some(id) = lexical {
             distance.lexical(graph, id);
@@ -546,6 +700,24 @@ impl Distance {
             if let Ancestor::Complete(ancestor_id) = ancestor {
                 self.record(*ancestor_id, step);
             }
+        }
+    }
+
+    /// The one seed that is not a walk rubydex is about to make.
+    ///
+    /// A concern's `ClassMethods` is on **none** of those chains — that is the whole reason its
+    /// members were missing from the list in the first place — so every one of them would land
+    /// on [`NO_DISTANCE`]: last, equally last, and *behind `Object`'s own methods*, which is
+    /// backwards for the name a model body is most likely to be typing.
+    ///
+    /// One `record` and not a chain, because [`Extended::candidates`] offers a module's own
+    /// members and never its ancestors': what those ancestors declare is not on this list, and
+    /// numbering them here could only make some *other* row look nearer than it is.
+    /// [`locator::Extends`] carries the step, which counts the classes the receiver's chain
+    /// passes through — where Ruby's own singleton chain puts the module the `extend` landed on.
+    fn extended(&mut self, extended: &Extended) {
+        for extends in &extended.modules {
+            self.record(extends.class_methods, extends.step);
         }
     }
 
@@ -734,13 +906,13 @@ fn namespace(graph: &Graph, id: DeclarationId) -> Option<(DeclarationId, &Namesp
 /// Deduplication happens *before* the sort, and on a hash of the label rather than the label:
 /// this runs over every method declaration in the graph on every keystroke, so a copy of each
 /// name would be a hundred thousand allocations to throw away.
-fn by_name(graph: &Graph, limit: usize, ranking: &Ranking) -> Vec<Item> {
+fn by_name(graph: &Graph, limit: usize, ranking: &Ranking) -> (Vec<Item>, bool) {
     // Every method name contains a `#` and no other declaration's does, so this is rubydex's
     // parallel filter doing the "methods only" pass for free.
     let query = format!("#{}", ranking.prefix);
     let mut best: HashMap<u64, Ranked> = HashMap::new();
 
-    for id in query::declaration_search(graph, &query, &MatchMode::Fuzzy) {
+    for id in query::declaration_search(graph, &[&query], &MatchMode::Fuzzy) {
         // The query leads with `#`, which only a method name contains, so this is rubydex's
         // parallel filter having already done the "methods only" pass — bound rather than
         // re-tested, since a second `matches!` over every method in the graph proved nothing.
@@ -764,8 +936,11 @@ fn by_name(graph: &Graph, limit: usize, ranking: &Ranking) -> Vec<Item> {
     }
 
     let mut ranked: Vec<Ranked> = best.into_values().collect();
-    take_best(&mut ranked, limit);
-    ranked.into_iter().map(|entry| entry.item).collect()
+    let truncated = take_best(&mut ranked, limit);
+    (
+        ranked.into_iter().map(|entry| entry.item).collect(),
+        truncated,
+    )
 }
 
 /// Everything the ranking needs that is not the candidate itself.
@@ -898,12 +1073,18 @@ fn order(a: &Ranked, b: &Ranked) -> std::cmp::Ordering {
         .then(a.item.label.cmp(&b.item.label))
 }
 
-fn take_best(ranked: &mut Vec<Ranked>, limit: usize) {
-    if ranked.len() > limit {
+/// Keep the `limit` best rows in order, and answer whether any were dropped.
+///
+/// The return value is the whole of `Completion::incomplete`: dropping a row is the only way
+/// this list can fail to hold something a longer prefix would reach. See the module docs.
+fn take_best(ranked: &mut Vec<Ranked>, limit: usize) -> bool {
+    let truncated = ranked.len() > limit;
+    if truncated {
         ranked.select_nth_unstable_by(limit, order);
         ranked.truncate(limit);
     }
     ranked.sort_unstable_by(order);
+    truncated
 }
 
 fn rank(
@@ -1102,10 +1283,6 @@ fn kind_of(declaration: &Declaration) -> Kind {
     }
 }
 
-fn wider(held: &rubydex::offset::Offset, candidate: &rubydex::offset::Offset) -> bool {
-    held.end() - held.start() > candidate.end() - candidate.start()
-}
-
 fn equal_ci(left: &str, right: &str) -> bool {
     left.len() == right.len() && starts_with_ci(left, right)
 }
@@ -1158,7 +1335,7 @@ mod tests {
         let scope = Scope::at(&graph, missing, 0);
         assert_eq!(
             scope.nesting,
-            object_name(),
+            object_name(&graph),
             "the top level, for want of one"
         );
         assert!(scope.self_id.is_none());
@@ -1175,8 +1352,10 @@ mod tests {
             &graph,
             &CompletionReceiver::Expression {
                 self_decl_id: None,
-                nesting_name_id: object_name(),
+                nesting_name_id: object_name(&graph),
             },
+            None,
+            &[],
         );
         assert!(
             distance.steps.is_empty(),

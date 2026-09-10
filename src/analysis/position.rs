@@ -77,11 +77,25 @@ impl PositionEncoding {
 /// An open buffer: source text plus its line index, kept in sync by construction.
 ///
 /// Note that rubydex's `Document` exposes a `line_index()` but *not* the source text, so we
-/// keep our own copy regardless. It is also what incremental sync (M2) and cursor context
-/// (M5) will need.
+/// keep our own copy regardless. It is also what incremental sync and cursor context need.
+///
+/// # Two texts, one set of offsets
+///
+/// A document is *read* and it is *addressed*, and for every file but one those are the same
+/// string. A template is not: it is read as the blanked Ruby view
+/// [`erb::ruby_view`](super::erb::ruby_view) makes of it, and it is addressed as the markup the
+/// editor actually has open. The byte offset is common to both — the view preserves length and
+/// every line break, which is the whole of why ERB needs no position map — but a *column* is
+/// not, because a column is a count of code units and blanking a 3-byte `“` writes three
+/// spaces where the client counts one UTF-16 unit. So [`Self::text`] is what is read and
+/// [`Self::coordinates`] is what columns are counted in.
 #[derive(Debug)]
 pub struct TextDocument {
     text: String,
+    /// The text the client's columns are counted in, when that is not [`Self::text`] itself.
+    ///
+    /// Only [`Self::blanked`] sets it, and only a template goes through that.
+    source: Option<String>,
     index: LineIndex,
     encoding: PositionEncoding,
 }
@@ -92,6 +106,27 @@ impl TextDocument {
         let index = LineIndex::new(&text);
         Self {
             text,
+            source: None,
+            index,
+            encoding,
+        }
+    }
+
+    /// A document that is *read* as `view` and *addressed* as `source`.
+    ///
+    /// The two are the same length, byte for byte, with their line breaks in the same places —
+    /// [`erb::ruby_view`](super::erb::ruby_view)'s central property, held by a `proptest` in
+    /// that module, and the only reason one line index and one byte offset can serve both. What
+    /// differs is how many code units a prefix is, so counting a column against the view
+    /// displaces the cursor left by (bytes − units) of every non-ASCII character in the markup
+    /// before it on the line, and displaces every span this server answers with by the same
+    /// amount in the other direction.
+    #[must_use]
+    pub fn blanked(source: String, view: String, encoding: PositionEncoding) -> Self {
+        let index = LineIndex::new(&source);
+        Self {
+            text: view,
+            source: Some(source),
             index,
             encoding,
         }
@@ -101,6 +136,7 @@ impl TextDocument {
     pub fn set_text(&mut self, text: String) {
         self.index = LineIndex::new(&text);
         self.text = text;
+        self.source = None;
     }
 
     /// Apply one `textDocument/didChange` content change.
@@ -125,6 +161,11 @@ impl TextDocument {
         self.text
             .replace_range(start as usize..end as usize, replacement);
         self.index = LineIndex::new(&self.text);
+        // An edited document addresses itself. The buffer an editor edits is never a blanked
+        // view — `with_text` builds those per request and hands out a shared reference — but a
+        // `source` that outlived an edit would count columns in text this document no longer
+        // holds, which is the failure this module exists to make impossible.
+        self.source = None;
     }
 
     #[must_use]
@@ -153,7 +194,7 @@ impl TextDocument {
     pub fn offset_at(&self, position: Position) -> u32 {
         let Some(line_range) = self.index.line(position.line) else {
             // Line past the end of the buffer.
-            return self.len();
+            return self.coordinates().len() as u32;
         };
 
         let line_start = u32::from(line_range.start());
@@ -192,7 +233,7 @@ impl TextDocument {
         let column = line_col.col.min(content_len);
         // Both bounds sit on character boundaries: `column` came from `line_col`, and a line's
         // content ends just before `\r` or `\n`, which are ASCII.
-        let prefix = &self.text[line_start as usize..(line_start + column) as usize];
+        let prefix = &self.coordinates()[line_start as usize..(line_start + column) as usize];
 
         Position {
             line: line_col.line,
@@ -209,9 +250,15 @@ impl TextDocument {
         }
     }
 
+    /// The text a position's line and column are counted in: the document itself, unless it is
+    /// a template, in which case it is the markup the editor has and not the view.
+    fn coordinates(&self) -> &str {
+        self.source.as_deref().unwrap_or(&self.text)
+    }
+
     /// A line's text without its terminator, so a column can never address the newline itself.
     fn line_content(&self, range: TextRange) -> &str {
-        let line = &self.text[usize::from(range.start())..usize::from(range.end())];
+        let line = &self.coordinates()[usize::from(range.start())..usize::from(range.end())];
         match line.strip_suffix('\n') {
             Some(stripped) => stripped.strip_suffix('\r').unwrap_or(stripped),
             None => line,
@@ -219,11 +266,191 @@ impl TextDocument {
     }
 
     fn clamp_to_char_boundary(&self, offset: u32) -> u32 {
-        let mut offset = (offset as usize).min(self.text.len());
-        while !self.text.is_char_boundary(offset) {
+        let mut offset = (offset as usize).min(self.coordinates().len());
+        while !self.coordinates().is_char_boundary(offset) {
             offset -= 1;
         }
         offset as u32
+    }
+}
+
+/// How the buffer's byte offsets map onto the ones the graph was indexed with.
+///
+/// **What makes deferring the index answerable at all.** rubydex's offsets index the text the
+/// indexer was last given, and `cursor::at` reads the *buffer*. The two are the same string
+/// wherever nothing has been typed since the last settle, and nothing has to translate; between
+/// a keystroke and the settle that indexes it they are not, and a buffer offset used as a graph
+/// key names different text — a **wrong** answer rather than a missing one.
+///
+/// It is [`TextDocument::blanked`]'s move on a second axis. There a document is *read* as one
+/// text and *addressed* as another because blanking replaced markup; here it is because time
+/// passed. The
+/// shared coordinate is the byte offset, and the translation is a function of the two texts —
+/// not of a maintained edit log, which is the version that can drift.
+///
+/// The map is a common byte prefix and a common byte suffix, so the buffer's
+/// `[prefix, buffer_len - suffix)` and the graph's `[prefix, graph_len - suffix)` are the
+/// regions that differ. Outside them the translation is exact; **inside, there is no answer and
+/// the caller must refuse** — a scattered edit merely widens the refused region, so this
+/// degrades safe rather than approximating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rebase {
+    prefix: u32,
+    suffix: u32,
+    buffer_len: u32,
+    graph_len: u32,
+}
+
+impl Rebase {
+    /// The map for a document the graph holds exactly as the buffer has it.
+    #[must_use]
+    pub fn identity(len: u32) -> Self {
+        Self {
+            prefix: len,
+            suffix: 0,
+            buffer_len: len,
+            graph_len: len,
+        }
+    }
+
+    /// Two scans, both early-exit. Boundaries are backed off to char boundaries so a translated
+    /// offset can never split a character — the same rule `clamp_to_char_boundary` keeps.
+    #[must_use]
+    pub fn between(buffer: &str, indexed: &str) -> Self {
+        /// Whether a byte can be part of one of the words this map has to keep whole.
+        ///
+        /// Deliberately wider than Ruby's identifier: `:` keeps a constant *path* together, so
+        /// `XY::Person` and `HR::Person` do not share `::Person` as an unchanged suffix, and
+        /// every non-ASCII byte counts because an identifier may hold one and a wrong answer
+        /// costs more here than a refusal does.
+        fn is_word_byte(byte: u8) -> bool {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b':' | b'@' | b'$' | b'?' | b'!')
+                || byte >= 0x80
+        }
+
+        let (b, g) = (buffer.as_bytes(), indexed.as_bytes());
+        let max = b.len().min(g.len());
+        let mut prefix = 0;
+        while prefix < max && b[prefix] == g[prefix] {
+            prefix += 1;
+        }
+        // **Byte identity is not token identity, and every consumer of this map needs the
+        // second.** `Alpha.` rewritten to `Gamma.` shares its last two bytes — `a.` — so a
+        // purely byte-wise scan leaves that `.` in the common suffix and hands back an offset
+        // the graph files `Alpha` under, which is the wrong class rather than no class.
+        // `Receiver::Constant` holds the byte after a constant path and `Instance` the byte
+        // after the constant it was built from, so an offset stands for a whole word and
+        // survives only if that word did. The changed region is therefore widened outward
+        // over word bytes at both ends.
+        //
+        // The condition is two-sided on purpose: a head that ends on `\n` before `class`
+        // ends *at* a token boundary, and widening it would refuse offsets in text neither
+        // side touched. It widens only where the word really straddles the seam.
+        while prefix > 0
+            && is_word_byte(b[prefix - 1])
+            && (b.get(prefix).copied().is_some_and(is_word_byte)
+                || g.get(prefix).copied().is_some_and(is_word_byte))
+        {
+            prefix -= 1;
+        }
+        // **No char-boundary back-off, because the rule above already is one.** A prefix that
+        // ends in the middle of a character has a continuation byte on both sides of it, every
+        // byte of a multi-byte character is `>= 0x80`, and `is_word_byte` calls all of those
+        // word bytes — so the loop above walks out of the character before it stops. The same
+        // holds at the tail. `every_translated_offset_round_trips_and_lands_on_a_boundary` is
+        // what holds that property, and it is the reason the `0x80` arm may not be narrowed
+        // without putting an explicit back-off back.
+        let mut suffix = 0;
+        while suffix < max - prefix && b[b.len() - 1 - suffix] == g[g.len() - 1 - suffix] {
+            suffix += 1;
+        }
+        while suffix > 0 {
+            let (at_b, at_g) = (b.len() - suffix, g.len() - suffix);
+            let straddles = is_word_byte(b[at_b])
+                && (at_b
+                    .checked_sub(1)
+                    .is_some_and(|before| is_word_byte(b[before]))
+                    || at_g
+                        .checked_sub(1)
+                        .is_some_and(|before| is_word_byte(g[before])));
+            if !straddles {
+                break;
+            }
+            suffix -= 1;
+        }
+        Self {
+            prefix: prefix as u32,
+            suffix: suffix as u32,
+            buffer_len: b.len() as u32,
+            graph_len: g.len() as u32,
+        }
+    }
+
+    /// Whether the two texts are the same, in which case every caller can skip the translation.
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        self.buffer_len == self.graph_len && self.prefix >= self.buffer_len
+    }
+
+    /// The graph offset a buffer offset names, or `None` where the text under it is text the
+    /// graph has never been given.
+    #[must_use]
+    pub fn to_graph(&self, offset: u32) -> Option<u32> {
+        self.map(offset, self.buffer_len, self.graph_len)
+    }
+
+    /// The region of the graph's text the buffer no longer agrees with, which is the widest a
+    /// scope question may be asked over when the cursor itself cannot be translated.
+    #[must_use]
+    pub fn changed_in_graph(&self) -> (u32, u32) {
+        (self.prefix, self.graph_len.saturating_sub(self.suffix))
+    }
+
+    /// The inverse: a span the graph handed back, in the buffer's coordinates.
+    ///
+    /// **Not optional, and the failure it prevents is worse than a slow answer.** `hover` and
+    /// `definition` answer with a range `locate` found in the *graph*, and a deferred buffer is
+    /// not the text those offsets came from — so without this a jump lands on the line a
+    /// declaration has moved off. `None` where the span overlaps what was just typed: it has no
+    /// honest position in the new text, and the request settles and asks again rather than
+    /// guessing at one.
+    #[must_use]
+    pub fn to_buffer(self, offset: u32) -> Option<u32> {
+        self.map(offset, self.graph_len, self.buffer_len)
+    }
+
+    /// The body both directions share, which is why they take their lengths as arguments.
+    ///
+    /// **One copy on purpose.** The rule below is subtle enough that it has already been wrong
+    /// once — the bounds were `<=` and had to become strict — and a second copy is a second
+    /// place for the next correction to miss.
+    fn map(&self, offset: u32, from_len: u32, to_len: u32) -> Option<u32> {
+        if self.is_identity() {
+            return (offset <= from_len).then_some(offset);
+        }
+        // **Strictly** inside the common prefix or the common suffix, and the strictness is a
+        // defect this module's own test found rather than caution. A position is a gap between two
+        // bytes, and it names the same place in both texts only when *both* of those bytes are
+        // unchanged — `offset < prefix` says the byte after it is, and `offset > from_len -
+        // suffix` says the byte before it is.
+        //
+        // With `<=` a pure deletion slips through: `Alpha.` becoming `Alph.` leaves the buffer
+        // side of the changed region **empty**, so a boundary offset refused nothing, and the
+        // end of the constant the user is halfway through typing landed inside the span of the
+        // longer one the graph still holds — a precise answer about `Alpha` for a receiver
+        // spelled `Alph`, which is exactly the class of wrong answer this map exists to stop.
+        //
+        // It also makes the map injective, which `<=` was not: an insertion had two buffer
+        // positions straddling it naming one graph position.
+        if offset < self.prefix {
+            return Some(offset);
+        }
+        if offset > from_len.saturating_sub(self.suffix) {
+            let shifted = i64::from(offset) + i64::from(to_len) - i64::from(from_len);
+            return u32::try_from(shifted).ok();
+        }
+        None
     }
 }
 
@@ -233,6 +460,190 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn an_unedited_document_maps_every_offset_to_itself() {
+        let text = "class Story\n  def title\n  end\nend\n";
+        let rebase = Rebase::between(text, text);
+        assert!(rebase.is_identity());
+        for offset in 0..=text.len() as u32 {
+            assert_eq!(rebase.to_graph(offset), Some(offset));
+            assert_eq!(rebase.to_buffer(offset), Some(offset));
+        }
+    }
+
+    #[test]
+    fn an_insertion_moves_everything_after_it_and_nothing_before_it() {
+        // The shape of one keystroke: `Story.f` where the graph still holds `Story.`.
+        let indexed = "x = Story.\ny = 1\n";
+        let buffer = "x = Story.f\ny = 1\n";
+        let rebase = Rebase::between(buffer, indexed);
+        assert!(!rebase.is_identity());
+        // `Story` is written before the edit, so the receiver every graph lookup needs is exact.
+        assert_eq!(rebase.to_graph(4), Some(4));
+        assert_eq!(rebase.to_graph(9), Some(9));
+        // Everything after the insertion shifts back by its length.
+        assert_eq!(rebase.to_graph(12), Some(11));
+        assert_eq!(
+            rebase.to_graph(buffer.len() as u32),
+            Some(indexed.len() as u32)
+        );
+        // The two positions straddling the inserted `f` are refused rather than both being
+        // called graph 10, which is what makes the map injective and the round trip an
+        // equality rather than an idempotence.
+        assert_eq!(rebase.to_graph(10), None);
+        assert_eq!(rebase.to_graph(11), None);
+        for offset in 0..=buffer.len() as u32 {
+            if let Some(graph) = rebase.to_graph(offset) {
+                assert_eq!(rebase.to_buffer(graph), Some(offset), "at {offset}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_offset_inside_the_edit_is_refused_rather_than_approximated() {
+        // Mid-typing a constant: the graph has never held the text under this cursor, and the
+        // whole point of the map is that it says so instead of naming a neighbour.
+        let rebase = Rebase::between("x = Stor\n", "x = Widget\n");
+        assert_eq!(rebase.to_graph(3), Some(3));
+        // The gap where the two constants start diverging is refused too: the byte after it is
+        // `S` in one text and `W` in the other, so it is not the same place.
+        assert_eq!(rebase.to_graph(4), None);
+        assert_eq!(rebase.to_graph(6), None);
+        assert_eq!(rebase.to_graph(7), None);
+    }
+
+    #[test]
+    fn a_scattered_edit_widens_the_refused_region_rather_than_lying() {
+        // Two edits far apart collapse to one region spanning both. Every offset it covers is
+        // refused, which is safe; nothing outside it is wrong.
+        let rebase = Rebase::between("a = 2\nb = 1\nc = 4\n", "a = 1\nb = 1\nc = 3\n");
+        assert_eq!(rebase.to_graph(0), Some(0));
+        // Both edges of the region and everything between them — including the whole untouched
+        // middle line — are refused; only what has an unchanged byte on either side maps.
+        assert_eq!(rebase.to_graph(3), Some(3));
+        assert_eq!(rebase.to_graph(4), None);
+        assert_eq!(rebase.to_graph(9), None);
+        assert_eq!(rebase.to_graph(17), None);
+        assert_eq!(rebase.to_graph(18), Some(18));
+    }
+
+    #[test]
+    fn a_word_the_graph_still_holds_widens_the_seam_even_where_the_buffer_broke_it() {
+        // **Why the straddle test is two-sided.** Here the buffer has `-b` where the graph has
+        // `ab`: on the buffer's side `b` starts a token of its own, so asking only the buffer
+        // would leave `b.x` in the common suffix and hand back the offset the graph files `ab`
+        // under. The graph's side is what knows the word was longer.
+        let rebase = Rebase::between("-b.x\n", "ab.x\n");
+        assert_eq!(
+            rebase.to_graph(2),
+            None,
+            "the byte after `b` names two different words"
+        );
+        // The `.x` past it is untouched in both and still maps.
+        assert_eq!(rebase.to_graph(3), Some(3));
+    }
+
+    #[test]
+    fn the_inverse_refuses_an_offset_inside_the_edit_too() {
+        // The round-trip proptest only ever asks the inverse about offsets the forward map
+        // accepted, so it cannot reach the refusal — and an inverse that answered inside the
+        // edit would put a graph span onto buffer text that never held it.
+        let rebase = Rebase::between("Gamma.\n", "Alpha.\n");
+        let (lo, hi) = rebase.changed_in_graph();
+        assert!(lo < hi, "the fixture has to leave a region to refuse");
+        assert_eq!(rebase.to_buffer(lo + 1), None);
+    }
+
+    #[test]
+    fn a_word_that_changed_is_never_mapped_onto_the_word_that_replaced_it() {
+        // **The map is about tokens and not about bytes**, and a same-length replacement is
+        // what tells the two apart. `Alpha.` and `Gamma.` share `a.`, so a byte-wise scan puts
+        // the `.` — which is exactly the offset `Receiver::Constant` holds — in the common
+        // suffix and maps a cursor on one constant onto the other. Every offset the two words
+        // occupy, and the `.` after them that `Receiver::Constant` actually holds, has to be
+        // refused. The newline past that is common to both texts and no constant is filed
+        // under it, so it maps and should.
+        let indexed = "class Alpha\nend\nAlpha.\n";
+        let buffer = "class Alpha\nend\nGamma.\n";
+        let rebase = Rebase::between(buffer, indexed);
+        let word = buffer.rfind("Gamma.").expect("the fixture writes it") as u32;
+        for offset in word..word + "Gamma.".len() as u32 {
+            assert_eq!(
+                rebase.to_graph(offset),
+                None,
+                "offset {offset} of a word the graph has never held was mapped anyway"
+            );
+        }
+        // And the class above it, which nothing touched, still maps.
+        let untouched = buffer.find("Alpha").expect("the fixture writes it") as u32;
+        assert_eq!(rebase.to_graph(untouched), Some(untouched));
+    }
+
+    #[test]
+    fn a_constant_path_is_one_word_for_this_purpose() {
+        // `::` is a word byte, so `HR::Person` and `XY::Person` do not share `::Person` as an
+        // unchanged suffix — the reference the graph holds is filed under the whole path, and
+        // its end offset means a different class in the two texts.
+        let rebase = Rebase::between("XY::Person.\n", "HR::Person.\n");
+        let end = "XY::Person".len() as u32;
+        assert_eq!(rebase.to_graph(end), None);
+    }
+
+    #[test]
+    fn an_edit_that_ends_on_a_token_boundary_widens_nothing() {
+        // The other side of the two-sided condition. `# pad!\n` inserted in front of `class`
+        // ends *at* a boundary, so the word after it did not change and refusing offsets in it
+        // would cost the map most of its value.
+        let indexed = "class Alpha\nend\n";
+        let buffer = "# pad!\nclass Alpha\nend\n";
+        let rebase = Rebase::between(buffer, indexed);
+        let at = buffer.find("Alpha").expect("the fixture writes it") as u32;
+        assert_eq!(
+            rebase.to_graph(at),
+            Some(indexed.find("Alpha").unwrap() as u32)
+        );
+    }
+
+    #[test]
+    fn a_multibyte_edit_never_splits_a_character() {
+        // The char-boundary rule again: a translated offset that is not one would index
+        // into the middle of a character and panic the moment anybody slices with it.
+        let indexed = "x = \"\u{201c}\"\ny\n";
+        let buffer = "x = \"\u{201c}\u{201d}\"\ny\n";
+        let rebase = Rebase::between(buffer, indexed);
+        for offset in 0..=buffer.len() as u32 {
+            // Only offsets that address the buffer at all: an offset in the middle of a
+            // character is not a cursor and no caller can produce one.
+            if !buffer.is_char_boundary(offset as usize) {
+                continue;
+            }
+            if let Some(graph) = rebase.to_graph(offset) {
+                assert!(
+                    indexed.is_char_boundary(graph as usize),
+                    "{offset} -> {graph} splits a character"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn every_translated_offset_round_trips_and_lands_on_a_boundary(
+            buffer in "\\PC{0,40}", indexed in "\\PC{0,40}") {
+            let rebase = Rebase::between(&buffer, &indexed);
+            for offset in 0..=buffer.len() as u32 {
+                if !buffer.is_char_boundary(offset as usize) {
+                    continue;
+                }
+                if let Some(graph) = rebase.to_graph(offset) {
+                    prop_assert!(graph as usize <= indexed.len());
+                    prop_assert!(indexed.is_char_boundary(graph as usize));
+                    prop_assert_eq!(rebase.to_buffer(graph), Some(offset));
+                }
+            }
+        }
+    }
 
     #[test]
     fn length_is_bytes_and_agrees_with_emptiness() {
@@ -427,6 +838,66 @@ mod tests {
         );
         // A byte offset in the middle of the emoji snaps back to its first byte.
         assert_eq!(doc.position_at(2).character, 0);
+    }
+
+    /// A blanked document is addressed exactly as the text the client has.
+    ///
+    /// The whole of what [`TextDocument::blanked`] is for, stated as an equality: for a template
+    /// and the Ruby view of it, every conversion in this module must answer what it answers for
+    /// the template alone. `text()` is the *only* thing a view is allowed to change. It fails on
+    /// any of the four places the arithmetic could reach for `self.text` instead.
+    ///
+    /// The view is made by `erb::ruby_view` rather than by a hand-written analogue, because the
+    /// property this rests on is that function's and asserting it against a local imitation
+    /// would be asserting the imitation.
+    #[test]
+    fn a_blanked_document_is_addressed_as_the_text_the_client_has() {
+        // A curly quote (3 bytes, 1 UTF-16 unit), an accent (2/1), an emoji (4/2) and CJK
+        // (3/1), all in the markup to the *left* of the Ruby on their line.
+        let template = "<h1>\u{201c}Stories\u{201d}</h1>\n\
+                        <p>caf\u{e9} \u{1f680} \u{65e5}\u{672c} <%= story.title %></p>\n";
+        let view = crate::analysis::erb::ruby_view(template);
+        assert_eq!(
+            view.len(),
+            template.len(),
+            "the invariant `blanked` rests on"
+        );
+
+        for encoding in ALL {
+            let plain = TextDocument::new(template.to_owned(), encoding);
+            let blanked = TextDocument::blanked(template.to_owned(), view.clone(), encoding);
+
+            assert_eq!(
+                blanked.text(),
+                view,
+                "what is read is the view ({encoding:?})"
+            );
+            for offset in 0..=template.len() as u32 {
+                assert_eq!(
+                    blanked.position_at(offset),
+                    plain.position_at(offset),
+                    "position_at({offset}) ({encoding:?})"
+                );
+                let position = plain.position_at(offset);
+                assert_eq!(
+                    blanked.offset_at(position),
+                    plain.offset_at(position),
+                    "offset_at({position:?}) ({encoding:?})"
+                );
+            }
+        }
+
+        // Non-vacuous, and the defect itself: the view addressed as its own text. The second
+        // line's markup is seven units short of its bytes —
+        // one for the accent, two for the emoji, four for the two CJK characters — so the caret
+        // the client put on `story` arrives seven bytes to the left of it.
+        let at_call = template.find("story.title").expect("the fixture") as u32;
+        let position =
+            TextDocument::new(template.to_owned(), PositionEncoding::Utf16).position_at(at_call);
+        assert_eq!(
+            TextDocument::new(view, PositionEncoding::Utf16).offset_at(position),
+            at_call - 7
+        );
     }
 
     #[test]

@@ -149,12 +149,12 @@ test('activating with no workspace folders registers every declared command', as
 /**
  * A multi-root workspace starts no server until a Ruby file asks for one.
  *
- * `folders[0]` is whichever folder the `.code-workspace` lists first. Activation is
- * `onLanguage:ruby`, so opening a Ruby file in *any* folder used to start a server on that one —
- * and a workspace whose first folder holds no Ruby (infrastructure, docs, a sibling service in
- * another language) got an index of nothing plus a warning telling it to widen `index.include`,
- * for a folder the user had not opened. Counted through `showErrorMessage`, which `start` raises
- * once per folder when it cannot find a server binary.
+ * `folders[0]` is whichever folder the `.code-workspace` lists first, and activation is
+ * `onLanguage:ruby`. Starting a server on that folder because a Ruby file was opened in *any*
+ * other one gives a workspace whose first folder holds no Ruby (infrastructure, docs, a sibling
+ * service in another language) an index of nothing plus a warning telling it to widen
+ * `index.include`, for a folder the user never opened. Counted through `showErrorMessage`, which
+ * `start` raises once per folder when it cannot find a server binary.
  */
 test('a multi-root workspace starts no server before a Ruby file is opened', async () => {
   const extension = require(bundle) as {
@@ -209,6 +209,57 @@ test('a single-folder workspace still starts its server eagerly', async () => {
   await extension.deactivate();
 
   assert.equal(errors.length, 1, 'the only folder must be served without waiting for a file');
+});
+
+/**
+ * A template opens a server on its folder, exactly as a Ruby file does.
+ *
+ * ya-lsp indexes `.erb`, and the extension is where that decision either reaches a
+ * user or does not: `startForDocument` filters on `languageId`, so a template in a folder whose
+ * Ruby nobody has opened would activate nothing at all and the whole feature would be invisible
+ * in the editor it was built for. Counted through `showErrorMessage`, which `start` raises once
+ * per folder it tries to serve.
+ */
+test('a template opens a server on its folder, the way a Ruby file does', async () => {
+  const extension = require(bundle) as {
+    activate(context: unknown): Promise<void>;
+    deactivate(): Promise<void>;
+  };
+  const folder = {
+    name: 'app',
+    uri: { toString: () => 'file:///multi/app', fsPath: '/multi/app' },
+  };
+  const document = (languageId: string): unknown => ({
+    languageId,
+    uri: { scheme: 'file', toString: () => `file:///multi/app/index.html.${languageId}` },
+  });
+
+  strict.workspace = {
+    ...(strict.workspace as Record<string, unknown>),
+    workspaceFolders: [
+      { name: 'infrastructure', uri: { toString: () => 'file:///multi/infra', fsPath: '/i' } },
+      folder,
+    ],
+    textDocuments: [document('erb')],
+    getWorkspaceFolder: () => folder,
+  };
+  errors.length = 0;
+  await extension.activate({ subscriptions: [], extensionPath: '/nonexistent' });
+  await extension.deactivate();
+
+  assert.equal(errors.length, 1, 'an open template must start its folder`s server');
+
+  // The guard, so this cannot pass because everything starts a server: a language this
+  // extension does not serve still starts nothing.
+  strict.workspace = {
+    ...(strict.workspace as Record<string, unknown>),
+    textDocuments: [document('markdown')],
+  };
+  errors.length = 0;
+  await extension.activate({ subscriptions: [], extensionPath: '/nonexistent' });
+  await extension.deactivate();
+
+  assert.equal(errors.length, 0, 'a Markdown file is not this extension`s business');
 });
 
 test('the language client turns a protocol relative pattern into an editor one', () => {

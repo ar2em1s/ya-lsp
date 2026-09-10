@@ -7,10 +7,12 @@
 use std::path::Path;
 
 use lsp_types::{
-    ClientCapabilities, CompletionOptions, CompletionOptionsCompletionItem,
-    DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher, FoldingRangeProviderCapability,
-    GlobPattern, HoverProviderCapability, OneOf, Registration, RelativePattern, RenameOptions,
-    SaveOptions, SelectionRangeProviderCapability, ServerCapabilities, SignatureHelpOptions,
+    ClientCapabilities, CodeActionKind, CodeActionOptions, CodeActionProviderCapability,
+    CompletionOptions, CompletionOptionsCompletionItem, DidChangeWatchedFilesRegistrationOptions,
+    FileSystemWatcher, FoldingRangeProviderCapability, GlobPattern, HoverProviderCapability, OneOf,
+    Registration, RelativePattern, RenameOptions, SaveOptions, SelectionRangeProviderCapability,
+    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, WorkDoneProgressOptions,
     WorkspaceFileOperationsServerCapabilities, WorkspaceFoldersServerCapabilities,
@@ -48,7 +50,7 @@ pub struct Advertised {
 pub fn advertised(encoding: PositionEncoding) -> Advertised {
     Advertised {
         standard: server_capabilities(encoding),
-        // v0.3.0. Nothing is taken away by this one: no editor guesses at a type hierarchy, so
+        // Nothing is taken away by this one: no editor guesses at a type hierarchy, so
         // the command simply reports that there are no results until a server answers it.
         type_hierarchy_provider: true,
     }
@@ -58,7 +60,7 @@ pub fn advertised(encoding: PositionEncoding) -> Advertised {
 pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
     ServerCapabilities {
         position_encoding: Some(encoding.to_lsp()),
-        // Incremental since M2. rubydex reparses the whole buffer on every `index_source`, so
+        // Incremental. rubydex reparses the whole buffer on every `index_source`, so
         // this saves transfer rather than parsing — but on a large file, sending the entire
         // text on every keystroke is transfer the editor pays for at typing speed.
         text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -72,25 +74,25 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
                 })),
             },
         )),
-        // M2. Announced only now that they are implemented: a client that is told a server
+        // Announced only once implemented: a client that is told a server
         // provides hover will stop showing its own word-based fallback, so advertising early
         // makes the editor worse, not better.
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
-        // M4. `workspace/symbol` answers with `SymbolInformation`, which carries a full
+        // `workspace/symbol` answers with `SymbolInformation`, which carries a full
         // location — so no `resolveProvider`, and no `workspaceSymbol/resolve`. The lazy shape
         // exists to avoid reading a file per result; measured here that read is a few
         // milliseconds for a capped result set, and every client understands the eager one.
         references_provider: Some(OneOf::Left(true)),
-        // v0.3.0. Announced with the rest of them and for the same reason: a client told a
+        // Announced with the rest of them and for the same reason: a client told a
         // server highlights occurrences stops matching words itself, and a word match — which
         // lights up the name inside a comment, inside a string, and in an unrelated scope — is
         // better than nothing at all. ya-lsp answers `null` wherever it does not know, which is
         // what puts the client's own fallback back in play for exactly those positions.
         document_highlight_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
-        // M5. `.` and `:` are the two characters that change what a completion *means* rather
+        // `.` and `:` are the two characters that change what a completion *means* rather
         // than just narrowing it, and a client only re-asks mid-word for characters listed
         // here. `:` covers `Foo::` — LSP trigger characters are single characters, so there is
         // no way to say `::`, and the request for a lone `:` is classified and answered with
@@ -112,7 +114,7 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
             }),
             ..CompletionOptions::default()
         }),
-        // v0.3.0. `(` and `,` are where a Ruby call gains an argument — the second covers the
+        // `(` and `,` are where a Ruby call gains an argument — the second covers the
         // paren-less form too, since `link_to "x", ` is where the next one goes. `)` only
         // re-triggers, which is to say it is asked while the popup is already up: the call it
         // closes has no further arguments, ya-lsp answers `null`, and the popup goes away
@@ -122,10 +124,10 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
             retrigger_characters: Some(vec![")".to_owned()]),
             ..SignatureHelpOptions::default()
         }),
-        // v0.3.0. Expand-selection has nothing to take away — in a Ruby file the command does
+        // Expand-selection has nothing to take away — in a Ruby file the command does
         // nothing at all today — so this one is pure addition.
         selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
-        // v0.3.0. `prepareProvider` is the half of this that matters: it is what lets ya-lsp
+        // `prepareProvider` is the half of this that matters: it is what lets ya-lsp
         // answer "not here" *before* the editor asks the user for a new name, which is the only
         // point at which declining costs the user nothing. A client that does not support it
         // sends `textDocument/rename` straight off, so every refusal is reachable from both.
@@ -133,16 +135,52 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
             prepare_provider: Some(true),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
-        // v0.3.0, and the one capability here that *removes* a fallback rather than replacing
+        // The kinds are listed rather than `Simple(true)` because a client filters on
+        // them *before* it asks: VS Code's Refactor… menu sends `only: ["refactor"]`, and a
+        // server that advertises no kinds is asked nothing. Listing the two that are implemented
+        // and no more is the same rule this module opens with, one level down — an advertised
+        // `quickfix` would put an empty entry under the lightbulb on every diagnostic.
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![
+                CodeActionKind::REFACTOR_EXTRACT,
+                CodeActionKind::REFACTOR_REWRITE,
+            ]),
+            resolve_provider: None,
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
+        // The one capability here that *removes* a fallback rather than replacing
         // an absence: a client with a folding provider stops guessing from indentation, and on
         // well-formatted Ruby that guess is decent. So `analysis::ranges` covers the shapes the
         // guess gets right as well as the ones it cannot see, and answers `null` — never an
         // empty array — where it found nothing, which is what hands the guess back.
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+        // The legend is the wire contract twice over: a client reads every token's type
+        // as an index into this list, so it must be exactly `tokens::LEGEND` and in exactly its
+        // order — a mismatch recolours every token in every file, consistently, which is the
+        // hardest kind of wrong to see. `the_legend_the_client_is_sent_is_the_one_the_tokens_are
+        // _numbered_against` is what holds the two together.
+        //
+        // `full: Bool(true)` and no `delta`, deliberately: a delta is a wire optimisation over
+        // an answer the server would have computed anyway, paid for with a cache of every
+        // response sent per document and an id to invalidate on every edit. See `tokens`.
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: SemanticTokensLegend {
+                    token_types: crate::analysis::tokens::LEGEND
+                        .iter()
+                        .map(|name| SemanticTokenType::new(name))
+                        .collect(),
+                    token_modifiers: Vec::new(),
+                },
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                range: None,
+                work_done_progress_options: WorkDoneProgressOptions::default(),
+            },
+        )),
         workspace: Some(WorkspaceServerCapabilities {
             workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                 supported: Some(true),
-                // Multi-root arrives with M6; announcing support for the notification without
+                // Announcing support for the notification without
                 // acting on it would be a lie the client cannot detect.
                 change_notifications: None,
             }),
@@ -161,6 +199,17 @@ pub fn server_info() -> serde_json::Value {
     })
 }
 
+/// The schema dumps `index.include` can never name, and the only non-Ruby file this server
+/// reads.
+///
+/// `db/*structure.sql` rather than `**/*.sql`, which would sweep up every fixture, seed and
+/// migration in a repository for the sake of one file. The shape mirrors Rails' own
+/// `schema_dump`, which names the primary database's dump `structure.sql` and every other one
+/// `<database>_structure.sql` — the same pair of names `rails::is_structure` matches, and it is
+/// that predicate rather than this glob that has the last word, exactly as `Workspace::indexes`
+/// does for the Ruby patterns.
+const SCHEMA_DUMP_GLOB: &str = "db/*structure.sql";
+
 /// The id the watcher registration is made under.
 ///
 /// Fixed rather than generated: the protocol identifies a registration by this string, so
@@ -171,15 +220,22 @@ const WATCHED_FILES_ID: &str = "ya-lsp-watched-files";
 ///
 /// The protocol has no static form for file watching — `initialize` cannot announce it, which is
 /// why this is not in `server_capabilities` — so `client/registerCapability` is the only way to
-/// ask, and `None` here means the client did not say it accepts one. Until v0.2.0 nothing sent
-/// this at all: the VS Code extension supplied a watcher of its own through
-/// `synchronize.fileEvents`, so reload worked there and in no other editor.
+/// ask, and `None` here means the client did not say it accepts one. Without it, reload works
+/// only in an editor whose extension supplies a watcher of its own.
 ///
 /// The Ruby patterns are `index.include` itself, so a project that widened it to cover `sig/`
 /// gets its signatures watched too. `index.exclude` has no counterpart here — LSP watchers
 /// cannot say "not this" — so the registration is deliberately the *wider* of the two, and
 /// `Workspace::indexes` narrows it back down on arrival. Watching too much costs notifications
 /// the server drops; watching too little is a file that never refreshes.
+///
+/// **Two of the patterns are constants and neither is indexed**, which is the shape rather than
+/// an exception. `ya-lsp.toml` is watched and never indexed, and [`SCHEMA_DUMP_GLOB`] is beside
+/// it for the same reason: a `db/structure.sql` is read
+/// by the generator pass, is not Ruby, and must never reach rubydex. Being constants is what
+/// makes them safe here — this registration is made once, at `initialize`, and is never made
+/// again, so anything derived from a configuration the user can reload would be stale for the
+/// life of the process.
 #[must_use]
 pub fn watched_files(
     root: &Path,
@@ -196,7 +252,8 @@ pub fn watched_files(
     }
     let relative = watched.relative_pattern_support == Some(true);
     let options = DidChangeWatchedFilesRegistrationOptions {
-        watchers: std::iter::once(CONFIG_FILE_NAME)
+        watchers: [CONFIG_FILE_NAME, SCHEMA_DUMP_GLOB]
+            .into_iter()
             .chain(index.include.iter().map(String::as_str))
             .map(|pattern| FileSystemWatcher {
                 glob_pattern: watch_glob(root, pattern, relative),
@@ -327,6 +384,41 @@ mod tests {
     }
 
     #[test]
+    fn the_v0_4_0_semantic_token_legend_is_the_one_the_tokens_are_numbered_against() {
+        // The legend *is* the wire contract: a client reads every token's type as an index into
+        // this list. A mismatch between it and `tokens::Kind` recolours every token in every
+        // file, consistently and plausibly, which is the hardest kind of wrong to notice — so
+        // the two are asserted against each other rather than each against a hand-written list.
+        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        let SemanticTokensServerCapabilities::SemanticTokensOptions(options) = capabilities
+            .semantic_tokens_provider
+            .expect("a semantic tokens provider")
+        else {
+            panic!("registered dynamically, which this server does not do");
+        };
+
+        let sent: Vec<String> = options
+            .legend
+            .token_types
+            .iter()
+            .map(|kind| kind.as_str().to_owned())
+            .collect();
+        assert_eq!(sent, crate::analysis::tokens::LEGEND);
+        assert!(
+            options.legend.token_modifiers.is_empty(),
+            "a modifier nothing sends is a promise nothing keeps"
+        );
+        // The full document and nothing else. A delta is a wire optimisation over an answer the
+        // server computes anyway; announcing it would oblige ya-lsp to keep every response it
+        // has sent, per document, keyed by an id it must invalidate on every edit.
+        assert!(matches!(
+            options.full,
+            Some(lsp_types::SemanticTokensFullOptions::Bool(true))
+        ));
+        assert!(options.range.is_none());
+    }
+
+    #[test]
     fn the_m4_providers_are_announced() {
         let capabilities = server_capabilities(PositionEncoding::Utf8);
         assert!(capabilities.references_provider.is_some());
@@ -395,6 +487,16 @@ mod tests {
             .expect("a watcher is registered");
         assert_eq!(registration.method, "workspace/didChangeWatchedFiles");
         assert_eq!(registration.id, WATCHED_FILES_ID);
+        // The schema dump is a constant and not derived from this configuration, which is the
+        // property that makes it correct: this runs once, at `initialize`, and a pattern
+        // computed from a `ya-lsp.toml` the user can reload would be stale for the life of the
+        // process. It also cannot be spelled by `index.include`, which is Ruby's shapes.
+        assert!(
+            !index
+                .include
+                .iter()
+                .any(|pattern| pattern == SCHEMA_DUMP_GLOB)
+        );
 
         let watchers = watchers(&registration);
         // `kind` unset is create|change|delete. A `ya-lsp.toml` that is deleted, or written for
@@ -409,6 +511,9 @@ mod tests {
             vec![
                 // A client without relative patterns gets absolute ones, with `/` separators.
                 GlobPattern::String("/tmp/ya-lsp-watch/project/ya-lsp.toml".to_owned()),
+                // The two constants come first and neither is `index.include`'s: both name a
+                // file this server reads and never indexes.
+                GlobPattern::String("/tmp/ya-lsp-watch/project/db/*structure.sql".to_owned()),
                 GlobPattern::String("/tmp/ya-lsp-watch/project/**/*.rb".to_owned()),
                 GlobPattern::String("/tmp/ya-lsp-watch/project/sig/**/*.rbs".to_owned()),
             ],
@@ -436,12 +541,20 @@ mod tests {
                 pattern: pattern.to_owned(),
             })
         };
+        // Derived from the default rather than spelled out: what this test is about is the
+        // *form* of each pattern, and `the_watchers_cover_the_config_and_everything_the_index_
+        // includes` above already pins that the list is `index.include` verbatim.
+        let expected: Vec<GlobPattern> = [CONFIG_FILE_NAME.to_owned(), SCHEMA_DUMP_GLOB.to_owned()]
+            .into_iter()
+            .chain(IndexConfig::default().include)
+            .map(|pattern| relative(&pattern))
+            .collect();
         assert_eq!(
             watchers(&registration)
                 .iter()
                 .map(|watcher| watcher.glob_pattern.clone())
                 .collect::<Vec<_>>(),
-            vec![relative(CONFIG_FILE_NAME), relative("**/*.rb")]
+            expected
         );
     }
 

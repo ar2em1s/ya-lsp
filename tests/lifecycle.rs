@@ -272,6 +272,12 @@ fn full_lifecycle_over_stdio() {
         result["capabilities"]["signatureHelpProvider"]["triggerCharacters"],
         serde_json::json!(["(", ","])
     );
+    // The kinds are the load-bearing half of this one: a client filters on them before it asks,
+    // so a `codeActionProvider` that lists none is never asked for a refactoring at all.
+    assert_eq!(
+        result["capabilities"]["codeActionProvider"]["codeActionKinds"],
+        serde_json::json!(["refactor.extract", "refactor.rewrite"])
+    );
     assert_eq!(result["serverInfo"]["name"], "ya-lsp");
 
     server.notify("initialized", serde_json::json!({}));
@@ -324,6 +330,57 @@ fn full_lifecycle_over_stdio() {
     );
     assert_eq!(symbols[1]["name"], "murmur", "{symbols}");
     assert_eq!(symbols[1]["containerName"], "Person", "{symbols}");
+
+    // A code action over the buffer the server is holding, asked of the real process: the two
+    // extractions and the accessors are pure functions over one string and are covered as such,
+    // but this is the only place the request reaches the shipped binary at all — and it is the
+    // one request whose answer is an edit to the user's file.
+    let id = server.request(
+        "textDocument/codeAction",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 1, "character": 2 },
+                "end": { "line": 1, "character": 2 }
+            },
+            "context": { "diagnostics": [] }
+        }),
+    );
+    let actions = server.response(&id).response_result.expect("codeAction");
+    // `def murmur` is a method with an empty body inside `class Person`: nothing to extract and
+    // no instance variable to declare an accessor for, so the honest answer is `null`.
+    assert_eq!(actions, serde_json::Value::Null, "{actions}");
+
+    server.notify(
+        "textDocument/didChange",
+        serde_json::json!({
+            "textDocument": { "uri": uri, "version": 3 },
+            "contentChanges": [{
+                "text": "class Person\n  def murmur\n    @volume = 1\n  end\nend\n"
+            }]
+        }),
+    );
+    let id = server.request(
+        "textDocument/codeAction",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 2, "character": 4 },
+                "end": { "line": 2, "character": 4 }
+            },
+            "context": { "diagnostics": [] }
+        }),
+    );
+    let actions = server.response(&id).response_result.expect("codeAction");
+    assert_eq!(
+        actions[0]["title"], "Declare attr_reader :volume",
+        "{actions}"
+    );
+    assert_eq!(actions[0]["kind"], "refactor.rewrite", "{actions}");
+    assert_eq!(
+        actions[0]["edit"]["changes"][&uri][0]["newText"], "attr_reader :volume\n  ",
+        "{actions}"
+    );
 
     // An unimplemented method must still be answered rather than dropped: an unanswered
     // request wedges the client forever.
@@ -412,7 +469,7 @@ fn a_broken_config_warns_instead_of_taking_the_server_down() {
 
 #[test]
 fn a_syntax_error_reaches_the_client_as_a_diagnostic() {
-    // The end-to-end claim of M1: a file that does not parse lights up in the editor, with a
+    // The end-to-end diagnostics claim: a file that does not parse lights up in the editor, with a
     // range the editor can place and a code the user can look up.
     let root = fixture();
     std::fs::write(
@@ -447,8 +504,8 @@ fn a_syntax_error_reaches_the_client_as_a_diagnostic() {
     // Prism's own words, forwarded verbatim: ya-lsp owns the severity and the code and not one
     // word of the text. `parse_errors_read_the_way_prism_wrote_them` pins the whole set; here
     // it is the wire that is being checked, so one sentence is enough — but a sentence, not a
-    // length. "Non-empty" was the entire contract until v0.2.0, which is the same gap as an
-    // unranked completion list: the mechanism tested, the content not.
+    // length. "Non-empty" as the whole contract is the same gap as an unranked completion
+    // list: the mechanism tested, the content not.
     assert_eq!(
         error["message"],
         "expected an `end` to close the `class` statement"
@@ -493,7 +550,7 @@ fn a_syntax_error_reaches_the_client_as_a_diagnostic() {
 
 #[test]
 fn navigation_over_stdio() {
-    // The end-to-end claim of M2: an editor that opens a file can ask what a name is, where it
+    // The end-to-end navigation claim: an editor that opens a file can ask what a name is, where it
     // came from, and what the file contains — and get answers in the shapes it advertised.
     let root = fixture();
     let mut server = started(root.path(), modern_client(root.path()));
@@ -597,7 +654,7 @@ fn navigation_over_stdio() {
 
 #[test]
 fn project_wide_search_over_stdio() {
-    // The end-to-end claim of M4: an editor can ask the project a question that names no file.
+    // The end-to-end search claim: an editor can ask the project a question that names no file.
     let root = fixture();
     std::fs::write(
         root.path().join("lib/team.rb"),
@@ -684,7 +741,7 @@ fn project_wide_search_over_stdio() {
 
 #[test]
 fn completion_over_stdio() {
-    // The end-to-end claim of M5: an editor asking what can be typed at a position gets an
+    // The end-to-end completion claim: an editor asking what can be typed at a position gets an
     // answer that came from the project, not from the words in the open buffer.
     let root = fixture();
     std::fs::write(
@@ -720,7 +777,10 @@ fn completion_over_stdio() {
         }),
     );
     let found = server.response(&id).response_result.expect("completion");
-    assert_eq!(found["isIncomplete"], true, "{found}");
+    // One row, so the cap dropped nothing and the client is told it may narrow this itself
+    // rather than ask again for every further character. Over the wire, because that flag is
+    // the one thing here an editor acts on without being asked anything else.
+    assert_eq!(found["isIncomplete"], false, "{found}");
     let labels: Vec<&str> = found["items"]
         .as_array()
         .expect("an item list")
@@ -798,7 +858,7 @@ fn completion_over_stdio() {
 
 #[test]
 fn signature_help_over_stdio() {
-    // The end-to-end claim of v0.3.0's first item: an editor asking what a half-written call
+    // The end-to-end signature-help claim: an editor asking what a half-written call
     // takes gets the method's real parameters, with the one being typed marked — over the wire,
     // from a buffer the disk has never seen, and with the offsets in the encoding the client
     // negotiated rather than in bytes.
@@ -894,7 +954,7 @@ fn signature_help_over_stdio() {
 
 #[test]
 fn document_highlight_over_stdio() {
-    // The end-to-end claim of v0.3.0's second item, and the one that needs a real server to
+    // The end-to-end highlight claim, and the one that needs a real server to
     // make: the two halves of the answer come from different places — a Prism walk of the
     // buffer for the local, the graph for the method — and an editor cannot tell, because both
     // arrive as ranges in the encoding it negotiated over a buffer the disk has never seen.
@@ -1219,9 +1279,9 @@ fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 
-/// M3: a gem the project depends on becomes navigable, and the editor is told it is happening.
+/// A gem the project depends on becomes navigable, and the editor is told it is happening.
 ///
-/// This is the milestone's acceptance criterion reduced to something CI can run: no Ruby is
+/// The acceptance criterion reduced to something CI can run: no Ruby is
 /// executed anywhere, the gem is found from `Gemfile.lock` plus a `GEM_HOME`, and
 /// goto-definition crosses from the project into it.
 #[test]
@@ -1454,7 +1514,7 @@ fn startup_logs_the_version_before_the_handshake() {
 
 /// Ruby's own core classes: indexed, navigable, and reachable from a literal.
 ///
-/// This is the whole of M7 through the wire. The workspace has no gems and asks for core only —
+/// The whole of Ruby's own signatures through the wire. The workspace has no gems and asks for core only —
 /// which rung of the ladder answered is `workspace::rbs`'s business, and pinning it here would
 /// make the test assert something about the machine rather than about the server.
 #[test]
@@ -1591,7 +1651,7 @@ fn the_stdlib_signatures_are_indexed_when_asked_for() {
     shut_down(server);
 }
 
-/// The same server, with the signatures turned off entirely: what shipped before M7.
+/// The same server, with the signatures turned off entirely.
 #[test]
 fn built_ins_can_be_turned_off_and_completion_still_answers() {
     let root = fixture();
@@ -1728,10 +1788,10 @@ fn a_client_without_progress_support_is_sent_no_progress() {
 
 #[test]
 fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
-    // v0.3.0's item 0, through the shipped binary. Until this landed the watcher covered
-    // `ya-lsp.toml` and nothing else, so a `git checkout`, a `git pull`, a rebase or a
-    // `rails g model` changed Ruby under a running server and nothing re-indexed it — a
-    // deleted file kept its declarations until someone restarted. Every step here happens with
+    // The file watcher through the shipped binary. With it covering `ya-lsp.toml` and nothing
+    // else, a `git checkout`, a `git pull`, a rebase or a `rails g model` changes Ruby under a
+    // running server and nothing re-indexes it — a deleted file keeps its declarations until
+    // someone restarts. Every step here happens with
     // no `didOpen` anywhere, because that is the situation: the editor never touched the file.
     let root = fixture();
     let mut server = Server::start(root.path());
@@ -1763,8 +1823,24 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
     };
     assert_eq!(
         watchers,
-        vec![spelled("ya-lsp.toml"), spelled("**/*.rb")],
-        "the config, and index.include verbatim"
+        vec![
+            spelled("ya-lsp.toml"),
+            // The second constant, and the only non-Ruby file this server reads: watched so
+            // that an editor's own save of a `db/structure.sql` re-settles, never indexed, and
+            // spelled here because this is the wire.
+            spelled("db/*structure.sql"),
+            spelled("**/*.rb"),
+            spelled("**/*.erb"),
+            spelled("**/*.rbs"),
+            spelled("**/*.rake"),
+            spelled("**/*.gemspec"),
+            spelled("**/Rakefile"),
+            spelled("**/Gemfile"),
+            spelled("**/config.ru"),
+        ],
+        "the config, and index.include verbatim — spelled out here rather than derived because \
+         this is the wire, and a widened default that reaches an editor by accident is exactly \
+         what an end-to-end pin is for"
     );
     server.send(Message::Response(Response::new_ok(
         registration.id,
@@ -1857,8 +1933,8 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
         "the method the rewrite removed is still in the index: {rewritten}"
     );
 
-    // And gone: the one change nothing else in the protocol can stand in for. Before item 0 a
-    // deleted file kept every declaration it had for the life of the process.
+    // And gone: the one change nothing else in the protocol can stand in for. Without it a
+    // deleted file keeps every declaration it had for the life of the process.
     std::fs::remove_file(&place_path).unwrap();
     server.notify(
         "workspace/didChangeWatchedFiles",
@@ -1875,11 +1951,11 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
 
 #[test]
 fn the_config_file_reloads_without_a_restart() {
-    // Item 8's whole claim, through the shipped binary rather than an in-process connection:
-    // an editor that takes a dynamic registration is asked to watch `ya-lsp.toml`, and the
-    // change it reports back actually changes an answer. Until v0.2.0 nothing in the server ever
-    // sent `client/registerCapability`, so this worked in exactly one editor — the one whose
-    // extension brought a watcher of its own — and the release notes said otherwise.
+    // Config reload through the shipped binary rather than an in-process connection: an editor
+    // that takes a dynamic registration is asked to watch `ya-lsp.toml`, and the change it
+    // reports back actually changes an answer. Without the server sending
+    // `client/registerCapability` this works in exactly one editor — the one whose extension
+    // brings a watcher of its own.
     let root = fixture();
     std::fs::write(
         root.path().join("lib/broken.rb"),
@@ -1962,10 +2038,10 @@ fn the_config_file_reloads_without_a_restart() {
 
 #[test]
 fn the_editor_can_switch_one_rule_off_and_leave_the_others_loud() {
-    // Item 6's diagnostics half, through the shipped binary and through the layer the *editor*
-    // sends — `ya-lsp.toml` is what `the_config_file_reloads_without_a_restart` drives, and it is
-    // the editor's view that item 6 is about. The rule is `parse-warning` because that is the one
-    // a project may already be linting for itself: the public Rails app measured for this release
+    // Per-rule severity through the shipped binary and through the layer the *editor* sends —
+    // `ya-lsp.toml` is what `the_config_file_reloads_without_a_restart` drives, and this is the
+    // editor's view of the same setting. The rule is `parse-warning` because that is the one
+    // a project may already be linting for itself: the public Rails app measured for it
     // switches off exactly its ground (`Lint/UselessAssignment`) in `.standard.yml` while a file
     // that does not parse is still worth a squiggle. One file carries both, so the assertion is
     // that the warning goes and the errors beside it stay.
@@ -2037,7 +2113,7 @@ fn published_codes(server: &mut Server, uris: &[&str]) -> Vec<Vec<String>> {
 
 #[test]
 fn selection_and_folding_ranges_over_stdio() {
-    // The end-to-end claim of v0.3.0's third item. Both are pure functions of one buffer, so what
+    // The end-to-end ranges claim. Both are pure functions of one buffer, so what
     // a real server adds over the unit tests is the wire: a chain arrives as a nest of `parent`
     // objects rather than a list, a fold arrives as two line numbers with no characters on it,
     // and both are measured against a buffer the disk has never seen.

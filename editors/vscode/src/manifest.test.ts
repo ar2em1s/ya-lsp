@@ -79,14 +79,19 @@ test('every setting the extension sends is one the manifest declares', () => {
 
 test('and every setting the manifest declares reaches somebody', () => {
   // The other direction, which is how five settings sat in `ya-lsp.toml` and nowhere else: a
-  // property nothing reads is a promise the extension does not keep. These three never reach the
-  // server — two the extension acts on itself, and one `vscode-languageclient` reads for its own
-  // tracing — so they are named rather than matched by pattern.
+  // property nothing reads is a promise the extension does not keep. These four never reach the
+  // server — three the extension acts on itself, and one `vscode-languageclient` reads for its
+  // own tracing — so they are named rather than matched by pattern.
+  //
+  // `rubocop.hint` is on this list for a reason worth stating: the server deserializes
+  // `initializationOptions` with `deny_unknown_fields`, so a client-only setting that leaked
+  // into `serverOptions` would not be ignored — it would reject the whole layer and silently
+  // switch every other setting off.
   assert.deepEqual(
     Object.keys(properties)
       .filter((setting) => !READ_BY_CONFIG.includes(setting))
       .sort(),
-    ['ya-lsp.logLevel', 'ya-lsp.serverPath', 'ya-lsp.trace.server']
+    ['ya-lsp.logLevel', 'ya-lsp.rubocop.hint', 'ya-lsp.serverPath', 'ya-lsp.trace.server']
   );
 });
 

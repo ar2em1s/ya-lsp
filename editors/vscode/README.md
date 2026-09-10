@@ -15,9 +15,9 @@ index; `ya-lsp.gems.rubyVersion` settles it, and `ya-lsp.gems.defaultGems` silen
 ## What you get
 
 Diagnostics, go-to-definition, hover, document symbols, workspace symbol search, find-references,
-completion, signature help, occurrence highlighting, folding, expand-selection, rename and the
-type hierarchy — across your project **and its gems**, which are read straight from `Gemfile.lock`
-and the gem directories on disk.
+completion, signature help, occurrence highlighting, folding, expand-selection, rename, four
+refactorings and the type hierarchy — across your project **and its gems**, which are read straight
+from `Gemfile.lock` and the gem directories on disk.
 
 Folding follows the syntax rather than the indentation VS Code otherwise guesses from: `if`,
 `elsif` and `else` fold as three regions, a heredoc's body folds, comment blocks and `#region`
@@ -37,12 +37,25 @@ look at. Methods, instance variables, anything defined in a gem, and a name that
 as a keyword or a hash key are declined the same way, each with its own reason — rename is the one
 feature here that would rather say no than be approximately right.
 
+**The lightbulb** offers four refactorings: extract the selection into a local variable or into a
+method, toggle a block between `{ }` and `do … end`, and declare an `attr_reader`, `attr_writer` or
+`attr_accessor` for the instance variable at the cursor. They are the four families that are
+rewrites over a syntax tree; the fifth, autocorrecting a style offence, is RuboCop's own and
+arrives if you run its server alongside.
+
+Like rename, these decline rather than approximate — an extraction whose result would have to hand
+a value back to the code after it, a block whose two spellings would bind to different calls, an
+`attr_reader` that would read the class's `@count` rather than an instance's. And every action is
+applied to a copy of the file and re-parsed before it is offered, so nothing in the menu can leave
+your buffer unparseable.
+
 ## How precise are the answers?
 
 ya-lsp resolves constants and does not infer types, and that line runs through every feature.
 Constants are exact. Methods are matched by name once the receiver is a local variable, which
 means find-references on `name` returns every call spelled that way. `Foo.`, `self.` and a bare
-call in a class body all resolve properly. The repository README goes into this in full.
+call in a class body all resolve properly. The repository README has the tier table and the
+order a receiver is tried in.
 
 ## Settings
 
@@ -81,6 +94,27 @@ Switch the rule off rather than the category. `ya-lsp.diagnostics.rules` set to
 ground RuboCop's and Standard's `Lint/UselessAssignment` covers — while a file that does not parse
 still gets its squiggle. Every rule can be set that way, all ten complete by name, and each says on
 hover what it fires on.
+
+### Running RuboCop alongside
+
+ya-lsp never runs Ruby, so no cop offence and no autocorrect ever comes from it. Install
+[RuboCop](https://marketplace.visualstudio.com/items?itemName=rubocop.vscode-rubocop), published by
+the RuboCop team, and run both — LSP allows a language to be served by more than one server, and
+these two divide the work rather than competing for it. There is nothing to configure: ya-lsp
+advertises no formatting capability, so there is no default formatter to pick between; each
+extension owns its own diagnostic collection rather than overwriting the other's; and the two
+lightbulbs merge, because ya-lsp advertises only `refactor.extract` and `refactor.rewrite` while
+RuboCop advertises only `quickfix`. Turn `parse-warning` off, as above, so
+that the one class of warning they both report arrives once.
+
+You get offences, formatting, and — **on RuboCop 1.89 or newer** — a lightbulb on each offence
+offering *Autocorrect* and *Disable for this line*. 1.89 is where RuboCop's server started
+answering `textDocument/codeAction`; on an older one the quick fixes are absent and only the
+whole-document **RuboCop: Format with Autocorrects** command applies them.
+
+ya-lsp offers this once per project, when it finds a `.rubocop.yml` or `rubocop` in
+`Gemfile.lock` and the extension is not installed. `ya-lsp.rubocop.hint` turns the offer off, and
+so does choosing **Don't show again**.
 
 ## Commands
 

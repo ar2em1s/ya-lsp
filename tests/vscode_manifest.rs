@@ -73,6 +73,10 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
             json!(config.rbs.path.clone().unwrap_or_default()),
         ),
         (
+            "ya-lsp.types.guessFromNames",
+            json!(config.types.guess_from_names),
+        ),
+        (
             "ya-lsp.diagnostics.enabled",
             json!(config.diagnostics.enabled),
         ),
@@ -98,16 +102,27 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
     }
 
     // The other direction: nothing may be added to the manifest without landing in the table
-    // above. The two exceptions are named rather than matched by pattern, because both are the
-    // extension's own business and neither has a server-side default to drift from — where the
-    // binary lives, and whether the client traces its own traffic.
+    // above. The three exceptions are named rather than matched by pattern, because each is the
+    // extension's own business and none has a server-side default to drift from — where the
+    // binary lives, whether the client traces its own traffic, and whether the client offers
+    // RuboCop's extension to a project that lints with RuboCop. That last one must never reach
+    // the server: `initializationOptions` is deserialized with `deny_unknown_fields`, so a
+    // client-only key that leaked into the layer would reject every setting in it, not just
+    // itself.
     let checked: BTreeSet<&str> = expected.iter().map(|(setting, _)| *setting).collect();
     let unchecked: Vec<&str> = properties
         .keys()
         .map(String::as_str)
         .filter(|setting| !checked.contains(setting))
         .collect();
-    assert_eq!(unchecked, ["ya-lsp.serverPath", "ya-lsp.trace.server"]);
+    assert_eq!(
+        unchecked,
+        [
+            "ya-lsp.rubocop.hint",
+            "ya-lsp.serverPath",
+            "ya-lsp.trace.server"
+        ]
+    );
 }
 
 #[test]
@@ -180,7 +195,7 @@ fn every_setting_the_server_reads_is_one_the_editor_can_set() {
     let file_only = ["gems.max_files"];
 
     let mut missing = Vec::new();
-    for table in ["index", "gems", "rbs", "diagnostics"] {
+    for table in ["index", "gems", "rbs", "types", "diagnostics"] {
         for field in fields_of(table) {
             let key = format!("{table}.{field}");
             if file_only.contains(&key.as_str()) {
@@ -239,4 +254,52 @@ fn camel(snake: &str) -> String {
         }
     }
     out
+}
+
+/// The extensions the editor calls a template are the extensions the server blanks.
+///
+/// The other side of `every_documented_default_is_the_one_the_server_actually_uses`, and a
+/// sharper failure: a file the manifest claims and `erb::is_template` does not is indexed as
+/// Ruby, so the whole of its markup reaches rubydex as code and its call sites are replaced by
+/// parse errors. The reverse — the server blanking an extension the editor never associates —
+/// is a template that opens as plain text and starts no server at all. Neither is visible from
+/// either language on its own.
+#[test]
+fn the_editor_and_the_server_agree_on_what_an_erb_template_is() {
+    use ya_lsp::analysis::erb;
+
+    let manifest = manifest();
+    let languages = manifest["contributes"]["languages"]
+        .as_array()
+        .expect("the manifest contributes languages");
+    let template = languages
+        .iter()
+        .find(|language| language["id"] == json!("erb"))
+        .expect("an `erb` language, or `.erb` files open as plain text and nothing activates");
+
+    let extensions: Vec<&str> = template["extensions"]
+        .as_array()
+        .expect("the language claims file extensions")
+        .iter()
+        .map(|value| value.as_str().expect("an extension is a string"))
+        .collect();
+    assert!(!extensions.is_empty());
+
+    for extension in &extensions {
+        let name = format!("index.html{extension}");
+        assert!(
+            erb::is_template(std::path::Path::new(&name)),
+            "the manifest claims {extension} and the server would index it as Ruby"
+        );
+    }
+
+    // And the guard, so the loop above cannot pass by accepting everything.
+    assert!(!erb::is_template(std::path::Path::new("story.rb")));
+
+    // Activation is what turns the contribution into a running server: without it, opening a
+    // template in a folder whose Ruby nobody has touched starts nothing.
+    let events = manifest["activationEvents"]
+        .as_array()
+        .expect("activation events");
+    assert!(events.contains(&json!("onLanguage:erb")), "{events:?}");
 }

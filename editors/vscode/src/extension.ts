@@ -14,6 +14,7 @@
 
 import * as fs from 'node:fs';
 import * as os from 'node:os';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import {
   DidChangeConfigurationNotification,
@@ -24,12 +25,15 @@ import {
 } from 'vscode-languageclient/node';
 
 import { RESTART_REQUIRED, Settings, serverEnvironment, serverOptions } from './config';
+import { FolderFiles, RUBOCOP_EXTENSION, usesRubocop } from './rubocop';
 import { resolveServer } from './server';
 
 const clients = new Map<string, LanguageClient>();
 const channels = new Map<string, vscode.LogOutputChannel>();
 /** Folders whose server could not be found, so the error is reported once and not per file. */
 const reported = new Set<string>();
+/** Folders already asked about RuboCop, so the hint is once per session and not per Ruby file. */
+const suggested = new Set<string>();
 
 let context: vscode.ExtensionContext;
 
@@ -68,8 +72,18 @@ export async function deactivate(): Promise<void> {
   await Promise.all([...clients.keys()].map(stop));
 }
 
+/**
+ * The language ids this extension serves.
+ *
+ * `erb` is contributed by this manifest, with the same id and the same extensions ruby-lsp uses,
+ * so a workspace that has an ERB grammar installed keeps it: a grammar binds to the id, and two
+ * contributions of one id merge. ya-lsp ships no grammar of its own — it is a language client,
+ * not a syntax — and semantic tokens colour the Ruby either way.
+ */
+const LANGUAGES = ['ruby', 'erb'];
+
 async function startForDocument(document: vscode.TextDocument): Promise<void> {
-  if (document.languageId !== 'ruby' || document.uri.scheme !== 'file') {
+  if (!LANGUAGES.includes(document.languageId) || document.uri.scheme !== 'file') {
     return;
   }
   const folder = vscode.workspace.getWorkspaceFolder(document.uri);
@@ -121,19 +135,17 @@ async function start(folder: vscode.WorkspaceFolder): Promise<void> {
     // an undefined pattern matches on language and scheme alone, so every folder's client would
     // claim every folder's files. Given this form it builds the `vscode.RelativePattern` itself,
     // which is also what makes the path separator right on Windows by construction.
-    documentSelector: [
-      {
-        scheme: 'file',
-        language: 'ruby',
-        pattern: { baseUri: folder.uri.toString(), pattern: '**/*' },
-      },
-    ],
+    documentSelector: LANGUAGES.map((language) => ({
+      scheme: 'file',
+      language,
+      pattern: { baseUri: folder.uri.toString(), pattern: '**/*' },
+    })),
     workspaceFolder: folder,
     outputChannel: channelFor(folder),
     initializationOptions: serverOptions(settings),
     // No `synchronize.fileEvents`. The server registers its own watchers through
-    // `client/registerCapability` — `ya-lsp.toml` as of v0.2.0, and everything `index.include`
-    // covers as of v0.3.0 — which is what makes reload and on-disk freshness work in editors
+    // `client/registerCapability` — `ya-lsp.toml` and everything `index.include` covers —
+    // which is what makes reload and on-disk freshness work in editors
     // that have no extension to bring one, and the client installs that registration itself.
     // Passing one here as well would mean two watchers on every file, so two
     // `didChangeWatchedFiles` per save and every file indexed twice per `git checkout`.
@@ -147,7 +159,71 @@ async function start(folder: vscode.WorkspaceFolder): Promise<void> {
   } catch (error) {
     clients.delete(key);
     void vscode.window.showErrorMessage(`ya-lsp failed to start: ${describe(error)}`);
+    return;
   }
+  // After the server is up, not before: a folder whose server could not start has a worse
+  // problem than its choice of linter, and two notifications about one folder is one too many.
+  void suggestRubocop(folder, settings);
+}
+
+/**
+ * Offer RuboCop's own extension to a project that lints with RuboCop.
+ *
+ * ya-lsp reports parse errors and Prism's warnings and stops there, because every cop is Ruby.
+ * The protocol's own answer to that is a second server, not a proxy inside this one — so the
+ * extension says so once, where the user is, rather than only in a README they have no reason
+ * to open. `rubocop.hint` turns it off, and choosing "Don't show again" is what writes it.
+ */
+async function suggestRubocop(
+  folder: vscode.WorkspaceFolder,
+  settings: Settings
+): Promise<void> {
+  const key = folder.uri.toString();
+  if (suggested.has(key) || settings.explicit<boolean>('rubocop.hint') === false) {
+    return;
+  }
+  // Marked before the checks, not after: this is "we have considered this folder", and a
+  // second `start` for the same folder must not re-ask while the first is still awaiting.
+  suggested.add(key);
+  if (vscode.extensions.getExtension(RUBOCOP_EXTENSION) || !usesRubocop(filesIn(folder))) {
+    return;
+  }
+
+  const install = 'Install RuboCop';
+  const never = "Don't show again";
+  const chosen = await vscode.window.showInformationMessage(
+    'This project lints with RuboCop, and ya-lsp does not run Ruby — it reports parse errors ' +
+      "and warnings only. RuboCop's own language server can run alongside ya-lsp for the cop " +
+      'offences and for formatting.',
+    install,
+    never
+  );
+  if (chosen === install) {
+    await vscode.commands.executeCommand(
+      'workbench.extensions.installExtension',
+      RUBOCOP_EXTENSION
+    );
+  } else if (chosen === never) {
+    // Global, not folder: the answer is about this user's taste, and being asked again in the
+    // next project is the thing they just declined.
+    await vscode.workspace
+      .getConfiguration('ya-lsp')
+      .update('rubocop.hint', false, vscode.ConfigurationTarget.Global);
+  }
+}
+
+/** The folder's files, read from disk, for the one question `rubocop.ts` asks of them. */
+function filesIn(folder: vscode.WorkspaceFolder): FolderFiles {
+  return {
+    read(relative: string): string | undefined {
+      try {
+        return fs.readFileSync(path.join(folder.uri.fsPath, relative), 'utf8');
+      } catch {
+        // Absent, a directory, or unreadable — all of which mean the same thing here.
+        return undefined;
+      }
+    },
+  };
 }
 
 async function stop(key: string): Promise<void> {
@@ -183,6 +259,7 @@ async function onFoldersChanged(event: vscode.WorkspaceFoldersChangeEvent): Prom
     channels.get(key)?.dispose();
     channels.delete(key);
     reported.delete(key);
+    suggested.delete(key);
   }
   // Added folders start lazily, the same as the ones that were there at startup.
 }

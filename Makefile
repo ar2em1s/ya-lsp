@@ -56,6 +56,11 @@ MIN_FILE_LINES ?= 90
 #                    prevent is macOS's vestigial 2.6 answering for a 4.0 project.
 #   bundler.rs       Gemfile.lock -> sources and specs. Pure text, no I/O, so there is nothing it
 #                    cannot be asked; mis-parse a line and those gems are silently not indexed.
+#   code_actions.rs  the second module that writes, and it is on this list for `rename.rs`'s
+#                    reason rather than for a new one: the failure is not a bad answer but a
+#                    broken buffer. Every guard in it is a *refusal*, so an untested one is an
+#                    action still being offered where it should not be — which is invisible
+#                    until somebody applies it.
 #   render.rs        the one place a construct is spelled for a human, shared by hover, the
 #                    outline and the picker. `is_nameable` shipped a page of anonymous classes.
 #                    It now also owns RDoc's markup -> markdown, which is the same shape of
@@ -72,7 +77,7 @@ MIN_FILE_LINES ?= 90
 #   messages.rs      every sentence a user reads. Pure formatting with no I/O, so like
 #                    bundler.rs there is nothing it cannot be asked. Lines are the whole gate
 #                    here — the file has no branch regions at all — and lines are exactly what
-#                    catches the failure item 6 exists to prevent: an arm of a message that
+#                    catches the failure it exists to prevent: an arm of a message that
 #                    ships without one test having read it. The enumeration test guards the set
 #                    of messages; only this guards the insides of one.
 #   rename.rs        the only module in the crate that *writes*. Every other wrong answer shows
@@ -85,6 +90,44 @@ MIN_FILE_LINES ?= 90
 #                    occurrences is seen the first time anybody looks, and the same bug behind a
 #                    rename writes over the wrong one. The second question was already yes; this
 #                    release is what turned the first one.
+#   erb.rs           the Ruby view of a template. Every offset in the file depends on it, and
+#                    the way it goes wrong is that a byte moves: ruby-lsp's own scanner pads by
+#                    character, which shortens the buffer once per accent and three times per
+#                    emoji and puts every answer below on the wrong column — silently, and only
+#                    for people who do not write their markup in English. Pure bytes in, bytes
+#                    out, no I/O and no platform, so like bundler.rs there is nothing it cannot
+#                    be asked; it landed at 100 of lines *and* branches on its first release.
+#   synthesized.rs   where a declaration ya-lsp wrote itself was really declared. The whole of
+#                    what stands between a generated declaration and a jump into a file that
+#                    does not exist, and both ways it goes wrong are silent: a mapping that
+#                    points at the wrong span opens the wrong line confidently, and one that
+#                    answers where it should have withheld opens nothing at all. Every
+#                    generated declaration in the release goes through one function here. Pure
+#                    lookups over a map, no I/O and no platform, like bundler.rs — and
+#                    `generated_uri` is deliberately total rather than fallible, so there is no
+#                    unreachable arm to make 100 impossible. It landed at 100 of lines *and*
+#                    branches on its first release.
+#   generated.rs     the RBS this crate writes, and where each declaration in it came from.
+#                    Thirty lines of builder, and `append` shifts every span in one generator's
+#                    output by the length of another's — off by one there is a jump that opens
+#                    the wrong line confidently, which is the same failure synthesized.rs is on
+#                    this list for, one layer earlier. Pure string building, no I/O.
+#   structs.rs       `Struct.new` and `Data.define`, and the same argument rails/ is here for
+#                    with the Rails word taken out: it decides which constant a member hangs on
+#                    and which name it is, both of them by reading a literal, and both failures
+#                    are silent — a member on the wrong constant answers confidently about a
+#                    class the user is not looking at, and a call it declines looks exactly like
+#                    a project that writes no structs. Pure text and no I/O, like bundler.rs.
+#   rails/           the *whole* of what ya-lsp knows about Rails — which is the reason it is
+#                    one directory and the reason every file of it is on this list: a
+#                    convention that reaches the wrong class answers confidently and wrongly
+#                    about the file the user is looking at, and a convention that reaches
+#                    nothing looks exactly like a project that does not follow it. Pure text
+#                    and no I/O, like bundler.rs, so there is nothing any of them cannot be
+#                    asked. `rails/mod.rs` is deliberately *not* listed: it is the convention
+#                    tables and the `pub use` list, so it has no executable line and
+#                    `llvm-cov` emits no row for it — and a floor whose path is not in the
+#                    report is an error here, on purpose.
 #
 # Deliberately *not* here, so the next reader does not re-litigate it:
 #   signatures.rs    highest blast radius in the crate — a bug indexed 7 of Array's 197 methods
@@ -94,6 +137,15 @@ MIN_FILE_LINES ?= 90
 #                    residual gap is a 64-deep nesting walk no Ruby file produces.
 #   progress.rs      already at 100, but a stream left open is a visible spinner, not a silent
 #                    wrong answer. Being at 100 is not by itself a reason to be on this list.
+#   analysis/synthesize.rs  the pass itself. Its residual is three lines and one arm, none
+#                    reachable: `workspace_relative`'s `to_path()` failing, which a `DocUri`
+#                    cannot do by construction, and the two arguments of the settle's
+#                    `tracing::debug!`, which the macro evaluates only when that level is on.
+#                    98.75 of lines and 98.00 of branches.
+#   annotations.rs   pure text like rails/ and it answers the first question yes — but its
+#                    residual line is a match arm over Prism's keyword-parameter list, which
+#                    holds exactly two node kinds and cannot hold a third. Not reachable, so
+#                    not listed; it sits at 99.7 of lines and 100 of branches.
 COVERAGE_FLOORS ?= \
   analysis/position.rs=100:100 \
   analysis/ranges.rs=100 \
@@ -102,7 +154,24 @@ COVERAGE_FLOORS ?= \
   analysis/render.rs=100:100 \
   messages.rs=100 \
   analysis/rename.rs=100:100 \
+  analysis/code_actions.rs=100:100 \
   analysis/scopes.rs=100:100 \
+  analysis/erb.rs=100:100 \
+  analysis/structs.rs=100:100 \
+  workspace/rails/conventions.rs=100:100 \
+  workspace/rails/inflect.rs=100:100 \
+  workspace/rails/schema.rs=100:100 \
+  workspace/rails/structure.rs=100:100 \
+  workspace/rails/attributes.rs=100:100 \
+  workspace/rails/models.rs=100:100 \
+  workspace/rails/delegates.rs=100:100 \
+  workspace/rails/enums.rs=100:100 \
+  workspace/rails/entrypoints.rs=100:100 \
+  workspace/rails/routes.rs=100:100 \
+  workspace/rails/syntax.rs=100:100 \
+  workspace/rails/tail.rs=100:100 \
+  analysis/synthesized.rs=100:100 \
+  generated.rs=100:100 \
   workspace/uri.rs=100 \
   workspace/config.rs=100:100 \
   workspace/bundler.rs=100:100 \
@@ -259,7 +328,7 @@ coverage-clean:
 CANARY_REPO     ?= https://github.com/lobsters/lobsters.git
 CANARY_SHA      ?= 6d15d8f118e305b1de5190662a9651bf90132784
 CANARY_DIR      ?= tmp/lobsters
-CANARY_FILES    ?= 476
+CANARY_FILES    ?= 606
 CANARY_WARNINGS ?= 14
 CANARY_MAX_MS   ?= 500
 

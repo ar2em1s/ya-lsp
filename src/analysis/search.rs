@@ -29,6 +29,7 @@ use rubydex::{
 use super::{
     locator::{self, Site},
     render, symbols,
+    synthesized::Synthesized,
 };
 
 /// One search result, ready to be turned into an LSP symbol once its file has been read.
@@ -53,12 +54,18 @@ pub struct Hit {
 /// of ids rather than a URI predicate because it is consulted once per *definition* of every
 /// candidate, and at gem scale that is a six-figure number of string comparisons per keystroke.
 #[must_use]
-pub fn search(graph: &Graph, query: &str, limit: usize, own: &HashSet<UriId>) -> Vec<Hit> {
+pub fn search(
+    graph: &Graph,
+    synthesized: &Synthesized,
+    query: &str,
+    limit: usize,
+    own: &HashSet<UriId>,
+) -> Vec<Hit> {
     if limit == 0 {
         return Vec::new();
     }
 
-    let mut ranked: Vec<Ranked> = query::declaration_search(graph, query, &MatchMode::Fuzzy)
+    let mut ranked: Vec<Ranked> = query::declaration_search(graph, &[query], &MatchMode::Fuzzy)
         .into_iter()
         .filter_map(|id| {
             let declaration = graph.declarations().get(&id)?;
@@ -107,7 +114,7 @@ pub fn search(graph: &Graph, query: &str, limit: usize, own: &HashSet<UriId>) ->
                 tags: definition
                     .is_deprecated()
                     .then(|| vec![SymbolTag::DEPRECATED]),
-                site: locator::site(graph, definition)?,
+                site: locator::site(graph, synthesized, definition)?,
             })
         })
         .collect()

@@ -39,13 +39,19 @@ const GEM_FILE_LINES: usize = 800;
 /// The buffer the debounce test types into, and how many questions it asks about it.
 ///
 /// Both are sized so that answering all of them takes several times [`RESOLVE_DEBOUNCE`] —
-/// ~890 ms against 150, six deep, with the deadline falling on the fourth answer here. The
+/// ~1.5 s against 500, three deep, with the deadline falling around the sixteenth answer. The
 /// margin only ever runs one way: a slower machine reaches the deadline *earlier* in the
 /// sequence, and the assertion is only that it is reached somewhere inside it. The first answer
 /// always precedes it, whatever the machine, because the timer is armed by the `didOpen`
 /// immediately before them.
+///
+/// **Sized against [`RESOLVE_DEBOUNCE`].** Half as many requests would fit under two deadlines
+/// rather than six, and a machine three times quicker would answer the lot before the deadline
+/// fell at all. That fails loudly rather than passing vacuously — the assertion is that
+/// diagnostics arrive *among* the answers — but a test depending on a constant has to be re-read
+/// when the constant moves.
 const FOLD_BLOCKS: usize = 12_000;
-const FOLD_REQUESTS: usize = 24;
+const FOLD_REQUESTS: usize = 40;
 
 /// How many questions the editor asks while the bundle is going in.
 ///
@@ -53,6 +59,23 @@ const FOLD_REQUESTS: usize = 24;
 /// on its own it would only show that the *first* batch yielded; every one after it is asked
 /// from inside the index, which is the claim. Four against the twelve that fit.
 const ROUND_TRIPS: usize = 4;
+
+/// How many methods the file the semantic-token measurement runs against carries.
+///
+/// Five lines each, so ~10,000 lines — comfortably past the largest file in the Rails
+/// application the canary opens, which is 1,116. A measurement taken on a file nobody has is
+/// still the right one here: the question is whether a whole-document request at typing speed
+/// can block the loop, and the answer only becomes interesting above the sizes that exist.
+const TOKEN_FILE_METHODS: usize = 2_000;
+
+/// The ceiling on a `semanticTokens/full` answer over [`TOKEN_FILE_METHODS`] methods.
+///
+/// A canary's ceiling rather than a benchmark's: what it exists to catch is an accidental
+/// quadratic — a change in *kind* — while a shared CI runner with a cold page cache moves the
+/// number by a small multiple. Over ~10,000 lines the answer takes about 25 ms in a debug build
+/// and 5 ms in a release one, and a request queued behind it a few ms more. The ceiling is twenty
+/// times the debug number, because that is the build the suite runs in.
+const TOKEN_CEILING: Duration = Duration::from_millis(500);
 
 /// A workspace with gems and Ruby's own signatures off, as `Harness` builds one and for the
 /// same reason: ~800 files of signature work nothing here is asking about.
@@ -287,6 +310,106 @@ impl Drop for Threaded {
     }
 }
 
+/// A file of `TOKEN_FILE_METHODS` methods, each with a local, a parameter and two calls in it.
+fn a_large_file() -> String {
+    (0..TOKEN_FILE_METHODS)
+        .map(|n| format!("def method_{n}(scale)\n  size = scale.abs\n  size.to_s\nend\n\n"))
+        .collect()
+}
+
+#[test]
+fn semantic_tokens_for_a_large_file_and_what_it_costs_the_request_behind_it() {
+    // This request ships on a stated precondition — it is a whole-file answer at
+    // typing speed on a loop that serialises everything, and there was no harness that could
+    // ask what that costs. This is that harness, and this is that question.
+    //
+    // **The number that matters is not this request's latency but what it does to the next
+    // one.** The loop answers in order, so everything queued behind a whole-file request waits
+    // for the whole of it — and an editor sends `semanticTokens/full` on every edit, while the
+    // user is still typing. So a cheap request goes into the queue with it, before the thread
+    // has looked at either, and the claim is that it is not made slow: it waits for the tokens
+    // answer, which is bounded, and then costs what it always costs.
+    let root = project();
+    let source = a_large_file();
+    let uri = write(root.path(), "app/big.rb", &source);
+    let mut server = Threaded::start(root);
+    server.open(&uri, &source);
+
+    let document = json!({ "textDocument": { "uri": uri.as_str() } });
+    // One round trip first, so what is measured is the request rather than the thread getting
+    // to the buffer for the first time.
+    server.ask("textDocument/foldingRange", document.clone());
+
+    let started = Instant::now();
+    let tokens = server.request("textDocument/semanticTokens/full", document.clone());
+    let behind = server.request(
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": { "uri": uri.as_str() },
+            "positions": [{ "line": 1, "character": 3 }],
+        }),
+    );
+
+    let answer = server
+        .response(&tokens)
+        .response_result
+        .expect("handlers never error");
+    let answered = started.elapsed();
+    server.response(&behind);
+    let queued = started.elapsed();
+
+    let data = answer["data"].as_array().expect("token data");
+    // Five numbers per token, and seven tokens per method: the name it is defined under, its
+    // parameter, the parameter read, two calls and two reads of the local.
+    assert_eq!(data.len(), TOKEN_FILE_METHODS * 7 * 5, "{}", data.len());
+    // The head-of-line bound: this is what every request queued behind it waits.
+    assert!(
+        answered < TOKEN_CEILING,
+        "{TOKEN_FILE_METHODS} methods took {answered:.2?} to colour"
+    );
+    // And the request behind it then runs at its own speed rather than at a degraded one.
+    assert!(
+        queued - answered < TOKEN_CEILING,
+        "the request behind it then took {:.2?} of its own",
+        queued - answered
+    );
+    server.join();
+}
+
+#[test]
+fn a_request_queued_behind_an_edit_is_answered_against_the_edit() {
+    // A `didChange` records its edit and indexes nothing, so that a request which reads only
+    // the buffer is not queued behind an index it never reads. This is the half that
+    // makes that safe, and it is asked over the real loop: `settle` is the one thing that
+    // drains `pending_index`, and a request that reaches the graph is what forces it. The
+    // request below is sent with no gap at all, so it arrives while the debounce is still
+    // running, and must be answered against the edit anyway.
+    //
+    // **There is deliberately no latency assertion here.** The saving deferred indexing buys is
+    // large on a real workspace and small on a fixture, because the cost of indexing one
+    // document is a function of how much of the graph names it rather than of the file. A
+    // ceiling here would look like a guard and hold nothing.
+    let root = project();
+    let source = "class Person\nend\n";
+    let uri = write(root.path(), "lib/person.rb", source);
+    let mut server = Threaded::start(root);
+    server.open(&uri, source);
+
+    server.send(Task::DidChange {
+        uri: uri.clone(),
+        changes: vec![TextChange {
+            range: None,
+            text: "class Person\n  def zzz_typed\n  end\nend\n".to_owned(),
+        }],
+        version: Some(2),
+    });
+
+    let found = server.ask("workspace/symbol", json!({ "query": "zzz_typed" }));
+
+    assert_eq!(found[0]["name"], "zzz_typed", "{found}");
+    server.join();
+}
+
 #[test]
 fn the_thread_answers_a_request_that_arrived_over_the_channel() {
     // The harness, proven: a task goes in one end and the answer comes out the other, with the
@@ -409,20 +532,18 @@ fn the_editor_is_answered_while_the_bundle_is_still_going_in() {
 
 #[test]
 fn push_diagnostics_for_an_edit_wait_for_the_background_index() {
-    // Written because the harness found it, and kept because it is a trade rather than an
-    // accident — an executable note for whoever changes the priority next.
+    // A trade rather than an accident — an executable note for whoever changes the priority
+    // next.
     //
     // `step_gem_indexing` returning true `continue`s, so while there is background work and an
     // empty queue the loop never reaches `resolve_at` at all. An edit made during a cold start
     // is *indexed* immediately — the test above is that — but the resolve its debounce armed
     // does not run until the bundle is in, so the squiggle for what was typed waits with it.
     //
-    // Nothing else waits: `step_gem_indexing`'s own comment is the design, and it holds — "the
-    // next request resolves what is there", and an editor asks something after nearly every
-    // keystroke. The delay is bounded by the background index, which is a quarter of a second
-    // for a 151-gem bundle in a release build. Making the loop settle an overdue resolve before
-    // the next batch instead would cost one resolve per 150 ms of typing, and a resolve during
-    // gem indexing was measured at ~100 ms p90 — so it is a decision to take against a
+    // Nothing else waits: the next request resolves what is there, and an editor asks something
+    // after nearly every keystroke. The delay is bounded by the background index, a fraction of
+    // a second for a real bundle in a release build. Settling an overdue resolve before the next
+    // batch instead would cost one resolve per debounce of typing — a decision to take against a
     // measurement on a real bundle, not inside a test.
     let (root, gem_home, env) = project_with_a_gem();
     let uri = write(root.path(), "app/main.rb", "class Person\nend\n");
@@ -503,7 +624,8 @@ fn a_debounce_whose_deadline_passed_while_the_thread_was_busy_settles_at_once() 
     // difference: `recv_timeout` only waits when the loop reaches it with time still on the
     // clock, and when it does not, the resolve is overdue and runs now.
     //
-    // What produces that in the wild is a client that keeps the thread busy past 150 ms — here
+    // What produces that in the wild is a client that keeps the thread busy past the debounce —
+    // here
     // with `foldingRange`, which is one of the two requests deliberately exempt from settling
     // because its answer does not come from the graph, and so is the one shape of question that
     // can be asked repeatedly without either resetting the timer or discharging it. Without the

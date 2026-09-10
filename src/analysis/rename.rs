@@ -3,38 +3,37 @@
 //! # Why this module is mostly refusals
 //!
 //! Every other request ya-lsp answers is read-only: being wrong shows the user something
-//! unhelpful and they look elsewhere. A rename edits their files. Being wrong here means code
-//! that no longer runs, or — worse — code that runs and means something else, discovered
-//! whenever the branch is next opened. So the shape of this module is not "how much can be
-//! renamed" but "what can be renamed *exactly*", and everything else is declined out loud.
+//! unhelpful and they look elsewhere. A rename edits their files, so being wrong here means code
+//! that does not run, or — worse — code that runs and means something else, discovered whenever
+//! the branch is next opened. The shape of this module is therefore not "how much can be renamed"
+//! but "what can be renamed *exactly*", and everything else is declined out loud.
 //!
-//! Two things are exact, and they are the two the earlier milestones already made exact:
+//! Two things are exact:
 //!
 //! - **Locals and block parameters**, from [`scopes`](super::scopes). Prism resolves every
-//!   local-variable node to the scope it belongs to, so "every place this variable appears" is
-//!   a fact about the file rather than a text search.
+//!   local-variable node to the scope it belongs to, so "every place this variable appears" is a
+//!   fact about the file rather than a text search.
 //! - **Constants**, from the graph. rubydex's resolver links each constant reference to what it
-//!   resolves to, so `Person` inside `module HR` and `HR::Person` at the top level are known to
-//!   be one constant, and a `Person` in another namespace is known not to be.
+//!   resolves to, so `Person` inside `module HR` and `HR::Person` at the top level are known to be
+//!   one constant, and a `Person` in another namespace is known not to be.
 //!
-//! And two are declined. **Methods**, because `textDocument/references` finds a method's uses
-//! by name alone — the README says so in those words — and a rename built on that would edit
-//! `call`, `id` and `name` in hundreds of unrelated places while looking like it had worked.
-//! **Instance variables**, because `@name` is exact inside one class body and stops being exact
-//! the moment a subclass or an included module writes the same name.
+//! Two are declined. **Methods**, because `textDocument/references` finds a method's uses by name
+//! alone, and a rename built on that would edit `call`, `id` and `name` in hundreds of unrelated
+//! places while looking like it had worked. **Instance variables**, because `@name` is exact
+//! inside one class body and stops being exact the moment a subclass or an included module writes
+//! the same name.
 //!
 //! # The guard that makes it safe
 //!
 //! A plan is a list of byte spans, and *every span is checked against the bytes it is about to
 //! replace* before a single edit is emitted. That check is not defensive padding; it fires on
-//! ordinary Ruby. rubydex promotes `Error = Class.new(StandardError)` to a class whose name
-//! span is the **entire assignment**, so a rename that trusted the span would replace
+//! ordinary Ruby. rubydex promotes `Error = Class.new(StandardError)` to a class whose name span
+//! is the **entire assignment**, so a rename that trusted the span would replace
 //! `Error = Class.new(StandardError)` with `Failure` and delete the class along with the name.
-//! [`narrow`] is what turns that into a correct one-word edit, and what refuses when it cannot.
+//! [`narrow`] turns that into a correct one-word edit, and refuses when it cannot.
 //!
-//! The consequence worth stating: a refusal is always whole. There is no path here that edits
-//! some of the places a name is written and not the rest, because a half-applied rename is the
-//! one outcome worse than no rename at all.
+//! A refusal is always whole. No path here edits some of the places a name is written and not the
+//! rest, because a half-applied rename is the one outcome worse than no rename at all.
 
 use std::collections::HashSet;
 
@@ -44,6 +43,7 @@ use rubydex::model::{declaration::Declaration, graph::Graph, ids::UriId};
 use super::{
     locator::{self, Located, Target},
     references, render, scopes,
+    synthesized::Synthesized,
 };
 use crate::messages;
 
@@ -81,13 +81,20 @@ pub enum Plan {
 /// `uri` is the document's URI as the graph spells it, which is what the edits for a local
 /// carry: those never leave the file, so there is no lookup to do for them.
 #[must_use]
-pub fn plan(graph: &Graph, uri: &str, source: &str, offset: u32, own: &HashSet<UriId>) -> Plan {
+pub fn plan(
+    graph: &Graph,
+    synthesized: &Synthesized,
+    uri: &str,
+    source: &str,
+    offset: u32,
+    own: &HashSet<UriId>,
+) -> Plan {
     // The scope walk is asked first, for the reason `highlight` asks it first: it is the half
     // that can say no, claiming the cursor only when the cursor really is on a variable.
     if let Some((name, occurrences)) = scopes::variable(source, offset) {
         return variable(uri, source, &name, &occurrences);
     }
-    constant(graph, UriId::from(uri), offset, own)
+    constant(graph, synthesized, UriId::from(uri), offset, own)
 }
 
 /// A local, a parameter or an instance variable.
@@ -143,17 +150,28 @@ fn is_shorthand(source: &str, end: u32) -> bool {
 }
 
 /// A constant, or something the graph resolves that is not one.
-fn constant(graph: &Graph, uri_id: UriId, offset: u32, own: &HashSet<UriId>) -> Plan {
+fn constant(
+    graph: &Graph,
+    synthesized: &Synthesized,
+    uri_id: UriId,
+    offset: u32,
+    own: &HashSet<UriId>,
+) -> Plan {
     // As in goto-definition and references: several targets can share the narrowest span, so
     // take the first that has something to say rather than the first that exists.
     locator::locate(graph, uri_id, offset)
         .into_iter()
-        .find_map(|located| decide(graph, &located, own))
+        .find_map(|located| decide(graph, synthesized, &located, own))
         .unwrap_or(Plan::Nothing)
 }
 
 /// What one target comes to, or `None` to ask the next one that shares its span.
-fn decide(graph: &Graph, located: &Located<'_>, own: &HashSet<UriId>) -> Option<Plan> {
+fn decide(
+    graph: &Graph,
+    synthesized: &Synthesized,
+    located: &Located<'_>,
+    own: &HashSet<UriId>,
+) -> Option<Plan> {
     let resolution = locator::resolve(graph, located);
     if resolution.declarations.is_empty() {
         return None;
@@ -195,7 +213,7 @@ fn decide(graph: &Graph, located: &Located<'_>, own: &HashSet<UriId>) -> Option<
     // `references` already answers exactly this question, filters the fabricated references out
     // of it, and confines it to the user's own code. `include_declaration` is not optional
     // here: a rename that changes every use and not the `class` line is broken code.
-    let edits = references::find(graph, located, &resolution, own, true)
+    let edits = references::find(graph, synthesized, located, &resolution, own, true)
         .into_iter()
         .map(|reference| Edit {
             uri: reference.uri,

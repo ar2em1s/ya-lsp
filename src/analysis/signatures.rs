@@ -2,31 +2,30 @@
 //!
 //! One thing, and for one reason. rbs's `interface _Foo … end` declares a *structural* type — a
 //! shape a value can satisfy, never a namespace a method can be called on. rubydex does not model
-//! them: `visit_interface_node`'s default walks straight into the members, and rubydex overrides
+//! them: `visit_interface_node`'s default walks straight into the members and rubydex overrides
 //! it nowhere, so the members are filed on whatever lexical scope encloses the block and the
-//! interface itself never enters the graph at all. `workspace/symbol "_Range"` finds nothing.
+//! interface itself never enters the graph. `workspace/symbol "_Range"` finds nothing.
 //!
-//! What is left is orphaned methods with no way to tell them apart from real ones, and the scope
-//! they land in is usually `Object` — every receiver's ancestor. Measured against rbs 4.1.3: 99
-//! `interface` blocks across 31 files, and on an instance receiver they were most of a band of
-//! 30 rows sitting between the class's own methods and `Kernel`'s. `"hi".begin`,
-//! `"hi".exclude_end?`, `4.each_entry` — none of which exist.
+//! What is left is orphaned methods with no way to tell them apart from real ones, in a scope
+//! that is usually `Object` — every receiver's ancestor. Ruby's own signatures hold enough
+//! `interface` blocks to put a band of invented rows between a class's own methods and
+//! `Kernel`'s: `"hi".begin`, `"hi".exclude_end?`, `4.each_entry`, none of which exist.
 //!
 //! # Why the text is edited rather than the answers filtered
 //!
-//! The obvious fix is to drop these where completion builds its list. It is also incomplete: the
-//! same declarations are `workspace/symbol` results and goto-definition targets, and for `rand`
-//! the *first* target offered was `interface _Rand` in `core/array.rbs`. A filter would have to
-//! be repeated in three modules and remembered in a fourth.
+//! Dropping these where completion builds its list is the obvious fix and an incomplete one: the
+//! same declarations are `workspace/symbol` results and goto-definition targets — for `rand` the
+//! *first* target offered is `interface _Rand` in `core/array.rbs`. A filter would have to be
+//! repeated in three modules and remembered in a fourth.
 //!
 //! Removing the text is one rule in one place — **ya-lsp does not index RBS interfaces** — and
 //! costs nothing per request. Every byte of the block is replaced with a space except its
 //! newlines, so every offset and every line number in the rest of the file is exactly what it was
-//! and everything else in it still resolves, hovers and navigates.
+//! and everything else still resolves, hovers and navigates.
 //!
 //! Nothing is lost by it. RBS reaches an interface's methods through `include _Foo`, and rbs's own
-//! core and stdlib contain no such include — nor could rubydex resolve one, since it has no
-//! declaration to resolve it to.
+//! core and stdlib contain no such include — nor could rubydex resolve one, having no declaration
+//! to resolve it to.
 
 use ruby_rbs::node::{InterfaceNode, Node, Visit, parse};
 
@@ -53,11 +52,10 @@ pub fn without_interfaces(source: &str) -> Option<String> {
     }
     let edited = blank(source, &spans.0)?;
 
-    // The guard, and it is not paranoia — the first version of this shipped a `core/array.rbs`
-    // that rbs refused with "cannot start a declaration", because a block's `%a{…}` annotations
-    // sit *outside* the span its node reports and were left with nothing to annotate. rubydex
-    // then indexed none of the file and `[].` offered seven methods instead of a hundred and
-    // fifty, silently, through a green suite.
+    // The guard, and it is not paranoia. A block's `%a{…}` annotations sit *outside* the span
+    // its node reports, so blanking the block alone leaves them with nothing to annotate and rbs
+    // refuses the file with "cannot start a declaration". rubydex then indexes none of it and
+    // `[].` offers seven methods instead of a hundred and fifty, silently.
     //
     // Editing a file that a parser has to read afterwards is only safe if the parser agrees, so
     // it is asked. A file this cannot improve keeps its interfaces, which is where it started.
@@ -187,9 +185,8 @@ end
 
     #[test]
     fn an_annotation_goes_with_the_block_it_annotates() {
-        // `core/array.rbs` writes exactly this, and the first version of this module left the
-        // `%a{…}` behind: rbs then refused the whole file with "cannot start a declaration" and
-        // rubydex indexed none of `Array`.
+        // `core/array.rbs` writes exactly this. Leaving the `%a{…}` behind makes rbs refuse the
+        // whole file with "cannot start a declaration", and rubydex then indexes none of `Array`.
         let source = "\
 %a{deprecated: Use Array::_Rand, or make your own}
 interface _Rand

@@ -30,7 +30,7 @@ this repository, the obligation attaches and `THIRD-PARTY-NOTICES.txt` is where 
 Usage (the numbers live in the `Makefile`, so a local run and the CI run cannot disagree):
 
     python3 scripts/canary.py --repo tmp/lobsters --server target/release/ya-lsp \
-        --files 476 --parse-warnings 14 --max-index-ms 500
+        --files 606 --parse-warnings 14 --max-index-ms 500
 """
 
 import argparse
@@ -61,7 +61,7 @@ class Server:
     def __init__(self, binary, repo):
         env = dict(os.environ)
         # The one line this driver needs is INFO, and raising the level further would bury it in
-        # a per-file debug stream on a 476-file workspace.
+        # a per-file debug stream on a 606-file workspace.
         env["YA_LSP_LOG"] = "ya_lsp=info"
         self.proc = subprocess.Popen(
             [binary, "--stdio"],
@@ -276,6 +276,18 @@ def main():
         failures.append(
             f"{counts.get('parse-warning', 0)} parse-warning diagnostics, expected "
             f"{args.parse_warnings}."
+        )
+    templates = sorted(uri for uri in published if uri.endswith((".erb", ".rhtml")))
+    if templates:
+        failures.append(
+            f"{len(templates)} ERB templates published diagnostics, expected none: "
+            + ", ".join(name.rsplit("/", 1)[-1] for name in templates[:5])
+            + ". A template's parse errors are about text nobody wrote — a `yield` that is "
+            "legal in the method the template compiles to, an `end` closing a block a helper "
+            "opened — so `Analysis::collect_diagnostics` drops them. One arriving here means "
+            "either that rule stopped firing or that the scanner in `analysis/erb.rs` "
+            "regressed; `make coverage-missing F=erb` and the corpus in its module docs are "
+            "where to look."
         )
     unexpected = sorted(
         code for code in counts if code not in ("parse-error", "parse-warning")

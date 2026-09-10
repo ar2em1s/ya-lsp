@@ -4,20 +4,19 @@
 //! `tracing::warn!` line on stderr. Both are plain text — no client renders markdown in a
 //! notification — so what is written here is what is read.
 //!
-//! They lived beside the code that raised them until v0.2.0, and seventeen sites answered the
-//! same four questions independently: how to spell a setting, where to break the clause,
-//! whether to name a remedy, whether to end with a period. Two of them were the *same string
-//! written twice*. The unit of work here is the sentence rather than the feature, so the
-//! sentences live together and the rule is written down once.
+//! They live together because the unit of work is the sentence rather than the feature. Spread
+//! beside the code that raises them, every site answers the same four questions on its own — how
+//! to spell a setting, where to break the clause, whether to name a remedy, whether to end with a
+//! period — and duplicates are invisible.
 //!
 //! # The rule
 //!
 //! 1. **A setting is its dotted TOML path**: `gems.max_files`, `index.include`,
-//!    `diagnostics.rules`. Never `[gems].max_files`, never `[gems] max_files`. The dotted form
-//!    is also valid TOML, so it is something the user can paste.
-//! 2. **One colon.** It joins what happened to what follows from it — or, when another
-//!    library's error is the explanation, it introduces that error, which is then the last
-//!    thing in the message and is passed through exactly as that library wrote it.
+//!    `diagnostics.rules`. Never `[gems].max_files`, never `[gems] max_files`. The dotted form is
+//!    also valid TOML, so it is something the user can paste.
+//! 2. **One colon.** It joins what happened to what follows from it — or, when another library's
+//!    error is the explanation, it introduces that error, which is then the last thing in the
+//!    message and is passed through exactly as that library wrote it.
 //! 3. **A remedy whenever ya-lsp knows one**, as its own sentence, starting with a verb. "Run
 //!    bundle install" is the difference between a warning and a nag.
 //! 4. **A full stop at the end**, unless the message ends in a foreign error.
@@ -163,6 +162,22 @@ pub fn index_rebuilt() -> String {
      scratch: navigation and completion may answer nothing for a moment. Report it if it keeps \
      happening."
         .to_owned()
+}
+
+/// One file crashed the indexer and has been left out.
+///
+/// The sentence a user gets instead of a server that answers nothing at all. Uncontained, a
+/// panic in the indexer kills the analysis thread and the only symptom is a language server that
+/// looks like it is thinking. Naming the file is the whole point — a gap somebody can see is a
+/// gap somebody can report.
+#[must_use]
+pub fn file_not_indexed(path: &Path) -> String {
+    format!(
+        "something went wrong while reading {}, so it has been left out of the index: nothing \
+         defined in that file can be found, completed or renamed. Edit the file to have \
+         ya-lsp try it again, and report it if it keeps happening.",
+        path.display()
+    )
 }
 
 // ---------------------------------------------------------------------------- signatures
@@ -468,6 +483,11 @@ mod tests {
             ("index_truncated", index_truncated(50_000), false),
             ("index_full", index_full(50_000), false),
             ("index_rebuilt", index_rebuilt(), false),
+            (
+                "file_not_indexed",
+                file_not_indexed(Path::new("/w/app/models/story.rb")),
+                false,
+            ),
             ("cannot_watch_files", cannot_watch_files(), false),
             (
                 "no_core_signatures",

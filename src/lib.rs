@@ -10,6 +10,7 @@
 //! - [`messages`] — every sentence the server says to a user, and the rule they are written to.
 
 pub mod analysis;
+pub mod generated;
 pub mod licenses;
 pub mod messages;
 pub mod server;

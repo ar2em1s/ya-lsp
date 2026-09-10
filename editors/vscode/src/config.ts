@@ -21,6 +21,7 @@ export interface ServerOptions {
     paths?: string[];
   };
   rbs?: { enabled?: boolean; stdlib?: boolean; path?: string };
+  types?: { guess_from_names?: boolean };
   diagnostics?: { enabled?: boolean; rules?: Record<string, string> };
 }
 
@@ -129,6 +130,11 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
   }
   if (Object.keys(rbs).length > 0) {
     options.rbs = rbs;
+  }
+
+  const guessFromNames = settings.explicit<boolean>('types.guessFromNames');
+  if (typeof guessFromNames === 'boolean') {
+    options.types = { guess_from_names: guessFromNames };
   }
 
   const diagnostics: NonNullable<ServerOptions['diagnostics']> = {};

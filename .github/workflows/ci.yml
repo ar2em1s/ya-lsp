@@ -146,10 +146,10 @@ jobs:
   # number in three plans came from a driver run by hand against a Rails app that is not public,
   # so none of them was reproducible by anyone else and none had ever run unattended.
   #
-  # What it covers: own-code discovery (476 files), parsing (zero `parse-error` across a Rails
-  # app targeting Ruby 4.0.0, under the pinned ruby-prism), the diagnostics that reach a user,
-  # and a generous ceiling on the cold index. It is a canary, not a benchmark — see
-  # `scripts/canary.py`.
+  # What it covers: own-code discovery (594 files, 118 of them ERB templates), parsing (zero
+  # `parse-error` across a Rails app targeting Ruby 4.0.0, under the pinned ruby-prism), the
+  # diagnostics that reach a user — including that a template publishes none — and a generous
+  # ceiling on the cold index. It is a canary, not a benchmark — see `scripts/canary.py`.
   #
   # **It does not cover gems.** Nothing runs `bundle install` here: lobsters' bundle needs Ruby
   # 4.0.0 and a hand-built `sqlite3`, which is a large amount of CI for a project whose headline

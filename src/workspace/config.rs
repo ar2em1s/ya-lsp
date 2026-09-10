@@ -38,12 +38,18 @@ pub struct Config {
     pub index: IndexConfig,
     pub gems: GemsConfig,
     pub rbs: RbsConfig,
+    pub types: TypesConfig,
     pub diagnostics: DiagnosticsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexConfig {
     /// Globs, relative to the workspace root, of files to index.
+    ///
+    /// The default covers every shape Ruby is written in rather than only `.rb`: an application's
+    /// `Rakefile`, `Gemfile`, `config.ru`, `lib/tasks/*.rake` and its own `.gemspec` are Ruby that
+    /// defines constants and methods like any other, and `sig/**/*.rbs` is the project saying what
+    /// those methods return.
     pub include: Vec<String>,
     /// Globs, relative to the workspace root, to skip.
     pub exclude: Vec<String>,
@@ -88,7 +94,7 @@ pub struct GemsConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RbsConfig {
     /// Index Ruby's core signatures. Off means the graph holds the five built-in classes
-    /// rubydex fabricates and nothing else — which is what every release before M7 shipped.
+    /// rubydex fabricates and nothing else.
     pub enabled: bool,
     /// Also index the stdlib signatures: `Set`, `CSV`, `URI`, `Pathname`, `Logger`, and the
     /// other ~57 libraries. Measured at ~3.5 ms added to the resolve every request pays, so it
@@ -97,6 +103,20 @@ pub struct RbsConfig {
     /// An explicit rbs root — a directory holding `core/`, usually an unpacked `rbs-x.y.z` gem.
     /// Skips discovery, and skips the vendored copy.
     pub path: Option<PathBuf>,
+}
+
+/// The types ya-lsp derives, and the one rung of them a user may want silenced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypesConfig {
+    /// Answer from a receiver's own name when nothing else can: `@user` is a `User`, `person`
+    /// is a `Person`.
+    ///
+    /// The only answer ya-lsp gives that is allowed to be wrong. It is labelled as a guess
+    /// wherever it appears — a hover footnote, a completion card — and it never displaces an
+    /// answer the code states or one derived from a signature. Off leaves ya-lsp with only
+    /// checkable answers, which is a defensible thing to want and the reason the setting is
+    /// here at all.
+    pub guess_from_names: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +135,20 @@ pub struct DiagnosticsConfig {
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
-            include: vec!["**/*.rb".to_owned()],
+            // Extensions first, then the fixed names, and every one of them spelled `**/` so it
+            // matches at the root and at every depth — an engine keeps its own `Rakefile`, and a
+            // monorepo keeps a `.gemspec` per gem. `Gemfile.lock` is deliberately not here: it is
+            // data Bundler writes, `bundler.rs` reads it as text, and it is not Ruby.
+            include: vec![
+                "**/*.rb".to_owned(),
+                "**/*.erb".to_owned(),
+                "**/*.rbs".to_owned(),
+                "**/*.rake".to_owned(),
+                "**/*.gemspec".to_owned(),
+                "**/Rakefile".to_owned(),
+                "**/Gemfile".to_owned(),
+                "**/config.ru".to_owned(),
+            ],
             exclude: vec![
                 "vendor/**/*".to_owned(),
                 ".bundle/**/*".to_owned(),
@@ -151,6 +184,14 @@ impl Default for RbsConfig {
     }
 }
 
+impl Default for TypesConfig {
+    fn default() -> Self {
+        Self {
+            guess_from_names: true,
+        }
+    }
+}
+
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
@@ -182,6 +223,7 @@ pub struct PartialConfig {
     pub index: Option<PartialIndex>,
     pub gems: Option<PartialGems>,
     pub rbs: Option<PartialRbs>,
+    pub types: Option<PartialTypes>,
     pub diagnostics: Option<PartialDiagnostics>,
 }
 
@@ -211,6 +253,12 @@ pub struct PartialRbs {
     pub enabled: Option<bool>,
     pub stdlib: Option<bool>,
     pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialTypes {
+    pub guess_from_names: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -245,6 +293,9 @@ impl Config {
             if rbs.path.is_some() {
                 self.rbs.path = rbs.path;
             }
+        }
+        if let Some(types) = layer.types {
+            replace(&mut self.types.guess_from_names, types.guess_from_names);
         }
         if let Some(diagnostics) = layer.diagnostics {
             replace(&mut self.diagnostics.enabled, diagnostics.enabled);
@@ -456,6 +507,27 @@ mod tests {
         assert!(
             load(dir.path(), None).problems.is_empty(),
             "a real signature root should be silent"
+        );
+    }
+
+    #[test]
+    fn the_default_include_is_every_shape_ruby_is_written_in() {
+        // Spelled out rather than derived, because this list *is* the decision: it is what a
+        // project gets with no configuration, it is republished in the extension's manifest
+        // (`tests/vscode_manifest.rs`), and each entry becomes a file watcher the client
+        // registers. Adding one is a settings change and should read as one in the diff.
+        assert_eq!(
+            IndexConfig::default().include,
+            vec![
+                "**/*.rb",
+                "**/*.erb",
+                "**/*.rbs",
+                "**/*.rake",
+                "**/*.gemspec",
+                "**/Rakefile",
+                "**/Gemfile",
+                "**/config.ru",
+            ]
         );
     }
 

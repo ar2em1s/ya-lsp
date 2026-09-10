@@ -253,6 +253,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
+name = "cypher-parser"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ada60f869dbe5818d0ee40b06ad988627cc0d692d1ed42d692353bf0af8ddb6"
+
+[[package]]
 name = "displaydoc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -875,9 +881,8 @@ dependencies = [
 
 [[package]]
 name = "rubydex"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c0660b56f746c3b01b4ffe61ba358e07e1fa931f806f00e7eebeaaf73c89eef"
+version = "0.2.6"
+source = "git+https://github.com/Shopify/rubydex?rev=ac3bb411b571a808fb48533500a105153a7ba710#ac3bb411b571a808fb48533500a105153a7ba710"
 dependencies = [
  "bitflags 2.13.1",
  "bytecount",
@@ -885,11 +890,14 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-deque",
  "crossbeam-utils",
+ "cypher-parser",
  "glob",
  "libc",
  "line-index",
  "ruby-prism",
  "ruby-rbs",
+ "serde",
+ "toml",
  "url",
  "xxhash-rust",
 ]
@@ -1352,7 +1360,7 @@ checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "ya-lsp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",

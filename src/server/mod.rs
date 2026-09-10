@@ -229,7 +229,7 @@ fn route_notification(
         "textDocument/didChange" => {
             let params: DidChangeTextDocumentParams = parse(notification)?;
             let uri = document_uri(&params.text_document.uri)?;
-            // Incremental sync (M2): every change has to reach the analysis thread, in order.
+            // Incremental sync: every change has to reach the analysis thread, in order.
             // Each range is expressed against the text the previous change produced, so
             // keeping only the last one — which full sync allowed — would corrupt the buffer.
             let changes: Vec<TextChange> = params
@@ -577,8 +577,8 @@ mod tests {
     fn a_watched_change_to_anything_else_is_a_file_to_re_index_and_not_a_reload() {
         // A reload drops the whole graph and re-runs the gem index. Watchers belong to the
         // client and are shared across every server it runs, so a client is free to deliver
-        // changes this server never asked for — and until v0.2.0 every one of them cost a full
-        // re-index. A same-named file in a subdirectory is here for the same reason: it is not
+        // changes this server never asked for, and answering each with a full re-index would
+        // be ruinous. A same-named file in a subdirectory is here for the same reason: it is not
         // the file this workspace is configured by, so it is an ordinary path like any other.
         //
         // Whether an ordinary path is one this workspace indexes at all is decided on the
@@ -1027,10 +1027,9 @@ mod tests {
 
     #[test]
     fn the_config_watcher_is_registered_with_the_client() {
-        // The whole of item 8. Until v0.2.0 nothing in `src/` ever sent
-        // `client/registerCapability`, so `ya-lsp.toml` reloaded in exactly one editor — the one
-        // whose extension brought a watcher of its own — and the changelog's "changes take
-        // effect without a restart" was false everywhere else.
+        // Without this registration `ya-lsp.toml` reloads in exactly one editor — the one
+        // whose extension brings a watcher of its own — and "changes take effect without a
+        // restart" is false everywhere else.
         let root = workspace();
         let mut client = Client::start_with(
             root.path(),

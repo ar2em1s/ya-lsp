@@ -3,21 +3,21 @@
 //! # Two mechanisms, one request
 //!
 //! Constants are exact. rubydex's resolver links every constant reference to the declaration it
-//! resolves to and files it under that declaration, so answering is a lookup, not a search, and
-//! the result is the truth: `Foo` inside `module Bar` and `Bar::Foo` at the top level are the
-//! same reference, and a `Foo` that means something else is not in the set.
+//! resolves to and files it under that declaration, so answering is a lookup rather than a
+//! search, and the result is the truth: `Foo` inside `module Bar` and `Bar::Foo` at the top level
+//! are the same reference, and a `Foo` that means something else is not in the set.
 //!
-//! Methods are not, and cannot be. Nothing in ya-lsp infers types, so `person.name` and
-//! `response.name` are indistinguishable — there is no receiver to resolve. rubydex records
-//! method references but never links them to a declaration, so the only question we can answer
-//! is "what is spelled this way". That is genuinely useful for an unusual name and close to
-//! useless for `call`, `id`, or `name`, and the honest thing is to say so rather than to dress
-//! a grep up as an index.
+//! Methods are matched by name. rubydex records method references but never links them to a
+//! declaration, and this request stays on `locator::resolve` **on purpose** — the resolution path
+//! with no document text, which therefore derives no receiver. A work list is a list of places to
+//! edit, and a derived receiver is the one entry in it that could be wrong. So the question
+//! answered is "what is spelled this way": useful for an unusual name, close to useless for
+//! `call`, `id` or `name`, and said plainly rather than dressed up as an index.
 //!
 //! # Scope
 //!
-//! Both mechanisms are confined to the user's own code. For methods the reason is noise — a
-//! Rails bundle spells `name` tens of thousands of times and not one of those is an answer. For
+//! Both mechanisms are confined to the user's own code. For methods the reason is noise — a Rails
+//! bundle spells `name` tens of thousands of times and not one of those is an answer. For
 //! constants the reason is that the result is a work list: nobody is going to edit a gem.
 
 use std::{cmp::Reverse, collections::HashSet};
@@ -28,7 +28,10 @@ use rubydex::model::{
     ids::{DeclarationId, StringId, UriId},
 };
 
-use super::locator::{self, Located, Resolution, Target};
+use super::{
+    locator::{self, Located, Resolution, Target},
+    synthesized::Synthesized,
+};
 
 /// One place a name appears.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,6 +55,7 @@ pub struct Reference {
 #[must_use]
 pub fn find(
     graph: &Graph,
+    synthesized: &Synthesized,
     located: &Located<'_>,
     resolution: &Resolution,
     scope: &HashSet<UriId>,
@@ -79,7 +83,12 @@ pub fn find(
     // A redirected resolution is deliberately not the declaration of the name under the cursor
     // — `Foo.new` answers with `Foo#initialize` — so it has no declaration site to add here.
     if include_declaration && !resolution.redirected {
-        found.extend(declaration_sites(graph, &resolution.declarations, scope));
+        found.extend(declaration_sites(
+            graph,
+            synthesized,
+            &resolution.declarations,
+            scope,
+        ));
     }
 
     // References arrive per declaration and per document, in hash order. Sorting makes the list
@@ -170,12 +179,13 @@ fn by_name(graph: &Graph, names: &[StringId], scope: &HashSet<UriId>) -> Vec<Ref
 /// Where the declarations themselves are written, for `includeDeclaration`.
 fn declaration_sites(
     graph: &Graph,
+    synthesized: &Synthesized,
     declarations: &[DeclarationId],
     scope: &HashSet<UriId>,
 ) -> Vec<Reference> {
     declarations
         .iter()
-        .flat_map(|id| locator::sites(graph, *id))
+        .flat_map(|id| locator::sites(graph, synthesized, *id))
         .filter(|site| scope.contains(&UriId::from(site.uri.as_str())))
         .map(|site| Reference {
             uri: site.uri,
@@ -238,10 +248,9 @@ fn at(graph: &Graph, uri_id: UriId, offset: &rubydex::offset::Offset) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rubydex::{
-        indexing::{self, LanguageId},
-        resolution::Resolver,
-    };
+    use rubydex::{indexing::LanguageId, resolution::Resolver};
+
+    use super::super::indexer;
 
     /// Every declaration whose name ends in `suffix`, in a graph built from one source.
     fn declarations_named(graph: &Graph, suffix: &str) -> Vec<DeclarationId> {
@@ -260,12 +269,12 @@ mod tests {
         // call site for an answer already known. Two classes defining `shout` is the ordinary
         // way a resolution comes to hold more than one declaration of one name.
         let mut graph = Graph::new();
-        indexing::index_source(
+        assert!(indexer::index_source(
             &mut graph,
             "file:///fixture/hr.rb",
             "class Person\n  def shout\n  end\nend\n\nclass Siren\n  def shout\n  end\nend\n",
-            &LanguageId::Ruby,
-        );
+            &LanguageId::Ruby
+        ));
         Resolver::new(&mut graph).resolve();
 
         let shouts = declarations_named(&graph, "#shout()");

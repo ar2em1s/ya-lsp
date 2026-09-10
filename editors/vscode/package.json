@@ -2,7 +2,7 @@
   "name": "yalsp",
   "displayName": "ya-lsp",
   "description": "A standalone Ruby language server. No Ruby runtime required.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "MIT",
   "icon": "images/logo.png",
   "publisher": "ar2em1s",
@@ -24,7 +24,8 @@
   },
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onLanguage:ruby"
+    "onLanguage:ruby",
+    "onLanguage:erb"
   ],
   "contributes": {
     "configuration": [
@@ -146,8 +147,21 @@
         }
       },
       {
-        "title": "Problems",
+        "title": "Types",
         "order": 4,
+        "properties": {
+          "ya-lsp.types.guessFromNames": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Answer from a receiver's own name when nothing else can — `@user` is a `User`, `person` is a `Person`. The only answer ya-lsp gives that is allowed to be wrong: it is always labelled as a guess in the hover card and on a completion row, and it never displaces a type the code states or one derived from a signature or an assignment. Turn it off to keep only checkable answers. Overridden by `[types] guess_from_names` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 1
+          }
+        }
+      },
+      {
+        "title": "Problems",
+        "order": 5,
         "properties": {
           "ya-lsp.diagnostics.enabled": {
             "type": "boolean",
@@ -367,12 +381,19 @@
             ],
             "scope": "resource",
             "order": 2
+          },
+          "ya-lsp.rubocop.hint": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Offer RuboCop's own extension once, in a project that has a `.rubocop.yml` or `rubocop` in its `Gemfile.lock`. ya-lsp never runs Ruby, so no cop offence and no autocorrect ever comes from it — RuboCop publishes a language server of its own, and it runs alongside ya-lsp rather than instead of it. Off, nothing is suggested and nothing else changes.",
+            "scope": "resource",
+            "order": 3
           }
         }
       },
       {
         "title": "Indexing",
-        "order": 5,
+        "order": 6,
         "properties": {
           "ya-lsp.index.include": {
             "type": "array",
@@ -380,9 +401,16 @@
               "type": "string"
             },
             "default": [
-              "**/*.rb"
+              "**/*.rb",
+              "**/*.erb",
+              "**/*.rbs",
+              "**/*.rake",
+              "**/*.gemspec",
+              "**/Rakefile",
+              "**/Gemfile",
+              "**/config.ru"
             ],
-            "markdownDescription": "Globs, relative to the workspace folder, of the files to index. Everything ya-lsp knows about your code comes from these, so narrowing it is the quickest way to make navigation stop working. Overridden by `[index] include` in a workspace `ya-lsp.toml`.",
+            "markdownDescription": "Globs, relative to the workspace folder, of the files to index. Everything ya-lsp knows about your code comes from these, so narrowing it is the quickest way to make navigation stop working. The default covers Ruby that is not named `.rb` — your `Rakefile`, `Gemfile`, `config.ru`, `lib/tasks/*.rake` and your own `.gemspec` — and the RBS signatures in `sig/`. Overridden by `[index] include` in a workspace `ya-lsp.toml`.",
             "scope": "resource",
             "order": 1
           },
@@ -430,6 +458,19 @@
             "order": 5
           }
         }
+      }
+    ],
+    "languages": [
+      {
+        "id": "erb",
+        "aliases": [
+          "ERB",
+          "Embedded Ruby"
+        ],
+        "extensions": [
+          ".erb",
+          ".rhtml"
+        ]
       }
     ],
     "commands": [

@@ -1,59 +1,51 @@
 //! What a file's *shape* is: what expanding the selection reaches, and what folds.
 //!
-//! # Why the two live together
-//!
 //! Both are pure functions of one buffer, both walk Prism outwards from something, and neither
-//! ever asks the graph a question — so the fourth direct use of Prism, after `cursor`, `requires`
-//! and `scopes`, is one module rather than two.
+//! ever asks the graph — so the fourth direct use of Prism, after `cursor`, `requires` and
+//! `scopes`, is one module rather than two.
 //!
-//! # What each replaces
-//!
-//! Expand-selection has no fallback at all: in a Ruby file the command does nothing today, so
-//! anything correct is an improvement. Folding does have one, and a decent one — VS Code guesses
-//! from indentation, and on well-formatted Ruby it guesses right most of the time. What it cannot
-//! see is what this is for: a heredoc's body, a literal whose closing bracket is outdented,
-//! `if`/`elsif`/`else` as three regions rather than one, a run of comment lines, and `#region`
-//! markers, which an indentation guess has no concept of at all.
+//! Expand-selection has no fallback: in a Ruby file the command does nothing without a provider.
+//! Folding has a decent one — VS Code guesses from indentation and is usually right on
+//! well-formatted Ruby — so this exists for what that guess cannot see: a heredoc's body, a
+//! literal whose closing bracket is outdented, `if`/`elsif`/`else` as three regions rather than
+//! one, a run of comment lines, and `#region` markers.
 //!
 //! # `end` stays on screen
 //!
 //! A collapsed range hides the lines *after* its first, so a `def` whose range ended on its `end`
 //! keyword would hide the keyword, and a folded `def foo` with nothing closing it reads as broken
-//! code rather than as folded code. Every range here therefore ends on the last line of the
-//! construct's **body**, never on its closer — which is also why a single-line construct produces
-//! no range at all: `def foo; end` would hide nothing and leave a chevron that does nothing when
-//! clicked.
+//! code rather than folded code. Every range therefore ends on the last line of the construct's
+//! **body**, never on its closer — which is also why a single-line construct produces no range:
+//! `def foo; end` would hide nothing and leave a chevron that does nothing.
 //!
 //! # Locations that do not nest
 //!
 //! A selection chain is *defined* by every link containing the one before it, and Prism's error
 //! recovery hands out locations that do not — the trap [`locator::spans`] exists for, and
-//! [`locator::nests`] is the one predicate both of them ask. Half-written code is the normal state
-//! of a buffer, so the chain is built by filtering rather than by trusting the parser, and every
-//! span is clamped to the buffer before it is measured.
+//! [`locator::nests`] is the one predicate both ask. Half-written code is the normal state of a
+//! buffer, so the chain is built by filtering rather than by trusting the parser, and every span
+//! is clamped to the buffer before it is measured.
 //!
 //! # What is a step here, and what is not
 //!
-//! The steps this adds are the ones *Ruby* has and a generic walk misses: a string's contents
-//! before its quotes, one argument before the argument list, a body before the construct that
-//! opens it, and a message and its receiver before the next call in a chain. What it deliberately
-//! does not add is the name in an assignment — `value` inside `value = 1`. That is not a step a
-//! generic walk misses; it is exactly what a word-based one finds, every client that has an
-//! expand-selection command already merges such a provider in, and Prism spells it across twenty
-//! node types with no accessor in common. Steps that are free elsewhere are not worth a hundred
-//! lines here.
+//! The steps added are the ones *Ruby* has and a generic walk misses: a string's contents before
+//! its quotes, one argument before the argument list, a body before the construct that opens it,
+//! and a message and its receiver before the next call in a chain. What is deliberately not added
+//! is the name in an assignment — `value` inside `value = 1`. That is exactly what a word-based
+//! provider finds, every client merges one in already, and Prism spells it across twenty node
+//! types with no accessor in common.
 //!
-//! # Prism's visitor has thirteen holes, and they are not obscure ones
+//! # Prism's visitor has thirteen holes
 //!
 //! `Visit::visit` announces each node through `visit_branch_node_enter` before dispatching, which
-//! is the generic hook the selection walk is built on. But thirteen node kinds are reached by
-//! their *typed* method instead — `visit_arguments_node`, `visit_statements_node` and eleven
-//! more — and for those the hook never fires. Those first two are "one argument before the whole
-//! argument list" and "a block's body before the block", which is to say the two steps the item
-//! this module exists for names by hand. Twelve are overridden below to announce themselves and
-//! then defer, so the walk underneath stays Prism's own. The thirteenth is `BlockArgumentNode`,
-//! which arrives that way only from an index assignment carrying a block — `a[&b] = 1`, which
-//! Ruby's own parser rejects — so it is left alone rather than written and never run.
+//! is the generic hook the selection walk is built on. Thirteen node kinds are reached by their
+//! *typed* method instead — `visit_arguments_node`, `visit_statements_node` and eleven more — and
+//! for those the hook never fires. The first two are "one argument before the whole argument
+//! list" and "a block's body before the block", which are two of the steps this module exists
+//! for. Twelve are overridden below to announce themselves and then defer, so the walk underneath
+//! stays Prism's own. The thirteenth is `BlockArgumentNode`, reached that way only from an index
+//! assignment carrying a block — `a[&b] = 1`, which Ruby's own parser rejects — so it is left
+//! alone rather than written and never run.
 
 use lsp_types::{FoldingRange, FoldingRangeKind, SelectionRange};
 use ruby_prism::{

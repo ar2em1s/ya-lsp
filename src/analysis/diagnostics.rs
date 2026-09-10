@@ -3,19 +3,18 @@
 //! # These are indexer diagnostics, not linter diagnostics
 //!
 //! Only `parse-error` and `parse-warning` are statements about the user's code. The rest are
-//! rubydex telling us *it* gave up: `class Foo < base` is perfectly good Ruby, but it is not
-//! statically resolvable, so rubydex records `dynamic-ancestor` and moves on. Squiggling that by
-//! default would put permanent warnings on correct code — the fastest way to get a language
-//! server uninstalled — so those rules ship `Off` and are opt-in through `[diagnostics.rules]`.
-//! They stay reportable because they are the only signal that explains *why* navigation fails
-//! at a given spot.
+//! rubydex saying *it* gave up: `class Foo < base` is perfectly good Ruby but is not statically
+//! resolvable, so rubydex records `dynamic-ancestor` and moves on. Squiggling that by default
+//! would put permanent warnings on correct code — the fastest way to get a language server
+//! uninstalled — so those rules ship `Off` and are opt-in through `[diagnostics.rules]`. They
+//! stay reportable because they are the only signal that explains *why* navigation fails at a
+//! given spot.
 //!
-//! With these defaults solargraph reports 14 diagnostics instead of 399, and every one of the
-//! 14 is real. Two results drove the table: `dynamic-ancestor` alone would have put 384
-//! warnings on working code, and *every* `undefined-method-visibility-target` hit was
-//! `private_class_method :new` — standard Ruby that rubydex flags only because it does not
-//! model the implicit `Class#new`. A check with no measured true positives does not earn a
-//! squiggle, so both resolution rules ship off until M3 completes the graph.
+//! Two measurements set the table. `dynamic-ancestor` alone accounts for the overwhelming
+//! majority of what a real Rails workspace would report, every one of them on working code; and
+//! *every* `undefined-method-visibility-target` hit is `private_class_method :new` — standard
+//! Ruby that rubydex flags only because it does not model the implicit `Class#new`. A check with
+//! no measured true positives does not earn a squiggle, so both resolution rules ship off.
 
 use lsp_types::DiagnosticSeverity;
 use rubydex::diagnostic::Rule;
@@ -48,14 +47,19 @@ fn describe(rule: Rule) -> (&'static str, Severity) {
         // "`module_function` can only be used in modules"), but the same rule also covers
         // "called with a non-literal argument", which is rubydex giving up rather than a defect.
         // `Hint` reports them without claiming the code is wrong.
-        Rule::InvalidPrivateConstant => ("invalid-private-constant", Severity::Hint),
+        // Upstream renamed the variant `InvalidPrivateConstant` -> `InvalidConstantVisibility`
+        // between 0.2.5 and 0.2.6. ya-lsp's *name* is deliberately not renamed with it: this
+        // string is a key a user writes in `ya-lsp.toml` and a `code` a client shows, and it is
+        // ya-lsp's to keep for the same reason the severity beside it is — a rename here would
+        // be a config break bought with nothing.
+        Rule::InvalidConstantVisibility => ("invalid-private-constant", Severity::Hint),
         Rule::InvalidMethodVisibility => ("invalid-method-visibility", Severity::Hint),
 
         // Genuine bugs in principle — `private :typo` where `typo` does not exist — but the
         // graph has to be complete for that to hold, and it is not. Both hits across the three
         // reference repos were `private_class_method :new`, which is correct Ruby; the constant
-        // variant fires the same way on a class whose superclass could not be resolved. Off
-        // until M3 indexes gems, then re-measure before turning either back on.
+        // variant fires the same way on a class whose superclass could not be resolved.
+        // Re-measure before turning either back on.
         Rule::UndefinedMethodVisibilityTarget => {
             ("undefined-method-visibility-target", Severity::Off)
         }
@@ -74,7 +78,7 @@ const ALL: [Rule; 10] = [
     Rule::DynamicSingletonDefinition,
     Rule::DynamicAncestor,
     Rule::TopLevelMixinSelf,
-    Rule::InvalidPrivateConstant,
+    Rule::InvalidConstantVisibility,
     Rule::InvalidMethodVisibility,
     Rule::UndefinedMethodVisibilityTarget,
     Rule::UndefinedConstantVisibilityTarget,
@@ -124,15 +128,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_match_rubydexs_own_spelling() {
-        // rubydex derives the wire name from the variant via `camel_to_snake`. If it renames a
-        // variant our config keys silently stop matching, so pin the strings to its `Display`.
+    fn names_are_the_variants_own_spelling_but_one() {
+        // 0.2.5 derived a hyphenated wire name from the variant and this pinned our strings to
+        // its `Display`. Upstream's prints the variant verbatim — `ParseError` — so there is no
+        // shared spelling left to pin to, and these names are now entirely ya-lsp's: a key a
+        // user writes in `ya-lsp.toml` and a `code` a client shows. What is still worth
+        // asserting is that none of them drifted by accident, so the rule is the variant
+        // hyphenated — with exactly one exception, kept here rather than in a comment because
+        // an exception nothing enforces is an exception nobody notices going stale.
         for rule in ALL {
-            assert_eq!(
-                name(rule),
-                rule.to_string(),
-                "rule name drifted from rubydex"
-            );
+            let hyphenated: String = rule
+                .to_string()
+                .char_indices()
+                .flat_map(|(at, character)| {
+                    let dash = (at > 0 && character.is_uppercase()).then_some('-');
+                    dash.into_iter().chain(character.to_lowercase())
+                })
+                .collect();
+            // Upstream renamed this one `InvalidPrivateConstant` -> `InvalidConstantVisibility`
+            // between 0.2.5 and 0.2.6; `describe` says why ya-lsp did not follow it.
+            let expected = match rule {
+                Rule::InvalidConstantVisibility => "invalid-private-constant".to_owned(),
+                _ => hyphenated,
+            };
+            assert_eq!(name(rule), expected, "rule name drifted");
         }
     }
 
