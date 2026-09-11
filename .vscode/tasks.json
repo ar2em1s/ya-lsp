@@ -9,6 +9,16 @@
       "command": "cargo build && mkdir -p editors/vscode/server && cp target/debug/ya-lsp editors/vscode/server/ya-lsp && cd editors/vscode && yarn install --frozen-lockfile && yarn bundle",
       "group": "build",
       "problemMatcher": ["$rustc", "$tsc"]
+    },
+    {
+      "label": "build the extension (release)",
+      "type": "shell",
+      // Release, and the binary is *not* staged into `server/`: the multi-root workspace names
+      // it outright, because a `ya-lsp.serverPath` in User settings outranks the staged one and
+      // would send a debug build to a check about a release build with nothing saying so.
+      "command": "cargo build --release && cd editors/vscode && yarn install --frozen-lockfile && yarn bundle",
+      "group": "build",
+      "problemMatcher": ["$rustc", "$tsc"]
     }
   ]
 }

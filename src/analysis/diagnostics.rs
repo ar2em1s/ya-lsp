@@ -126,6 +126,7 @@ pub fn to_lsp_severity(severity: Severity) -> Option<DiagnosticSeverity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
 
     #[test]
     fn names_are_the_variants_own_spelling_but_one() {
@@ -196,5 +197,105 @@ mod tests {
                 "{configured:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_errors_read_the_way_prism_wrote_them() {
+        // ya-lsp owns the severity and the `code` of a diagnostic and **not one word of the
+        // text**: `diagnostic.message()` is forwarded verbatim. That is the decision, and it is
+        // the right one — rewriting a parser's diagnostics is a real cost and a real risk of
+        // saying something false about code the rewriter did not parse.
+        //
+        // What was wrong is that it was assumed rather than pinned. The only assertion anywhere
+        // was that the message is non-empty, which is the same gap as an unranked completion
+        // list: the mechanism tested, the content not. So the actual sentences are here. If
+        // Prism rewrites one, this fails and someone reads the new wording and decides whether
+        // users are better off — which is the entire point of a pass-through being deliberate.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/broken.rb", UNTERMINATED);
+        harness.index();
+
+        let items = harness.latest(&uri).expect("diagnostics");
+        let said: Vec<(Option<String>, &str)> = items
+            .iter()
+            .map(|item| {
+                (
+                    match &item.code {
+                        Some(lsp_types::NumberOrString::String(name)) => Some(name.clone()),
+                        _ => None,
+                    },
+                    item.message.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            said,
+            vec![
+                (
+                    Some("parse-error".to_owned()),
+                    "expected an `end` to close the `class` statement",
+                ),
+                (
+                    Some("parse-error".to_owned()),
+                    "expected an `end` to close the `def` statement",
+                ),
+                (
+                    Some("parse-warning".to_owned()),
+                    "mismatched indentations at '\n' with 'def' at 2",
+                ),
+                (
+                    Some("parse-error".to_owned()),
+                    "unexpected end-of-input, assuming it is closing the parent top level \
+                     context",
+                ),
+            ],
+            "{items:?}"
+        );
+        // Two of these are worth reading twice. The indentation warning names the character it
+        // mismatched against and that character is a newline, so a user sees a message with a
+        // line break in the middle of it. The last says "assuming it is closing the parent top
+        // level context", which is Prism explaining its own error recovery to someone who did
+        // not ask. Neither is ya-lsp's to fix — but neither was anyone's to notice either,
+        // until they were written down.
+    }
+
+    #[test]
+    fn rules_that_fire_on_correct_ruby_are_off_until_asked_for() {
+        // `class Child < base` is legal Ruby that rubydex cannot resolve statically. Squiggling
+        // it by default would put a permanent warning on working code.
+        let source = "base = Object\nclass Child < base\nend\n";
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/dynamic.rb", source);
+        harness.index();
+
+        assert!(
+            harness.latest(&uri).is_none_or(|items| items
+                .iter()
+                .all(|item| item.code != code("dynamic-ancestor"))),
+            "dynamic-ancestor must be silent by default"
+        );
+
+        // ... but turning it on in config must actually work.
+        std::fs::write(
+            harness
+                .root
+                .path()
+                .join(crate::workspace::config::CONFIG_FILE_NAME),
+            "[diagnostics.rules]\ndynamic-ancestor = \"warning\"\n",
+        )
+        .unwrap();
+        harness.run(Task::ReloadConfig);
+
+        let items = harness.latest(&uri).expect("now reported");
+        let dynamic: Vec<_> = items
+            .iter()
+            .filter(|item| item.code == code("dynamic-ancestor"))
+            .collect();
+        assert!(!dynamic.is_empty(), "{items:?}");
+        assert!(
+            dynamic
+                .iter()
+                .all(|item| item.severity == Some(DiagnosticSeverity::WARNING))
+        );
     }
 }

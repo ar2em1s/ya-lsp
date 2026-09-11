@@ -7,39 +7,7 @@
 //! [`super::schema`] an interpolated table name is a table it declines, and for
 //! [`super::models`] a `class_name:` that is not a literal is an association it declines.
 
-use ruby_prism::{CallNode, DefNode, Node};
-
-/// Rails' candidate list for a constant named inside `owner`, innermost first and bare last.
-///
-/// `pub` because it is re-exported: [`super::candidates`] is what `analysis::synthesize` asks,
-/// and every other item in this module is a Prism shape only a reader in this directory meets.
-///
-/// `ActiveRecord::Inheritance#compute_type` is
-/// ``name.scan(/::|$/) { candidates.unshift "#{$`}::#{type_name}" }`` followed by
-/// `candidates << type_name`, so the walk is over the *joined* name of the body the reference is
-/// written in and not over the lexical nesting that produced it — `class Spree::LineItem`
-/// written at top level asks the same three questions as `module Spree; class LineItem`.
-///
-/// The empty prefix is **not** among them: a top-level `Story` asks for `Story::Adjustment` and
-/// then the bare name, which is two candidates rather than three. Nothing here checks that a
-/// candidate could be a constant, because it does not have to — a prefix put in front of a name
-/// that is not one leaves a name that is still not one, and the caller's `known` declines every
-/// entry.
-///
-/// Two readers ask it and they are asking two different questions with one answer: an
-/// association's `belongs_to :adjustment`, which is `compute_type`'s own list, and the module
-/// `isolate_namespace Spree` names, which is Ruby's ordinary lexical lookup. Rails modelled the
-/// first on the second, so one function is not a coincidence being reused.
-pub fn candidates(owner: &str, name: &str) -> Vec<String> {
-    let mut candidates = vec![format!("{owner}::{name}")];
-    candidates.extend(
-        owner
-            .rmatch_indices("::")
-            .map(|(at, _)| format!("{}::{name}", &owner[..at])),
-    );
-    candidates.push(name.to_owned());
-    candidates
-}
+use ruby_prism::{CallNode, DefNode, Node, ParametersNode};
 
 /// A call's first argument, when it is a symbol or a plain string.
 ///
@@ -215,4 +183,69 @@ pub(super) fn keyword_name<'src>(source: &'src str, node: &Node<'_>) -> &'src st
         .get(location.start_offset()..location.end_offset())
         .unwrap_or_default();
     text.split_once(':').map_or(text, |(name, _)| name)
+}
+
+/// Whether RBS can spell this method name.
+///
+/// Every operator Ruby lets a `def` name — `<=>`, `[]`, `+` — reaches here, and the whole file's
+/// declarations ride on the answer: `Synthesized::record` parses a generated document whole and
+/// refuses all of it if any line does not, so one unspellable name would take a mailer's other
+/// eleven actions with it. An action Rails routes to is a plain identifier by construction,
+/// because it has to be a template's file name too.
+///
+/// **A trailing `=` is spellable and the corpus is why.** RBS writes `def primary_key=: (untyped)
+/// -> untyped` and this crate already declares such names — `Affix::Around("", "=")` is how every
+/// `mattr_writer` in [`super::tail`] renders. Leaving it out cost the writers a concern's
+/// `ClassMethods` declares: `self.primary_key = :id` in lobsters' `StoryText` went from answered to
+/// guessed, found by a tier diff over 1,200 cursors rather than by the suite. `==` and `[]=` are
+/// still refused, because stripping the one `=` leaves a first character that is not a letter.
+pub(super) fn spellable(name: &str) -> bool {
+    let mut characters = name.strip_suffix(['?', '!', '=']).unwrap_or(name).chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|rest| rest.is_ascii_alphanumeric() || rest == '_')
+}
+
+/// The RBS parameter list a `def`'s parameters imply, every type `untyped`.
+///
+/// The shape and not the types, which is all a convention can know — and all it needs to know,
+/// because arity is what `types.rs` matches on and a keyword is not part of it. `perform_later`
+/// taking exactly what `perform` takes is the whole requirement, and it is what keeps a
+/// two-argument call from being rejected against a zero-argument declaration.
+pub(super) fn parameters_of(source: &str, node: Option<&ParametersNode<'_>>) -> String {
+    let Some(node) = node else {
+        return "()".to_owned();
+    };
+    let mut spelled: Vec<String> = Vec::new();
+    spelled.extend(node.requireds().iter().map(|_| "untyped".to_owned()));
+    spelled.extend(node.optionals().iter().map(|_| "?untyped".to_owned()));
+    // A `def`'s rest is a `*rest` or nothing: Prism's `ImplicitRestNode` — the `|a,|` of a
+    // block — cannot appear in a method's parameters, so asking which kind this is would put an
+    // arm here that no Ruby reaches.
+    if node.rest().is_some() {
+        spelled.push("*untyped".to_owned());
+    }
+    // Trailing positionals are required exactly as the leading ones are; RBS keeps them in
+    // their own list only so it can say where the optional ones went.
+    spelled.extend(node.posts().iter().map(|_| "untyped".to_owned()));
+    for keyword in node.keywords().iter() {
+        let optional = keyword.as_optional_keyword_parameter_node().is_some();
+        let name = keyword_name(source, &keyword);
+        spelled.push(format!(
+            "{}{name}: untyped",
+            if optional { "?" } else { "" }
+        ));
+    }
+    if let Some(rest) = node.keyword_rest() {
+        // `**nil` is the third kind this can be, and it says the method takes no keywords at
+        // all — so it is exactly the one that adds nothing.
+        if rest.as_forwarding_parameter_node().is_some() {
+            spelled.push("*untyped".to_owned());
+            spelled.push("**untyped".to_owned());
+        } else if rest.as_keyword_rest_parameter_node().is_some() {
+            spelled.push("**untyped".to_owned());
+        }
+    }
+    format!("({})", spelled.join(", "))
 }

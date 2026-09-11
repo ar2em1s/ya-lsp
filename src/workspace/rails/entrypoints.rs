@@ -31,9 +31,9 @@
 //!   a document it cannot parse *whole* — so one odd name would silence every declaration the file
 //!   makes. The guard is load-bearing rather than tidy.
 
-use ruby_prism::{ClassNode, DefNode, Node, ParametersNode, StatementsNode};
+use ruby_prism::{ClassNode, DefNode, Node, StatementsNode};
 
-use super::syntax::{constant_spelling, def_header, keyword_name, symbol_or_string};
+use super::syntax::{constant_spelling, def_header, parameters_of, spellable, symbol_or_string};
 use super::{BASES, INHERITS, WORKERS};
 use crate::generated::{Declared, Facts, Owner, Source};
 
@@ -470,68 +470,11 @@ impl Reader<'_> {
     }
 }
 
-/// Whether RBS can spell this method name.
-///
-/// Every operator Ruby lets a `def` name — `<=>`, `[]`, `+` — reaches here, and the whole file's
-/// declarations ride on the answer: `Synthesized::record` parses a generated document whole and
-/// refuses all of it if any line does not, so one unspellable name would take a mailer's other
-/// eleven actions with it. An action Rails routes to is a plain identifier by construction,
-/// because it has to be a template's file name too.
-fn spellable(name: &str) -> bool {
-    let mut characters = name.strip_suffix(['?', '!']).unwrap_or(name).chars();
-    characters
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-        && characters.all(|rest| rest.is_ascii_alphanumeric() || rest == '_')
-}
-
-/// The RBS parameter list a `def`'s parameters imply, every type `untyped`.
-///
-/// The shape and not the types, which is all a convention can know — and all it needs to know,
-/// because arity is what `types.rs` matches on and a keyword is not part of it. `perform_later`
-/// taking exactly what `perform` takes is the whole requirement, and it is what keeps a
-/// two-argument call from being rejected against a zero-argument declaration.
-fn parameters_of(source: &str, node: Option<&ParametersNode<'_>>) -> String {
-    let Some(node) = node else {
-        return "()".to_owned();
-    };
-    let mut spelled: Vec<String> = Vec::new();
-    spelled.extend(node.requireds().iter().map(|_| "untyped".to_owned()));
-    spelled.extend(node.optionals().iter().map(|_| "?untyped".to_owned()));
-    // A `def`'s rest is a `*rest` or nothing: Prism's `ImplicitRestNode` — the `|a,|` of a
-    // block — cannot appear in a method's parameters, so asking which kind this is would put an
-    // arm here that no Ruby reaches.
-    if node.rest().is_some() {
-        spelled.push("*untyped".to_owned());
-    }
-    // Trailing positionals are required exactly as the leading ones are; RBS keeps them in
-    // their own list only so it can say where the optional ones went.
-    spelled.extend(node.posts().iter().map(|_| "untyped".to_owned()));
-    for keyword in node.keywords().iter() {
-        let optional = keyword.as_optional_keyword_parameter_node().is_some();
-        let name = keyword_name(source, &keyword);
-        spelled.push(format!(
-            "{}{name}: untyped",
-            if optional { "?" } else { "" }
-        ));
-    }
-    if let Some(rest) = node.keyword_rest() {
-        // `**nil` is the third kind this can be, and it says the method takes no keywords at
-        // all — so it is exactly the one that adds nothing.
-        if rest.as_forwarding_parameter_node().is_some() {
-            spelled.push("*untyped".to_owned());
-            spelled.push("**untyped".to_owned());
-        } else if rest.as_keyword_rest_parameter_node().is_some() {
-            spelled.push("**untyped".to_owned());
-        }
-    }
-    format!("({})", spelled.join(", "))
-}
-
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
     use crate::generated::declaring;
 
     const MAILER: &str = "\
@@ -793,6 +736,10 @@ end
 
     /// A name RBS cannot spell takes nothing else with it, which is the point of the guard:
     /// `Synthesized::record` refuses a generated document it cannot parse *whole*.
+    ///
+    /// **A writer is spellable and is routed.** `ActionMailer::Base` answers every public instance
+    /// method on the class, `value=` included, and RBS writes `def self.value=: (untyped) -> …`
+    /// without complaint. `<=>` is the shape the guard exists for.
     #[test]
     fn a_method_name_rbs_cannot_spell_is_the_only_one_declined() {
         let rbs = rbs(
@@ -819,8 +766,8 @@ end
         assert!(rbs.contains("def self.ready?:"), "{rbs}");
         assert!(rbs.contains("def self.send!:"), "{rbs}");
         assert!(rbs.contains("def self.welcome:"), "{rbs}");
+        assert!(rbs.contains("def self.value=:"), "{rbs}");
         assert!(!rbs.contains("<=>"), "{rbs}");
-        assert!(!rbs.contains("value="), "{rbs}");
     }
 
     /// A class that wrote the class method itself keeps its own, in both spellings — and the
@@ -1001,5 +948,196 @@ end
             let (start, end) = span.selection;
             assert_eq!(&source[start as usize..end as usize], "welcome");
         }
+    }
+
+    #[test]
+    fn a_mailer_action_is_a_class_method_that_jumps_to_its_def_and_chains() {
+        // A mailer in one expression. Three things have to happen at once: the
+        // action is a *class* method, the jump lands on the `def` that implied it, and the
+        // chain runs on through `MessageDelivery` — which nothing in this workspace declares,
+        // so the stub is what carries it.
+        let source = "UserMailer.welcome(current_user).deliver_later\n";
+        let (mut harness, _story, uri) = models_project(source);
+        let mailer = harness.write("app/mailers/user_mailer.rb", MAILERS);
+        harness.watch(&[&mailer]);
+
+        assert!(
+            harness.has("UserMailer::<UserMailer>#welcome()"),
+            "the action is not a class method"
+        );
+        assert!(
+            !harness.has("UserMailer::<UserMailer>#sender()"),
+            "a private def is not an action"
+        );
+
+        let definition = harness.definition_at(&uri, source, "welcome");
+        assert_eq!(
+            definition[0]["targetUri"],
+            serde_json::json!(mailer.as_str()),
+            "{definition}"
+        );
+        // `  def welcome(user)` on line 1, revealed whole, with the name selected past `def `.
+        assert_eq!(
+            (
+                &definition[0]["targetRange"]["start"]["line"],
+                &definition[0]["targetRange"]["start"]["character"],
+                &definition[0]["targetSelectionRange"]["start"]["character"],
+            ),
+            (
+                &serde_json::json!(1),
+                &serde_json::json!(2),
+                &serde_json::json!(6),
+            ),
+            "{definition}"
+        );
+
+        let card = card(&mut harness, &uri, source, "deliver_later");
+        assert!(
+            card.contains("MessageDelivery#deliver_later"),
+            "the chain did not reach the stub: {card}"
+        );
+        assert!(!card.contains("Matched on the method name alone"), "{card}");
+    }
+
+    #[test]
+    fn a_hover_on_a_mailer_action_says_which_def_it_came_from() {
+        // The provenance rule again, and it is the same rule: the card names the file and the
+        // `def`, because the *generated RBS* carries a comment above the declaration. Nothing
+        // in `hover.rs` knows the word "mailer".
+        let source = "UserMailer.welcome(current_user)\n";
+        let (mut harness, _story, uri) = models_project(source);
+        let mailer = harness.write("app/mailers/user_mailer.rb", MAILERS);
+        harness.watch(&[&mailer]);
+
+        let card = card(&mut harness, &uri, source, "welcome");
+        assert!(card.contains("app/mailers/user_mailer.rb"), "{card}");
+        assert!(card.contains("def welcome"), "{card}");
+    }
+
+    #[test]
+    fn a_jobs_perform_installs_both_entry_points_with_its_own_arity() {
+        // The job half, and the arity is the part that has to be exact: an answer is
+        // partitioned by how many positional arguments the *call* wrote, so a
+        // `perform_later` claiming `()` would answer nothing for every call anybody makes.
+        let source = "DigestJob.perform_later(1)\n";
+        let (mut harness, _story, uri) = models_project(source);
+        let job = harness.write(
+            "app/jobs/digest_job.rb",
+            "class DigestJob < ApplicationJob\n  \
+             def perform(user_id, force = false)\n  \
+             end\n\n  \
+             def helper\n  end\n\
+             end\n",
+        );
+        harness.watch(&[&job]);
+
+        let rbs = harness.generated_rbs("app/jobs/digest_job.rb");
+        assert!(
+            rbs.contains("def self.perform_later: (untyped, ?untyped) -> untyped\n"),
+            "{rbs}"
+        );
+        assert!(
+            rbs.contains("def self.perform_now: (untyped, ?untyped) -> untyped\n"),
+            "{rbs}"
+        );
+        assert!(
+            !rbs.contains("helper"),
+            "a job's only entry point is `perform`: {rbs}"
+        );
+
+        // Both map to the one `def perform`, which is the whole convention.
+        let definition = harness.definition_at(&uri, source, "perform_later");
+        assert_eq!(
+            definition[0]["targetUri"],
+            serde_json::json!(job.as_str()),
+            "{definition}"
+        );
+        assert_eq!(
+            definition[0]["targetSelectionRange"]["start"]["line"],
+            serde_json::json!(1),
+            "{definition}"
+        );
+    }
+
+    #[test]
+    fn a_sidekiq_worker_is_read_and_a_service_object_named_perform_is_not() {
+        // Sidekiq is not a footnote: 241 of the corpus' 401 job classes are `include
+        // Sidekiq::Worker` or `Sidekiq::Job`. And the gate is the superclass or the mixin and
+        // never the `def` — 161 of chatwoot's classes define a public `def perform` with
+        // nothing above them, and every one of them is a service object.
+        let (mut harness, _story, _uri) = models_project("");
+        let worker = harness.write(
+            "app/workers/bust_cache_worker.rb",
+            "class BustCacheWorker\n  \
+             include Sidekiq::Worker\n\n  \
+             def perform(key)\n  end\n\
+             end\n",
+        );
+        let service = harness.write(
+            "app/services/filter_service.rb",
+            "class FilterService\n  def perform(scope)\n  end\nend\n",
+        );
+        harness.watch(&[&worker, &service]);
+
+        for installed in ["perform_async", "perform_in", "perform_at"] {
+            assert!(
+                harness.has(&format!("BustCacheWorker::<BustCacheWorker>#{installed}()")),
+                "{installed} was not installed"
+            );
+        }
+        assert!(
+            !harness.has("BustCacheWorker::<BustCacheWorker>#perform_later()"),
+            "Sidekiq has no ActiveJob entry points"
+        );
+        for declined in ["perform_async", "perform_later", "perform_now"] {
+            assert!(
+                !harness.has(&format!("FilterService::<FilterService>#{declined}()")),
+                "{declined} was declared on a service object"
+            );
+        }
+    }
+
+    #[test]
+    fn the_message_delivery_stub_is_written_once_and_is_never_a_place() {
+        // The relation class's bargain, on a name that is real: one type however many mailers
+        // reach it, so exactly one file writes it — and nothing in it is mapped, so when
+        // actionmailer *is* indexed the gem keeps every place there is.
+        let (mut harness, _story, _uri) = models_project("");
+        let first = harness.write("app/mailers/user_mailer.rb", MAILERS);
+        let second = harness.write(
+            "app/mailers/admin_mailer.rb",
+            "class AdminMailer < ActionMailer::Base\n  def alert\n  end\nend\n",
+        );
+        harness.watch(&[&first, &second]);
+
+        assert!(harness.has("UserMailer::<UserMailer>#welcome()"));
+        assert!(
+            harness.has("AdminMailer::<AdminMailer>#alert()"),
+            "`< ActionMailer::Base` is 19 of the corpus' 53 mailers"
+        );
+        assert!(harness.has("ActionMailer::MessageDelivery#deliver_now()"));
+
+        // URI order, so `admin_mailer.rb` writes it and `user_mailer.rb` does not.
+        let admin = harness.generated_rbs("app/mailers/admin_mailer.rb");
+        let user = harness.generated_rbs("app/mailers/user_mailer.rb");
+        assert!(
+            admin.contains("class ActionMailer::MessageDelivery\n"),
+            "{admin}"
+        );
+        assert!(
+            !user.contains("class ActionMailer::MessageDelivery"),
+            "{user}"
+        );
+
+        // Every declaration in the stub is text this crate invented, so none of them is a
+        // definition anything will offer as a place to jump to.
+        let source = "AdminMailer.alert.deliver_now\n";
+        let uri = harness.write("app/deliver.rb", source);
+        harness.watch(&[&uri]);
+        let definition = harness.definition_at(&uri, source, "deliver_now");
+        assert!(
+            definition.as_array().is_none_or(Vec::is_empty),
+            "a generated declaration with no span is not a place: {definition}"
+        );
     }
 }

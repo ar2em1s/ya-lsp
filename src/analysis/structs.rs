@@ -425,6 +425,7 @@ fn spelling(source: &str, node: &Node<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::read;
+    use crate::analysis::testing::*;
     use crate::generated::{Namespaces, declaring, declaring_kinds};
 
     /// Every namespace the fixtures below nest into, so that [`Reader::spellable`] is not
@@ -744,5 +745,164 @@ end
         assert_eq!(rbs("class Story\n  def title; end\nend\n"), "");
         assert_eq!(rbs(""), "");
         assert_eq!(rbs("Point = 1\n"), "");
+    }
+
+    /// End to end: a constant assigned a `Struct.new` is a class with members.
+    ///
+    /// Three things at once, and the first is the one the whole pass rests on: `Point` is a
+    /// **constant assignment** to rubydex and a `class Point` to the RBS this pass writes, and
+    /// the two are one constant — the same property a generated `module` rests on, reached
+    /// from the other side. Then the member types the chain off it, and the jump lands on the `:x`
+    /// that named it.
+    #[test]
+    fn a_struct_constant_is_a_class_whose_members_type_and_jump() {
+        let source = "Point.new(1, 2).x\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let shapes = harness.write("app/models/shapes.rb", "Point = Struct.new(:x, :y)\n");
+        harness.watch(&[&shapes]);
+
+        assert!(harness.has("Point#x()"), "the member is not there");
+        assert!(harness.has("Point#x=()"), "and neither is its writer");
+
+        let card = card(&mut harness, &uri, source, "x");
+        assert!(card.contains("Point#x"), "{card}");
+        assert!(card.contains("`Struct.new(:x, :y)`"), "{card}");
+
+        let definition = harness.definition_at(&uri, source, "x");
+        assert_eq!(
+            definition[0]["targetUri"],
+            serde_json::json!(shapes.as_str()),
+            "the jump leaves the caller for the file that declared it"
+        );
+        assert_eq!(
+            definition[0]["targetSelectionRange"],
+            serde_json::json!({
+                "start": {"line": 0, "character": 20},
+                "end": {"line": 0, "character": 21}
+            }),
+            "and selects the `x` inside the `:x`"
+        );
+    }
+
+    /// `Data.define`'s `with` hands the class back, which is the one return type it can chain on.
+    ///
+    /// Also the two halves of the shape rule in one project: a `Data` gets no writer, and a call
+    /// assigned to a local rather than to a constant declares nothing at all — 94 of the 268
+    /// uses measured are that second shape.
+    #[test]
+    fn a_data_chains_through_with_and_a_local_declares_nothing() {
+        let source = "Coord.new.with.north\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let shapes = harness.write(
+            "app/models/shapes.rb",
+            "Coord = Data.define(:north)\nanon = Struct.new(:hidden)\n",
+        );
+        harness.watch(&[&shapes]);
+
+        assert!(!harness.has("Coord#north=()"), "a `Data` has no writers");
+        assert!(
+            harness.analysis.graph.get("Struct#hidden()").is_none(),
+            "a call assigned to a local names no class"
+        );
+
+        let card = card(&mut harness, &uri, source, "north");
+        assert!(card.contains("Coord#north"), "{card}");
+        assert!(
+            card.contains("Type derived through `Coord#with()`"),
+            "the copy is what the chain was followed through: {card}"
+        );
+    }
+
+    /// A namespace nobody defines keeps its own members, **and** the struct under it declares.
+    ///
+    /// `module Reports::Registry` is a whole Rails application's spelling for a `Reports` that
+    /// Zeitwerk conjures and no file writes. Declaring `class Reports::Registry::Metric` is the
+    /// first thing in the graph to introduce `Reports`, and it costs `Reports::Registry` its
+    /// **own** singleton members — measured over chatwoot as 12 positions that resolved before
+    /// the declaration and fell to the name list with it.
+    ///
+    /// **The namespace is opened rather than the call declined**, so both halves are asserted
+    /// here: the module still answers for itself, and `Metric#name` exists rather than being
+    /// the price of that.
+    #[test]
+    fn a_struct_under_a_namespace_nobody_defines_declares_and_costs_nothing() {
+        let source = "Reports::Registry.supported?(1)\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let signatures = dir.path().join("sig");
+        std::fs::create_dir_all(signatures.join("core")).unwrap();
+        std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            format!(
+                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
+                signatures.display().to_string()
+            ),
+        )
+        .unwrap();
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        let registry_uri = harness.write(
+            "app/services/reports/registry.rb",
+            "module Reports::Registry\n  Metric = Data.define(:name)\n\n  def self.supported?(name)\n    name\n  end\nend\n",
+        );
+        let source_uri = harness.write(
+            "app/services/reports/source.rb",
+            "class Reports::Source\n  def go\n    Reports::Registry.supported?(1)\n  end\nend\n",
+        );
+        // A **third** file naming it, and it is load-bearing: with one reference the answer
+        // survives the joined name and with two it does not, which is why this reproduced over
+        // a corpus long before it reproduced here. Chatwoot's third is the spec.
+        harness.write("spec/services/reports/registry_spec.rb", source);
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        assert!(
+            harness
+                .analysis
+                .graph
+                .get("Reports::Registry::Metric#name()")
+                .is_some(),
+            "a conjured namespace no longer costs the struct under it"
+        );
+        let _ = (&registry_uri, &source_uri);
+        let card = card(&mut harness, &uri, source, "supported?");
+        assert!(card.contains("Reports::Registry.supported?"), "{card}");
+        // The tier and not the list length: this workspace holds exactly one `supported?`, so
+        // a receiver that fails to resolve still names the right method — on the *name* rung,
+        // with the footnote that says so. Over a corpus the same failure spells itself as a
+        // candidate list, and asserting on the list is what made this look unreproducible here.
+        assert!(
+            !card.contains("Matched on the method name alone"),
+            "the module keeps its own singleton: {card}"
+        );
+    }
+
+    /// One file feeding two generators merges into one document, and both halves survive.
+    ///
+    /// Worth asking of every pair of generators: a rank collision is resolved before
+    /// render, so a bug there is a duplicate `def` that only shows up when two generators meet.
+    /// The struct and the schema are the pair worth asking, because they are the two that
+    /// declare a *typed* member on a class the other has never heard of.
+    #[test]
+    fn a_file_that_writes_a_macro_and_a_struct_declares_both() {
+        let source = "Story.new.title\nPoint.new(1).x\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  has_many :stories\nend\nPoint = Struct.new(:x)\n",
+        );
+        harness.watch(&[&story]);
+
+        assert!(harness.has("Point#x()"), "the struct half");
+        assert!(harness.has("Story#stories()"), "the macro half");
+        assert!(
+            harness.has("Story#title()"),
+            "and the schema's, in another document"
+        );
+
+        // Two documents, two sentences: neither generator's provenance leaks into the other's.
+        let column = card(&mut harness, &uri, source, "title");
+        assert!(column.contains("db/schema.rb"), "{column}");
+        let member = card(&mut harness, &uri, source, "x");
+        assert!(member.contains("`Struct.new(:x)`"), "{member}");
     }
 }

@@ -2,6 +2,7 @@
 
 pub mod bundler;
 pub mod config;
+pub mod features;
 pub mod gems;
 pub mod rails;
 pub mod rbs;
@@ -15,6 +16,7 @@ use glob::{MatchOptions, Pattern};
 use crate::messages;
 
 pub use config::{Config, Severity};
+pub use features::Features;
 pub use gems::{Gem, Gems};
 pub use rbs::Signatures;
 pub use uri::DocUri;
@@ -24,6 +26,18 @@ pub use uri::DocUri;
 pub struct Workspace {
     root: PathBuf,
     config: Config,
+    /// Which bodies of knowledge apply here, with `rails.enabled = "auto"` already decided.
+    ///
+    /// Held rather than recomputed, because deciding it reads the filesystem: `auto` asks
+    /// whether `config/application.rb` is there and, failing that, reads `Gemfile.lock`. It is
+    /// rebuilt by [`Workspace::reload`] with everything else the configuration decides.
+    features: Features,
+    /// Which way `rails.enabled` went and why, as the one sentence that says so.
+    ///
+    /// Held rather than logged where it is decided, because that is inside `load` — before
+    /// `[log]` has been read and therefore before the file sink exists. See
+    /// [`Workspace::say_which_way_rails_went`].
+    rails_detection: String,
     config_path: Option<PathBuf>,
     initialization_options: Option<serde_json::Value>,
     /// The process environment gem discovery reads. Captured once at load so a fixture test can
@@ -55,8 +69,11 @@ impl Workspace {
         env: gems::Env,
     ) -> (Self, Vec<String>) {
         let loaded = config::load(&root, initialization_options.as_ref());
+        let (features, rails_detection) = Features::resolve(&root, &loaded.config);
         let workspace = Self {
             root,
+            features,
+            rails_detection,
             config: loaded.config,
             config_path: loaded.path,
             initialization_options,
@@ -79,6 +96,7 @@ impl Workspace {
     /// Re-read `ya-lsp.toml` after a `workspace/didChangeWatchedFiles`.
     pub fn reload(&mut self) -> Vec<String> {
         let loaded = config::load(&self.root, self.initialization_options.as_ref());
+        (self.features, self.rails_detection) = Features::resolve(&self.root, &loaded.config);
         self.config = loaded.config;
         self.config_path = loaded.path;
         // `[gems]` and `[rbs]` may have moved; the next caller re-discovers rather than
@@ -96,6 +114,22 @@ impl Workspace {
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Which bodies of knowledge apply here. See [`features`].
+    #[must_use]
+    pub fn features(&self) -> Features {
+        self.features
+    }
+
+    /// Say which way `rails.enabled` went, once, at `info`.
+    ///
+    /// **Called by whoever has just pointed the log**, never from `load`: the detection happens
+    /// before `[log]` has been read, so a line written where the decision is made reaches stderr
+    /// and never the file a user is about to attach to a bug report — which is the one place it
+    /// is most worth having.
+    pub fn say_which_way_rails_went(&self) {
+        tracing::info!("{}", self.rails_detection);
     }
 
     /// The `ya-lsp.toml` actually in use, if there is one.

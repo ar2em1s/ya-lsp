@@ -66,7 +66,7 @@ pub fn helper_module(name: &str) -> Option<String> {
 /// `None` for anything that cannot be a class name. The caller must have established that the
 /// class is **top level** — `Admin::Setting`'s table depends on `table_name_prefix`, which is
 /// Ruby that only runs, so a namespaced model is declined here and left to
-/// [`table_name_overrides`], which is the escape that works for it.
+/// `schema::read_table_names`, which is the escape that works for it.
 #[must_use]
 pub fn table_of(class: &str) -> Option<String> {
     Some(pluralize(&underscore(class)?))

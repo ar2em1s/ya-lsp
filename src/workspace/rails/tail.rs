@@ -973,6 +973,7 @@ pub(super) fn gem_class(installs: Installs) -> Option<&'static str> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use crate::analysis::testing::*;
     use crate::generated::declaring;
     use std::collections::BTreeSet;
 
@@ -1509,5 +1510,129 @@ end
         families.sort_unstable_by_key(|what| format!("{what:?}"));
         families.dedup();
         assert_eq!(families.len(), 18, "{families:?}");
+    }
+
+    /// The long tail end to end: two families, and the two shapes the whole table has.
+    ///
+    /// A `store_accessor` key is `untyped` and is therefore a **name** and no more — the half of
+    /// the long tail that is navigational, exactly as a `delegate` is — and a
+    /// `class_attribute` is six
+    /// members across both sides of the class, of which the predicate is the one thing a macro
+    /// that says nothing about its type still types: `!!self.setting` is a `bool` whatever
+    /// `setting` turns out to hold.
+    #[test]
+    fn a_long_tail_macro_is_a_member_on_both_sides_and_its_predicate_is_a_bool() {
+        let source = "Story.new.setting?\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  class_attribute :setting\n  \
+             store_accessor :description, :colour\nend\n",
+        );
+        harness.watch(&[&story]);
+        harness.settle();
+
+        // The type is pinned as text in `tail.rs`; a card does not print a return type, which
+        // true of every card. What this asks is the other half: the member
+        // reaches the editor and says which line of the user's own file declared it.
+        let predicate = card(&mut harness, &uri, source, "setting?");
+        assert_eq!(
+            predicate,
+            "```ruby\nStory#setting?\n```\n\n*From `app/models/story.rb`, \
+             `class_attribute :setting`.*"
+        );
+        // Asked after the hover, because a completion fixture replaces the document's text and
+        // the positions the hover was asked at are the old text's.
+        let offered = harness.declarations_at(&uri, "Story.~\n");
+        assert!(
+            ["setting", "setting=", "setting?"]
+                .iter()
+                .all(|name| offered.contains(&(*name).to_owned())),
+            "a class_attribute is three members on the class side too: {offered:?}"
+        );
+        let instance = harness.declarations_at(&uri, "Story.new.~\n");
+        for name in [
+            "setting",
+            "setting=",
+            "setting?",
+            "colour",
+            "colour=",
+            "colour_changed?",
+        ] {
+            assert!(
+                instance.contains(&name.to_owned()),
+                "{name} is missing from {instance:?}"
+            );
+        }
+    }
+
+    /// A `serialize` re-types its column, and the class it names may be a **generic** one.
+    ///
+    /// The reason this is an end-to-end test and not a rendering one: `Array` and `Hash` are the
+    /// two classes the corpus writes as a `type:` and both take type arguments in RBS. If
+    /// rubydex's parser refused a bare one, `Synthesized::record`'s gate would throw away the
+    /// *whole* generated document — every other member in the file with it — and every unit test
+    /// in `tail.rs` would still pass, because none of them parses what it renders.
+    #[test]
+    fn a_serialize_re_types_its_column_with_a_class_that_takes_type_arguments() {
+        let source = "Story.new.description.first\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  serialize :description, coder: YAML, type: Array\n\
+             end\n",
+        );
+        harness.watch(&[&story]);
+
+        assert_eq!(
+            harness.declarations_of("Story#description()"),
+            1,
+            "the column is withdrawn, so the serialized type is the only declaration"
+        );
+        assert!(
+            harness.has("Story#title()"),
+            "the rest of the document survived the generic"
+        );
+        let chained = card(&mut harness, &uri, source, "first");
+        assert!(
+            chained.contains("Array#first"),
+            "a text column carrying YAML is an Array in Ruby and never the String the schema \
+             says: {chained}"
+        );
+    }
+
+    /// The attachment macros type a receiver only when the class they name is in the graph.
+    ///
+    /// `ActiveStorage::Attached::One` is nobody's application class and it is not under an
+    /// engine's `app/` either — it is in activestorage's `lib/`, one directory from `Blob` and on
+    /// the far side of the engine gate — so `Context::classes` can never hold it and the
+    /// gate is a lookup rather than a projection. What this pins is that the lookup is what
+    /// decides, and `tail.rs` pins the decline on its own.
+    #[test]
+    fn an_attachment_declares_only_when_the_class_it_names_is_in_the_graph() {
+        let source = "Story.new.avatar.attach\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let attached = harness.write(
+            "app/models/active_storage/attached/one.rb",
+            "module ActiveStorage\n  module Attached\n    class One\n      def attach\n      \
+             end\n    end\n  end\nend\n",
+        );
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  has_one_attached :avatar\nend\n",
+        );
+        harness.watch(&[&attached, &story]);
+        harness.settle();
+
+        let chained = card(&mut harness, &uri, source, "attach");
+        assert!(
+            chained.contains("ActiveStorage::Attached::One#attach"),
+            "the chain runs on through the gem's class: {chained}"
+        );
+        let offered = harness.declarations_at(&uri, "Story.new.~\n");
+        assert!(
+            offered.contains(&"avatar".to_owned()) && offered.contains(&"avatar=".to_owned()),
+            "and both halves of the macro are members: {offered:?}"
+        );
     }
 }

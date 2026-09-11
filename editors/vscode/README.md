@@ -16,8 +16,8 @@ index; `ya-lsp.gems.rubyVersion` settles it, and `ya-lsp.gems.defaultGems` silen
 
 Diagnostics, go-to-definition, hover, document symbols, workspace symbol search, find-references,
 completion, signature help, occurrence highlighting, folding, expand-selection, rename, four
-refactorings and the type hierarchy — across your project **and its gems**, which are read straight
-from `Gemfile.lock` and the gem directories on disk.
+refactorings, document links, inlay hints and the type and call hierarchies — across your project
+**and its gems**, which are read straight from `Gemfile.lock` and the gem directories on disk.
 
 Folding follows the syntax rather than the indentation VS Code otherwise guesses from: `if`,
 `elsif` and `else` fold as three regions, a heredoc's body folds, comment blocks and `#region`
@@ -27,6 +27,17 @@ markers fold as themselves, and every `end` stays on screen.
 or the command palette. Upwards it lists Ruby's own ancestors — so included and `prepend`ed modules
 are in it, the way `Module#ancestors` reports them; downwards it lists every class below, not only
 the ones written `< Base`, so a subclass three levels down is in the list too.
+
+**Inlay hints** label three things the line does not say: what a block parameter holds, what a
+local assigned from a call holds, and what a method returns where a signature declares it. A type
+ya-lsp matched on a name alone is **never drawn** — a margin has no room for a footnote and is read
+as fact — so every hint you see is derived from a signature, an assignment or a convention, and
+points at which one in its tooltip. Each family has its own switch.
+
+**Call hierarchy** works in both directions. *Show Call Hierarchy* upwards is a work list: nothing
+links a call to a declaration, so every caller is a name match and each row says `by name` beside
+the file it is in. Downwards it lists only the calls that resolve precisely, because an edge in a
+tree claims more than a row in a list does.
 
 **F2 renames** local variables, parameters and constants. A constant changes in every file it is
 written in, and only where it really is that constant — `Person` inside `module HR` and
@@ -67,7 +78,10 @@ meaning, so the TOML key is named beside each setting.
 | Setting | `ya-lsp.toml` | What it does |
 | --- | --- | --- |
 | `ya-lsp.serverPath` | — | Run a binary of your own instead of the bundled one. Takes `~` and `${workspaceFolder}`. Restarts the server. |
-| `ya-lsp.logLevel` | — | How much the server writes to its output channel. `off` is off. Restarts the server. |
+| `ya-lsp.logLevel` | `[log] level` | How much the server writes to its output channel. `off` is off. Applied while it runs, so nothing restarts. |
+| `ya-lsp.log.file` | `[log] file` | Also write the log to a file, so a bug report can carry one instead of a screenshot. Off by default. |
+| `ya-lsp.log.filePath` | `[log] file_path` | Where that file goes, relative to the folder or absolute. Nothing is ever truncated. |
+| `ya-lsp.log.fileLevel` | `[log] file_level` | How much goes in the file. Its own level, because the per-request detail is the reason to turn it on. |
 | `ya-lsp.trace.server` | — | Log the LSP traffic between VS Code and the server. For debugging this extension. |
 | `ya-lsp.gems.enabled` | `[gems] enabled` | Follow definitions, hover and completion into the project's gems. On by default; it is most of the value. |
 | `ya-lsp.gems.defaultGems` | `[gems] default_gems` | Also the ~40 gems that ship inside Ruby itself — `json`, `uri`, `optparse`. |
@@ -76,8 +90,24 @@ meaning, so the TOML key is named beside each setting.
 | `ya-lsp.rbs.enabled` | `[rbs] enabled` | Ruby's core signatures, so `String`, `Array` and `Kernel` have members. |
 | `ya-lsp.rbs.stdlib` | `[rbs] stdlib` | Also the ~60 standard library signatures — `CSV`, `URI`, `Logger`. Adds ~3.5 ms to every request. |
 | `ya-lsp.rbs.path` | `[rbs] path` | An explicit directory of RBS signatures. Found automatically when empty. |
+| `ya-lsp.types.guessFromNames` | `[types] guess_from_names` | Answer from a receiver's own name where nothing else can — `@user` is a `User`. Always labelled a guess; off keeps only checkable answers. |
+| `ya-lsp.types.structs` | `[types] structs` | Read `Struct.new` and `Data.define`, so the members they install complete and hover like any other. |
+| `ya-lsp.types.annotations` | `[types] annotations` | Read a Sorbet `sig` and a YARD `@return` as the type they declare, where the Ruby itself cannot say. |
+| `ya-lsp.hints.blockParameters` | `[hints] block_parameters` | Label what a block parameter holds, where the method the block was passed to declares it. |
+| `ya-lsp.hints.locals` | `[hints] locals` | Label what a local holds where it is assigned from a call. Not where the assignment already names the class. |
+| `ya-lsp.hints.returns` | `[hints] returns` | Label what a method returns where a signature declares it and the Ruby cannot say so. |
 | `ya-lsp.diagnostics.enabled` | `[diagnostics] enabled` | Report problems found while indexing. |
 | `ya-lsp.diagnostics.rules` | `[diagnostics.rules]` | Per-rule severity, keyed by the rule name in the problem's `code`. All ten complete by name and say what they fire on. |
+| `ya-lsp.rubocop.hint` | — | Offer RuboCop's own extension, once, in a project that lints with it. |
+| `ya-lsp.rails.enabled` | `[rails] enabled` | Bring Rails' conventions to this project. `auto` looks for `config/application.rb`, then railties in `Gemfile.lock`. |
+| `ya-lsp.rails.schema` | `[rails] schema` | Read `db/schema.rb` or `db/structure.sql`, so a column completes and hovers with its type. |
+| `ya-lsp.rails.models` | `[rails] models` | Read the model macros: associations, `enum`, `attribute`, `delegate`, `scope` and 17 more. Also what types `Story.where(...)`. |
+| `ya-lsp.rails.routes` | `[rails] routes` | Read `config/routes.rb`, so `stories_path` is a name to complete and jump to. |
+| `ya-lsp.rails.entrypoints` | `[rails] entrypoints` | Read mailers, jobs and Sidekiq workers, so `UserMailer.welcome` and `perform_later` are calls ya-lsp knows. |
+| `ya-lsp.rails.views` | `[rails] views` | Answer inside a template: what a bare word can call, and what the `@story` the controller assigned is. |
+| `ya-lsp.trees.test` | `[trees] test` | Directory names holding your test suite. A `def` written in one is offered only from inside another. **Replaces** the list; `[]` turns the fence off. |
+| `ya-lsp.trees.testSupport` | `[trees] test_support` | Extra names that count as test scaffolding for the cursor only. Added to the built-in list, never replacing it. |
+| `ya-lsp.trees.migration` | `[trees] migration` | Where migrations live, as `parent/mark` pairs. A migration is loaded by path, alone, so what is written in one is reachable from nothing. |
 | `ya-lsp.index.include` | `[index] include` | Globs, relative to the folder, of the files to index. |
 | `ya-lsp.index.exclude` | `[index] exclude` | Globs to skip. Where vendored or generated Ruby goes when git does not ignore it. |
 | `ya-lsp.index.loadPaths` | `[index] load_paths` | Extra roots to index, also used to resolve `require "..."`. |

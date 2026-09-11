@@ -18,7 +18,7 @@ of which moves these numbers by a factor, not by a percent.
 4.0.0 and a hand-built `sqlite3` — a large amount of CI for a project whose headline is that it
 needs no Ruby at all. The run leaves the gem settings at their defaults, so on a machine with an
 installed bundle the gem half runs and on CI it finds nothing; nothing asserted here depends on
-which. The gem numbers stay manual (`.claude/rules/benchmarking.md`). Do not read a green canary
+which. The gem numbers stay manual. Do not read a green canary
 as covering them.
 
 **Legal.** lobsters is BSD-3-Clause, (c) 2012-2019 Joshua Stein. CI clones it at test time and
@@ -29,7 +29,7 @@ this repository, the obligation attaches and `THIRD-PARTY-NOTICES.txt` is where 
 
 Usage (the numbers live in the `Makefile`, so a local run and the CI run cannot disagree):
 
-    python3 scripts/canary.py --repo tmp/lobsters --server target/release/ya-lsp \
+    python3 scripts/canary.py --repo tmp/corpora/lobsters --server target/release/ya-lsp \
         --files 606 --parse-warnings 14 --max-index-ms 500
 """
 

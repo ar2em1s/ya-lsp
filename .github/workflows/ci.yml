@@ -29,6 +29,12 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+      # Through the Makefile, like the notices and coverage steps below: which rustdoc lints are
+      # denied is configuration, and a second copy written out here could deny a different set
+      # from the one `make ci` denies locally, with nothing to say the two had diverged.
+      - name: no doc link points at nothing
+        run: make docs-check
+
       # `THIRD-PARTY-NOTICES.txt` is committed rather than generated at build time, so that
       # `cargo build` and `cargo install` need no extra tool. The trade is that it can go stale,
       # and a stale notice is one that silently omits a dependency somebody added — so it is
@@ -154,7 +160,7 @@ jobs:
   # **It does not cover gems.** Nothing runs `bundle install` here: lobsters' bundle needs Ruby
   # 4.0.0 and a hand-built `sqlite3`, which is a large amount of CI for a project whose headline
   # is that it needs no Ruby at all. The run finds no gems and asserts nothing about them, and
-  # the gem numbers stay manual (`.claude/rules/benchmarking.md`). A green tick here is not
+  # the gem numbers stay manual. A green tick here is not
   # evidence that gem indexing works.
   #
   # lobsters is BSD-3-Clause, (c) 2012-2019 Joshua Stein. It is cloned at test time and never

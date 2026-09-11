@@ -38,7 +38,7 @@
 //! costs the server a cache of every response it has sent per document, keyed by an id it must
 //! invalidate on every edit. ya-lsp declines it: the whole-file answer for the largest file in a
 //! real Rails application is measured in microseconds. See
-//! [`analysis::threaded_tests`](super::threaded_tests) for the measurement and for what it costs
+//! `analysis::threaded_tests` for the measurement and for what it costs
 //! the requests queued behind it.
 
 use ruby_prism::{
@@ -52,7 +52,7 @@ use ruby_prism::{
 /// What a token is, as an index into [`LEGEND`].
 ///
 /// The numbers are the wire format: a client reads them against the legend the server sent at
-/// initialize, so the order of the two must never disagree. [`tests::the_legend_is_the_wire`]
+/// initialize, so the order of the two must never disagree. `tests::the_legend_is_the_wire`
 /// is what holds them together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -260,6 +260,8 @@ impl Walk<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
+    use crate::analysis::tokens;
 
     /// The source with every token underlined beneath the line it is on, named by its kind.
     ///
@@ -463,5 +465,87 @@ v
         assert_eq!(LEGEND[Kind::Variable as usize], "variable");
         assert_eq!(LEGEND[Kind::Parameter as usize], "parameter");
         assert_eq!(LEGEND[Kind::Method as usize], "method");
+    }
+
+    /// A `semanticTokens/full` answer read back into absolute positions and named kinds.
+    ///
+    /// The wire format is deltas from the previous token, which is unreadable and is exactly
+    /// what has to be checked: an entry that is off by one does not misplace one colour, it
+    /// misplaces every colour after it. Decoding it here is the only way an assertion can be
+    /// about what the user sees.
+    fn decoded(answer: &serde_json::Value) -> Vec<(u64, u64, u64, &'static str)> {
+        let data = answer["data"].as_array().expect("token data");
+        let mut rows = Vec::new();
+        let (mut line, mut start) = (0, 0);
+        for token in data.chunks(5) {
+            let numbers: Vec<u64> = token
+                .iter()
+                .map(|n| n.as_u64().unwrap_or_default())
+                .collect();
+            line += numbers[0];
+            start = if numbers[0] == 0 {
+                start + numbers[1]
+            } else {
+                numbers[1]
+            };
+            rows.push((
+                line,
+                start,
+                numbers[2],
+                *tokens::LEGEND
+                    .get(numbers[3] as usize)
+                    .expect("a type in the legend"),
+            ));
+        }
+        rows
+    }
+
+    #[test]
+    fn semantic_tokens_arrive_as_deltas_from_the_token_before() {
+        let mut harness = Harness::new();
+        let source = "def render(scale)\n  size = scale\n  size\nend\n";
+        let uri = harness.write("app/big.rb", source);
+        harness.index();
+        harness.open(&uri, source);
+
+        let answer = harness.ask(
+            "textDocument/semanticTokens/full",
+            serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+        );
+
+        assert_eq!(
+            decoded(&answer),
+            vec![
+                (0, 4, 6, "method"),
+                (0, 11, 5, "parameter"),
+                (1, 2, 4, "variable"),
+                (1, 9, 5, "variable"),
+                (2, 2, 4, "variable"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_token_length_is_counted_in_the_encoding_the_client_negotiated() {
+        // `имя` is a legal Ruby local and three characters of two bytes each. A length taken as
+        // `end - start` in bytes underlines six units where the client counts three, which
+        // paints the colour over whatever follows. The offsets go through `TextDocument` for
+        // exactly this reason, and a fixture that is all ASCII cannot see it.
+        let mut harness = Harness::new();
+        let source = "имя = 1\nимя\n";
+        let uri = harness.write("app/utf.rb", source);
+        harness.index();
+        harness.open(&uri, source);
+
+        let answer = harness.ask(
+            "textDocument/semanticTokens/full",
+            serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+        );
+
+        assert_eq!(
+            decoded(&answer),
+            vec![(0, 0, 3, "variable"), (1, 0, 3, "variable")],
+            "three UTF-16 code units, not six bytes"
+        );
     }
 }

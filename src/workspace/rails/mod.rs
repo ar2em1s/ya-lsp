@@ -4,10 +4,11 @@
 //! in here" is answered by reading one list**, and that list is this file. The convention tables
 //! are `const` arrays below, `mod.rs` is the only public surface, and every submodule is private.
 //!
-//! # The twelve modules
+//! # The sixteen modules
 //!
-//! - [`conventions`] — the two rules that are about a **path**: which controller renders a
-//!   template, and which files `rails db:migrate` dumps a schema into. Neither opens a file.
+//! - [`conventions`] — the rules that are about a **path** and nothing else: which controller
+//!   renders a template, which class a mailer's views hang off, which files are a helper Rails
+//!   globs, and which files `rails db:migrate` dumps a schema into. None opens a file.
 //! - [`inflect`] — Rails' inflector, minus everything this corpus did not need.
 //! - [`syntax`] — the half-dozen Prism shapes the readers start from.
 //! - [`schema`] — `db/*schema.rb`: what tables exist and what their columns return.
@@ -15,8 +16,13 @@
 //!   tool wrote. The one reader here that is not Ruby, and the only one with no Prism in it.
 //! - [`attributes`] — `attribute`, the cast type it may be told, and the three different features
 //!   that spell their macro that way.
-//! - [`models`] — the association macros, the monomorphic relation class, and the query interface
-//!   the relation and the model's own singleton share.
+//! - [`models`] — one model file: which bodies it holds, which of them may declare at all, and
+//!   the order the families come back together in.
+//! - [`associations`] — `belongs_to`, `has_one`, `has_many`, `has_and_belongs_to_many` and
+//!   `scope`: every member one line installs, and the four declined.
+//! - [`relations`] — the relation class every model gets, the two classes a scope goes on, and
+//!   the query interface the relation and the model's own singleton share.
+//! - [`concerns`] — a concern body's macros, and which including classes they land on.
 //! - [`delegates`] — `delegate`, and the two hops between a name written here and a type written
 //!   somewhere else. The only reader whose answer needs the *other* generators' output, which is
 //!   why it is a second phase rather than a second macro in [`models`].
@@ -28,6 +34,9 @@
 //!   `perform`, recognised by a superclass or a mixin and read out of a `def`.
 //! - [`routes`] — `config/routes.rb`: which helpers Rails names, the one module they go in, and
 //!   every class that `include`s it.
+//! - [`framework`] — what the framework's own singletons return, the four rows declined and the
+//!   measurement that declined them. The one generator whose input is almost nothing: it reads
+//!   a class name out of `config/application.rb` and takes the rest from a table.
 //!
 //! # What every one of them has in common
 //!
@@ -39,33 +48,44 @@
 //! wrong class answers confidently and wrongly about the file the user is looking at, and one
 //! that reaches nothing looks exactly like a project that does not follow it.
 
+mod associations;
 mod attributes;
+mod concerns;
 mod conventions;
 mod delegates;
 mod entrypoints;
 mod enums;
+mod framework;
 mod inflect;
 mod models;
+mod relations;
 mod routes;
 mod schema;
 mod structure;
 mod syntax;
 mod tail;
 
-pub use conventions::{controller_of, is_helper, is_routes, is_schema, is_structure, mailer_of};
+pub use concerns::{
+    CLASS_METHODS, ClassMethod as ConcernMethod, From as ConcernSource,
+    declare as declare_concern_members, installed as concern_members,
+};
+pub use conventions::{
+    autoloaded_namespaces, confirmed_spelling, controller_of, is_helper, is_routes, is_schema,
+    is_structure, mailer_of,
+};
 pub use entrypoints::{Entrypoints, MESSAGE_DELIVERY, convention_of, is_mailer, read_entrypoints};
+pub use framework::{application_class, read_framework, singleton_classes};
 pub use inflect::{camelize, helper_module, table_of};
-pub use models::{
-    Elsewhere, Model, RECORD_BASE, RELATION_BASE, element_of, is_record_base, read_model,
-    relation_base, relation_of,
+pub use models::{Elsewhere, Model, RECORD_BASE, is_record_base, read_model};
+pub use relations::{
+    RAILS_CLASS_SIDE, RAILS_RELATION, RELATION_BASE, element_of, relation_base, relation_of,
 };
 pub use routes::{Routes, Whose, hosts_routes, mixins, read_routes};
 pub use schema::{Schema, TableNames, engine_prefix, read_schema, read_table_names};
 pub use structure::read_structure;
-pub use syntax::candidates;
 
+use associations::Kind;
 use entrypoints::Convention;
-use models::Kind;
 use tail::Installs;
 
 /// The ten column types lobsters' 38 tables are made of, and the Ruby class each returns.
@@ -119,7 +139,7 @@ const PRIMARY_KEY: (&str, &str) = ("id", "bigint");
 ///
 /// Both tables are deliberately short. A word this does not know pluralizes to something no
 /// table is called, the class matches nothing, and the answer is **nothing** — which is the
-/// failure direction the whole item is built to have, and the reason the class→table direction
+/// failure direction this is built to have, and the reason the class→table direction
 /// was chosen over singularizing table names.
 const UNCOUNTABLE: [&str; 10] = [
     "equipment",
@@ -222,6 +242,33 @@ pub const MACROS: [&str; 35] = [
     "helper_method",
     "helper",
 ];
+
+/// Every receiverless name that puts a document in front of [`models::read_model`].
+///
+/// [`MACROS`] **plus `class_methods` and `included`**, and neither extra name is a macro — which
+/// is why they are here rather than on that list. `class_methods` declares no member of the body
+/// it is written in: `ActiveSupport::Concern` evaluates its block on a nested `ClassMethods`
+/// module, and the `def`s inside it are the declaration. `included` declares none either, and it
+/// is on this list for a narrower reason still — a bare `extend M` written in one puts `M`'s
+/// instance methods on every including class's singleton, and a concern that writes nothing else
+/// at all would otherwise be on no list. `activemodel/lib/active_model/api.rb` is exactly that
+/// file, and it is what installs `model_name` and `human_attribute_name` on every Rails model.
+/// See [`concerns`].
+///
+/// **Derived from [`MACROS`] rather than written out beside it**, unlike [`LONG_TAIL`]: there
+/// the two lists are the same *kind* of thing and a name in one and not the other is a bug worth
+/// a test, and here one list is the other plus a name that is deliberately not a macro.
+pub const MODEL_CALLS: [&str; MACROS.len() + 2] = {
+    let mut names = [""; MACROS.len() + 2];
+    let mut at = 0;
+    while at < MACROS.len() {
+        names[at] = MACROS[at];
+        at += 1;
+    }
+    names[MACROS.len()] = "class_methods";
+    names[MACROS.len() + 1] = "included";
+    names
+};
 
 /// Every remaining macro that names a member, and which family it is in.
 ///
@@ -374,6 +421,40 @@ const BASES: [(&str, Convention); 2] = [
 /// [`routes`] is checked against the real router rather than against a reading of it.
 pub const ROUTE_HELPERS: &str = "RouteHelpers";
 
+/// The framework's own half of a view context: the modules `ActionView::Base` includes.
+///
+/// Rails builds the class a template renders in out of three includes — `include Helpers,
+/// ::ERB::Util, Context` (`action_view/base.rb`) — and then layers the application's own
+/// `app/helpers` modules and the controller's `helper_method` proxies over them. The first two
+/// are here; the third is declined below. Nothing is generated: actionview is in the bundle and
+/// therefore already in the graph, so all this table supplies is the **name of the root** for
+/// `analysis::views` to walk ancestors from, and rubydex's own linearization does the rest —
+/// `ActionView::Helpers` `include`s its 24 helper modules at module-body level, so one name
+/// reaches every one of them and an alias like `t` comes along with its `translate`.
+///
+/// **Order matters and is Ruby's.** These are the *outermost* rungs of the chain: an
+/// application's `def tag` in `ApplicationHelper` is included later and therefore wins, which is
+/// why [`analysis::views`](crate::analysis) reads this table last of its three halves.
+///
+/// **What is declined, and the measurement that declined it.** Over 8,732 bare-word call sites
+/// in the six corpora's templates and `app/helpers` files, 5,104 answered with a candidate list
+/// or with nothing. Asked of the graph, one module at a time, against a control class that
+/// includes nothing:
+///
+/// | module | words it alone answers | positions |
+/// |---|---|---|
+/// | `ActionView::Helpers` | 27 | 4,639 |
+/// | `ERB::Util` | 2 (`h`, `json_escape`) | 38 |
+/// | `ActionView::Context` | **0** | 0 |
+///
+/// `Context` is the renderer's own plumbing — `output_buffer`, `view_flow` — and no template in
+/// six corpora calls any of it bare, so it is a row that would cost a walk and answer nothing.
+/// **`ActionView::Base` itself is declined too**, and not for lack of reach: it answers exactly
+/// the same 29 words, because it is these two modules plus `Context`. What it would add is
+/// `Object` and `Kernel`, whose members would then arrive through the view rung rather than the
+/// name rung at every template in the project — a far wider displacement bought for nothing.
+pub const VIEW_CONTEXT: [&str; 2] = ["ActionView::Helpers", "ERB::Util"];
+
 /// The two framework controllers a Rails application's own base inherits from.
 ///
 /// Rails installs the route helpers with an `inherited` hook on both — `on_load(:action_controller)`
@@ -391,10 +472,58 @@ const CONTROLLERS: [&str; 2] = ["ActionController::Base", "ActionController::API
 /// keeps that reviewable.
 const WORKERS: [&str; 2] = ["Sidekiq::Worker", "Sidekiq::Job"];
 
-#[cfg_attr(coverage_nightly, coverage(off))]
+// ---------------------------------------------------------------------------------------
+// The one model more than one reader's tests ask the same questions of
+//
+// Here rather than beside either of them because a descendant sees its ancestors' private
+// items: `models::tests` and `relations::tests` both read this source, and two copies of "the
+// same" model are how the two files quietly stop asserting the same thing. A fixture with a
+// single reader stays with that reader.
+// ---------------------------------------------------------------------------------------
+
+/// One model writing every association shape this directory reads, and a `scope`.
 #[cfg(test)]
+const MODEL: &str = "\
+class Story < ApplicationRecord
+  belongs_to :user
+  belongs_to :parent_story, class_name: \"Story\", optional: true
+  belongs_to :owner, polymorphic: true
+  has_one :draft, class_name: \"Comment\"
+  has_many :comments
+  has_many :taggings
+  has_many :tags, through: :taggings
+  has_many :voters, through: :votes, source: :user
+  scope :recent, -> { order(created_at: :desc) }
+end
+";
+
+/// Every class [`MODEL`]'s application defines, which is what a macro's candidate list is read
+/// against.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn known() -> std::collections::BTreeSet<String> {
+    ["Story", "User", "Comment", "Tag", "Tagging"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every class [`MODEL`] gives a generated relation class to — its four collection elements and
+/// `Story` itself, which has one because it writes a `scope`.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn relation_classes() -> std::collections::BTreeSet<String> {
+    ["Comment", "Tag", "Tagging", "Story"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
 
     /// The tables above are one list written twice, and this is the seam between them.
     ///
@@ -500,6 +629,329 @@ mod tests {
                 "ActiveStorage::Attached::Many",
                 "ActionText::RichText",
             ]
+        );
+    }
+
+    #[test]
+    fn a_nested_class_claims_a_table_only_when_it_is_a_model() {
+        // "A nested class claims nothing" is too coarse: it claims what Rails
+        // says it claims", and the superclass is the whole of the new gate. A `class Story`
+        // inside `module Legacy` that is not an ActiveRecord model must still claim nothing, or
+        // the schema's columns land on a service object that never reads one — which is
+        // measured: the six corpora hold 43 such classes whose name inflects onto a real table.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let nested = harness.write(
+            "app/models/admin/story.rb",
+            // The second is two hops from the base rather than one, which is the shape
+            // solidus writes 101 of and the reason `is_model` climbs rather than asks once.
+            "module Admin\n  class Story < ApplicationRecord\n  end\nend\n\n\
+             class Base < ApplicationRecord\nend\n\n\
+             module Legacy\n  class Story < Base\n  end\nend\n\n\
+             module Service\n  class Story\n  end\nend\n",
+        );
+        // And the spelling of "top level" that says so outright.
+        let widget = harness.write("app/models/widget.rb", "class ::Widget\nend\n");
+        harness.watch(&[&nested, &widget]);
+
+        assert!(harness.has("Story#title()"));
+        assert!(harness.has("Widget#name()"));
+        // `Admin` declares no prefix, so `compute_table_name` is the bare plural and all three
+        // models really do read `stories`; a one-claimant rule lets only the top-level one
+        // answer.
+        assert!(harness.has("Admin::Story#title()"));
+        assert!(harness.has("Legacy::Story#title()"));
+        // The one that inherits nothing is not a model, and claims nothing.
+        assert!(!harness.has("Service::Story#title()"));
+    }
+
+    #[test]
+    fn a_namespace_that_declares_a_prefix_moves_every_table_under_it() {
+        // `full_table_name_prefix` is `module_parents.detect { |p| p.respond_to?(...) }`, so a
+        // `def self.table_name_prefix` on `Admin` says every model under it reads a table that
+        // begins `admin_`. It is read out of a file, which is why the inflection happens where
+        // the documents are and not where the definitions are.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let schema = harness.write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[7.1].define(version: 1) do\n  \
+             create_table \"admin_stories\", force: :cascade do |t|\n    \
+             t.string \"headline\", null: false\n  end\nend\n",
+        );
+        let admin = harness.write(
+            "app/models/admin.rb",
+            "module Admin\n  def self.table_name_prefix\n    \"admin_\"\n  end\nend\n",
+        );
+        let nested = harness.write(
+            "app/models/admin/story.rb",
+            "module Admin\n  class Story < ApplicationRecord\n  end\nend\n",
+        );
+        harness.watch(&[&schema, &admin, &nested]);
+
+        assert!(harness.has("Admin::Story#headline()"));
+        // And the bare plural is not also its: `stories` is a table this schema does not have,
+        // but the claim would still have been wrong.
+        assert!(!harness.has("Admin::Story#title()"));
+    }
+
+    #[test]
+    fn a_namespace_that_declares_a_suffix_moves_every_table_under_it_too() {
+        // `full_table_name_suffix` is the same `module_parents.detect`, and it measures **0**
+        // in six applications. It is read anyway because it is the same syntax in the same
+        // walk, and ignoring it is the only way this reader can name a table that exists and is
+        // not the one the class reads.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let schema = harness.write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[7.1].define(version: 1) do\n  \
+             create_table \"stories_v2\", force: :cascade do |t|\n    \
+             t.string \"headline\", null: false\n  end\nend\n",
+        );
+        let legacy = harness.write(
+            "app/models/legacy.rb",
+            "module Legacy\n  def self.table_name_suffix\n    \"_v2\"\n  end\nend\n",
+        );
+        let nested = harness.write(
+            "app/models/legacy/story.rb",
+            "module Legacy\n  class Story < ApplicationRecord\n  end\nend\n",
+        );
+        harness.watch(&[&schema, &legacy, &nested]);
+
+        assert!(harness.has("Legacy::Story#headline()"));
+    }
+
+    #[test]
+    fn an_engine_that_isolates_a_namespace_declares_the_same_prefix() {
+        // The commoner of the two spellings by a factor of nearly four — 36 of the 46
+        // declarations in six corpora — and it is a call rather than a `def` because the engine says it about a
+        // module somebody else wrote. `Rails::Engine#isolate_namespace` installs
+        // `table_name_prefix` as `generate_railtie_name(mod.name)` and an underscore.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let schema = harness.write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[7.1].define(version: 1) do\n  \
+             create_table \"spree_orders\", force: :cascade do |t|\n    \
+             t.string \"number\", null: false\n  end\nend\n",
+        );
+        let engine = harness.write(
+            "lib/spree/core/engine.rb",
+            "module Spree\n  module Core\n    class Engine < ::Rails::Engine\n      \
+             isolate_namespace Spree\n    end\n  end\nend\n",
+        );
+        let order = harness.write(
+            "app/models/spree/order.rb",
+            "module Spree\n  class Order < ApplicationRecord\n  end\nend\n",
+        );
+        harness.watch(&[&schema, &engine, &order]);
+
+        assert!(harness.has("Spree::Order#number()"));
+    }
+
+    #[test]
+    fn a_class_nested_inside_a_model_claims_nothing() {
+        // `compute_table_name`'s other branch is `parent_singular_child_plural`, and it needs
+        // the parent's own table and then the parent's parent's. Declining it is measured
+        // rather than assumed: 22 classes in six applications are nested inside a model and not
+        // one of them names a table any of those applications has.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let nested = harness.write(
+            "app/models/widget.rb",
+            "class Widget < ApplicationRecord\n  class Story < ApplicationRecord\n  end\nend\n",
+        );
+        harness.watch(&[&nested]);
+
+        assert!(harness.has("Widget#name()"));
+        assert!(!harness.has("Widget::Story#title()"));
+    }
+
+    #[test]
+    fn a_nested_model_whose_namespace_nothing_declares_claims_nothing() {
+        // The namespace rule, asked by the second generator to reach the shape. A generated
+        // `class Reports::Metric` where nothing declares `Reports` costs that namespace its own
+        // members silently, so the claim is declined rather than spelled. It declines nothing
+        // in six corpora and is here because the damage it prevents cannot be seen.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        // `class Reports::Story` and no `module Reports` anywhere — **and no `reports/`
+        // directory either**, which is the half that makes the namespace unreachable rather
+        // than merely unwritten. A file sitting in one is the other test below.
+        let unreachable = harness.write(
+            "app/models/story_reports.rb",
+            "class Reports::Story < ApplicationRecord\nend\n",
+        );
+        harness.watch(&[&unreachable]);
+
+        assert!(harness.has("Story#title()"));
+        assert!(!harness.has("Reports::Story#title()"));
+    }
+
+    /// The same class one directory over, where Rails' own autoloader declares the namespace.
+    ///
+    /// `app/models/reports/story.rb` is a file Zeitwerk loads by defining `Reports` first — a
+    /// directory under an autoload root with no `reports.rb` beside it **is** the declaration —
+    /// so the namespace is spellable and the claim is not declined. The two tests are the same
+    /// class and the same superclass, and the only difference between them is which directory
+    /// the file sits in, which is the whole of the rule.
+    #[test]
+    fn a_nested_model_the_directory_declares_a_namespace_for_claims_its_table() {
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let conjured = harness.write(
+            "app/models/reports/story.rb",
+            "class Reports::Story < ApplicationRecord\nend\n",
+        );
+        harness.watch(&[&conjured]);
+
+        assert!(harness.has("Reports::Story#title()"));
+    }
+
+    #[test]
+    fn a_class_whose_superclass_is_nobody_the_workspace_defines_is_not_a_model() {
+        // The other end of the same walk: a chain that runs out is not a model, and a chain
+        // that runs in a circle is not an infinite loop. Neither shape can claim a table.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let odd = harness.write(
+            "app/models/odd.rb",
+            "module Legacy\n  class Story < Sinatra::Base\n  end\nend\n\n\
+             module Circular\n  class Story < Other\n  end\n\n  class Other < Story\n  \
+             end\nend\n",
+        );
+        harness.watch(&[&odd]);
+
+        assert!(harness.has("Story#title()"));
+        assert!(!harness.has("Legacy::Story#title()"));
+        assert!(!harness.has("Circular::Story#title()"));
+    }
+
+    #[test]
+    fn a_written_table_name_meets_the_class_whose_name_implies_it() {
+        // The one place an inflected claim and a written one meet, and both readings are in
+        // the corpus. mastodon's throwaway `MoveUserSettings::LegacySetting` says
+        // `self.table_name = "settings"` and, if a written name simply replaces an inflected
+        // one, *takes* those columns off
+        // the `Setting` model that reads them; discourse's three test doubles do the same to
+        // `Post`. But discourse's `TopicViewItem` says `topic_views` and the `TopicView` whose
+        // name implies it is a plain view object that reads no table at all.
+        //
+        // So the guess survives the meeting only when the class it is about is a model.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let model = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\nend\n",
+        );
+        // The other half of the fixture: a top-level class named after a table it does not read.
+        let widget = harness.write("app/models/widget.rb", "class Widget\nend\n");
+        let migration = harness.write(
+            "db/migrate/20240101000000_backfill.rb",
+            "class Backfill < ActiveRecord::Migration[7.1]\n  \
+             class LegacyStory < ApplicationRecord\n    self.table_name = \"stories\"\n  \
+             end\n\n  class WidgetRow < ApplicationRecord\n    \
+             self.table_name = \"widgets\"\n  end\nend\n",
+        );
+        harness.watch(&[&model, &widget, &migration]);
+
+        assert!(harness.has("Story#title()"), "the model lost its own table");
+        assert!(harness.has("Backfill::LegacyStory#title()"));
+        // And the class that is not a model does not keep a table somebody else named.
+        assert!(harness.has("Backfill::WidgetRow#name()"));
+        assert!(!harness.has("Widget#name()"));
+    }
+
+    #[test]
+    fn an_anonymous_class_is_not_a_model_however_it_is_written() {
+        // A defect only measurement finds, and it is reachable from two different
+        // generators. rubydex names an anonymous `Class.new(ApplicationRecord)`
+        // `<hash>:<offset><anonymous>`; that class is an ActiveRecord model by every rule this
+        // crate has, so it asked for a relation — and `class ` + that name is not RBS, so
+        // `Synthesized::record`'s parse gate threw away **the whole document**, taking every
+        // real declaration in the file with it. Solidus writes 38 such specs.
+        //
+        // The assertion is on a *neighbour*: what proves the document survived is that the
+        // class written beside the anonymous one still declares its own members.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        harness.write(
+            "spec/models/thing_spec.rb",
+            "class Thing < ApplicationRecord\n  has_many :parts\nend\n\n\
+             thrown = -> { Class.new(ApplicationRecord) { def spin; end } }\n",
+        );
+        harness.write(
+            "app/models/part.rb",
+            "class Part < ApplicationRecord\nend\n",
+        );
+        harness.index();
+
+        assert!(
+            harness.has("Thing#parts()"),
+            "the macro beside the anonymous class still declares"
+        );
+        assert!(
+            harness.has("Thing::Relation"),
+            "and so does the relation the same document writes"
+        );
+    }
+
+    #[test]
+    fn a_model_reopened_to_nest_something_under_it_keeps_its_table() {
+        // `claims` is filled per *definition*, so a model reopened in a second file pushed its
+        // own name twice and "a table two classes claim is claimed by neither" then declined it
+        // — losing every column on a model nothing was ambiguous about. The shape is the
+        // ordinary Ruby idiom for namespacing a helper under a model: forem writes
+        // `class AuditLog` again in `app/queries/audit_log/unpublish_alls_query.rb`, and
+        // discourse writes `class Reviewable < ActiveRecord::Base` in **six** `lib/reviewable/`
+        // files. **Three models in six corpora** were in that state, discourse's `Post` among
+        // them, and none of the three is a collision.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let query = harness.write(
+            "app/queries/story/recent_query.rb",
+            "class Story\n  class RecentQuery\n  end\nend\n",
+        );
+        harness.watch(&[&query]);
+
+        assert!(harness.has("Story#title()"));
+    }
+
+    #[test]
+    fn two_nested_names_that_reach_one_table_claim_neither() {
+        // The narrowed ambiguity rule, in the case it was built for. Several claimants are kept
+        // when they demodulize alike — the same convention applied twice — and two *different*
+        // names landing on one table is the inflector having got one of them wrong.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let rivals = harness.write(
+            "app/models/rivals.rb",
+            "module Legacy\n  class Storie < ApplicationRecord\n  end\nend\n",
+        );
+        harness.watch(&[&rivals]);
+
+        assert!(!harness.has("Story#title()"), "an ambiguous table answered");
+        assert!(!harness.has("Legacy::Storie#title()"));
+    }
+
+    #[test]
+    fn two_classes_that_pluralize_to_one_table_claim_neither() {
+        // An ambiguous answer is not an answer. Both classes are top level, both are the user's
+        // own, and both name `stories` — so the columns go to neither of them.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let rival = harness.write("app/models/storie.rb", "class Storie\nend\n");
+        harness.watch(&[&rival]);
+
+        assert!(!harness.has("Story#title()"), "an ambiguous table answered");
+        assert!(!harness.has("Storie#title()"));
+    }
+
+    #[test]
+    fn a_model_that_names_its_own_table_reads_that_one_and_not_the_other() {
+        // The documented escape, and the half of it that is easy to get wrong: a class that
+        // says `self.table_name` must *stop* claiming the table its name implies, or one model
+        // answers with two schemas at once.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let model = harness.write(
+            "app/models/story.rb",
+            "class Story\n  self.table_name = \"widgets\"\nend\n",
+        );
+        harness.watch(&[&model]);
+
+        assert!(harness.has("Story#name()"), "the named table was not read");
+        assert!(
+            !harness.has("Story#title()"),
+            "and the table its name implies was read as well"
         );
     }
 }

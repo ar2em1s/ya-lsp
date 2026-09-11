@@ -98,6 +98,42 @@ pub fn rbs_path_has_no_core(path: &Path) -> String {
 
 // ---------------------------------------------------------------------------- the file walk
 
+/// A `trees.migration` entry that is not a `parent/mark` pair.
+///
+/// The rule is not "a directory called migrate" — `migrate` is an ordinary enough word for
+/// `app/services/migrate/` — so an entry with no parent in it would fence a tree the project
+/// really does load, which is an answer deleted rather than a setting ignored.
+#[must_use]
+pub fn migration_needs_a_parent(entry: &str) -> String {
+    format!(
+        "trees.migration entry {entry} is not a directory and the one above it, so it is being \
+         ignored. Write it as db/migrat, where db is the parent and migrat matches the \
+         directory."
+    )
+}
+
+/// `[log] level` or `[log] file_level` is not something `EnvFilter` can read.
+///
+/// Silence here is the expensive kind: the symptom is a log at a level nobody chose, which is
+/// not something anyone traces back to the setting that decides it.
+#[must_use]
+pub fn invalid_log_level(field: &str, value: &str, default: &str) -> String {
+    format!(
+        "{field} is set to {value}, which is not a log level, so {default} is in use instead. \
+         Use one of off, error, warn, info, debug or trace."
+    )
+}
+
+/// `[log] file` is on and the file cannot be written.
+#[must_use]
+pub fn log_file_unwritable(path: &Path, error: &dyn Display) -> String {
+    format!(
+        "the log file {} could not be opened, so the log is only on the server's error output. \
+         Set log.file_path somewhere writable: {error}",
+        path.display()
+    )
+}
+
 /// A directory under the workspace root could not be read.
 #[must_use]
 pub fn workspace_scan_failed(error: &dyn Display) -> String {
@@ -148,6 +184,20 @@ pub fn cannot_watch_files() -> String {
      ya-lsp.toml made outside it is not noticed: navigation, completion and diagnostics keep \
      answering against the files as they were when ya-lsp started. Restart ya-lsp after \
      changing files outside the editor."
+        .to_owned()
+}
+
+/// The client takes no dynamic registrations, so nothing outside the project can be claimed.
+///
+/// Logged rather than shown, for [`cannot_watch_files`]' reasons and with the same cost: the
+/// symptom is a file that answers nothing while every file beside it answers, which reads as the
+/// server being wrong rather than the server never having been asked.
+#[must_use]
+pub fn cannot_claim_foreign_files() -> String {
+    "this editor cannot be asked to claim files outside the project: hover, go-to-definition and \
+     completion answer nothing inside a gem, inside Ruby's own library or inside a signature file, \
+     because the editor never tells ya-lsp those files are open. Everything inside the project \
+     answers as before."
         .to_owned()
 }
 
@@ -316,6 +366,16 @@ pub fn subtypes_truncated(found: usize, shown: usize) -> String {
     format!("{found} subtypes found: only the first {shown} are shown.")
 }
 
+/// `callHierarchy/incomingCalls` found more than it will send.
+///
+/// The third of the same sentence, and the one reached by ordinary work rather than by an
+/// ordinary mistake: a method named `call` or `name` has callers everywhere, and a tree that
+/// stops at two thousand of them looks exactly like a tree that found two thousand.
+#[must_use]
+pub fn incoming_calls_truncated(found: usize, shown: usize) -> String {
+    format!("{found} callers found: only the first {shown} are shown.")
+}
+
 // ---------------------------------------------------------------------------- rename
 
 /// `textDocument/rename` on a method.
@@ -415,6 +475,22 @@ mod tests {
         "index.load_paths",
         "index.max_files",
         "index.respect_gitignore",
+        "log.level",
+        "log.file",
+        "log.file_path",
+        "log.file_level",
+        "rails.enabled",
+        "rails.schema",
+        "rails.models",
+        "rails.routes",
+        "rails.entrypoints",
+        "rails.views",
+        "trees.test",
+        "trees.test_support",
+        "trees.migration",
+        "types.structs",
+        "types.annotations",
+        "types.guess_from_names",
         "gems.enabled",
         "gems.default_gems",
         "gems.ruby_version",
@@ -490,6 +566,11 @@ mod tests {
             ),
             ("cannot_watch_files", cannot_watch_files(), false),
             (
+                "cannot_claim_foreign_files",
+                cannot_claim_foreign_files(),
+                false,
+            ),
+            (
                 "no_core_signatures",
                 no_core_signatures(Path::new("/w/sig/core")),
                 false,
@@ -533,6 +614,11 @@ mod tests {
                 subtypes_truncated(24_918, 2_048),
                 false,
             ),
+            (
+                "incoming_calls_truncated",
+                incoming_calls_truncated(4_112, 2_048),
+                false,
+            ),
             ("rename_refuses_methods", rename_refuses_methods(), false),
             (
                 "rename_refuses_instance_variables",
@@ -569,6 +655,21 @@ mod tests {
                 rename_needs_a_ruby_name("Person", false),
                 false,
             ),
+            (
+                "migration_needs_a_parent",
+                migration_needs_a_parent("migrate"),
+                false,
+            ),
+            (
+                "invalid_log_level",
+                invalid_log_level("log.level", "verbose", "info"),
+                false,
+            ),
+            (
+                "log_file_unwritable",
+                log_file_unwritable(Path::new("/w/tmp/ya-lsp.log"), &error),
+                true,
+            ),
         ]
     }
 
@@ -590,7 +691,16 @@ mod tests {
                 !message.contains('\n'),
                 "{name}: clients collapse a notification onto one line: {message}"
             );
-            for bracket in ["[index", "[gems", "[rbs", "[diagnostics"] {
+            for bracket in [
+                "[index",
+                "[log",
+                "[rails",
+                "[trees",
+                "[types",
+                "[gems",
+                "[rbs",
+                "[diagnostics",
+            ] {
                 assert!(
                     !message.contains(bracket),
                     "{name}: a setting is its dotted path, not its section header: {message}"
@@ -656,7 +766,16 @@ mod tests {
     /// Every `<section>.<key>` a message names, for the four sections `ya-lsp.toml` has.
     fn settings_named(message: &str) -> Vec<String> {
         let mut named = Vec::new();
-        for section in ["index", "gems", "rbs", "diagnostics"] {
+        for section in [
+            "index",
+            "log",
+            "rails",
+            "trees",
+            "types",
+            "gems",
+            "rbs",
+            "diagnostics",
+        ] {
             let mut rest = message;
             while let Some(at) = rest.find(section) {
                 let tail = &rest[at + section.len()..];

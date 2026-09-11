@@ -50,6 +50,16 @@
 //! [`Origin::Unknown`](crate::analysis::synthesized::Origin::Unknown), which means the declaration
 //! types a chain and is never offered as a place to jump to. **No mapping means no place, never a
 //! guess**, and it costs one `Option` here.
+//!
+//! # A member is not the only thing a file can declare
+//!
+//! Every span here is a member's but one. [`Facts::namespace`] takes an `at` too, because the
+//! namespace Zeitwerk conjures from a directory *holds* no member — the body is the whole of the
+//! declaration, and a directory is not a line anybody can be sent to. Its place is the
+//! `class Mod::FlaggedController` that confirmed the directory, which is the same rule the
+//! members obey: **the source this generator read**. A body reached any other way — a wrapper
+//! [`Declarations::open`] introduced to spell a name, a route-helper host, a relation class —
+//! still carries no span and still cannot be a place, and those are lines no file wrote.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -103,6 +113,19 @@ impl Owner {
     #[must_use]
     fn is_module(&self) -> bool {
         matches!(self, Self::Module(_) | Self::ModuleSingleton(_))
+    }
+
+    /// How the body this hangs on is named, where a name is what a document is filed under.
+    ///
+    /// The render key spelled out: [`Owner::Instance`] and [`Owner::Singleton`] of one class are
+    /// **one** body, because they open one `class X`, and [`Owner::Module`] of the same name is a
+    /// different one, because `class X` and `module X` are two declarations of one constant that
+    /// RBS refuses to hold together. [`Facts::split`] cuts on exactly this, so a part can never
+    /// hold half a body.
+    #[must_use]
+    pub fn body(&self) -> String {
+        let keyword = if self.is_module() { "module" } else { "class" };
+        format!("{keyword}:{}", self.name())
     }
 
     /// What a `def` written on this side starts with.
@@ -164,6 +187,15 @@ pub enum Source {
     /// `Struct#each` is here for the same sentence rather than for a second reason: no line of anybody's
     /// code declares it, so it carries no span and can never become a place.
     Interface,
+    /// ActiveRecord's query interface — `where`, `first`, `find` — which is [`Self::Interface`]
+    /// with one thing more said about it.
+    ///
+    /// The same rank and the same argument: no file in the project declares `Story.where`. What
+    /// separates it is that a file in the **bundle** does, and this tag is how
+    /// [`Declarations::named`] knows which members to go and look for. Ranked beside
+    /// `Interface` rather than below it, because where the two could collide they are equally
+    /// bad evidence and neither should displace the other.
+    Query,
 }
 
 impl Source {
@@ -192,7 +224,7 @@ impl Source {
             Self::Attribute => 7,
             Self::Derived => 8,
             Self::Delegated => 9,
-            Self::Interface => 10,
+            Self::Interface | Self::Query => 10,
         }
     }
 }
@@ -230,7 +262,7 @@ pub struct Declared {
     ///
     /// `None` is not a failure: it is text this crate invented, which must type a chain without
     /// ever becoming a jump target.
-    pub at: Option<((u32, u32), (u32, u32))>,
+    pub at: Option<At>,
     /// Which generator said so. The precedence table's key.
     pub from: Source,
 }
@@ -309,6 +341,20 @@ pub struct Facts {
     /// file already gives one is silently ignored**, so this may only ever be written on a name
     /// nothing else declares.
     supers: Vec<(Owner, String)>,
+    /// The bodies that exist and hold nothing — a namespace, and nothing it contains.
+    ///
+    /// A map rather than a list because one document states a namespace once per *name* and the
+    /// chain above a deeply nested class states three, and because rendering it in name order is
+    /// the only order there is: it has no member whose position could carry one. One producer,
+    /// the autoloaded namespace.
+    ///
+    /// The value is the line that implied it, in the file this [`Facts`] belongs to, and it is
+    /// the one span in this table that is **not** a member's. A namespace a directory conjures
+    /// has no `def` to hang a place on, so the place is the `Api` of the `class Api::V1::Foo`
+    /// that confirmed the directory — the same rule as every other span here, *the source this
+    /// generator read*, reached through the one construct that is not a member. `None` keeps the
+    /// no-place behaviour for a body nothing confirmed.
+    bodies: BTreeMap<Owner, Option<At>>,
 }
 
 impl Facts {
@@ -360,12 +406,33 @@ impl Facts {
         self.supers.push((owner, superclass));
     }
 
+    /// Say that a type exists and that nothing is being said about what is in it.
+    ///
+    /// The one fact with no member and no type, and both are the point. Zeitwerk defines
+    /// `User::Policy` because a directory is named `policy/`; what is *in* it are the classes
+    /// the files below it write, which rubydex already holds. So this declares the constant and
+    /// stops.
+    ///
+    /// **`at` is the line that confirmed the directory**, and it is what makes this the one body
+    /// in this table that can be a place. A directory is not a line and cannot be jumped to, but
+    /// the directory conjures nothing until a file in it writes the directory's name plus
+    /// exactly one segment — so the `Api` of that file's `class Api::V1::Foo` is the source this
+    /// generator read, which is the same rule every span here obeys. Passing `None` keeps the
+    /// no-mapping-no-place behaviour for a body nothing confirmed.
+    pub fn namespace(&mut self, owner: Owner, at: Option<At>) {
+        // `or_insert` and not `insert`: two calls for one name in one document are the same
+        // namespace seen twice — `class Api::V1::Foo` states `Api` and so does the `class
+        // Api::Bar` beside it — and the first span is the one the document reads earliest,
+        // which is the line a reader sent here would expect to land on.
+        self.bodies.entry(owner).or_insert(at);
+    }
+
     /// Say that a body `include`s a module.
     ///
     /// The owner is a body and not a member, so [`Owner::Singleton`] is meaningless here and is
     /// rendered as the instance side: `include` inside `class X` is what RBS has, and an
-    /// `extend` would be a different keyword with a different meaning. The query interface needs one and
-    /// measured why it may not have it — `synthesized.md`.
+    /// `extend` would be a different keyword with a different meaning. The query interface needs
+    /// one and measured why it may not have it — `synthesized.md`.
     pub fn mixin(&mut self, owner: Owner, module: String) {
         self.mixins.push((owner, module));
     }
@@ -381,6 +448,9 @@ impl Facts {
         }
         self.notes.extend(other.notes);
         self.mixins.extend(other.mixins);
+        for (owner, at) in other.bodies {
+            self.bodies.entry(owner).or_insert(at);
+        }
         for (owner, superclass) in other.supers {
             self.inherits(owner, superclass);
         }
@@ -446,16 +516,83 @@ impl Facts {
     ///
     /// A `Facts` holding nothing but `include`s is **not** empty: a route-helper host is a
     /// document of nothing else, and a `merge` that dropped them would put the helpers in the
-    /// graph with nothing reaching them.
+    /// graph with nothing reaching them. A `Facts` holding nothing but an empty body is not
+    /// empty either, and for the sharper version of the same reason: that body *is* the whole of
+    /// what its generator had to say.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.members.is_empty() && self.mixins.is_empty() && self.supers.is_empty()
+        self.members.is_empty()
+            && self.mixins.is_empty()
+            && self.supers.is_empty()
+            && self.bodies.is_empty()
     }
 
     /// How many members survived precedence. What a generator reports it declared.
     #[must_use]
     pub fn len(&self) -> usize {
         self.members.len()
+    }
+
+    /// Cut this into one [`Facts`] per **body**, which is one generated document each.
+    ///
+    /// **The partition is of the rendering and never of the generation.** Every generator has
+    /// spoken by the time this runs and [`Facts::declare`] has settled every collision, so what
+    /// this moves is finished text-to-be: no rank is re-decided, and
+    /// [`Facts::returns`], [`Facts::declared`] and [`Facts::source`] are all asked of the whole
+    /// file's facts before it. That is what makes splitting safe rather than delicate.
+    ///
+    /// **A collision cannot cross a part.** Two generators that name one member collide on
+    /// `(owner, name)` and the owner decides the part, so anything [`Facts::declare`] would have
+    /// settled is in one part by construction. And every field here is keyed by an [`Owner`],
+    /// so the partition is total — nothing is left behind for a caller to remember.
+    ///
+    /// The order is the key's and not the facts': a part is a document of its own, so the order
+    /// bodies come back in is only ever the order documents are handed over in, and a stable one
+    /// is worth more than the order they were stated in.
+    ///
+    /// Why at all: [`Synthesized::record`](crate::analysis::synthesized::Synthesized::record) is
+    /// charged per declaration it re-indexes, so a document is the unit of invalidation. One
+    /// document per file means a column that changed type re-indexes every column in the schema —
+    /// 2.2 seconds of a 2.49 second keystroke on discourse. One document per body means it
+    /// re-indexes one table. `synthesized.md` has the measurement.
+    #[must_use]
+    pub fn split(self) -> Vec<(String, Self)> {
+        let mut parts: BTreeMap<String, Self> = BTreeMap::new();
+        for member in self.members {
+            parts
+                .entry(member.owner.body())
+                .or_default()
+                .declare(member);
+        }
+        for (owner, text) in self.notes {
+            parts
+                .entry(owner.body())
+                .or_default()
+                .notes
+                .push((owner, text));
+        }
+        for (owner, module) in self.mixins {
+            parts
+                .entry(owner.body())
+                .or_default()
+                .mixins
+                .push((owner, module));
+        }
+        for (owner, superclass) in self.supers {
+            parts
+                .entry(owner.body())
+                .or_default()
+                .inherits(owner, superclass);
+        }
+        for (owner, at) in self.bodies {
+            parts
+                .entry(owner.body())
+                .or_default()
+                .bodies
+                .entry(owner)
+                .or_insert(at);
+        }
+        parts.into_iter().collect()
     }
 
     /// Spell all of it as RBS, and record where each declaration really came from.
@@ -481,7 +618,7 @@ impl Facts {
                 if open.is_some() {
                     out.close(wrappers);
                 }
-                wrappers = out.open(key.1, key.0, self.superclass(key), namespaces);
+                wrappers = out.open(key.1, key.0, self.superclass(key), namespaces).0;
                 open = Some(key);
                 // Only above the first body of a type: a note is about the type, and a type
                 // whose members were stated in two runs is still one type.
@@ -492,26 +629,56 @@ impl Facts {
             if !member.because.is_empty() {
                 out.comment(&member.because);
             }
+            // Read before the `def` is written and used only after, because `declare` records
+            // the same offset for a `Span` — so the two lists cannot disagree about where a
+            // declaration starts, whichever of them the member ends up in.
+            let start = out.rbs.len() as u32;
             out.declare(&member.signature(), member.at);
+            if member.at.is_none() && member.from == Source::Query {
+                out.named.push(Named {
+                    generated: (start, out.rbs.len() as u32),
+                    singleton: matches!(
+                        member.owner,
+                        Owner::Singleton(_) | Owner::ModuleSingleton(_)
+                    ),
+                    name: member.name.clone(),
+                });
+            }
         }
         if open.is_some() {
             out.close(wrappers);
         }
-        // A body that declares nothing has no member to open it, and two shapes are all of
+        // A body that declares nothing has no member to open it, and three shapes are all of
         // that: a route-helper host, where a controller gets one `include` and it is not a
-        // `def`, and a relation class, which is a superclass line and nothing else. Written after the members so that the order of the document is still the order
-        // the facts were stated in for everything that states one.
-        for owner in self
+        // `def`; a relation class, which is a superclass line and nothing else; and a namespace
+        // a directory conjures, which is the empty body itself. Written after the members so
+        // that the order of the document is still the order the facts were stated in for
+        // everything that states one.
+        for (owner, at) in self
             .mixins
             .iter()
             .chain(&self.supers)
-            .map(|(owner, _)| owner)
+            .map(|(owner, _)| (owner, None))
+            .chain(self.bodies.iter().map(|(owner, at)| (owner, *at)))
         {
             let key = (owner.is_module(), owner.name());
             if !noted.insert(key) {
                 continue;
             }
-            let wrappers = out.open(key.1, key.0, self.superclass(key), namespaces);
+            let (wrappers, line) = out.open(key.1, key.0, self.superclass(key), namespaces);
+            // The one span in this function that is not a member's, and it is recorded against
+            // the body's own line rather than against anything inside it: a namespace a
+            // directory conjures holds nothing, so the line *is* the declaration. A body reached
+            // through `mixins` or `supers` carries no span and keeps the no-place rule, which is
+            // what a route-helper host and a relation class need — neither is a line any file
+            // wrote.
+            if let Some((declared, selection)) = at {
+                out.spans.push(Span {
+                    generated: line,
+                    declared,
+                    selection,
+                });
+            }
             self.head(&mut out, key);
             out.close(wrappers);
         }
@@ -566,7 +733,40 @@ pub struct Declarations {
     /// much of a generator's output is text this crate invented.
     pub classes: usize,
     pub methods: usize,
+    /// The members whose place is somebody else's file, for a caller that can go and look.
+    ///
+    /// Disjoint from `spans` by construction — a member is in one list or the other — because
+    /// the two say different things. A span is *the source this generator read*, which the
+    /// generator knows; this is *the name Rails gave the same method*, which only the graph
+    /// can turn into a file.
+    pub named: Vec<Named>,
 }
+
+/// A generated declaration whose real definition is a name rather than a span.
+///
+/// The whole of the difference from [`Span`]: a column's place is a line in the `db/schema.rb`
+/// this generator just read, and a query method's place is a `def` in a gem nobody read at all.
+/// One is an offset the generator has in hand; the other is a question for the graph, which is
+/// why this carries a name and a side and no file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Named {
+    /// The declaration's range in [`Declarations::rbs`], end exclusive — a [`Span::generated`]
+    /// for a declaration that has no `Span`.
+    pub generated: (u32, u32),
+    /// Whether it was written on a class object's side, which decides which ancestry answers.
+    pub singleton: bool,
+    /// The member's own name, as it was declared.
+    pub name: String,
+}
+
+/// `(the whole construct, the name inside it)` in the file that really declared something.
+///
+/// The pair `locator::spans` produces and the two spans a `LocationLink` needs, and the one
+/// shape every generator in this crate hands back: a column's `t.string "title"` and the `title`
+/// in it, an association's macro call and its symbol, the `class Api::V1::Foo` a directory was
+/// believed on and the `Api` in it. Named because it is nested three deep in two of the tables
+/// that carry it, where four anonymous `u32`s say nothing at all.
+pub type At = ((u32, u32), (u32, u32));
 
 /// One generated declaration, and the bytes of the source that declared it.
 ///
@@ -591,7 +791,7 @@ pub struct Span {
 /// a kind out loud.
 ///
 /// The first source is the application's own code, and every name in it answers both questions
-/// — [`Analysis::walk`](crate::analysis::Analysis) fills it from the same walk that collects
+/// — `Analysis::walk` fills it from the same walk that collects
 /// everything else. The second is **the bundle**, and it is deliberately not the same set: it
 /// answers only for a namespace *above* a name the application already writes, which is the one
 /// place a generated name can introduce a segment nobody declared. Widening what a **macro** may
@@ -668,6 +868,44 @@ impl Namespaces {
     }
 }
 
+/// Which names a constant written inside `owner` could have meant, innermost first and bare last.
+///
+/// **Ruby's own lexical lookup rather than a framework's**, which is why it lives beside the fact
+/// table and not in `workspace/rails/`: `class Spree::LineItem` naming `Adjustment` asks for
+/// `Spree::LineItem::Adjustment`, then `Spree::Adjustment`, then `Adjustment`, and that is the
+/// language. Rails modelled `compute_type`'s search on it, so an association's `class_name` and an
+/// `include`'s spelling get one answer from one function — which is not a coincidence being
+/// reused.
+///
+/// and every other item in this module is a Prism shape only a reader in this directory meets.
+///
+/// `ActiveRecord::Inheritance#compute_type` is
+/// ``name.scan(/::|$/) { candidates.unshift "#{$`}::#{type_name}" }`` followed by
+/// `candidates << type_name`, so the walk is over the *joined* name of the body the reference is
+/// written in and not over the lexical nesting that produced it — `class Spree::LineItem`
+/// written at top level asks the same three questions as `module Spree; class LineItem`.
+///
+/// The empty prefix is **not** among them: a top-level `Story` asks for `Story::Adjustment` and
+/// then the bare name, which is two candidates rather than three. Nothing here checks that a
+/// candidate could be a constant, because it does not have to — a prefix put in front of a name
+/// that is not one leaves a name that is still not one, and the caller's `known` declines every
+/// entry.
+///
+/// Two readers ask it and they are asking two different questions with one answer: an
+/// association's `belongs_to :adjustment`, which is `compute_type`'s own list, and the module
+/// `isolate_namespace Spree` names, which is Ruby's ordinary lexical lookup. Rails modelled the
+/// first on the second, so one function is not a coincidence being reused.
+pub fn candidates(owner: &str, name: &str) -> Vec<String> {
+    let mut candidates = vec![format!("{owner}::{name}")];
+    candidates.extend(
+        owner
+            .rmatch_indices("::")
+            .map(|(at, _)| format!("{}::{name}", &owner[..at])),
+    );
+    candidates.push(name.to_owned());
+    candidates
+}
+
 /// Whether every segment of `name` is a constant somebody could have written.
 ///
 /// **rubydex names things a person cannot**, and a generated declaration on one of those names
@@ -732,7 +970,7 @@ impl Declarations {
         module: bool,
         superclass: Option<&str>,
         namespaces: &Namespaces,
-    ) -> usize {
+    ) -> (usize, (u32, u32)) {
         let (wrapper, inner) = nesting(name, namespaces);
         if let Some(wrapper) = wrapper {
             self.rbs.push_str("module ");
@@ -740,6 +978,10 @@ impl Declarations {
             self.rbs.push('\n');
             self.classes += 1;
         }
+        // Read after the wrapper and before the declaration, so the range is the *inner* line
+        // alone. A wrapper is a namespace this generator introduced to spell a name and no file
+        // wrote it, so a span over it would send a reader to a line that does not exist.
+        let start = self.rbs.len() as u32;
         self.rbs.push_str(if module { "module " } else { "class " });
         self.rbs.push_str(inner);
         // A `module` cannot have one, and [`Facts::inherits`] is only ever told about a class.
@@ -749,7 +991,10 @@ impl Declarations {
         }
         self.rbs.push('\n');
         self.classes += 1;
-        usize::from(wrapper.is_some())
+        (
+            usize::from(wrapper.is_some()),
+            (start, self.rbs.len() as u32),
+        )
     }
 
     /// Write an `include`, which names no member and so records no span.
@@ -767,7 +1012,7 @@ impl Declarations {
     }
 
     /// Write one `def`, and record the source that declared it when a source did.
-    fn declare(&mut self, text: &str, at: Option<((u32, u32), (u32, u32))>) {
+    fn declare(&mut self, text: &str, at: Option<At>) {
         self.methods += 1;
         let start = self.rbs.len() as u32;
         self.rbs.push_str("  ");
@@ -869,6 +1114,69 @@ mod tests {
             from,
             overloads: Vec::new(),
         }
+    }
+
+    /// One `Facts` per body, and every field goes with its owner.
+    ///
+    /// The property that makes the split safe to do at all: what each part renders is what the
+    /// whole would have rendered for that body, so a document is a body and never half of one.
+    #[test]
+    fn splitting_puts_every_body_in_its_own_document_and_leaves_nothing_behind() {
+        let namespaces = declaring(&["Story", "Widget", "Storyish"]);
+        let mut facts = Facts::default();
+        facts.declare(said(story(), "title", "String", Source::Column));
+        facts.declare(said(
+            Owner::Instance("Widget".to_owned()),
+            "name",
+            "String",
+            Source::Column,
+        ));
+        // Interleaved on purpose: the split is by owner and not by the order the facts arrived,
+        // and a generator that goes back to a body it already spoke about is the ordinary case.
+        facts.declare(said(
+            Owner::Singleton("Story".to_owned()),
+            "recent",
+            "untyped",
+            Source::Association,
+        ));
+        facts.note(story(), "ya-lsp writes this.".to_owned());
+        facts.mixin(story(), "Storyish".to_owned());
+        facts.inherits(Owner::Instance("Widget".to_owned()), "Object".to_owned());
+        facts.namespace(Owner::Module("Storyish".to_owned()), None);
+
+        let parts = facts.clone().split();
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(body, _)| body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["class:Story", "class:Widget", "module:Storyish"],
+            "one part per render key, in a stable order"
+        );
+
+        // `class Story` and `def self.recent` are one body, because the render key is
+        // `(is_module, name)` and not the `Owner`.
+        let first = &parts[0].1;
+        assert_eq!(first.len(), 2);
+        assert!(
+            first
+                .returns(&Owner::Instance("Story".to_owned()), "title")
+                .is_some()
+        );
+        // And what the part renders is what the whole rendered for that body, note, `include`
+        // and all.
+        let whole = facts.render(&namespaces).rbs;
+        for (_, part) in &parts {
+            let rendered = part.render(&namespaces).rbs;
+            for line in rendered.lines() {
+                assert!(whole.contains(line), "{line} is not in {whole}");
+            }
+        }
+        // Nothing was dropped on the way: every declaration the whole made is in some part.
+        assert_eq!(
+            parts.iter().map(|(_, part)| part.len()).sum::<usize>(),
+            facts.len()
+        );
     }
 
     /// A member that answers two things, and the three places one arm is not enough.
@@ -1257,6 +1565,107 @@ mod tests {
         facts.note(story(), "nobody wrote this".to_owned());
         assert!(facts.is_empty());
         assert_eq!(facts.render(&declaring(&[])), Declarations::default());
+    }
+
+    /// A body with nothing in it is still a body, and it renders as the two lines it is.
+    ///
+    /// The empty `Facts` above and this one are the two halves of the same question: a note says
+    /// something *about* a type and declares nothing, so it is nothing said; a namespace says the
+    /// type **exists**, which is the whole of what its generator has to say. So one renders an
+    /// empty document and the other renders a declaration.
+    ///
+    /// Told of no line, it records no span — which is the no-mapping-no-place rule for a body
+    /// nothing confirmed, and the shape every other placeless body in this table has.
+    #[test]
+    fn a_body_that_holds_nothing_is_still_declared() {
+        let mut facts = Facts::default();
+        assert!(facts.is_empty());
+        facts.namespace(Owner::Module("User::Policy".to_owned()), None);
+        assert!(!facts.is_empty());
+
+        let out = facts.render(&declaring(&[]));
+        assert_eq!(out.rbs, "module User::Policy\nend\n");
+        assert!(out.spans.is_empty());
+        assert_eq!(out.methods, 0);
+        assert_eq!(out.classes, 1);
+    }
+
+    /// A namespace told where it was confirmed is a place, and the span is the body's own line.
+    ///
+    /// The one body in this table that can be one, and the span has to cover the `module` line
+    /// rather than anything inside it: there *is* nothing inside it, and
+    /// `Synthesized::origin` looks the mapping up by the offset of the definition it is asked
+    /// about. A member's span would be the `def`; here the declaration is the whole body.
+    #[test]
+    fn a_namespace_that_was_confirmed_somewhere_is_a_place() {
+        let mut facts = Facts::default();
+        facts.namespace(Owner::Module("Mod".to_owned()), Some(((6, 28), (6, 9))));
+
+        let out = facts.render(&declaring(&[]));
+        assert_eq!(out.rbs, "module Mod\nend\n");
+        assert_eq!(out.spans.len(), 1);
+        let span = out.spans[0];
+        assert_eq!(
+            &out.rbs[span.generated.0 as usize..span.generated.1 as usize],
+            "module Mod\n"
+        );
+        assert_eq!((span.declared, span.selection), ((6, 28), (6, 9)));
+    }
+
+    /// The wrapper a generated name is spelled inside is never the place.
+    ///
+    /// `Api::V1` is written `module Api` / `module V1` when the application declares `Api` as a
+    /// module, and only the inner line is the declaration this fact is about. A span over the
+    /// wrapper would send a reader to `class Api::V1::Foo` and tell them it was `Api`'s
+    /// declaration, which is a different constant.
+    #[test]
+    fn the_wrapper_a_name_is_spelled_inside_is_never_the_place() {
+        let mut facts = Facts::default();
+        facts.namespace(
+            Owner::Module("Api::V1".to_owned()),
+            Some(((6, 30), (11, 13))),
+        );
+
+        let out = facts.render(&declaring(&["Api"]));
+        assert_eq!(out.rbs, "module Api\nmodule V1\nend\nend\n");
+        assert_eq!(out.spans.len(), 1);
+        let span = out.spans[0];
+        assert_eq!(
+            &out.rbs[span.generated.0 as usize..span.generated.1 as usize],
+            "module V1\n"
+        );
+    }
+
+    /// Said twice is said once, and `extend` carries it like everything else.
+    ///
+    /// One file writes `class User::Policy::A` and `class User::Policy::B`, so the map is what
+    /// keeps its document from opening the namespace twice — and a `Facts` merged into another
+    /// has to bring it, or a file that also feeds a second generator would lose the declaration
+    /// to the merge. **The first line said is the one kept**, through the merge as well as
+    /// inside one `Facts`: a reader sent to a file is sent to the place it says the name
+    /// earliest, and which generator ran first is not a fact about the file.
+    #[test]
+    fn a_body_that_holds_nothing_is_declared_once_however_often_it_is_said() {
+        let mut facts = Facts::default();
+        facts.namespace(
+            Owner::Module("User::Policy".to_owned()),
+            Some(((6, 24), (6, 10))),
+        );
+        facts.namespace(
+            Owner::Module("User::Policy".to_owned()),
+            Some(((60, 78), (60, 64))),
+        );
+        let mut into = Facts::default();
+        into.extend(facts);
+        into.namespace(
+            Owner::Module("User::Policy".to_owned()),
+            Some(((90, 99), (90, 94))),
+        );
+
+        let out = into.render(&declaring(&[]));
+        assert_eq!(out.rbs, "module User::Policy\nend\n");
+        assert_eq!(out.spans.len(), 1);
+        assert_eq!(out.spans[0].selection, (6, 10));
     }
 
     /// The namespace rule as a table: the one that becomes a body of its own.

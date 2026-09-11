@@ -112,6 +112,7 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
 
     fn kinds(received: &[Message]) -> Vec<String> {
         received
@@ -212,5 +213,95 @@ mod tests {
             };
             assert_eq!(params["token"], "gems");
         }
+    }
+
+    #[test]
+    fn a_reload_during_gem_indexing_closes_the_progress_stream_it_cancelled() {
+        // The queued files refer to the old configuration's gem roots, and the graph they were
+        // going to be indexed into no longer exists. A stream left open is a spinner forever.
+        let (dir, _gem_home, env) = project_with_gem("module Shouty\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/main.rb", "Shouty\n");
+        harness.index();
+        // Queued but not stepped: the files are still waiting when the config changes, which is
+        // the whole situation this is about.
+        harness.analysis.queue_background_indexing();
+        let started: Vec<String> = harness
+            .progress()
+            .into_iter()
+            .map(|(kind, _)| kind)
+            .collect();
+        assert_eq!(started, vec!["begin".to_owned()], "{started:?}");
+
+        harness.run(Task::ReloadConfig);
+
+        // The cancelled stream is closed *before* the reload's own indexing opens a new one.
+        // Leaving the first open would put two spinners in the status bar, one of them forever.
+        let progress = harness.progress();
+        let kinds: Vec<&str> = progress.iter().map(|(kind, _)| kind.as_str()).collect();
+        assert_eq!(kinds, vec!["end", "begin"], "{progress:?}");
+        assert_eq!(progress[0].1, "cancelled", "{progress:?}");
+    }
+
+    #[test]
+    fn a_reload_with_no_progress_stream_open_cancels_just_as_quietly() {
+        // The same cancellation, for a client that never advertised `window/workDoneProgress`.
+        // There is a stream to close only when there was one to open, and reaching for it
+        // unconditionally would take the analysis thread down on the client that asked for
+        // least — which is the one least likely to be tested against.
+        let (dir, _gem_home, env) = project_with_gem("module Shouty\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.analysis.client.work_done_progress = false;
+        harness.write("app/main.rb", "Shouty\n");
+        harness.index();
+        harness.analysis.queue_background_indexing();
+        assert!(
+            harness.analysis.gem_work.is_some(),
+            "there is background work to cancel"
+        );
+
+        harness.run(Task::ReloadConfig);
+
+        assert_eq!(
+            harness.progress(),
+            Vec::new(),
+            "no stream, no notifications"
+        );
+        assert_eq!(harness.messages(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn gem_indexing_reports_progress_and_always_closes_the_stream() {
+        let (dir, _gem_home, env) = project_with_gem("module Shouty\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/main.rb", "Shouty\n");
+        harness.index();
+        let _ = harness.progress();
+
+        harness.index_gems();
+
+        let progress = harness.progress();
+        let kinds: Vec<&str> = progress.iter().map(|(kind, _)| kind.as_str()).collect();
+        // A stream that begins and never ends leaves a spinner in the status bar forever.
+        assert_eq!(kinds.first(), Some(&"begin"), "{progress:?}");
+        assert_eq!(kinds.last(), Some(&"end"), "{progress:?}");
+        assert!(
+            progress
+                .last()
+                .is_some_and(|(_, message)| message.contains("1 gems")),
+            "{progress:?}"
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_gems_starts_no_progress_stream() {
+        // An empty spinner for work that never happens is worse than silence.
+        let mut harness = Harness::new();
+        harness.write("app/main.rb", "class Mine; end\n");
+        harness.index();
+        let _ = harness.progress();
+
+        harness.index_gems();
+        assert_eq!(harness.progress(), Vec::new());
     }
 }

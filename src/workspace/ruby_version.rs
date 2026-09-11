@@ -285,6 +285,7 @@ pub fn compare(left: &str, right: &str) -> std::cmp::Ordering {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use crate::analysis::testing::*;
     use std::cmp::Ordering;
 
     use super::*;
@@ -600,5 +601,24 @@ mod tests {
             Source::GemfileLock.to_string(),
             "RUBY VERSION in Gemfile.lock"
         );
+    }
+
+    #[test]
+    fn a_workspace_that_never_says_which_ruby_it_uses_hears_about_it() {
+        // `ruby_lib_dirs` refuses to guess a Ruby — rightly, because guessing puts Apple's
+        // vestigial 2.6 stdlib into the graph and answers `"hello".u` with `unspace` — and
+        // refusing in *silence* costs every one of Ruby's own 727 library files with nothing
+        // said. The unit test in `workspace::gems`
+        // pins the text; this pins that it reaches `window/showMessage` at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("ya-lsp.toml"), "[rbs]\nenabled = false\n").unwrap();
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        harness.write("lib/thing.rb", "class Thing\nend\n");
+        harness.index();
+        let _ = harness.messages();
+
+        harness.index_gems();
+
+        assert_eq!(harness.messages(), vec![messages::no_ruby_version()]);
     }
 }

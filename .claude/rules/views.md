@@ -19,14 +19,14 @@ paths:
   is what forbids the easy road here.** Third reason: declaring the helpers half in RBS would give
   every helper method in the corpus a second *place* on its card.
 - **So it is a rung, stated once and read twice.** `locator::resolve_typed` takes the first answer,
-  `completion::in_view` collects all of them — `locator::extended_class_methods`' seam reached by a
+  `completion::in_view` collects all of them — `locator::extended_modules`' seam reached by a
   second road. The gate deciding what the view context *is* lives in `views.rs` and nowhere else,
   so a jump and a list cannot disagree.
-- **The two halves are not the same size.** `app/helpers` reaches an order of magnitude more
+- **The two halves an application writes are not the same size.** `app/helpers` reaches an order of magnitude more
   template call sites than `helper_method` does, and a third of the export half names a method that
   is *also* an `app/helpers` `def`, so its marginal reach is smaller again. A rough survey badly
-  understated the gap; the counted truth is far more lopsided. If this item is ever cut down, that
-  is where the line goes.
+  understated the gap; the counted truth is far more lopsided. If this is ever cut down, that is
+  where the line goes.
 - **`rails::is_helper` is Rails' own glob and both halves are load-bearing.** `all_helpers_from_path`
   globs `**/*_helper.rb` under each `app/helpers`, so a file under `app/helpers` not named that way
   is in **no** view context by default — one corpus writes several, under a nested
@@ -61,11 +61,72 @@ paths:
   produces whatever the directory spells, and `app/views/shared/` spells `Shared`. `Views::mailers`
   is the gate — `rails::is_mailer` asked of `Context::superclasses`, the same superclass table the
   mailer and job reader uses.
-- **The rung is additive and must never be exclusive.** The view context is the two halves *plus*
-  every helper module ActionView ships, which this crate does not model. An application writing
-  `def tag` in `ApplicationHelper` shadows `ActionView::Helpers::TagHelper#tag`, so its own is
-  right there — and a template calling `link_to`, which it does not redefine, must go on answering
-  what it always did. `Reachable::member` returning `None` reaches the same name rung as before.
+- **`Views::rendered_by` is the one place the two are ordered, and `types` reads it as well.** The
+  controller first and the mailer only where there is no controller, which is Rails' own order: an
+  application that really writes a `UserMailerController` has said where that template renders
+  from. The same question decides three different answers — what a template may *call* here, what
+  a card says its `@ivar` *is*, and where `definition` *jumps* — so it is asked once and answered
+  in `RenderedBy`. Two modules resolving one path to two classes is not a state this can reach.
+  The `controller` flag travels with the name for the two readers that need it: the `app/helpers`
+  glob is a controller's and not a mailer's, and the card's footnote has to say *mailer* rather
+  than call one a controller.
+- **The third half is ActionView's own, and it is two names rather than a reader.** The view
+  context is the two halves an application writes *plus* every helper module ActionView ships, and
+  the last is `rails::VIEW_CONTEXT` — `ActionView::Helpers` and `ERB::Util`, which is what
+  `action_view/base.rb` writes as `include Helpers, ::ERB::Util, Context`. Nothing is generated
+  and nothing is declared: actionview is in the bundle and therefore already in the graph, so all
+  the table supplies is a **root to walk ancestors from**, and rubydex's linearization reaches the
+  24 helper modules `ActionView::Helpers` includes at module-body level — an alias like `t`
+  included. A project whose bundle has no actionview has no such declaration, which is the whole
+  of the gate: there is no switch, because a name the graph does not hold cannot be walked.
+- **The rung is additive and must never be exclusive.** An application writing `def tag` in
+  `ApplicationHelper` shadows `ActionView::Helpers::TagHelper#tag`, so its own is right there, and
+  the framework's half is read **last** for exactly that reason — the order is Ruby's own, since
+  the proxy sits on `_helpers`, the application's module is included into it, and ActionView's
+  were included into the view class before either. A name in none of the three halves still falls
+  to the name rung: after the third half shipped, 8,325 of the six corpora's 8,732 bare-word call
+  sites answer exactly and **407 are that residue** — `can?` 151, `defined?` 35, `confirm` 24,
+  `policy` 21, and a long tail of one project's own words.
+- **A module under `app/helpers` is *in* the view context, not merely read by it.** Rails includes
+  every one of them into the same `_helpers`, so a bare call written in one reaches the sibling
+  helper modules and ActionView's own exactly as a template's does — and it is the only other
+  place in an application where that is true, which is why `Views::reachable` answers for a helper
+  file and for nothing else that is not a template. What a helper file does **not** get is the
+  export half: `helper_method` is a permission one controller grants and a helper module is
+  included into every controller's context, so there is no class to name and none is picked. 296
+  of the 4,697 positions this half moved are in that lane. **The bound it inherits is the
+  template lane's own**: `rails::is_helper` is asked of the path under the cursor, so a helper
+  file inside an indexed *engine* gets the application's helper modules in scope exactly as an
+  engine's template already did. It is stated rather than fenced because the population is six
+  files across six corpora — 0 in lobsters and discourse, 1 each in mastodon, chatwoot and forem,
+  3 in solidus — and a fence for it would be the first time this module read `environment`.
+- **Declined, and the measurement that declined each.** Over 8,732 bare-word call sites in six
+  corpora's templates and `app/helpers` files, asked of the graph one module at a time against a
+  control class that includes nothing: `ActionView::Helpers` answers 27 words no other rung did,
+  `ERB::Util` 2 (`h`, `json_escape`, 38 sites), and **`ActionView::Context` 0** — it is the
+  renderer's own plumbing, `output_buffer` and `view_flow`, which no template calls bare.
+  **`ActionView::Base` itself is declined too, and not for lack of reach**: it answers the same 29
+  words, being these two plus `Context`. What it would add is `Object` and `Kernel`, whose members
+  would then arrive through the view rung rather than the name rung at every template in the
+  project — a far wider displacement bought for nothing.
+- **Swept with one binary per side, nothing else different: 4,697 of 8,732 positions moved from a
+  candidate list to one exact answer, 0 moved the other way, 0 went silent, 0 lost a place.** By
+  corpus: forem 3,144, solidus 993, mastodon 212, discourse 178, chatwoot 88, lobsters 82. `t` and
+  `translate` are 3,966 of it — the translation helper really is the call a Rails template makes
+  more than any other — then `link_to` 181, `raw` 86, `content_tag` 85, `render` 51. Every new
+  answer names an ActionView module or, in three cases, the sibling helper the widened helper lane
+  reaches; `h` lands on `ActiveSupport::CoreExt::ERBUtilPrivate`, which is the method that
+  actually runs.
+- **Completion was measured apart, because the audit sees none of it, and it is where the cost
+  is.** Over 297 real template lists the rows a template is offered went 266 to 285 on average,
+  with **0 lists shrinking** — but 37 of the 297 were already at the 512-item ceiling, and 312
+  rows were pushed past it, 79 of them route-helper labels. That is the cap and the ranking
+  behaving as specified rather than a new rule, and the obvious repair is **declined by
+  measurement**: filtering the view context's rows to public methods lost **932** rows across
+  135 lists instead of 312 across 37, because ActionView marks 185 of its 438 helper `def`s
+  private *and the corpora's own helper modules mark 192*, every one of which was already being
+  offered. `completion`'s `private_ok` is the rule — a cursor with no receiver written may call a
+  private method, because Ruby lets it — and this half does not get an exception to it.
 - **In completion the view context *shadows* what `Object` offers, and that is Ruby too.** A helper
   module is `include`d into the view class and `Kernel` is at the end of every chain, so an
   application writing `def format` in `ApplicationHelper` really has replaced `Kernel#format` for
@@ -83,7 +144,7 @@ paths:
   and `name` at one rank, so the navigation half was expected to read near zero; it does not,
   because the answer lands on `derived` — a convention that names a class is a derivation with a
   footnote. `sweep.tier` had to be taught that footnote first; it read "Reached through" as
-  *resolved*, which would have handed the item an unearned top tier.
+  *resolved*, which would have handed these positions an unearned top tier.
 - **The residue is small and every part of it is named.** Some positions were already `resolved`;
   some stay on the name rung — mostly partials under `shared/` or a vendored view path no path
   convention can reach; some stay a list; and a handful **answer nothing**, which is the harness

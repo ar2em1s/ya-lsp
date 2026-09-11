@@ -190,6 +190,7 @@ impl Attribute {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use crate::analysis::testing::*;
     use crate::generated::declaring;
     use std::collections::BTreeSet;
 
@@ -379,5 +380,113 @@ end
             model.retyped_columns().collect::<Vec<_>>(),
             [("Story", "price")]
         );
+    }
+
+    /// `attribute`'s precedence, which Rails documents and which is easy to get backwards.
+    ///
+    /// `attributes.rb` says a cast type "will override the type of existing attributes if
+    /// needed" and that a call with no cast type keeps "the previously defined type" — so the
+    /// two halves of this test are the two halves of that sentence. `price` is re-typed and the
+    /// schema withdraws its column, which has to produce **one** `Story#price` and a chain that
+    /// reaches the cast type rather than the storage. `note` names no type, so nothing is
+    /// declared for it at all and the column is exactly where it was — which is both what Rails
+    /// does and what the serializer gems require, since a call with no cast type is the shape
+    /// their macros also have.
+    #[test]
+    fn an_attribute_re_types_the_column_it_overrides_and_defers_where_it_names_no_type() {
+        let source = "Story.new.price.upcase\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let schema = harness.write(
+            "db/schema.rb",
+            "\
+ActiveRecord::Schema[7.1].define(version: 2024_01_01_000000) do
+  create_table \"stories\", force: :cascade do |t|
+    t.integer \"price\", null: false
+    t.string \"note\", null: false
+  end
+end
+",
+        );
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  attribute :price, :string\n  attribute :note\nend\n",
+        );
+        harness.watch(&[&schema, &story]);
+
+        assert_eq!(
+            harness.declarations_of("Story#price()"),
+            1,
+            "a column an `attribute` re-types is one declaration, not an overload"
+        );
+        let chained = card(&mut harness, &uri, source, "upcase");
+        assert!(
+            chained.contains("String#upcase"),
+            "the cast type, not the integer it is stored as: {chained}"
+        );
+        // The other half: an `attribute` with no cast type declares nothing, so the column is
+        // the only declaration there is and it still types the chain.
+        assert_eq!(
+            harness.declarations_of("Story#note()"),
+            1,
+            "an `attribute` that names no type leaves the column exactly where it was"
+        );
+        let note = "Story.new.note.upcase\n";
+        let reads = harness.write("app/reads.rb", note);
+        harness.watch(&[&reads]);
+        let chained = card(&mut harness, &reads, note, "upcase");
+        assert!(
+            chained.contains("String#upcase"),
+            "the column still types the chain: {chained}"
+        );
+    }
+
+    /// The long tail's phase two: an alias takes the type of the column it aliases, across two
+    /// generated documents.
+    ///
+    /// The second consumer of `Facts::returns`, and the shorter of the two paths — one
+    /// hop where a `delegate` takes two. `title` is declared into `db/schema.rb`'s document and
+    /// the alias into the model's, in the same pass, with nothing resolved and nothing indexed.
+    #[test]
+    fn an_alias_attribute_takes_the_type_of_the_column_it_aliases() {
+        let source = "Story.new.headline.upcase\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  alias_attribute :headline, :title\nend\n",
+        );
+        harness.watch(&[&story]);
+
+        assert!(
+            harness.has("Story#headline?()"),
+            "the pattern set, not only the reader"
+        );
+        let chained = card(&mut harness, &uri, source, "upcase");
+        assert!(
+            chained.contains("String#upcase"),
+            "the aliased column's own type: {chained}"
+        );
+    }
+
+    /// An `attribute` and a `def` of the same name are two places, and both are the user's own.
+    ///
+    /// The one position in 420,249 a tier sweep calls *worse*, pinned here because it is the
+    /// instrument rather than the answer: forem's `ResponseTemplate` writes
+    /// `attribute :user_identifier, :string` and a `def user_identifier` under it, so the card
+    /// gains a second place and `sweep.py`'s `tier` reads any card containing "Defined in " as
+    /// the name-based list. The answer got strictly better — the same declaration, now with the
+    /// line that typed it named beside the line that wrote it.
+    #[test]
+    fn an_attribute_beside_a_def_of_the_same_name_is_two_places() {
+        let source = "Story.new.nickname\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  attribute :nickname, :string\n\n               def nickname\n    \"x\"\n  end\nend\n",
+        );
+        harness.watch(&[&story]);
+
+        let card = card(&mut harness, &uri, source, "nickname");
+        assert!(card.contains("Defined in 2 places"), "{card}");
+        assert!(card.contains("`attribute :nickname, :string`"), "{card}");
     }
 }

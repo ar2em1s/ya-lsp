@@ -3,24 +3,36 @@ paths:
   - "src/analysis/threaded_tests.rs"
   - "src/analysis/mod.rs"
   - "src/analysis/indexer.rs"
+  - "src/analysis/testing.rs"
 ---
 
 # The run loop, and how it is tested
 
-- **`analysis/threaded_tests.rs` is the only place `Analysis::run` is executed.** `mod tests` calls
-  `analysis.handle(task)` on the test's own thread, which can ask what an answer *is* and nothing
+- **`analysis/threaded_tests.rs` is the only place `Analysis::run` is executed.** Every other test
+  drives `analysis/testing.rs`'s `Harness`, which calls
+  `analysis.handle(task)` on the test's own thread, and can ask what an answer *is* and nothing
   about what happens when two things arrive at once. The debounce deadline, the `receiver.is_empty()`
   check that makes gem indexing yield, the shared `Cancellations` set and the order requests are
   answered in are all unreachable from there. A new invariant about *ordering* belongs in
-  `threaded_tests.rs`; one about an answer's *shape* belongs in `mod tests`, which is faster to read.
+  `threaded_tests.rs`; one about an answer's *shape* belongs beside the module whose invariant it
+  would break, driven through the `Harness`, which is faster to read.
 - **Assert positions in the message stream, never elapsed time.** `Threaded` keeps every message the
   thread sent, in order, and every assertion is `a < b` over that list. A latency assertion would
   flake on a shared runner and would say nothing a position does not.
-- **The one exception is `semanticTokens/full`, and it is a ceiling rather than a measurement.** A
+- **The exception is the whole-file request, and it is a ceiling rather than a measurement.** A
   whole-file answer at typing speed on a loop that serialises everything is a head-of-line question,
   and this harness is the only thing that can ask it. What is bounded is **what the request behind it
   waits**, not its own latency: a cheap request goes into the queue *with* it, before the thread has
-  looked at either. The bar is twentyfold, like the canary's.
+  looked at either. Three requests are asked that way — `semanticTokens/full`, `documentLink` and a
+  whole-document `inlayHint` — each with its own constant, and all three tests have the same five
+  lines in the same order. The bar is twentyfold, like the canary's.
+- **A claim about *work* is counted, never timed, even here.** `inlayHint` carries a range that stops
+  a binding outside the window from being classified at all, and the first version of that assertion
+  was a ratio between the two elapsed times — which failed one run in six, because ~12 ms of a
+  window's 13 is the whole-buffer parse every request pays and a loaded runner inflates the fixed
+  cost, not the variable one. A ratio is only the same number on a slow runner when both sides scale
+  together. `cursor::CLASSIFIED` counts instead, beside the module that makes the claim; see
+  `hints.md`.
 - **The margin lives in the fixture, and it only runs one way.** Two tests need the thread still busy
   when the next thing lands, so the fixture carries several times the work the test consumes: the gem
   is 1,200 files (twelve batches; twelve round trips fit, the test asks four), and the debounce test
@@ -72,9 +84,37 @@ paths:
     held — so writing the new text there would make the map compare two equal strings, answer
     `identity`, and hand offsets to a graph an unknown number of edits behind, with no refusal to
     fall back from.
+  - **Everything that becomes a graph key goes in through the map, and a `Receiver` is a graph
+    key.** The cursor's own offset is the obvious one and it was never the whole set: `cursor`
+    parses the buffer, and the `Constant`/`Instance` offsets it hands back are looked up in the
+    graph exactly as the cursor is. Three callers reached `types::method_receiver` without
+    translating and the failure was invisible, because it degrades to a *plausible* answer rather
+    than to none — a name guess — which `answered_nothing` cannot see and so never retries.
+    `a_deferred_card_on_an_instance_variable_keeps_the_type_its_assignment_gives_it` and its two
+    neighbours are what fail if it comes back.
   - **A span coming *out* of the graph is mapped by the map of the document it is in**, which is not
     always the one asked. `Analysis::link` does that for every jump target; `references`, the
     highlights and the hierarchies do not, which is exactly why they are not on `defers`' list.
+  - **A span is not a caret, and the seam is where that stops being pedantic.** `Rebase::map` asks
+    for an unchanged byte on *each* side of a position, which is what a caret means and is what
+    keeps a deletion from answering precisely about the text it removed. Text inserted at offset
+    *p* leaves the graph's *p* naming **two** buffer positions — before what was typed and after
+    it — so `map` refuses it, and every declaration whose span begins exactly where the user is
+    typing loses its place. `Rebase::span_to_buffer` is the only way graph → buffer now, and it
+    takes the *span*, because the span is what resolves the ambiguity: its start is the byte it
+    covers first and its end the byte it covers last, so each leans on the side the span is on.
+    `to_graph` keeps both sides — its offsets are carets. `map` is written as the **agreement of
+    the two one-sided maps** rather than as its own comparisons, so the strictness cannot drift
+    from them.
+    **Measured over the six corpora with the graph actually held frozen**: 11 positions lost 36
+    places, every one at line 0 column 7 — `module Foo` — and all of it silent, since `link` drops
+    a *place* rather than the answer, `answered_nothing` stays false and the settle-and-retry
+    never fires. **Fixing only the document's first offset fixes nothing**, and the sweep that
+    said so is the reason this bullet is here: one settle puts the newlines already typed into the
+    graph, the declaration no longer starts at offset 0, and the refusal moves with the seam. The
+    exposure is a corpus convention: `.rb` files whose first byte opens a declaration are 91% of
+    forem and 78% of chatwoot, and 0% of mastodon and discourse, which write
+    `# frozen_string_literal: true` on line 1.
 - **Why the index is the expensive half.** `didChange` does two things and only the second costs
   anything: applying the edit to `open` is microseconds; putting a heavily-referenced document into
   rubydex costs hundreds of times more, because the cascade is a function of how much of the graph
@@ -113,7 +153,8 @@ paths:
   harness. The cost removed is a property of the graph, so a one-file fixture cannot produce it:
   measured on `threaded_tests`' own large fixture the difference is real but far under any non-flaky
   ceiling. A ceiling there would look like a guard and hold nothing. What is
-  asserted instead is the mechanism, in `mod tests` where the graph can be inspected —
+  asserted instead is the mechanism, in `analysis/mod.rs`'s own tests where the graph can be
+  inspected —
   `definitions_in` and not `has`, because a *declaration* is built by `Resolver::resolve` and an
   indexed-but-unresolved document has none, so `has` reads the same as never indexed at all.
 - **`Threaded` joins in `Drop`, and that is not tidiness.** A test failing an assertion unwinds with

@@ -27,9 +27,11 @@
 use std::borrow::Cow;
 
 use ruby_prism::{
-    CallNode, ConstantPathNode, InstanceVariableAndWriteNode, InstanceVariableOrWriteNode,
-    InstanceVariableWriteNode, LocalVariableWriteNode, Location, MatchLastLineNode, Node,
-    ParseResult, RegularExpressionNode, StringNode, SymbolNode, Visit, XStringNode,
+    BlockNode, CallNode, ClassNode, ConstantOrWriteNode, ConstantPathNode, ConstantPathOrWriteNode,
+    ConstantPathWriteNode, ConstantWriteNode, DefNode, InstanceVariableAndWriteNode,
+    InstanceVariableOrWriteNode, InstanceVariableWriteNode, LambdaNode, LocalVariableWriteNode,
+    Location, MatchLastLineNode, ModuleNode, Node, ParseResult, RegularExpressionNode,
+    SingletonClassNode, StringNode, SymbolNode, Visit, XStringNode,
 };
 
 use super::position::Rebase;
@@ -70,7 +72,7 @@ impl Context {
             // No receiver written at all, so the call has one implicitly.
             Context::Expression | Context::Argument { .. } => true,
             Context::MethodCall { receiver } | Context::NamespaceAccess { receiver } => {
-                matches!(*receiver, Receiver::SelfObject)
+                matches!(*receiver, Receiver::SelfObject(_))
             }
         }
     }
@@ -140,12 +142,14 @@ impl Receiver {
                 was: Box::new(was.rebased(rebase)?),
                 name: name.clone(),
             },
-            // Nothing to move: a name, a literal, `self`, `::` and the two dead ends.
-            Receiver::Literal(_)
-            | Receiver::SelfObject
-            | Receiver::TopLevel
-            | Receiver::Named(_)
-            | Receiver::Unknown => self.clone(),
+            // The body this offset falls in is what decides the answer, so it is as much a
+            // position in the graph's text as `Constant`'s is — and a `self` captured above
+            // the cursor is exactly the case a keystroke moves.
+            Receiver::SelfObject(offset) => Receiver::SelfObject(rebase.to_graph(*offset)?),
+            // Nothing to move: a name, a literal, `::` and the two dead ends.
+            Receiver::Literal(_) | Receiver::TopLevel | Receiver::Named(_) | Receiver::Unknown => {
+                self.clone()
+            }
         })
     }
 }
@@ -163,8 +167,30 @@ pub enum Receiver {
     /// already decided that `"x"` is a `String` and `[1]` an `Array`, and reading the node kind
     /// is reading that decision back.
     Literal(&'static str),
-    /// A literal `self`.
-    SelfObject,
+    /// A literal `self`, or the implicit one a receiverless call has, **and where it was
+    /// written**.
+    ///
+    /// # Why a `self` has an offset at all
+    ///
+    /// Everywhere else in this enum an offset is a graph key. This one is not: it is the
+    /// position whose *enclosing body* decides what `self` means, which is a question
+    /// [`types::method_receiver`](super::types::method_receiver) answers against the graph
+    /// and this module cannot.
+    ///
+    /// It has to be carried because a `self` is not always written where it is read.
+    /// `held = self` above a `Class.new(base) do … end` block, and `held.` inside that
+    /// block, are two different `self`s: rubydex records the block's body as an anonymous
+    /// class, so the cursor's `self` is that class while the assignment's is the enclosing
+    /// instance. Resolving this variant against the *cursor's* scope answered the anonymous
+    /// class — which has none of the instance's members, so `completion` listed `Object`'s
+    /// and the card said the receiver's type is unknown, because an anonymous class is not a
+    /// name [`locator::missed`](super::locator) will print. Two chatwoot positions, found by
+    /// the audit's check 6 rather than by a test.
+    ///
+    /// A plain block rebinds nothing and neither does a `def` inside one, so the offset and
+    /// the cursor land in the same body and this is the identity — which is every case but
+    /// the one above.
+    SelfObject(u32),
     /// Nothing at all, as in `::Foo`: the receiver is the top-level scope.
     TopLevel,
     /// The value a call hands back: what the call was written on, and the name it called.
@@ -304,6 +330,16 @@ pub struct Call {
     /// convention `Context::Argument` uses.
     pub name: u32,
     pub active: Active,
+    /// Whether Ruby would let a **private** method be written as this call.
+    ///
+    /// The same rule [`Context::allows_private`] applies, read off the same node rather than
+    /// asked again: this finder already holds the `CallNode` whose receiver decides it, and a
+    /// second parse to recover a fact one is standing on would be the expensive way to get the
+    /// same answer. `signatureHelp` is the consumer — the card it draws is for the call under
+    /// the cursor, and a signature for a method the interpreter refuses would disagree with the
+    /// jump at the identical cursor, which is what [`locator::precise_call`](super::locator)
+    /// exists to prevent.
+    pub allows_private: bool,
 }
 
 /// Which of a method's parameters the cursor is writing an argument for.
@@ -331,6 +367,18 @@ pub struct Cursor {
     /// usual case immediately after typing `.`.
     pub start: u32,
     pub end: u32,
+    /// Whether a **bare word** here is inside a block written straight into a class or module
+    /// body — the one place `self` is not what the file says it is. See [`closure_in_a_body`],
+    /// which is the walk that answers it, for what the question means and why it is only half
+    /// the evidence.
+    ///
+    /// **On the cursor rather than asked where it is needed**, because both places that need it
+    /// have already parsed this buffer: [`locator`](super::locator) for the rung it gates and
+    /// [`completion`](super::completion) for the list beside it. Asked separately it was a
+    /// second parse of the whole file on a keystroke; asked here it is a second walk over a tree
+    /// that already exists, and only for the contexts that read it — `false` on any cursor with
+    /// a receiver written in front of it, which is where the walk would have been wasted.
+    pub in_a_closure: bool,
 }
 
 /// What the cursor at `offset` is completing.
@@ -361,6 +409,11 @@ pub fn at(source: &str, offset: u32) -> Option<Cursor> {
 
     let (start, end) = word_at(source, offset);
     Some(Cursor {
+        // Gated on the context and not asked of every cursor, because both readers of the
+        // answer are in one arm: a receiver somebody wrote down says what `self` is, whatever
+        // block it sits in, so `person.` and `Foo::` pay nothing for a walk neither would read.
+        in_a_closure: matches!(context, Context::Expression | Context::Argument { .. })
+            && closure_in_a_body(&result.node(), offset),
         context,
         start,
         end,
@@ -387,7 +440,7 @@ pub fn call_at(source: &str, offset: u32) -> Option<Call> {
 
 /// Every assignment to `@name` on an instance of the class written as `path`, in file order.
 ///
-/// The syntax half of the view↔controller convention, and the one entry point that reads a
+/// The syntax half of the view↔renderer convention, and the one entry point that reads a
 /// file the cursor is not in. A template has no enclosing class, so
 /// [`Finder::type_the_instance_variable`] has nothing to walk; the assignments that type
 /// `@story` are in `StoriesController`, and [`types`](super::types) is what knows which file
@@ -423,6 +476,439 @@ pub fn assignments_in(source: &str, path: &str, name: &str) -> Vec<(u32, Receive
             (!matches!(receiver, Receiver::Unknown)).then_some((occurrence.start, receiver))
         })
         .collect()
+}
+
+/// What the constant whose name is written at `name` was assigned, as a shape.
+///
+/// The syntax half of the constant-assignment rung, and the second entry point that reads a
+/// file the cursor is not in. `ENV` is typed by a signature; an application's own
+/// configuration constant is typed by the `CONFIG = Settings.new` in an initializer nobody is
+/// looking at, and [`types`](super::types) is what knows which file that is.
+///
+/// **`name` is a span and not a name**, which is what makes this exact rather than a text
+/// match. rubydex files a `Definition::Constant` under the span of the name it writes — the
+/// last segment alone, so `Foo::BAR = x` is recorded at the `BAR` — and the caller takes the
+/// span off that definition. Two constants spelled the same in two namespaces are two spans,
+/// and a name the file merely *mentions* is not a span this walk ever recorded.
+///
+/// `None` where the span names no assignment in this text, and where the assignment is a shape
+/// nothing could be made of — which is what [`assignments_in`] does with one too. The first is
+/// the normal answer for a buffer that has been edited since it was indexed: the graph's span
+/// no longer names the same bytes, and refusing is what this does instead of reading whichever
+/// constant happens to be there now.
+#[must_use]
+pub fn constant_assignment(source: &str, name: (u32, u32)) -> Option<Receiver> {
+    let result = ruby_prism::parse(source.as_bytes());
+    // No cursor in this file, exactly as in `assignments_in`: `u32::MAX` is past every offset
+    // in it, so nothing is being typed and the walk collects assignments and nothing else.
+    let mut finder = Finder::new(source, u32::MAX);
+    finder.visit(&result.node());
+    let write = finder
+        .constant_writes
+        .iter()
+        .find(|write| write.name == name)?;
+    let receiver = finder.receiver_of(Some(&write.value), 0);
+    (!matches!(receiver, Receiver::Unknown)).then_some(receiver)
+}
+
+/// The instance variable spanned by `span`, as the shape a type can be looked up from.
+///
+/// [`at`] answers about a call being *written* and reaches an instance variable only as the
+/// thing to the left of a `.`. This asks the same question about the variable itself — what
+/// `@story` is, where the cursor is on `@story` and nothing follows it — and hands back the same
+/// [`Receiver`], so a card on `@story` and a card on `@story.title` cannot disagree about the
+/// type or about which rung it came from.
+///
+/// `span` is an instance variable's name span as [`scopes`] hands it back, `@` and all.
+/// **Which `@foo` this is is not a syntactic question** — see
+/// [`Finder::type_the_instance_variable`] — so placing the cursor on one is that module's, and
+/// the caller has already done it: [`locator::variable_at`](super::locator::variable_at) is the
+/// one that asks.
+#[must_use]
+pub fn instance_variable(source: &str, span: (u32, u32)) -> Receiver {
+    let result = ruby_prism::parse(source.as_bytes());
+    // Nothing is being typed: this answers a hover over text that is settled, so the
+    // half-typed-call repair has nothing to blank out. `u32::MAX` is past every offset in the
+    // file, which is how `assignments_in` says the same thing.
+    let mut finder = Finder::new(source, u32::MAX);
+    finder.visit(&result.node());
+    finder.type_the_instance_variable(span, 0)
+}
+
+/// What introduced a name whose type the line it is written on does not spell out.
+///
+/// The two shapes a *binding* can have, which is the question an inlay hint asks and no other
+/// caller in the crate does. Everything else here starts from a cursor and asks what one name
+/// means; this starts from the file and asks which names have a type worth saying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binding {
+    /// A block's parameter: the `story` in `stories.each do |story|`.
+    BlockParameter,
+    /// A local being assigned: the `author` in `author = story.author`.
+    Local,
+}
+
+/// One binding, and the shape that would type it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bound {
+    pub binding: Binding,
+    /// The span of the name, which is what a label is drawn after.
+    pub name: (u32, u32),
+    /// What it was bound to, as a shape. [`types::method_receiver`](super::types::method_receiver)
+    /// is what turns it into a type, and a **shape** is all that can be said without a graph.
+    pub was: Receiver,
+}
+
+/// Every binding whose name starts inside `within`, in source order.
+///
+/// The third entry point shaped like [`assignments_in`] and [`instance_variable`] — a walk with
+/// no cursor in it — and the one that reports rather than resolves: there is no name to look up,
+/// so `u32::MAX` says the same thing it says there and the whole file is collected.
+///
+/// **`within` is not a filter applied afterwards.** Classifying a shape walks a chain and every
+/// assignment above it, and the caller that asks this asks it about the range an editor has on
+/// screen — so the range is here, where it can stop the classification from running at all, and
+/// not in the caller, where it would only stop the answer from being used. Collecting the
+/// candidates is one parse either way; what the range buys is everything after it.
+///
+/// It **overlaps** rather than contains, and an empty range is a legal question: a name half
+/// scrolled off the top of the window is still a binding the visible half wants labelled, and a
+/// caller asking about one label it already has in its hand asks with the two ends equal.
+///
+/// A shape nothing could be made of is dropped rather than reported as [`Receiver::Unknown`],
+/// which is the same thing [`assignments_in`] does with one.
+#[must_use]
+pub fn bindings_in(source: &str, within: (u32, u32)) -> Vec<Bound> {
+    let result = ruby_prism::parse(source.as_bytes());
+    let mut finder = Finder::new(source, u32::MAX);
+    finder.visit(&result.node());
+
+    let mut bound: Vec<Bound> = finder
+        .yielded
+        .iter()
+        .filter(|parameter| overlaps(parameter.name, within))
+        .filter_map(|parameter| {
+            #[cfg(test)]
+            classified_one();
+            Some(Bound {
+                binding: Binding::BlockParameter,
+                name: parameter.name,
+                was: finder.yielded_shape(parameter, 0)?,
+            })
+        })
+        .chain(
+            finder
+                .locals
+                .iter()
+                .filter(|write| overlaps(write.name, within))
+                .filter_map(|write| {
+                    #[cfg(test)]
+                    classified_one();
+                    let was = finder.receiver_of(Some(&write.value), 0);
+                    (!matches!(was, Receiver::Unknown)).then_some(Bound {
+                        binding: Binding::Local,
+                        name: write.name,
+                        was,
+                    })
+                }),
+        )
+        .collect();
+    bound.sort_by_key(|found| found.name);
+    bound
+}
+
+/// Whether two spans share any byte, or touch at an end. See [`bindings_in`].
+#[must_use]
+pub const fn overlaps(span: (u32, u32), within: (u32, u32)) -> bool {
+    span.0 <= within.1 && within.0 <= span.1
+}
+
+// How many of [`bindings_in`]'s candidates have had their shape worked out since a test last
+// asked.
+//
+// The claim `within` exists for is that a binding outside the window is **never classified**,
+// and no answer can show it: a version that classified the file and filtered afterwards returns
+// the same list from the same call. What separates the two is work, and the only other way to
+// see work is the clock — which on a shared runner measures the runner, and did: the ratio this
+// replaces failed one run in six on an idle laptop, on the machine the numbers were taken on.
+// A count is the same claim as an integer, and it is the same integer everywhere.
+//
+// `thread_local` for [`REQUESTS_TO_CRASH`](super::REQUESTS_TO_CRASH)'s reason, one step further:
+// there, so that a parallel test cannot arm another's crash; here, so that it cannot be counted
+// into another's total. `bindings_in` runs on the thread that asked — it is reached from one
+// request handler and from nowhere the indexer's workers go — so there is nothing to miss.
+#[cfg(test)]
+thread_local! {
+    static CLASSIFIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn classified_one() {
+    CLASSIFIED.set(CLASSIFIED.get() + 1);
+}
+
+/// How many candidates have been classified since this was last called, which also resets it.
+///
+/// Read-and-reset rather than a pair, so that a test cannot read a number another request in
+/// the same test left behind.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub(super) fn classifications_taken() -> usize {
+    CLASSIFIED.replace(0)
+}
+
+/// A symbol literal written as a macro's argument, and the macro that wrote it.
+///
+/// `before_action :authenticate`, `validates :title`, `belongs_to :user`. rubydex records the
+/// *call* and not its arguments — [`requires`](super::requires) exists for the same gap one
+/// literal over — so a symbol is invisible to the graph, and it is the second commonest thing
+/// in a Rails file to put a cursor on that resolves to nothing at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroSymbol {
+    /// The name, colon excluded: `authenticate`.
+    pub name: String,
+    /// The call it is an argument to: `before_action`.
+    pub macro_name: String,
+    /// The span of the name, colon excluded — what the editor underlines.
+    pub start: u32,
+    pub end: u32,
+}
+
+/// The macro argument `offset` is inside, if it is inside one.
+///
+/// # What counts as a macro, without knowing a single macro's name
+///
+/// **A receiverless call written straight into a class or module body**, which is what a macro
+/// *is* in Ruby — there is no other construct the phrase describes. That test is syntax and
+/// nothing else, so this module stays a module with no vocabulary: `workspace/rails/` remains
+/// the only place in the crate that knows the word `belongs_to`, and a DSL this crate has never
+/// heard of — a gem's own `acts_as_list :position` — reads exactly the same way.
+///
+/// # Positional arguments only
+///
+/// The first `:symbol` after the macro name is a name the macro is *about*. A symbol in a
+/// keyword argument is a name the macro is *configured with* and usually means something else
+/// entirely: `dependent: :destroy` is not a method on this class, `on: :create` is a lifecycle
+/// event, and `validates :status, inclusion: { in: [:draft, :live] }` ends in two values of a
+/// column. `to: :user` in a `delegate` is the one that would resolve, and it is left out with
+/// the rest rather than special-cased, because telling it from `dependent:` is the Rails
+/// knowledge this module does not have.
+///
+/// Nothing nested counts either, by the same rule read one level down: `scope :recent, -> {
+/// order(created_at: :desc) }` offers `:recent` and not `:desc`, and `enum :status, [:draft,
+/// :live]` offers `:status` and not its values.
+#[must_use]
+pub fn macro_symbol(source: &str, offset: u32) -> Option<MacroSymbol> {
+    let result = ruby_prism::parse(source.as_bytes());
+    let mut finder = MacroSymbols {
+        offset,
+        body: false,
+        found: None,
+    };
+    finder.visit(&result.node());
+    finder.found
+}
+
+/// The walk [`macro_symbol`] runs: where `self` is a class body, and which call is under the
+/// cursor.
+struct MacroSymbols {
+    offset: u32,
+    /// Whether the node being visited is written in a class or module body rather than inside a
+    /// `def`. A block does not change the answer — `included do … end` and `scope :recent, -> {}`
+    /// are still the body — which is why this follows `def` and not every nesting Prism has.
+    body: bool,
+    found: Option<MacroSymbol>,
+}
+
+impl<'pr> Visit<'pr> for MacroSymbols {
+    fn visit_class_node(&mut self, node: &ClassNode<'pr>) {
+        let held = std::mem::replace(&mut self.body, true);
+        ruby_prism::visit_class_node(self, node);
+        self.body = held;
+    }
+
+    fn visit_module_node(&mut self, node: &ModuleNode<'pr>) {
+        let held = std::mem::replace(&mut self.body, true);
+        ruby_prism::visit_module_node(self, node);
+        self.body = held;
+    }
+
+    fn visit_singleton_class_node(&mut self, node: &SingletonClassNode<'pr>) {
+        let held = std::mem::replace(&mut self.body, true);
+        ruby_prism::visit_singleton_class_node(self, node);
+        self.body = held;
+    }
+
+    fn visit_def_node(&mut self, node: &DefNode<'pr>) {
+        let held = std::mem::replace(&mut self.body, false);
+        ruby_prism::visit_def_node(self, node);
+        self.body = held;
+    }
+
+    fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+        if self.found.is_none() {
+            self.found = self.argument_at(node);
+        }
+        if self.found.is_none() {
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+}
+
+impl MacroSymbols {
+    fn argument_at(&self, node: &CallNode<'_>) -> Option<MacroSymbol> {
+        // `Foo.validates :title` is somebody's own method on somebody's own object, and a call
+        // inside a `def` is a call rather than a declaration.
+        if !self.body || node.receiver().is_some() {
+            return None;
+        }
+        for argument in node.arguments()?.arguments().iter() {
+            let Some(symbol) = argument.as_symbol_node() else {
+                continue;
+            };
+            // The hit test takes the whole literal, colon included, so a cursor resting on the
+            // `:` still counts; the span reported is the name, which is what an editor
+            // underlines and what the generators already record as a declaration's own place.
+            let literal = symbol.location();
+            if self.offset < literal.start_offset() as u32
+                || self.offset > literal.end_offset() as u32
+            {
+                continue;
+            }
+            // A dynamic symbol — `:"#{prefix}_id"` — has no static value and names nothing this
+            // can look up.
+            let value = symbol.value_loc()?;
+            return Some(MacroSymbol {
+                name: String::from_utf8_lossy(symbol.unescaped()).into_owned(),
+                macro_name: String::from_utf8_lossy(node.name().as_slice()).into_owned(),
+                start: value.start_offset() as u32,
+                end: value.end_offset() as u32,
+            });
+        }
+        None
+    }
+}
+
+/// Whether `offset` is inside a **block written straight into a class or module body**.
+///
+/// # The one place `self` is not what the file says
+///
+/// Everywhere else in Ruby the enclosing construct decides what `self` is, and the graph
+/// already records that: a bare call in a `def` is on an instance, a bare call in a class body
+/// is on the class object. A block is different because it is a *value* — whoever receives it
+/// may run it against something else entirely, and every DSL that takes one does:
+/// `rule(:colon) { str(':') }`, `scope :recent, -> { where(...) }`,
+/// `validates :x, if: -> { active? }`. So a name written there may be on the class object, and
+/// may equally be on an instance, and nothing in the file says which.
+///
+/// This answers only the syntax half — *is there a block between the cursor and the namespace
+/// body it is written in* — because that is all a module with no graph can say. The other half
+/// is the graph's, and the two together are the evidence: [`locator`](super::locator) asks it of
+/// one name, which is absent from the class object and present on an instance, and
+/// [`completion`](super::completion) asks it of every name at once, which is the same rule read
+/// as a list rather than as a lookup.
+///
+/// **A `def` ends the question and a block inside one never starts it.** `self` in
+/// `def self.run; [1].each { … }; end` is the class object whatever `each` does with the block,
+/// because the block closes over the method's `self` and a method's `self` is not up for
+/// rebinding. That is the same rule [`MacroSymbols::body`] follows one step short: a macro is a
+/// receiverless call in a body, and a block does not stop it being one.
+///
+/// A second **walk** and not a second parse. The state this needs is not the state [`Finder`]
+/// keeps — a stack of what fixes `self`, against a stack of what the cursor is written inside —
+/// so the two cannot be one visitor without one of them carrying the other's fields. Over the
+/// same tree that is a walk each; over two parses it was the file read twice on a keystroke.
+#[must_use]
+fn closure_in_a_body(node: &Node<'_>, offset: u32) -> bool {
+    let mut walk = BodyClosure {
+        offset,
+        body: false,
+        block: false,
+        found: false,
+    };
+    walk.visit(node);
+    walk.found
+}
+
+/// The walk [`closure_in_a_body`] runs.
+///
+/// Both flags describe *the node being visited*, and the answer is read at the innermost
+/// construct that still contains the cursor — recorded on the way in, so that the deepest one
+/// visited is the one that stands. A construct that does not contain the cursor records
+/// nothing, and nothing inside it can.
+struct BodyClosure {
+    offset: u32,
+    /// Whether this is a class or module body rather than the inside of a `def`, which is
+    /// [`MacroSymbols::body`]'s question asked at a cursor instead of at a call.
+    body: bool,
+    /// Whether a block or a lambda has been entered since that body began.
+    block: bool,
+    found: bool,
+}
+
+impl BodyClosure {
+    /// Enter a construct that fixes what `self` is: a namespace body, or a `def`.
+    ///
+    /// It closes any block above it — a block *containing* a `class` keyword is not between the
+    /// cursor and the body the cursor is in.
+    fn fixes_self(&mut self, location: &Location<'_>, body: bool) -> (bool, bool) {
+        let held = (self.body, self.block);
+        self.body = body;
+        self.block = false;
+        self.record(location);
+        held
+    }
+
+    fn record(&mut self, location: &Location<'_>) {
+        if location.start_offset() as u32 <= self.offset
+            && self.offset <= location.end_offset() as u32
+        {
+            self.found = self.body && self.block;
+        }
+    }
+}
+
+impl<'pr> Visit<'pr> for BodyClosure {
+    fn visit_class_node(&mut self, node: &ClassNode<'pr>) {
+        let held = self.fixes_self(&node.location(), true);
+        ruby_prism::visit_class_node(self, node);
+        (self.body, self.block) = held;
+    }
+
+    fn visit_module_node(&mut self, node: &ModuleNode<'pr>) {
+        let held = self.fixes_self(&node.location(), true);
+        ruby_prism::visit_module_node(self, node);
+        (self.body, self.block) = held;
+    }
+
+    fn visit_singleton_class_node(&mut self, node: &SingletonClassNode<'pr>) {
+        let held = self.fixes_self(&node.location(), true);
+        ruby_prism::visit_singleton_class_node(self, node);
+        (self.body, self.block) = held;
+    }
+
+    fn visit_def_node(&mut self, node: &DefNode<'pr>) {
+        let held = self.fixes_self(&node.location(), false);
+        ruby_prism::visit_def_node(self, node);
+        (self.body, self.block) = held;
+    }
+
+    fn visit_block_node(&mut self, node: &BlockNode<'pr>) {
+        let held = std::mem::replace(&mut self.block, true);
+        self.record(&node.location());
+        ruby_prism::visit_block_node(self, node);
+        self.block = held;
+    }
+
+    // `-> { }` and `lambda { }` are the same construct to Ruby and a different node to Prism,
+    // and `scope :recent, -> { … }` is the spelling a Rails model writes it in.
+    fn visit_lambda_node(&mut self, node: &LambdaNode<'pr>) {
+        let held = std::mem::replace(&mut self.block, true);
+        self.record(&node.location());
+        ruby_prism::visit_lambda_node(self, node);
+        self.block = held;
+    }
 }
 
 /// The half-typed word the cursor is at the end of, as a span.
@@ -503,6 +989,13 @@ struct Finder<'s, 'pr> {
     /// `@name` it writes — which is the span [`scopes`] reports occurrences under, and the only
     /// thing the two walks have to agree about.
     instance_writes: Vec<InstanceWrite<'pr>>,
+    /// Every assignment to a constant anywhere in the file, keyed by the span of the name it
+    /// writes.
+    ///
+    /// The span is the **last segment alone** — the `BAR` of `Foo::BAR = x` — because that is
+    /// the span rubydex files its `Definition::Constant` under, and the span is the only thing
+    /// the graph and this walk have to agree about. See [`constant_assignment`].
+    constant_writes: Vec<ConstantWrite<'pr>>,
     /// The half-typed operator the cursor is completing after, as a span to blank out.
     ///
     /// See [`Finder::without_the_half_typed_call`]. Recorded here because the call node it
@@ -519,6 +1012,16 @@ struct InstanceWrite<'pr> {
     name: (u32, u32),
     /// The span of the assigned value, so that a write cannot answer for the read inside it.
     value_span: (u32, u32),
+    value: Node<'pr>,
+}
+
+/// One `CONST = <something>`.
+///
+/// No `value_span`, unlike the instance variable above: that field exists so that a *cursor*
+/// inside an assignment is not answered by the assignment it is inside, and nothing asks this
+/// about a cursor — it is read of a file the cursor is in a different document from.
+struct ConstantWrite<'pr> {
+    name: (u32, u32),
     value: Node<'pr>,
 }
 
@@ -568,9 +1071,10 @@ fn relays_a_block_parameter(receiver: &Receiver) -> bool {
 ///
 /// A **written** `self.foo` is treated the same as an implicit one, because it is the same call.
 fn rooted_in_self(receiver: &Receiver) -> bool {
-    // A **bare** receiverless call carries its own name rung in a `Spelled` — the wrapper item
-    // 41 adds around the lookup — and that wrapper is this same call rather than a variable in
-    // the middle of a chain, so it is unwrapped once here and never followed again below.
+    // A **bare** receiverless call carries its own name rung in a `Spelled` — the wrapper that
+    // keeps a spelling beside the shape — and that wrapper is this same call rather than a
+    // variable in the middle of a chain, so it is unwrapped once here and never followed again
+    // below.
     let receiver = match receiver {
         Receiver::Spelled { was, .. } => was.as_ref(),
         other => other,
@@ -580,7 +1084,7 @@ fn rooted_in_self(receiver: &Receiver) -> bool {
 
 fn rooted_in_a_call(receiver: &Receiver) -> bool {
     match receiver {
-        Receiver::SelfObject => true,
+        Receiver::SelfObject(_) => true,
         Receiver::Returned { on, .. } => rooted_in_a_call(on),
         _ => false,
     }
@@ -644,6 +1148,11 @@ impl<'pr> Visit<'pr> for Finder<'_, 'pr> {
             self.arguments = Some(Call {
                 name: message.start_offset() as u32,
                 active: self.active_argument(node),
+                // No receiver written, or one written `self` — through `.` and `::` alike,
+                // which is one node either way. See `Context::allows_private`.
+                allows_private: node
+                    .receiver()
+                    .is_none_or(|receiver| receiver.as_self_node().is_some()),
             });
         }
 
@@ -715,6 +1224,33 @@ impl<'pr> Visit<'pr> for Finder<'_, 'pr> {
         ruby_prism::visit_instance_variable_and_write_node(self, node);
     }
 
+    // The four shapes rubydex files a `Definition::Constant` for, and deliberately no others.
+    // `A &&= v` and `A += v` record a *reference* upstream and no definition at all, so a name
+    // span taken off a definition could never name one of them — and an operator write says
+    // what happens to a value rather than what it is, which is already the rule the three
+    // instance-variable visitors above follow.
+    fn visit_constant_write_node(&mut self, node: &ConstantWriteNode<'pr>) {
+        self.note_constant_write(&node.name_loc(), node.value());
+        ruby_prism::visit_constant_write_node(self, node);
+    }
+
+    fn visit_constant_or_write_node(&mut self, node: &ConstantOrWriteNode<'pr>) {
+        self.note_constant_write(&node.name_loc(), node.value());
+        ruby_prism::visit_constant_or_write_node(self, node);
+    }
+
+    // `Foo::BAR = x`. The name is the target's **last segment**, which is what rubydex records
+    // and what `Foo::BAR` and a plain `BAR` therefore arrive here spelled the same way.
+    fn visit_constant_path_write_node(&mut self, node: &ConstantPathWriteNode<'pr>) {
+        self.note_constant_write(&node.target().name_loc(), node.value());
+        ruby_prism::visit_constant_path_write_node(self, node);
+    }
+
+    fn visit_constant_path_or_write_node(&mut self, node: &ConstantPathOrWriteNode<'pr>) {
+        self.note_constant_write(&node.target().name_loc(), node.value());
+        ruby_prism::visit_constant_path_or_write_node(self, node);
+    }
+
     fn visit_string_node(&mut self, node: &StringNode<'pr>) {
         self.note_literal(&node.content_loc());
     }
@@ -749,6 +1285,7 @@ impl<'s, 'pr> Finder<'s, 'pr> {
             locals: Vec::new(),
             yielded: Vec::new(),
             instance_writes: Vec::new(),
+            constant_writes: Vec::new(),
             repair: None,
         }
     }
@@ -789,6 +1326,13 @@ impl<'s, 'pr> Finder<'s, 'pr> {
         self.instance_writes.push(InstanceWrite {
             name: (name.start_offset() as u32, name.end_offset() as u32),
             value_span: (span.start_offset() as u32, span.end_offset() as u32),
+            value,
+        });
+    }
+
+    fn note_constant_write(&mut self, name: &Location<'_>, value: Node<'pr>) {
+        self.constant_writes.push(ConstantWrite {
+            name: (name.start_offset() as u32, name.end_offset() as u32),
             value,
         });
     }
@@ -919,7 +1463,7 @@ impl<'s, 'pr> Finder<'s, 'pr> {
             return self.receiver_of(Some(&inner), depth + 1);
         }
         if node.as_self_node().is_some() {
-            return Receiver::SelfObject;
+            return Receiver::SelfObject(node.location().start_offset() as u32);
         }
         if is_constant(node) {
             // The end of the path, which is inside its last segment: `HR::Person` resolves as a
@@ -1043,6 +1587,15 @@ impl<'s, 'pr> Finder<'s, 'pr> {
             })
             // Innermost: the shortest span that still contains the read.
             .min_by_key(|parameter| parameter.body.1 - parameter.body.0)?;
+        self.yielded_shape(parameter, depth)
+    }
+
+    /// The same shape, for a parameter that has already been picked out.
+    ///
+    /// [`Finder::yielded_to`] searches for the parameter a *read* means; [`bindings_in`] already
+    /// has one, because it reports every parameter rather than resolving one name. Both need the
+    /// call classified and neither may do it during the walk, so the tail is shared.
+    fn yielded_shape(&self, parameter: &BlockParameter<'pr>, depth: usize) -> Option<Receiver> {
         let Receiver::Returned { on, method, .. } =
             self.receiver_of(Some(&parameter.call), depth + 1)
         else {
@@ -1185,7 +1738,9 @@ impl<'s, 'pr> Finder<'s, 'pr> {
             // *written* `self` already produces, and `types::method_receiver` has typed it as
             // the enclosing class.
             let returned = Receiver::Returned {
-                on: Box::new(Receiver::SelfObject),
+                // Where the implicit `self` stands is where the call is written, which is the
+                // same fact a written one records — see `Receiver::SelfObject`.
+                on: Box::new(Receiver::SelfObject(node.location().start_offset() as u32)),
                 method: method.to_owned(),
                 block: call.block().is_some(),
                 arity: arity_of(&call),
@@ -1372,6 +1927,7 @@ fn instance_span(node: &Node<'_>) -> Option<(u32, u32)> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     /// Classify the cursor written as `~` in the fixture, which is removed before parsing.
@@ -1412,9 +1968,9 @@ mod tests {
     }
 
     /// [`self_call`]'s shape with an argument count, for the widened-guard half.
-    fn self_call_with(arity: u32, name: &str) -> Receiver {
+    fn self_call_with(at: u32, arity: u32, name: &str) -> Receiver {
         Receiver::Returned {
-            on: Box::new(Receiver::SelfObject),
+            on: Box::new(Receiver::SelfObject(at)),
             method: name.to_owned(),
             block: false,
             arity: Arity::Exactly(arity),
@@ -1425,10 +1981,14 @@ mod tests {
     /// the method's own spelling kept under it for the rung below.
     ///
     /// The same name one rung further up, with the name-based answer still beneath it.
-    fn self_call(name: &str) -> Receiver {
+    ///
+    /// `at` is where the call is written, which is where its implicit `self` stands — see
+    /// [`Receiver::SelfObject`]. Every one of these is a byte count into the test's own source
+    /// with the `~` taken out, so a source that gains a line ahead of the call has to move it.
+    fn self_call(at: u32, name: &str) -> Receiver {
         Receiver::Spelled {
             was: Box::new(Receiver::Returned {
-                on: Box::new(Receiver::SelfObject),
+                on: Box::new(Receiver::SelfObject(at)),
                 method: name.to_owned(),
                 block: false,
                 arity: Arity::Exactly(0),
@@ -1519,7 +2079,7 @@ mod tests {
         assert_eq!(
             receiver("x = whatever\nx.~"),
             Receiver::Spelled {
-                was: Box::new(self_call("whatever")),
+                was: Box::new(self_call(4, "whatever")),
                 name: "x".to_owned(),
             },
             "with nothing declared anywhere, what is left is two names one below the other — \
@@ -1621,7 +2181,7 @@ mod tests {
         assert_eq!(
             receiver("person.new.~"),
             Receiver::Returned {
-                on: Box::new(self_call("person")),
+                on: Box::new(self_call(0, "person")),
                 method: "new".to_owned(),
                 block: false,
                 arity: Arity::Exactly(0),
@@ -1704,7 +2264,7 @@ mod tests {
             receiver("thing(1).foo.~"),
             Receiver::Returned {
                 on: Box::new(Receiver::Returned {
-                    on: Box::new(Receiver::SelfObject),
+                    on: Box::new(Receiver::SelfObject(0)),
                     method: "thing".to_owned(),
                     block: false,
                     arity: Arity::Exactly(1),
@@ -1720,7 +2280,7 @@ mod tests {
         assert_eq!(
             *on,
             Receiver::Returned {
-                on: Box::new(Receiver::SelfObject),
+                on: Box::new(Receiver::SelfObject(0)),
                 method: "thing".to_owned(),
                 block: true,
                 arity: Arity::Exactly(0),
@@ -1733,7 +2293,7 @@ mod tests {
             receiver("thing.foo.bar.~"),
             Receiver::Returned {
                 on: Box::new(Receiver::Returned {
-                    on: Box::new(self_call("thing")),
+                    on: Box::new(self_call(0, "thing")),
                     method: "foo".to_owned(),
                     block: false,
                     arity: Arity::Exactly(0),
@@ -1743,7 +2303,7 @@ mod tests {
                 arity: Arity::Exactly(0),
             }
         );
-        assert_eq!(receiver("build.~"), self_call("build"));
+        assert_eq!(receiver("build.~"), self_call(0, "build"));
     }
 
     #[test]
@@ -1842,13 +2402,13 @@ mod tests {
         assert_eq!(
             receiver("x = compute\nx.~\n"),
             Receiver::Spelled {
-                was: Box::new(self_call("compute")),
+                was: Box::new(self_call(4, "compute")),
                 name: "x".to_owned(),
             }
         );
         // Never assigned at all: a bare word, which Prism reads as a receiverless call — so it
         // is the *call's* shape, with the same spelling under it.
-        assert_eq!(receiver("x.~\n"), self_call("x"));
+        assert_eq!(receiver("x.~\n"), self_call(0, "x"));
         // `x = x.` must not type `x` from the half-written statement it is part of. It stays a
         // bare `Named` and the `self` rung does not reach it: the assignment above makes `x` a *local*
         // to Prism, so this is the local's own fall-through and never a call on `self`.
@@ -1888,7 +2448,7 @@ mod tests {
                 was: Box::new(Receiver::Assigned {
                     at: 20,
                     was: Box::new(Receiver::Returned {
-                        on: Box::new(self_call("fetch")),
+                        on: Box::new(self_call(29, "fetch")),
                         method: "first".to_owned(),
                         block: false,
                         arity: Arity::Exactly(0),
@@ -1975,6 +2535,51 @@ mod tests {
     }
 
     #[test]
+    fn what_a_constant_was_assigned_is_found_by_the_span_of_its_name() {
+        // The four shapes rubydex files a `Definition::Constant` for, keyed the way it keys
+        // them: the span of the name it writes, which for a path is the **last segment alone**.
+        // A name match would answer `Vault::HANDLE` for a `HANDLE` in another namespace; a span
+        // cannot.
+        let source = "\
+HOLDER = Vault::Store.new
+MEMO ||= \"x\"
+Vault::HANDLE = Vault::Store.new
+Vault::KEPT ||= 1
+GUARD &&= Vault::Store.new
+";
+        let at = |needle: &str| {
+            let start = source.find(needle).expect("needle") as u32;
+            (start, start + needle.len() as u32)
+        };
+        // `Klass.new` is a shape of its own rather than a call whose return has to be looked
+        // up, so what comes back names the class and not the method.
+        let built = |nth: usize| {
+            let (start, found) = source.match_indices("Vault::Store").nth(nth).unwrap();
+            Some(Receiver::Instance((start + found.len()) as u32))
+        };
+
+        assert_eq!(constant_assignment(source, at("HOLDER")), built(0));
+        assert_eq!(
+            constant_assignment(source, at("MEMO")),
+            Some(Receiver::Literal("String"))
+        );
+        // The path forms, found by the last segment and not by the whole path.
+        assert_eq!(constant_assignment(source, at("HANDLE")), built(1));
+        assert_eq!(
+            constant_assignment(source, at("KEPT")),
+            Some(Receiver::Literal("Integer"))
+        );
+
+        // **`&&=` is not one of the four**, and it could not be reached anyway: rubydex records
+        // a reference for it and no definition, so no caller holds a span that names one. Asked
+        // directly, it answers nothing rather than reading the value beside it.
+        assert_eq!(constant_assignment(source, at("GUARD")), None);
+        // A span that names nothing in this text — which is what an edit since the last index
+        // looks like from here.
+        assert_eq!(constant_assignment(source, (900, 906)), None);
+    }
+
+    #[test]
     fn an_instance_variable_assigned_from_itself_terminates() {
         // `@v = @v.foo` reads the variable inside the write that assigns it, and that write
         // cannot be the answer for that read.
@@ -2021,7 +2626,7 @@ mod tests {
             Receiver::Spelled {
                 was: Box::new(Receiver::Assigned {
                     at: 20,
-                    was: Box::new(self_call("compute")),
+                    was: Box::new(self_call(25, "compute")),
                 }),
                 name: "@v".to_owned(),
             }
@@ -2104,7 +2709,7 @@ mod tests {
             context("p = build_person\np.~\n"),
             Context::MethodCall {
                 receiver: Receiver::Spelled {
-                    was: Box::new(self_call("build_person")),
+                    was: Box::new(self_call(4, "build_person")),
                     name: "p".to_owned(),
                 }
             }
@@ -2118,7 +2723,7 @@ mod tests {
         assert_eq!(
             context("self.~\n"),
             Context::MethodCall {
-                receiver: Receiver::SelfObject
+                receiver: Receiver::SelfObject(0)
             }
         );
     }
@@ -2164,7 +2769,7 @@ mod tests {
             panic!("a yielded receiver");
         };
         assert_eq!(method, "map");
-        assert_eq!(*on, self_call("b"));
+        assert_eq!(*on, self_call(16, "b"));
     }
 
     #[test]
@@ -2179,7 +2784,7 @@ mod tests {
             Context::MethodCall {
                 receiver: Receiver::Spelled {
                     was: Box::new(Receiver::Yielded {
-                        on: Box::new(Receiver::SelfObject),
+                        on: Box::new(Receiver::SelfObject(0)),
                         method: "each".to_owned(),
                         index: 0,
                     }),
@@ -2247,7 +2852,7 @@ mod tests {
             Receiver::Returned {
                 on: Box::new(Receiver::Returned {
                     on: Box::new(Receiver::Spelled {
-                        was: Box::new(self_call_with(1, "make")),
+                        was: Box::new(self_call_with(12, 1, "make")),
                         name: "c".to_owned(),
                     }),
                     method: "rows".to_owned(),
@@ -2299,7 +2904,7 @@ mod tests {
         assert_eq!(
             context("a.each do |story|\n  story\nend\nstory.~\n"),
             Context::MethodCall {
-                receiver: self_call("story")
+                receiver: self_call(30, "story")
             }
         );
     }
@@ -2344,7 +2949,7 @@ mod tests {
             Context::MethodCall {
                 receiver: Receiver::Spelled {
                     was: Box::new(Receiver::Yielded {
-                        on: Box::new(self_call("items")),
+                        on: Box::new(self_call(0, "items")),
                         method: "each".to_owned(),
                         index: 0,
                     }),
@@ -2585,6 +3190,172 @@ mod tests {
         let found = call("build(Person.~").expect("the enclosing call");
         assert_eq!(found.name, 0);
         assert_eq!(found.active, Active::Nth(0));
+    }
+
+    /// [`macro_symbol`] at the `~`, as `macro name` or the reason there is none.
+    fn macro_at(marked: &str) -> String {
+        let offset = marked.find('~').expect("a ~ marking the cursor") as u32;
+        let source = marked.replace('~', "");
+        macro_symbol(&source, offset).map_or_else(
+            || "none".to_owned(),
+            |found| {
+                format!(
+                    "{} {} [{}..{}]",
+                    found.macro_name, found.name, found.start, found.end
+                )
+            },
+        )
+    }
+
+    #[test]
+    fn a_macros_positional_symbol_is_the_name_it_is_about() {
+        // The span is the name and not the literal, so an editor underlines `user` and not
+        // `:user` — which is also the span `workspace/rails/` already records as the
+        // declaration's own place, so the two cannot draw different boxes.
+        assert_eq!(
+            macro_at("class Story\n  belongs_to :u~ser\nend\n"),
+            "belongs_to user [26..30]"
+        );
+        // The colon counts as being on it, the way `locate` treats the edge of every span.
+        assert_eq!(
+            macro_at("class Story\n  belongs_to ~:user\nend\n"),
+            "belongs_to user [26..30]"
+        );
+        // A module body is a body, and so is a block written inside one — `included do … end`
+        // is where half of a concern's macros live.
+        assert_eq!(
+            macro_at("module Taggable\n  included do\n    before_save :nor~malise\n  end\nend\n"),
+            "before_save normalise [47..56]"
+        );
+        // `class << self` too, which is a namespace by the same test.
+        assert_eq!(
+            macro_at("class Story\n  class << self\n    attr_reader :cac~hed\n  end\nend\n"),
+            "attr_reader cached [45..51]"
+        );
+    }
+
+    #[test]
+    fn what_is_not_a_macros_own_name() {
+        // A keyword argument configures the macro rather than naming its subject, and telling
+        // `to:` from `dependent:` is the Rails knowledge this module does not have.
+        assert_eq!(
+            macro_at("class Story\n  has_many :c, dependent: :des~troy\nend\n"),
+            "none"
+        );
+        // Nested, one level down in each of the two shapes a macro nests: a block and an array.
+        assert_eq!(
+            macro_at("class Story\n  scope :recent, -> { order(created_at: :de~sc) }\nend\n"),
+            "none"
+        );
+        assert_eq!(
+            macro_at("class Story\n  enum :status, [:dr~aft, :live]\nend\n"),
+            "none"
+        );
+        // Inside a `def`, where a call is a call. The body flag follows `def` and nothing else.
+        assert_eq!(
+            macro_at("class Story\n  def run\n    send(:no~rmalise)\n  end\nend\n"),
+            "none"
+        );
+        // A receiver makes it somebody else's method on somebody else's object.
+        assert_eq!(
+            macro_at("class Story\n  Other.validates :ti~tle\nend\n"),
+            "none"
+        );
+        // Top-level code is not a class body, so nothing outside one is read at all.
+        assert_eq!(macro_at("attr_reader :ca~ched\n"), "none");
+        // A symbol with no static value names nothing that could be looked up.
+        assert_eq!(
+            macro_at("class Story\n  validates :\"#{pre}_i~d\"\nend\n"),
+            "none"
+        );
+        // Not on a symbol at all.
+        assert_eq!(macro_at("class Story\n  belongs~_to :user\nend\n"), "none");
+    }
+
+    /// The cursor is the `~`, which is removed before the source is parsed.
+    fn closure_at(marked: &str) -> bool {
+        let offset = marked.find('~').expect("a ~ marking the cursor") as u32;
+        let source = marked.replace('~', "");
+        let result = ruby_prism::parse(source.as_bytes());
+        closure_in_a_body(&result.node(), offset)
+    }
+
+    #[test]
+    fn a_block_in_a_namespace_body_is_a_closure_and_a_statement_in_one_is_not() {
+        // The distinction the whole rung rests on. A statement in a class body runs with the
+        // class object as `self` and nothing can change that; a block is a value, and what
+        // `rule` does with it is `rule`'s business.
+        assert!(closure_at(
+            "class Parser\n  rule(:colon) { st~r(':') }\nend\n"
+        ));
+        assert!(!closure_at("class Parser\n  st~r(':')\nend\n"));
+
+        // `do … end` and `{ … }` are one construct to Ruby and one node to Prism.
+        assert!(closure_at(
+            "class Parser\n  included do\n    va~lidate\n  end\nend\n"
+        ));
+        // `-> { }` is a different node, and it is the spelling a Rails model writes.
+        assert!(closure_at(
+            "class Story\n  scope :recent, -> { whe~re(live: true) }\nend\n"
+        ));
+        // A module body is a class body for this question: a concern's `included do` block is
+        // written in one, and it is the block Rails re-binds most often of all.
+        assert!(closure_at(
+            "module Countable\n  included do\n    has_ma~ny :counts\n  end\nend\n"
+        ));
+        // `class << self` fixes `self` the way `class` does, one singleton step further out.
+        assert!(closure_at(
+            "class Story\n  class << self\n    [1].each { he~lper }\n  end\nend\n"
+        ));
+    }
+
+    #[test]
+    fn the_closure_answer_rides_on_the_cursor_rather_than_being_asked_for_again() {
+        // The field is the whole reason this walk runs where it does: `locator` used to parse
+        // the file a second time to ask it, and `completion` would have had to make that a
+        // third. One parse, two walks, and the answer travels with the cursor that needed it.
+        let cursor = |marked: &str| {
+            let offset = marked.find('~').expect("a ~ marking the cursor") as u32;
+            at(&marked.replace('~', ""), offset).expect("a cursor")
+        };
+        assert!(cursor("class Parser\n  rule(:colon) { st~r(':') }\nend\n").in_a_closure);
+        assert!(!cursor("class Parser\n  st~r(':')\nend\n").in_a_closure);
+    }
+
+    #[test]
+    fn a_def_ends_the_question_and_a_block_inside_one_never_starts_it() {
+        // A block closes over the method's `self`, and a method's `self` is not up for
+        // rebinding — `instance_exec` on a block that came from inside a `def` still binds the
+        // receiver the block already had for `self` at the point it was written. So both of
+        // these are the `def`'s answer and neither is this rung's.
+        assert!(!closure_at(
+            "class Story\n  def self.run\n    [1].each { he~lper }\n  end\nend\n"
+        ));
+        assert!(!closure_at(
+            "class Story\n  def run\n    [1].each { he~lper }\n  end\nend\n"
+        ));
+        // And a `def` written *inside* a closure is a `def` like any other: the innermost
+        // construct that fixes `self` is what the cursor is in, not the outermost.
+        assert!(!closure_at(
+            "class Story\n  [1].each do\n    def run\n      he~lper\n    end\n  end\nend\n"
+        ));
+    }
+
+    #[test]
+    fn a_block_with_no_namespace_body_over_it_is_not_this_question() {
+        // Top level: `self` is `main`, there is no class object, and rubydex never hands this
+        // rung a receiver for it. The syntax half says so on its own.
+        assert!(!closure_at("[1].each { he~lper }\n"));
+        assert!(!closure_at("he~lper\n"));
+        // A `class` keyword written inside a block does not make the block one the body's
+        // statements are in — the body begins after it.
+        assert!(!closure_at(
+            "[1].each do\n  class Story\n    he~lper\n  end\nend\n"
+        ));
+        // A cursor in a sibling block that does not contain it records nothing.
+        assert!(!closure_at(
+            "class Story\n  [1].each { helper }\n  ru~n\nend\n"
+        ));
     }
 
     #[test]

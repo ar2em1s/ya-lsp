@@ -7,6 +7,7 @@ paths:
   - "src/analysis/structs.rs"
   - "src/generated.rs"
   - "src/analysis/synthesize.rs"
+  - "src/knowledge/**"
 ---
 
 # Declarations ya-lsp wrote itself
@@ -36,17 +37,115 @@ paths:
   is checked once and the jump is trusted forever.
 - **Mappings may nest and the narrowest containing the offset wins**, the same rule as the spans
   under the cursor in `locator::locate`.
+- **One kind of body is a place, and it is the only one.** Every other span is a member's — a
+  `def` the generator wrote because a line of the user's code implied it. A namespace Zeitwerk
+  conjures from a directory holds no member at all, so the body *is* the declaration, and a
+  directory is not a line anybody can be sent to. `Facts::namespace` therefore takes an `at`, and
+  the place is the `Api` of a `class Api::V1::Foo` — **the file that confirmed the directory**,
+  which is the same rule every member span obeys and not an exception to it. The generated
+  document is keyed by that file rather than by the directory, so a name has as many places as
+  there are files declaring into it: none of them is *the* declaration and all of them are one,
+  which is Ruby's own operational test. Measured over six corpora at 210 such names behind 1,932
+  openers: 93 answered no place and 4 do. A body reached any other way — a wrapper `open`
+  introduced, a route-helper host, a relation class — carries no span still, and those are lines
+  no file wrote.
+- **The span travels in the walk's projection, not in the generator.** A confirming file is
+  typically a plain controller on no generator's list, so the *sources changed* gate never sees
+  an edit to it and `Context`'s own gate is the only one that can. A span left out of
+  `Contribution` would be a mapping that goes stale the first time somebody presses return above
+  the `class` line — the one failure `Synthesized::record` cannot catch, because it compares the
+  text and the text is byte-identical.
+- **The path proposes and the file confirms — the spelling as well as the existence.**
+  `autoloaded_namespaces` camelizes, which is Zeitwerk's default inflector and not Zeitwerk: an
+  application registering an acronym autoloads `app/serializers/rest/` as `REST`, and a chain
+  proposed as `Rest` agrees with nothing that file writes. `rails::confirmed_spelling` matches
+  the directory with its underscores dropped against the segment, case-insensitively, and takes
+  **the file's** spelling — so `not_already_silenced` confirms `NotAlreadySilenced` exactly as
+  before and `rest` now confirms `REST` too. The acronym table is
+  `config/initializers/inflections.rb`, which is Ruby that only runs; what is on disk is the
+  answer rather than the rule. It cannot conjure a name the directory does not spell, which is
+  the bound that matters.
+- **A mapping may point into a file this generator never read, and one kind of member does.**
+  Every other place is a line in the document the generator just read — a column's `t.string
+  "title"`, an association's `has_many :comments`. ActiveRecord's query interface has no such
+  line, because **no file in the project declares `Story.where`**: it was written with no span at
+  all, which made a *Resolved* card over it send a reader nowhere. It does have a definition, and
+  the bundle is already indexed, so the place is **found rather than read** — `Story.where`
+  answers `activerecord/lib/active_record/relation/query_methods.rb:1033`.
+- **The lookup is Ruby's own method lookup, asked of the graph.** `rails::RAILS_RELATION` is
+  **one name** — `ActiveRecord::Relation` — because rubydex has already walked `relation.rb`'s
+  `include FinderMethods, Calculations, SpawnMethods, QueryMethods, Batches, Explain, Delegation`,
+  so the ancestor walk *is* `Method#owner`. Checked against `Method#source_location` under
+  activerecord 7.2.3.1, 8.0.5, 8.0.5.1 and 8.1.3.1: of the 127 names the generator declares,
+  **125 resolve and all 125 land on the line Ruby names**. The two that do not are `instantiate`,
+  which is the class side's alone, and `default_order`, which is in Rails' main branch and no
+  released version. That include line is **byte-identical across all four versions**.
+- **The class side is ten names and one delegation.** `Story.where` is
+  `delegate(*QUERYING_METHODS, to: :all)` at `querying.rb:24`, and no reader can expand a splatted
+  constant into ninety method names, so `ActiveRecord::Querying` holds no `def` to find.
+  `RAILS_CLASS_SIDE` names the three modules Rails does write a class-side `def` in —
+  `Persistence::ClassMethods`, `Core::ClassMethods`, `Inheritance::ClassMethods`, **10 of 10
+  matching `source_location` across the four versions** — and then falls through to the relation,
+  which is exactly what the `delegate` line says those names are. `ActiveRecord::Base`'s own
+  singleton is deliberately **not** on the list although Ruby searches it first: the generator
+  writes the class side onto that very singleton, so looking there finds this crate's own
+  declaration, which has no place, and the ten that do have one would lose it to the fall-through.
+- **It runs after the resolve and cannot run inside the pass.** Every generator writes the text
+  rubydex is about to link, so while one is running the graph holds **four** declarations —
+  `Object`, `BasicObject`, `Module`, `Class` — and every question about a gem's classes answers
+  nothing. So `Facts::render` states *names* (`Declarations::named`, tagged `Source::Query`) and
+  `Analysis::place_generated_members` answers them one step later. `Analysis::regenerate` is the
+  three steps as one function, because two of the three is not a valid state.
+- **Asked again on every resolve, never cached across one.** A bundle can change under a
+  workspace and a jump into the version that went away is silent — the same sentence the rest of
+  this file is built on. What bounds the cost is a memo *within* one pass: the class side is
+  written onto every base in the project and states the same names on each.
+- **The callbacks are deliberately not looked up, and that is the line.** `before_save` is built
+  by `define_model_callbacks`; a jump into the machinery that defines a *family* of methods tells
+  a reader nothing about the one they asked about. The rule is **the file that defines this
+  method, not the file that defines methods** — which is why `relations::callbacks` keeps
+  `Source::Interface` and only `relation_base` and `class_side` carry `Source::Query`.
+- **Two things the corpora caught here and the suite could not have.** A hit on the object model
+  is not an answer: `Kernel` alone declares `select`, `format`, `open` and `test`, and four
+  positions answered `Story.select` with `IO.select` in `core/kernel.rbs` — so the walk applies
+  `locator::ruby_s_own`, the same rule the name rung has for the same reason. And one `def`
+  borrowed by several declarations is still **one place**: the interface is declared once per
+  relation class and once per base, so a name rung offering all of them offered mastodon's
+  `find_each` five times over, four of them the same line. `locator::all_places` deduplicates
+  across declarations, which `places` cannot — it is asked about one declaration at a time.
+  Over the audit's own draw that is **32,140 repeated URIs down to 29,488**, most of which
+  predate this row.
+- **What it was worth.** Over 5,523 drawn positions: **297 cards named a tier and no place, and
+  231 of them were this** — 157 *Resolved* on the class side, 74 *Derived* on the relation side.
+  After: **246 lists gained a place, 0 emptied, 0 distinct places lost, 0 tiers moved**, and every
+  new place is in activerecord. What is left placeless is 39 namespaces a directory declares,
+  where no line declares them and nothing is wrong, and 27 ivar reads, which are another row's.
 - **A generated `class Foo` is deliberately left unmapped.** The schema reader maps its columns and
   not the `class Story` it hangs them off, because `create_table "stories"` does not declare
   `Story` — the model file does. So goto-definition on `Story` offers one place rather than two,
   and the picker grows no second `Story` row opening `db/schema.rb`. A generator wanting the
   reopening navigable has to map it on purpose.
-- **One generated document per source file, by naming rather than bookkeeping.**
-  `synthesized::generated_uri` is a pure function of the source's URI, so regenerating cannot leave
-  two answers: rubydex replaces a document indexed under a URI it holds, and the table is keyed by
-  that URI. No second key to leak, no list to prune — the failure that would cause (an edited
-  `db/schema.rb` still answering with the old column) is silent and permanent. `generated_uri` is
-  deliberately **total**: a `None` arm would be a silent "generated nothing".
+- **One generated document per source file *and body*, by naming rather than bookkeeping.**
+  `synthesized::generated_uri` is a pure function of the source's URI and the body's own name —
+  `ya-lsp-generated:file:///…/db/schema.rb#class:Story` — so regenerating cannot leave two answers:
+  rubydex replaces a document indexed under a URI it holds, and the table is keyed by that URI.
+  `generated_uri` is deliberately **total**: a `None` arm would be a silent "generated nothing".
+  The *source* stays recoverable from the name alone, by the prefix `generated_prefix` writes and
+  `source_of` cuts, which is what `environment`, `completion::Locality` and `hints` read rather
+  than asking the table.
+- **A body is `Facts::render`'s own key, `(is_module, name)`, and `Facts::split` cuts on it.**
+  `Instance` and `Singleton` of one class are one body because they open one `class X`; `Module` of
+  the same name is a different one because `class X` and `module X` are two declarations of one
+  constant RBS refuses to hold. Three things make the split safe rather than delicate, and each is
+  a property something else already had: it happens **after** every generator has spoken and every
+  collision is settled, so no rank is re-decided and `declared`, `returns` and `source` are still
+  asked of the whole file's facts; **a collision cannot cross a part**, because two generators that
+  name one member collide on `(owner, name)` and the owner picks the part; and **every field of
+  `Facts` is keyed by an `Owner`**, so the partition is total.
+- **The one thing that is bookkeeping: `record` takes every part of a source at once.** A source
+  that wrote three bodies and now writes two has to *forget* the third, or a dropped table answers
+  forever. Taking the whole list is what makes the set of documents a source owns move atomically;
+  a per-part `record` would need a second list somebody kept pruned, and that failure is silent.
 - **`record` makes both calls in one function, so they cannot drift.** The graph learns the
   declarations and `Types` learns what they return. It does not mark the graph dirty (the caller
   does) and does not blank `interface` blocks (that rule is for signature files somebody else
@@ -72,11 +171,36 @@ paths:
   ancestor the resolver never found, so it reads a document URI directly. Generated RBS should
   never name a class the graph does not hold, and if it did, `DocUri::from_uri_str` drops the row.
   The failure direction is a missing row, never a wrong one.
-- **A generated declaration is not in `own_documents`, so it ranks like a gem's — and that is
-  right.** `completion::Locality` scores only the user's own documents, so `Story.new.` offers
-  `summary`, `description`, `id`, `title`, then `tap`: what the class was written to do, then what
-  its table says it holds, then what every object can do. Pinned by a test rather than discovered
-  from a bug report. Same treatment a `sig/` signature already gets.
+- **A generated declaration ranks as the user's code, one directory out — and it took a
+  measurement to get there.** `Story.new.` offers `summary`, `description`, `id`, `title`, then
+  `tap`: what the class was written to do, then what its table says it holds, then what every
+  object can do. That order is pinned by a test and has never moved. What moved is the reason for
+  it. The first reading was that a generated document is absent from `own_documents`, so
+  `completion::Locality` never scores it and `group` reads the miss as *somebody else's code* —
+  the same treatment a `sig/` signature gets. **That is wrong the moment the project patches a
+  class at the far end of the chain**, which every Rails application does: `group` is the first
+  term of the ranking key, so a `def` in `config/initializers` on `Object` outranked every column,
+  association and enum the receiver's own table implies, and `distance` — which had the right
+  answer — was never reached. Measured on a real application: two `Object` patches took ranks 1
+  and 2 of `story.`, above `body`, `score` and `title`.
+- **So `Locality::at` files a generated document beside the file that implied it, at the same
+  step.** One source writes one generated document per body, so the set cannot be computed from the
+  source's URI any more: the generated documents are picked out of the pass over the graph that
+  `Locality::at` already makes, and each is mapped back to its source by `synthesized::source_of`,
+  which is the naming read backwards. Still no `Synthesized` in `completion.rs` and no second scan. `own_documents` itself is untouched,
+  which is what keeps the `rename` rule below saying what it says: a generated definition is still
+  not somewhere ya-lsp will edit. A generated document whose source is *not* the user's code stays
+  unscored, exactly as before.
+- **And the entry carries *which kind of document scored*, because the pinned order above is not a
+  distance question.** A column is declared in `db/schema.rb` and the method beside it in
+  `app/models/story.rb`. Score them by locality alone and the order holds from a cursor in `app/`
+  and inverts from one in `db/`, which is the pinned order becoming an accident of layout. So
+  `Ranked` has a `generated` term between `distance` and `locality`: a near owner still wins, and at
+  the same owner the user's own `def` leads what the generator wrote for it, from anywhere in the
+  tree. **The corpora argue against it and it is kept anyway**: it moves 18 words out of rank 1 into
+  the top ten while tightening every band below, so a developer does reach a table's members slightly
+  more often than the `def`s beside them — and an order that changes with the cursor's directory is
+  one nobody can learn. `completion.md` has the key and the numbers.
 - **A generated definition makes `rename` refuse, and that is the right answer.** `rename` reads
   *every* definition and refuses unless all are somewhere ya-lsp will edit; a generated document is
   not the user's own code by the test that keeps a vendored bundle out. So a `class Story`
@@ -138,6 +262,54 @@ flat in the four that do not. And at the positions whose member name is one this
 **candidate lists get shorter, none gets longer, none collapses, none appears**. Re-measure that
 pair; the tier sweep will read nothing whatever you do.
 
+## A class nobody can name, and a member that still exists
+
+Some association calls say outright that no single class can be named: `polymorphic: true`, whose
+companion `*_type` column decides one row at a time, and either of the two keywords that name a
+class outright — `class_name:` and `source_type:` — written as anything but a string literal. One
+corpus lets the host application supply its own user class through a runtime object, and no reading
+of the text turns one into a name. All of them used to emit **nothing**.
+
+- **A deliberate refusal and a lookup that came back empty are both silence, and one rung down
+  silence is the name rung's cue to fire.** With no `Follow#follower()` in the graph, the cursor on
+  a bare `follower` fell through to matching the word against every `def follower` in the workspace
+  — which on two corpora is an unrelated service object and on one is a **spec** file. The decline
+  was right and the thing after it was not, so the decline is now written down: `def follower: ()
+  -> untyped`, spanned onto the `belongs_to` line like every other generated member.
+- **`untyped` is the honest type, and the alternative is not a better type — it is no member.**
+  The member exists at run time whatever the column holds. What nobody can write down is its
+  class, and that is exactly what `untyped` says.
+- **The line between these two and an ordinary miss is evidence, not degree.** `belongs_to
+  :parent_comment` naming no `ParentComment` is a *lookup* that failed — the reader may have
+  camelized the wrong word, or the class may be somewhere this pass cannot see — and it still
+  declines whole. `polymorphic:`, `class_name:` and `source_type:` are ActiveRecord's **own
+  keywords**, so their presence is also positive evidence that the call is an association at all,
+  which is the same argument `attribute` makes from a cast type.
+- **What is lost is the type and never the member.** Every name the macro installs that does not
+  have to name a class is installed exactly as it would be — the writer, and a collection's
+  `_ids` pair, whose element type was never this reader's to say. The three constructors are the
+  one group that goes: Rails writes them `unless reflection.polymorphic?` because there is
+  nothing to instantiate, and a `(*untyped) -> untyped` constructor for the `class_name:` half
+  states nothing the association's own name did not. Dropping the `_ids` pair as well was tried
+  and **cost a real answer** — one corpus writes `self.user_ids = …` in the very model whose
+  `has_many :users` carries the runtime `class_name:`, and lane 2's check 1 reported it as a
+  highlight with no definition.
+- **`polymorphic:` is read first and wins.** That is Rails' order rather than a preference —
+  `compute_type` is never reached for a polymorphic reflection — and the corpus writes the pair
+  together inside a `with_options class_name: "User"`, so the order is not hypothetical.
+- **Below it, one list decides the class and the first of it that is written answers.**
+  `class_name:`, then `source_type:`. The list is stated once and both halves read it — the one
+  that resolves the class and the one that records the refusal — so a readable `class_name:`
+  leaves nothing undecided even where the `source_type:` beside it is a method call, because that
+  `source_type:` was never going to be asked.
+- **`source_type:` names a class and `source:` names a member, which is why the order of those two
+  is the whole of what reading it buys.** `source_type:` is ActiveRecord's disambiguator for a
+  `through:` whose source association is polymorphic, and it has to be read *before* the `source:`
+  on the same line: eight association lines across four corpora write both, and camelizing the
+  `source:` names a class the application does not have on every one of them. Rails rejects
+  `source_type:` as an unknown key without a `through:`, so it is read wherever it is written
+  rather than gated on one — a line that could confuse the two does not boot.
+
 ## The class side of a concern
 
 A concern's instance-side macros are declared on the module and reach every includer through the
@@ -148,10 +320,11 @@ one line.
 Declaring it on the module's own singleton answers `Expireable.expired`, which raises, and still
 leaves `Poll.expired` unanswered — wrong in both directions rather than absent.
 
-- **The declaration goes on the includer and lives in the concern's document.** One `Declared` per
-  `(concern, includer)`, `Owner::Singleton(includer)`, returning `relation_of(includer)`, span
-  still on the `scope` line — so both `Poll.expired` and `Invite.expired` jump to the same line in
-  `expireable.rb`. `Synthesized` is keyed by *source*, and the source is the concern.
+- **The declaration goes on the includer and lives in the concern's document.** Two `Declared` per
+  `(concern, includer)` — `Owner::Singleton(includer)` and the relation copy every scope gets — both
+  returning `relation_of(includer)`, span still on the `scope` line, so `Poll.expired`,
+  `Invite.expired` and `Poll.expired.expired` all jump to the same line in `expireable.rb`.
+  `Synthesized` is keyed by *source*, and the source is the concern.
 - **What bounds it is `relations`, a gate not written for this.** Every model owns a relation class,
   so a fanned `scope` has a type to return; a PORO that includes a concern declines exactly as a
   `has_many` naming it would. Inventing a `Plain::Relation` is the one way this could answer worse
@@ -159,7 +332,7 @@ leaves `Poll.expired` unanswered — wrong in both directions rather than absent
 - **`Context::includers` is resolved after the walk, not during it.** An `include` is recorded on a
   definition at index time, so which classes include a concern is a question about the *graph* —
   and it needs no resolve, because rubydex records the `Mixin` while indexing. Spellings resolve
-  with `rails::candidates`, the same `compute_type` list `class_name:` uses, so
+  with `generated::candidates`, the same `compute_type` list `class_name:` uses, so
   `include Sidekiq::Worker` adds no row.
 - **The closure is transitive and moves nothing in practice.** `ActiveSupport::Concern` hands an
   inner concern's `included` block to whatever includes the outer one. Over six corpora it changes
@@ -205,7 +378,7 @@ class no row is an instance of, at dozens of positions.
 - **`models_of` walks the chain, and the chain is `compute_type`'s.** One hop would call a
   namespaced `Shop::Order` no model: an engine monorepo writes most of its models two hops from
   `ActiveRecord::Base` and some four or five, through its own `Shop::Base`. Each hop resolves the
-  spelling Rails' way — `rails::candidates`, innermost nesting first, bare name last — because
+  spelling Rails' way — `generated::candidates`, innermost nesting first, bare name last — because
   `class Address < Shop::Base` inside `module Shop` and `class LineItem < Base` beside it name one
   class two ways. `seen` guards a
   cycle the *source* can be written with.
@@ -227,10 +400,10 @@ class no row is an instance of, at dozens of positions.
   is the *project's*, not the file's: the file writing `ApplicationRecord::Relation` is rarely
   `application_record.rb`.
 - **A model that writes no macro is on no list, so the list gains a membership decided *after* the
-  walk.** Every predicate in `WANTS` is a question about one document; whether a class is a model is
+  walk.** Every predicate in a `Wants` row is a question about one document; whether a class is a model is
   a question about the chain above it, complete only when every document has been seen. So
   `Context::models` is computed after the loop and each model's defining document joins
-  `List::Models` then. `Context::settle` sorts every list afterwards, so appending cannot change
+  `rails::MODELS` then. `Context::settle` sorts every list afterwards, so appending cannot change
   which document writes what.
 - **A relation class that already had a home keeps it — measured, not reasoned.** The first build
   emitted every relation class into the document that *defines* its element, on the argument that
@@ -258,12 +431,15 @@ class no row is an instance of, at dozens of positions.
 - **The name-based candidate list gets longer, and that cost is real.** Every relation class and
   class side declares the same names, so a `.where` on an untyped receiver offers **more than twice
   the possible definitions** it used to. The tier does not move and no answer is worse, but a reader
-  meeting that card is not better off. The fix is elsewhere: a generated declaration mapped to
-  nothing is not a *place*, so by this file's own rule it does not belong in a list of possible
-  definitions, and most of that list is generated.
+  meeting that card is not better off. The fix was said to be elsewhere — a generated declaration
+  mapped to nothing is not a *place*, so it does not belong in a list of possible definitions —
+  and **that turned out to be half an answer**. Those declarations are mapped now, to the `def`
+  Rails really wrote, so they *are* places and they belong on the list. What was actually wrong is
+  that they are the **same** place: `locator::all_places` deduplicates across declarations, and the
+  list is shorter than it was before either change.
 - **What the whole thing costs.** Generated documents, RBS bytes and declared members all grow by a
   fraction; the pass and the resolve each grow by a few per cent of the settle. Measure it on the
-  largest corpus, where the settle is longest — `benchmarking.md`.
+  largest corpus, where the settle is longest.
 
 ## The table a nested model claims
 
@@ -310,7 +486,7 @@ that only runs. It is a `def` in a file, and reading it is the first half.
   nothing while a table has one claimant and a great deal once a nested class may claim one: the six
   corpora hold dozens of nested non-model classes whose name lands on a real table under a different
   last segment, and every one would take that table from the model that reads it.
-  `Context::is_model` climbs `superclasses` to `ApplicationRecord` or `ActiveRecord::Base` and
+  `rails::Projection::is_model` climbs `superclasses` to `ApplicationRecord` or `ActiveRecord::Base` and
   declines every one of them. It is a **chain**, not one hop, and carries a `seen` set — not caution about Ruby
   but about *source*: a superclass cycle cannot run and can be written.
 - **A written `self.table_name` and the class whose name implies the same table meet, and both
@@ -481,8 +657,19 @@ that way by Rails, and the difference is a whole namespace wide.
 
 ## The conjured namespace
 
-**The damage is real and only one rule for it costs nothing.** A handful of positions in one corpus
-resolve with the decline in place and fall to a name-matched list without it. Five rules were built
+**Everything below is a property of rubydex 0.2.5, and the pinned rev retired it.** It is kept
+because the code is: `Namespaces::spellable` still declines, and removing a decline is a behaviour
+change owed its own sweep rather than a side effect of moving a pin. What changed is the tense. On
+the pin a generated joined name costs a conjured namespace nothing — the fixture that reproduced it
+reaches `build()` in every row, the subclass row that was the trigger included — and `spellable`
+reduced to `is_constant_path`, the decline removed entirely, sweeps **74 up, 0 down, 41 sideways**
+over five applications, the corpus that once cost 234 positions among them. So the rules below are
+why the decline was built and what widening it would cost, not a description of damage the server
+can still be shown. **The one thing not attributed is which upstream commit removed it**, so the
+decline outliving its cause is the conservative half of that.
+
+**The damage was real and only one rule for it cost nothing.** A handful of positions in one corpus
+resolved with the decline in place and fell to a name-matched list without it. Five rules were built
 and swept before one got there with nothing worse.
 
 - **A joined RBS name introduces every segment above the last.** `class Reports::Registry::Metric`
@@ -528,6 +715,81 @@ and swept before one got there with nothing worse.
 - **`annotations.rs` is in the same family and must stay in step.** A `def self.` carrying a `sig` or
   a `@return` inside a `module` is `Owner::Module` / `Owner::ModuleSingleton`, picked from the
   innermost body the walk is in.
+
+## The namespace a directory declares
+
+**`class A::B::C` where `A::B` is undefined raises `NameError` in Ruby.** discourse writes 125 of
+them and they run, because **Zeitwerk defines the namespace from the directory**: an autoload path
+with a `policy/` in it and no `policy.rb` beside it gets a `module` named after the directory — an
+*implicit namespace*. So the declaration this generator writes is not an invention. It is the one
+constant in this whole section that the running application certainly holds and no file writes down.
+
+- **The damage is a wrong answer everywhere, and silence is only how it is noticed.** rubydex binds
+  a plain `def` in `handle_remaining_definitions`, once, after the convergence loop;
+  `resolve_lexical_owner` walks *up* the lexical chain whenever the enclosing definition has no
+  declaration **yet** and ends at `break Some(*OBJECT_ID)`. A compact-path class whose middle segment
+  is missing is declared a pass too late, so every `def` inside it lands on `Object`. Measured on
+  discourse before the fix: of the 126 method names its 46 compact-path service classes define,
+  **57 reported `Object` as their owner** — `initialize`, `call`, `delete`, `edit`, `enable`,
+  `reason`, `users` — so every receiver in the workspace answered all of them and the jump landed in
+  a service object. After: **7**, and every one of those is a real top-level `def` in a spec file or
+  RBS's own `Object#to_json`. The `def` line itself answering nothing is the same bug read from the
+  other end: the class does not hold the member, so `definition_to_declaration_id` misses.
+- **`resolve_lexical_owner` already excepts `SingletonClass` from that walk**, with the reason
+  written out — "returning the surrounding scope would attach its members to the wrong owner and
+  never recover". A `Class` with no declaration yet wants the same exception. That is the upstream
+  fix and it is three lines; this one is in-house because the namespace is missing from the graph
+  whatever rubydex does with it.
+- **Rails' own three bounds, and none of them is this crate's** — `rails::autoloaded_namespaces`.
+  The anchor is a segment literally named `app`, which an engine and a discourse plugin keep.
+  `NOT_AUTOLOADED` is `assets`, `javascript` and `views`, the three Rails leaves out. And Rails'
+  glob is `app/{*,*/concerns}`, so a `concerns` directly under a root **is a root** and nothing
+  named `Concerns` is ever conjured.
+- **The path proposes and the file confirms.** A directory conjures nothing unless a document in it
+  declares a constant that is the directory's name plus exactly one segment, which is Zeitwerk's own
+  contract for the file. Doubling the evidence is what keeps a directory of unrelated code — a
+  `spec/` fixture tree, a plugin's `app/` holding one oddly-named class — from declaring a namespace
+  nobody uses.
+- **The filter runs after the walk and never in it.** What makes a directory's namespace real is
+  that **nothing else declares the name**, and "nothing else" includes the bundle, which
+  `Analysis::bundle_namespaces` only answers for once every document has been seen. Every conjured
+  name is a proper prefix of a class the application declares, so it is already in
+  `wanted_namespaces` and the bundle has already been asked about it.
+- **The whole chain, not its last link.** `app/services/chat/thread/policy/` answers `Chat`,
+  `Chat::Thread` and `Chat::Thread::Policy`. That is what makes every survivor **spellable** by
+  construction: each prefix is either declared already or is itself in the map, and `walk` declares
+  the survivors into `Context::namespaces` before any generator renders.
+- **A module per directory, and the directory is the source.** `Facts::namespace` is the one fact
+  with no member, no type and no place: the classes under a namespace are in the files below it and
+  rubydex holds every one, so this declares the constant and stops. No member means no span, so
+  `locator::site` has nothing to offer and the no-mapping-no-place rule needs no exception. A
+  `policy.rb` written tomorrow takes the name out of the map and `forget_stale` drops the document,
+  with no list to prune.
+- **It widens the section above rather than arguing with it.** More names are now `module`s the
+  application declares, so `Declarations::open` wraps more bodies in their immediate parent — the
+  spelling that rule already calls the safer of the two. `a_document_that_opens_one_body_twice_is_still_indexed`
+  is where that shows: one body is wrapped and the other joined, which is still two openings.
+- **It is not the rule that section forbids, and the difference is the evidence.** What must never
+  be attempted on argument alone is *synthesising the segments between a name and its nearest
+  declared ancestor* — inventing `Api` because somebody wrote `Api::V1::UsersController`. This
+  invents nothing: a directory on an autoload path is a declaration Rails itself makes, and where
+  there is no such directory the name is still declined. The distinction is checkable, which is why
+  the two tests in `rails/mod.rs` are the same class with the same superclass in two directories.
+- **The audit reads 13 findings *new* on discourse and every one of them is the removal of a wrong
+  answer.** They are the same 13 positions that were already findings under another name, all of
+  the shape `SomeService::Class.call(` — and the item completion ranked **first** at each was
+  `Object#call`, the leak itself. Probed both ways at
+  `app/controllers/admin/search_controller.rb:9`: without the namespace, 20 items led by `call`
+  (`detail: Object#call`), `params` and `reason`; with it, 4 items and none of those three. What is
+  left there is a **pre-existing** gap this never touched — discourse writes `.call` in a
+  `class_methods do` block inside an `ActiveSupport::Concern`, so rubydex records it as an
+  *instance* member of `Service::Base` and the class object cannot reach it. A counter that goes
+  the wrong way because a wrong answer stopped being offered is the audit working.
+- **`own` code only, and that is a bound rather than a proof.** A Rails engine's `app/*` really is on
+  the application's autoload paths, so an engine could conjure a namespace too; it is left out
+  because a gem that ships an engine declares its top namespace in `lib/` almost without exception,
+  and the measured damage is all in workspace code. If an engine ever needs it, the widening is one
+  flag — the same one `Context::classes` already took.
 
 ## `Struct.new` and `Data.define`
 
@@ -821,8 +1083,11 @@ because a struct member is spelled the same as somebody else's method — `categ
 - **A `delegate` in a concern hangs on the module, and unlike a `scope` it can.** `delegate :name, to:
   :user` is `User#name` in every includer, so there is one type to write down and `Owner::Module` is
   where it goes. A handful of the corpus' calls are in a module, most of those inside an `included do`.
-- **The few calls in a `class_methods do` are not read.** `ActiveSupport::Concern` `module_eval`s that
-  block on a nested `ClassMethods` module, so those methods reach the includer by `extend`.
+- **The few `delegate` calls in a `class_methods do` are not read, and the `def`s beside them are.**
+  `ActiveSupport::Concern` `module_eval`s that block on a nested `ClassMethods` module, so what it
+  installs reaches the includer by `extend` rather than by the `include` a `delegate`'s owner is
+  reached through. `concerns.rs` declares the `def`s onto that module; a `delegate` written there
+  would have to be typed against a receiver the block does not name, and stays declined.
 - **`to:` an ivar declines its type, and the reason is a measurement.** `Context` cannot know an
   ivar's class — that is `types.rs`' rung 3, which needs the graph this pass runs before. Reading the
   assignments out of the *file* was measured before it was declined: nearly every ivar target is
@@ -854,7 +1119,7 @@ because a struct member is spelled the same as somebody else's method — `categ
   to the top-level classes whose name implies it; `hosts` is who gets `include RouteHelpers`, which an
   engine's controllers must not — `ActiveStorage`'s six would each cost an `include` of a module
   holding nothing for them. Both are guarded by `own` where they are filled, tested in both
-  directions, which is why `hosts` stays closed while `List::Routes` is open.
+  directions, which is why `hosts` stays closed while `rails::ROUTES` is open.
 - **`Context::classes` did widen, and that is the bound on what a macro may name.** An engine's
   `has_many :variant_records` has to reach `ActiveStorage::VariantRecord` and both are under `app/`,
   so the exception is one directory per gem: a gem defining `class Story` in its `lib/` is still not
@@ -903,13 +1168,21 @@ because a struct member is spelled the same as somebody else's method — `categ
   `nested { super }`, so `resources :accounts do namespace :whatsapp` names `account_whatsapp_calls`;
   a plain `scope` never nests, so the same shape with `scope as: :x` names `x_a_bs`; and
   `Resource#name` is `@as || @name`, so `as:` **replaces** a resource's word.
-- **The module is a top-level constant because a qualified one silently does not work.** `Facts` can
-  spell `module A::B::C` and rubydex indexes it — but an `include A::B::C` written in RBS does not
-  reach it and `find_member_in_ancestors` walks past the host. Measured with two segments and three,
-  and with the outer modules declared in the workspace's own Ruby: only an unqualified name crosses.
-  `ActionDispatch::Routing::RouteHelpers` was the first spelling and bought nothing; `RouteHelpers` is
-  the second and is declared in none of the six corpora. An application that declares it keeps it and
-  this pass says nothing — here that costs the whole feature, which is the right price for never
+- **The module is a top-level constant, and the reason for that is no longer rubydex's.** On the
+  0.2.5 pin `Facts` could spell `module A::B::C`, rubydex indexed the module under exactly that name,
+  and an `include A::B::C` written in RBS then did not reach it — the mixin was recorded as a
+  `<partial>` ancestor and `find_member_in_ancestors` walked past the host as though it were not
+  there. `ActionDispatch::Routing::RouteHelpers` was the first spelling and silently bought nothing.
+  **The pinned rev linearizes it**, measured both ways: the ancestors read
+  `[StoriesController, App::Web::Helpers, Object, Kernel, BasicObject]`, and a generated document
+  holding `module App::Web::Helpers` with an `include` of it hovers `story_path` as
+  `App::Web::Helpers#story_path`, identically to the top-level spelling.
+- **`RouteHelpers` stays top-level on three arguments that are this crate's own.** Every route
+  helper's hover card prints its owner, so moving the constant renames what a user reads at 9,479
+  call sites; the collision a namespace would guard against measures **0 in six corpora**; and Rails'
+  own module is anonymous, so a qualified spelling would be either a lie about `ActionDispatch` or a
+  namespace invented for one constant. An application that declares `RouteHelpers` itself keeps it
+  and this pass says nothing — here that costs the whole feature, which is the right price for never
   shadowing a name somebody chose.
 - **`Facts::mixins` exists for this and nothing else.** A concern is a module the user already wrote an
   `include` for; route helpers have none, so the pass writes both halves. An `include` is deliberately
@@ -1033,7 +1306,7 @@ because a struct member is spelled the same as somebody else's method — `categ
 - **`Context::superclasses` is the projection these two conventions read**, asked one question,
   `rails::convention_of` — **the same function that answers it for the reader**: `synthesize` asks it
   of what the graph recorded to decide which documents to open, and `read_entrypoints` asks it of what
-  Prism read to decide which classes to read. It is the one `WANTS` list filled by what a class
+  Prism read to decide which classes to read. It is the one registered list filled by what a class
   *inherits*.
 
 ## The concern bodies
@@ -1052,11 +1325,87 @@ because a struct member is spelled the same as somebody else's method — `categ
   is a plain method on `Object` and hosts anywhere — **every** one in the corpus is in a class.
   Everything else is unchanged:
   the body of a `def`, an `if`, or any other block declares nothing.
-- **`class_methods do` is not a host, twice over.** It holds **no macro at all** in any of the six
+- **`class_methods do` is not a macro host, twice over — and its `def`s are a different question,
+  which `concerns.rs` answers.** It holds **no macro at all** in any of the six
   corpora — its calls are `private`, `delegate` and `attr_reader` — and one written there
   would be broken Ruby: `ActiveSupport::Concern` `module_eval`s the block on a nested `ClassMethods`
   module, and a plain `Module` has no `has_many`. Nor does it declare on the module's own singleton:
-  those methods reach the includer through `base.extend ClassMethods`.
+  those methods reach the includer through `base.extend ClassMethods`. The host test was never
+  wrong; it was answering about macros while the `def`s went unread.
+- **A concern's class methods are declared on the singleton of every class that includes it, and
+  `locator` lost its walk for it.** `ActiveSupport::Concern#class_methods` builds — or reopens — a
+  nested `ClassMethods` module and `module_eval`s the block on it, and `append_features` ends with
+  `base.extend const_get(:ClassMethods)`. The edge used to be **walked** in `locator`, behind
+  `const CLASS_METHODS`; it is now spent here, once per includer, so an ordinary ancestor walk finds
+  the member and no Rails word is left in the module that answers `definition`.
+- **The obvious shape — one module and one `extend` — is measured dead, and the measurement is the
+  same one the query interface's cheap version failed.** A mixin arriving in a document indexed
+  *after* its class was resolved is **never linearized**, and a generated document is always that
+  shape. Re-checked across every spelling on 2026-09-15: RBS `extend M::CM`, Ruby `extend M::CM`,
+  `class << self; include M; end` and `singleton_class.include M` all leave the member unreachable,
+  while a generated `include` on the instance side and a generated `def self.` both resolve. It is a
+  rubydex defect and `navigation.md` names the two code sites.
+- **Three spellings, one list.** A `class_methods do` block; a hand-written `module ClassMethods`,
+  which six corpora write in **17** files against the block's **120** calls — discourse 83,
+  mastodon 21, forem 8, solidus 6, chatwoot 2, lobsters 0, holding **270** `def`s; and an
+  `included do` holding a bare `extend M`, which puts `M`'s **instance** methods on the includer's
+  singleton with no `ClassMethods` module anywhere in it. **The block speaks first**, because
+  `module_eval` runs it on the module a hand-written one already declared, so a name written both
+  ways is the block's — and `Facts` keeps the first of an equal-ranked pair.
+- **The third spelling is the one worth the item, and it is finished against the graph.**
+  `activemodel/lib/active_model/api.rb` is two such lines — `extend ActiveModel::Naming` and
+  `extend ActiveModel::Translation` — reached by every model in all six applications through
+  `ActiveRecord::Base`'s `include ActiveModel::API`, and they install `model_name` and
+  `human_attribute_name`. The `def`s are in a *second* file the concern only names, which no
+  predicate over documents could have selected in advance, so `Analysis::concern_declarations` asks
+  the graph which document declares the module and hands that document's text back to
+  `concerns::installed`. **Measured over solidus' 369 such cursors, 20 drawn on seed 6: 20 of 20
+  guessed before, 0 of 20 after, every one landing in `active_model/translation.rb` or
+  `naming.rb`.** On mastodon both jumps moved off a presenter and a shoulda-matchers test model onto
+  `naming.rb`.
+- **That one is keyed by the module's own file and not by the concern's**, which is what gives it a
+  place: a span is an offset into the text the generator read, so writing it into `api.rb`'s
+  document would point every jump at bytes of a file holding no such `def`.
+- **A fan-out over the includers, which is where this parts company with what it replaced.** The old
+  shape was one module, because `extend` would put it in front of every class Ruby does — *including
+  the ones this pass cannot enumerate*. It can enumerate them: `Context::includers` resolves the
+  project's `include` edges after the walk, transitively through concerns that include concerns, and
+  a concern nothing includes now declares nothing, which is Ruby — `Tallyable.tally_by` raises.
+  **Measured, the fan-out is small**: over each corpus' own code plus every gem its lockfile pins,
+  537 (solidus), 608 (lobsters), 1,167 (discourse), 1,293 (chatwoot), 1,837 (mastodon) and 3,355
+  (forem) `def self.` lines, because class inheritance carries a generated `def self.` down and
+  Rails' own concerns are included into base classes.
+- **`rails::CONCERNS` is the one projection a gem's `lib/` may join**, and it exists so that opening
+  `rails::MODELS` to gems is not the price: `validates`, `scope`, `belongs_to` and `has_many` are all
+  a Rails concern's class methods, and every one of them is written in a gem. The walk's gem path
+  skips the `Definition::Method` arm outright, which is most of what a document holds — measured,
+  settle is unmoved on lobsters (canary) and on chatwoot (1.8/1.8/1.9 s against 1.9/1.8/1.9 s).
+- **A gem's names feed exactly one thing.** `Contribution::foreign` is separate from `declared`
+  because `Context::classes` and `modules` are read as *the names this application declares* —
+  `Elsewhere::known` gates a `delegated_type` on them, `Namespaces` decides what a generated name may
+  be joined onto, `models_of` climbs them. What a gem's names are needed for is `includers_of`:
+  `ActiveRecord::Base` includes `ActiveModel::API`, and resolving that edge needs both names and
+  needs them for nothing else.
+- **`Source::Convention`, for a mailer action's reason**: the `def` is really in the file and the
+  class method is really installed, but the *type* is this table's and not the file's. It is also
+  what gives the declaration a **place** — `at` is the `def` itself, so the jump lands on the line
+  the user wrote rather than on a macro that implied it, however many classes it was written onto.
+- **The one decline is the joined-name rule, and it moved with the owner.** It used to be asked of
+  `<concern>::ClassMethods`; it is now asked of the **includer**, because `Owner::Singleton` opens
+  `class <includer>` and a name with an undeclared namespace above it would introduce that namespace
+  — RBS that does not parse, which `Synthesized::record` answers by refusing the *whole* document.
+- **Three shapes of the call reach nothing, and one of them is the interesting one.** `class_methods`
+  with no block, with a block passed as an argument (`&:sym`), and with an empty one all declare
+  nothing. Written **in a class** it declares nothing either, and that is Ruby rather than caution:
+  `class_methods` is defined on `ActiveSupport::Concern`, which is extended onto modules, so the
+  call raises `NoMethodError`. Whether the call has a *receiver* is not asked in `concerns.rs` at
+  all — `models::bare` has already asked it, and it is the one that can tell a `with_options`
+  merger from somebody else's object.
+- **Visibility is the file's own, read as `entrypoints.rs` reads a mailer's.** A bare `private` or
+  `protected` closes the public section and `private :name` names one already written; the corpora
+  write **19** bare ones inside these blocks. A `def self.` is declined — it is a singleton method
+  of the `ClassMethods` module, which is the thing being extended rather than a thing extending, and
+  six corpora write **zero**.
 - **`with_options`' keywords are merged into the macros inside it, and the merge is load-bearing.**
   `with_options class_name: 'Account', optional: true do belongs_to :approved_by_account end` is a
   `belongs_to` naming `Account`; without the merge it names an `ApprovedByAccount` no application
@@ -1182,12 +1531,41 @@ because a struct member is spelled the same as somebody else's method — `categ
 - **`Owner::Module` is what makes a concern's macros and the route-helper module possible.** Being able
   to *spell* a module is not the same as knowing an RBS `module` reaches its includers, which is proved
   by a test.
+- **The pass names no body of knowledge, and a build with none registered still runs.**
+  `src/knowledge/` is the contract: a module registers its `ListId`s and `Wants` rows, answers its
+  own feature switch, folds its own projection out of what the one walk saw, keeps its own parse
+  memo, and declares in three phases — *conjure*, *declare*, *derive* — plus two hooks for what
+  only the whole walk decides (`after_the_walk`, before the feature gate; `after_the_bundle`, once
+  the bundle has answered). `grep -c 'rails::' src/analysis/synthesize.rs` is **0**.
+- **`workspace/rails/` did not move and must not.** Its property is *pure text in, text out, no
+  I/O and no graph*, and every file of it is at 100:100. What moved is the orchestration, to
+  `knowledge/rails.rs`, which may not open a file or read the graph either: it is handed closures
+  for a document's text, its caption, whether it is the user's own, and the one graph question a
+  generator may ask — which document declares each of these module names, asked by *name* because
+  the pass runs before the resolve.
+- **Three things a module owns that are not declarations.** `discover`, for files nothing indexed
+  and no list can name (`db/*structure.sql`); `places_members_on`, for the step after the resolve,
+  because the query interface's place is a `def` in a gem; and `views`, because what a template's
+  implicit receiver can answer is an output of a body of knowledge that is not a `Facts`.
+- **`generated::candidates` was misfiled rather than coupled.** It is Ruby's own lexical constant
+  lookup, which Rails modelled `compute_type` on; it sits beside `is_constant_path` now, where
+  both `workspace/rails/` and `knowledge/` reach it without either depending on the other.
+- **`Facts::split` cuts the finished table into one `Facts` per body, and it runs after every
+  generator and after precedence.** The partition is of the *rendering* and never of the generation:
+  nothing it moves can re-decide a rank, and `declared`, `returns` and `source` are still asked of
+  the whole file's facts before it. Two generators that name one member collide on `(owner, name)`
+  and the owner picks the part, so a collision cannot cross one; every field of `Facts` is keyed by
+  an `Owner`, so the partition is total. It is what makes a generated document the unit of
+  invalidation rather than a file — see *The document is a body* below for the measurement.
+- **A generator may still return one `Facts`, and that is deliberate.** The split is downstream of
+  the merge, so no reader in `workspace/rails/` learns that a document can be cut in two, and a file
+  that feeds two generators still merges into one table before anything is partitioned.
 - **Phase two is a query and not a loop.** `Facts::returns` answers `Story#user -> User` then
   `User#name -> String`, both written in the same pass into other files' documents and neither rendered
   nor indexed, and the two-hop is tested in both merge orders. There is **no phase-two loop**: the
   union costs a merge per settle and only `delegate` asks for one.
 - **One walk of the graph fills every list, and a generator names a list rather than writing a loop.**
-  `WANTS` is four rows over three predicates — "calls one of these receiverless names", "the path ends
+  the row table is nine rows over seven predicates — "calls one of these receiverless names", "the path ends
   with this", "a `@return`/`@param` tag sits above a `def`". A document matching two of a row's tests
   is pushed **once**: a file with a `sig` *and* a YARD tag would otherwise be generated twice.
 - **Every projection `Context` carries is filled by the one walk**, because a projection added later is
@@ -1333,7 +1711,7 @@ because a struct member is spelled the same as somebody else's method — `categ
   branch sits **below** the open-buffer short-circuit and **above** both the `is_file` test and the
   `Workspace::indexes` gate.
 - **`Context::dumps` is a path under the root, not a URI out of the graph.** A `.sql` is not a
-  document, so no `WANTS` row can reach one. It is one `read_dir` of `<root>/db` per settle — the same
+  document, so no registered row can reach one. It is one `read_dir` of `<root>/db` per settle — the same
   rule the watcher registers, so what is watched and what is read cannot disagree. Bounded to that one
   directory: a dump found deeper would be read and would then never refresh.
 - **`Context::is_empty` counts the dumps, and leaving that out would be silent.** An application with a
@@ -1366,8 +1744,8 @@ because a struct member is spelled the same as somebody else's method — `categ
 - **Two artefacts look like regressions in a sweep of this size and neither is one.** A tranche of
   positions "moved to nothing" and every one is in the **first decile of the ask order**. More "moved
   to list" because `sweep.py`'s `tier()` tests for `Defined in ` before the footnotes. Behind both
-  sits a defect in the harness: `settle()` reads a cold server's silence as the end of its work, so
-  every shard reported `settled after 0.0s` (`benchmarking.md`).
+  sits a defect in the harness: a `settle()` that reads a cold server's silence as the end of its
+  work, so every shard reported `settled after 0.0s`.
 - **`array: true` must be read, and by both readers.** Unread, a Postgres array column answers its
   *element* type — `t.string "languages", array: true` returning `String` — a wrong answer rather than
   an absent one. **Half the corpora write such a column in `schema.rb` alone.** `Column::array` is
@@ -1473,10 +1851,12 @@ because a struct member is spelled the same as somebody else's method — `categ
   workspace writes, it costs at most one class per model. Which file writes a shared one is the caller's decision — the first
   source in URI order that asked — and that is allowed to be arbitrary *because* nothing in a relation
   class is a place.
-- **Nothing in a relation class is mapped, and that is not a shortcut.** No line of anybody's code
+- **Nothing in the query interface is mapped, and that is not a shortcut.** No line of anybody's code
   declares `Comment::Relation#first`. A relation shared by four `has_many :comments` could be pointed
   at one of them, and pointing at an arbitrary one of four is the confidently-wrong answer these
-  readers exist to avoid. `Declared::at` is an `Option` for exactly this.
+  readers exist to avoid. `Declared::at` is an `Option` for exactly this. **A `scope` is the
+  exception and the only one**: a file really does declare `Comment::Relation#recent`, on the same
+  line it declares `Comment.recent`, so both carry that span.
 - **The members are the ones that can be typed without a type parameter, and no others.** `first`,
   `last`, `find`, `find_by`, `to_a`, `each`, and the `where`/`order`/`limit`/`includes` group. `map`,
   `select` and `pluck` are **absent rather than wrong**: their element type is a block's return, which
@@ -1501,6 +1881,24 @@ because a struct member is spelled the same as somebody else's method — `categ
 - **A `scope` is a class method and its lambda is never read.** The name and the class it is written in
   are enough, because a scope returns a relation of its own class whatever the body does. rubydex files
   `def self.recent` on the singleton exactly as it resolves `Story.recent` there.
+- **And it is a relation method too, which is the half that makes a chain work.** Rails delegates
+  every scope to the relation — `ActiveRecord::Delegation` builds a module per relation class holding
+  them — which is what makes `Story.recent.visible.limit(10)` the ordinary spelling of a query rather
+  than a clever one. On the class object alone the **first** hop resolves and every hop after it falls
+  to the name-based list: a chain that gets worse the further the code has already got. So one macro
+  line is two declarations, `Owner::Singleton(Story)` and `Owner::Instance(Story::Relation)`, carrying
+  one span. The `enum`'s class-side pair is a `scope` Rails writes itself and takes the same two.
+- **The relation copies are held to the end of the document and sorted by owner.** `Facts` renders in
+  the order it was told things and reopens a body every time the owner changes, so declaring the two
+  halves side by side writes one `class Story::Relation ... end` per scope. One run per relation class
+  costs one body and says the same thing; the sort is stable, so within a class the order is still the
+  order the macros were written in, which is what the collision rule reads.
+- **A document may write members onto a relation class another document opened.** A concern's `scope`
+  lives in the concern's document and the includer's relation class is written wherever it was first
+  asked for — so `Poll::Relation` is opened with its superclass in one generated document and reopened
+  with a member in another. The two merge exactly as a reopened Ruby class does: measured, the query
+  interface still answers after the second scope. This is the one shape where a member and the class
+  it hangs on are written by two generators that never see each other, and there is a test for it.
 - **Measured over a real application, the macros declare more members than the schema does columns.**
   At every `.member` position outside the schemas, **positions are gained and none is lost** — and the
   result that matters more: **many positions move from a guessed candidate list to a precise answer,
@@ -1600,7 +1998,7 @@ because a struct member is spelled the same as somebody else's method — `categ
   genuinely invalidates the graph.
 - **A file with no macro in it is not a file no generator reads.** `Wants::calls` matches a macro name
   called **anywhere** in a file, not in a class body, so a `lib/email/sender.rb` lands on
-  `List::Models` for a call to something named `helper` inside a `def`. A control for this gate has to
+  `rails::MODELS` for a call to something named `helper` inside a `def`. A control for this gate has to
   be chosen by testing every `MACROS` name, the YARD tags, `Struct.new` and `sig`.
 - **The tier sweep cannot see this gate, by construction**: `sweep.py` never `didOpen`s anything. Its
   evidence is the two unit tests and the `stat` guarantee, and `Analysis::passes` is the instrument.
@@ -1610,13 +2008,33 @@ because a struct member is spelled the same as somebody else's method — `categ
 - **Two gates, and the cheap one runs first.** Comparing the whole merged `Context` can only be asked
   after paying for the walk. `context_would_be_the_same` asks the same question of **one document**:
   `Analysis::contribution` is the loop body made callable for a single `Document`, `Context::absorb` is
-  the only thing that merges one, and eight bytes per document — a `DefaultHasher` of the
-  `Contribution` — go beside `generated_from`. It runs **before** the walk.
+  the only thing that merges one, and one `Contribution` per document goes beside `generated_from`.
+  It runs **before** the walk.
+- **That map is the walk's memo as well as the gate's evidence, and it is one map because it is one
+  fact.** "This document contributes what it contributed last time" is the gate's question asked of
+  the document a keystroke named, and the walk's answer for every other document at once — so the
+  walk takes the held value instead of projecting it again. Keyed on **"has rubydex re-indexed this
+  document"** and never on a file stamp: `contribution` reads the graph and never a file, and
+  `touched`/`touched_all` already carry the right question. Measured 2026-09-16, median of three
+  keystrokes that add a new top-level class, the walk goes **275 ms → 70** on discourse and
+  **52 → 22** on lobsters, and the pass around it **340 → 132** and **64 → 34**. What is left is a
+  floor — `absorb` is a fold with no inverse, `includers_of` and `bundle_namespaces` are folds over
+  the whole projection — 32 + 9 + 18 ms of the 70.
+- **The clone was the one cost nobody had measured, and it is 2 ms.** `absorb` takes a `Contribution`
+  by value, so a walk that keeps it has to clone. Measured on the same keystrokes: the merge step
+  goes 30 ms → 32, against 205 ms saved. The `&Contribution` shape that would avoid it stays unbuilt.
+- **What it costs to hold is 50 MB on discourse** (924 → 977 resident) and nothing measurable on
+  lobsters. One `Contribution` per document, 25,900 of them, and most of what is in them is a
+  gem's class and module names — which `Context::foreign_classes` already holds a second copy of.
+- **`engine_prefixes` is the one input that is not a document, and gem discovery drops the map where
+  it writes them.** `is_own_code` and `is_generator_source` read it, so a held `Contribution` projected
+  under a previous bundle could admit a former engine's `app/`. The gem batch sets `touched_all` and
+  would drop it anyway; saying it at the assignment is what stops that being a fact two files apart.
 - **The whole-`Context` comparison stays, behind it, because it is strictly wider.** A document whose
-  contribution moved without moving the merged answer is a case eight bytes cannot see. When it fires
-  it also **keeps the fresh fingerprints**, or that document would re-fail the cheap comparison for the
-  rest of the session.
-- **Three things make a fingerprint per document enough**, two of which had to be built:
+  contribution moved without moving the merged answer is a case a per-document comparison cannot see.
+  When it fires the fresh contributions are **kept**, or that document would re-fail the cheap
+  comparison for the rest of the session.
+- **Three things make one document's `Contribution` enough**, two of which had to be built:
   1. **The merge is a function of the *set* of contributions**, not the order the graph hands them
      over in — `Context::absorb` and `Context::settle`.
   2. **A document nothing re-indexed cannot have contributed anything different.** Only `index_buffer`
@@ -1644,9 +2062,54 @@ because a struct member is spelled the same as somebody else's method — `categ
   sweep is for here is the two order-independence fixes, which **can** move an answer, and over five
   applications they move **nothing** — not up, not down, not sideways, in any corpus. The corpus that
   reopens a model under two spellings had to be looked at rather than counted.
-- **A keystroke in a file that *is* on a list pays the whole pass**, and on the largest workspace that
-  is over a second, of which the walk is under a tenth. A small workspace is two orders of magnitude
-  cheaper, in the same proportions.
+- **A keystroke in a file that *is* on a list pays the whole pass, and what that costs depends
+  entirely on whether a generated document's *text* moved.** Measured 2026-09-16 on discourse,
+  release, median of three, 977 generated documents:
+
+| the keystroke | the pass | the walk | `index_source` |
+|---|---:|---:|---|
+| a macro that names nothing new — every generated document byte-identical | **63 ms** | 0 | 0 documents |
+| a new class name — the projection moves, no generated text does | **132 ms** | 70 ms | 0 documents |
+| `attribute :x, :string` — one model re-declares | **224 ms** | 0 | 1 document, 18 KB, **148 ms** |
+| `attribute :raw, :integer` — re-types a real column, so the schema declines it | **2.49 s** | 0 | 1 document, 450 KB, **2.2 s** |
+| the cold pass | 8.5 s | 275 ms | 509 documents, **7.9 s** |
+
+  **Re-indexing generated RBS into a *settled* graph is the pass's one steep cost — 95% of any
+  pass that re-indexes anything — and it is charged per *declaration*, not per byte.** The eleven
+  generators, the render and both gates are 62 ms of every row above and are edit-independent.
+  Fitted and then cross-checked against four independent results: **~32 ms per document plus
+  ~0.7 ms per declaration warm, and ~0.46 ms per declaration cold.** Checks: the schema's 3,180
+  columns → 32 + 2,194 ms ≈ 2.2 s; `post.rb`'s ~165 declarations → 148 ms; the split keystroke
+  below, 0.27 s predicted against 0.31 measured. It is `Graph::consume_document_changes`
+  invalidating per declaration against an index that is near-empty cold and holds ~144,000 entries
+  warm — rubydex's cost and not this crate's — which is the whole of the 35× cold/warm gap.
+- **There is no byte term, and two levers that assumed one are dead.** *Shrink the provenance
+  comments*: they really are **1.76 MB of the 2.61 MB** a discourse pass writes (67.7%, universal
+  across schema, routes, an engine, a base class and the models), and removing **all** of them moved
+  a cold pass 8.31 → 8.24 s and the keystroke 2.46 → 2.44 s. Nothing. *Concatenate every generated
+  document into one before indexing*: moves only the per-document term — 0.05–0.5 s of an 8.3 s boot
+  — and is actively harmful warm, because it destroys the per-document text comparison that makes
+  975 of 977 documents free (0.6 ms in total).
+
+### The document is a body, and that is what the cost model buys
+
+- **Splitting on `Facts::render`'s own key is what makes the per-declaration cost payable.** One
+  document per file means a column that changed type re-indexes every column in the project; one
+  document per body re-indexes one table. Measured on discourse, release, median of three, with the
+  split behind an environment switch before it was written for keeps:
+
+| | one document per file (977) | one per body (1,320) |
+|---|---:|---:|
+| cold open | 8.44 s | 8.47 s |
+| cold open, every table moving | 8.77 s | 9.07 s |
+| keystroke re-typing a column | 2.48 s | **0.31 s** |
+| every table at once, warm | 2.6 s | **13.7 s** |
+
+- **The last row is the objection and the counter-case is counted rather than imagined.**
+  discourse's own 1,007 migrations: **median 1 table, 92.8% exactly one, 98.4% one or two, 0.2% more
+  than five.** So the split wins ~8× interactively and ~35× on the shape a real migration has, and
+  loses only on a shape this corpus has never produced. The first version of this argument said "a
+  migration moves every table"; it was hypothetical and it was wrong.
 
 ### Why one changed file does not re-read every other
 
@@ -1677,7 +2140,7 @@ Reading and parsing every listed file — the obvious culprit — is about a ten
 - **And the document usually had not changed at all.** A provenance comment names a *file and a macro*
   and never a line number, so pressing return above a `has_many` re-derives RBS that is
   **byte-identical** and mappings that have every one of them shifted. The graph holds the text; the
-  side table holds where the text came from; before this item a move in the second tore down and
+  side table holds where the text came from; before this gate a move in the second tore down and
   rebuilt the first.
 - **So the text decides whether the graph is touched, and the mappings are taken either way.**
   Assigning them costs a pointer and comparing them costs a scan of every span, so they are not
@@ -1705,7 +2168,7 @@ Reading and parsing every listed file — the obvious culprit — is about a ten
 - **The reads are per document and were per generator.** A model file that also carries a `@return` tag
   and a `self.table_name=` was read three times and is now read once.
 - **The memo compares the readers as well as the text, and the reason is a finding.** Every list but
-  one is a function of a document's own content. `List::Models` is not: `Analysis::walk` adds to it,
+  one is a function of a document's own content. `rails::MODELS` is not: `Analysis::walk` adds to it,
   *after* the walk, every **model** that writes no macro, and whether a class is a model depends on a
   superclass chain running through other files. So `class Widget < Base` joins the model list the moment
   a different file makes `Base` a model, with not one byte of `widget.rb` changed — and a memo keyed on
@@ -1734,8 +2197,8 @@ Reading and parsing every listed file — the obvious culprit — is about a ten
 
 ### What the three gates are worth, idle machine
 
-One keystroke in a model file, each mechanism added in turn. Measure it with `benchmarking.md`'s
-harness on the largest corpus, where the differences are legible:
+One keystroke in a model file, each mechanism added in turn. Measure it by hand against a real
+repository, on the largest corpus, where the differences are legible:
 
 | | effect on the pass |
 |---|---|
@@ -1757,6 +2220,94 @@ The `walk` line reads **nothing on every keystroke** on both corpora once the la
 - **The tier sweep cannot see any of the three gates.** What it *can* see is the memo, which changes
   how every generator gets its source on a cold pass as well as a warm one, and over five applications
   it moves **nothing at all** in any corpus.
+
+## What the framework's own singletons return
+
+- **railties and activesupport ship no `sig/`, so four of the most-written chains in a Rails
+  application stopped at their first hop.** `Rails.root.join` resolved its receiver perfectly —
+  `Receiver::Constant` reaches `singleton_of`, rubydex has the `def self.root` railties really
+  writes — and then died at the `?` on `Types::returns`, falling to the name rung: **30 possible
+  `join`s** on lobsters, 59 `fetch`es for `Rails.cache`. The member was never missing. Only what it
+  returns was, and that is a sentence this crate can write down in advance, which is why it goes
+  through the generator route like everything else here and adds no rung.
+- **The bar is not "is the return knowable" — it is "does the class the answer names hold the
+  members the call then asks for".** `types.md` records four times a rung that *gained* a type lost
+  the name-matched list that had been holding the right word. So every candidate was scored before
+  anything was written, against the members the six corpora really call one hop later, asked of a
+  real bundle. Four rows passed and four failed, and the four that failed share one mechanism: the
+  class Rails really returns answers those calls through `method_missing` or `define_method`, which
+  rubydex cannot see.
+
+  | chain | chained calls | return | answered |
+  | --- | --- | --- | --- |
+  | `Time.zone` | 2,060 | `ActiveSupport::TimeZone` | 100% |
+  | `Rails.root` | 895 | `Pathname` | 100% |
+  | `Rails.cache` | 362 | `ActiveSupport::Cache::Store` | 99% |
+  | `Rails.application` | 682 | the application's own class | 88% as `Rails::Application` alone |
+  | `Rails.logger` | 1,395 | `ActiveSupport::BroadcastLogger` | **5%** |
+  | `Rails.env` | 455 | `ActiveSupport::EnvironmentInquirer` | **4%** |
+  | `Rails.configuration` | 611 | `Rails::Application::Configuration` | **56%** |
+  | `Time.current` | 199 | `ActiveSupport::TimeWithZone` | **79%** |
+
+- **`Rails.logger` is the row worth stating twice, because it is the largest population of the
+  eight and the temptation is real.** `ActiveSupport::Logger` answers **94%** of those 1,395 calls
+  and is **not what Rails returns**: since 7.1 `Rails.logger` is an `ActiveSupport::BroadcastLogger`,
+  whose `info`, `warn`, `error` and `debug` are `method_missing`. A rank that is correct-if-true
+  cannot be bought by naming the wrong class, so the whole row is declined and the name rung keeps
+  it. The same sentence declines `Rails.env`, whose `development?` and its two siblings are
+  `define_method` over a constant list.
+- **What it was worth, measured the way the rule asks.** Every `Const.method.member` position in six
+  corpora, one release binary with the list on and one with it off, nothing else different:
+  **6,659 positions, 3,693 moved from a name-based list to one exact answer, 0 moved the other way,
+  0 went silent and 0 lost a place.** The four declined chains are byte-identical across the two
+  runs, which is the control. By chain: `Time.zone` 2,032 of 2,060, `Rails.root` 880 of 895,
+  `Rails.application` 442 of 682, `Rails.cache` 339 of 362.
+- **Only the return is declared, never the method**, which is what keeps every one of those jumps
+  where it was. railties writes `def self.root` and activesupport writes `def zone` in a
+  `class << self`, so the declaration rubydex holds already has a place; the definition written here
+  carries `Declared::at` `None` and never becomes a second one. `Source::Interface` for that reason
+  — no file says what these return, whatever else it says about them.
+- **Both ends of every row are checked against the graph first, and the owner is the half that is
+  not obvious.** A `def self.root` declared on a `Rails` nothing else declares would *invent* the
+  module: a constant with one member and no place, where before there was an honest miss. So
+  `rails::singleton_classes` names both sides, `wanted_namespaces` asks the bundle about all six,
+  and a workspace with no railties indexed declares nothing at all. It is
+  `rails::framework_classes`' rule for the long tail's three gem classes, read the same way.
+- **Which keyword opens each owner's body is read rather than assumed.** railties writes
+  `module Rails`; activesupport reopens Ruby's `class Time`. The render key is `(is_module, name)`,
+  so guessing wrong declares a second constant RBS refuses to hold beside the first —
+  `Namespaces::opens` is the graph's answer and the table deliberately does not carry one.
+- **`Rails.application` is the *project's own* class, read from the same document the list is keyed
+  by.** `config/application.rb` holds `class Shop::Application < Rails::Application`, and that class
+  is where a project writes the `config.domain` and `shortname` it hangs off `Rails.application` —
+  12% of every call the corpora make on it, and unreachable through the framework's base. A file
+  that declares none falls back to `Rails::Application` and loses only those. The class read here
+  needs no second opinion from the graph: it came off a `class` line in the application's own file.
+- **The host is `config/application.rb` and that is the honest choice rather than an arbitrary
+  one.** These four returns are a property of the framework, not of any document, so the list
+  answers *where to write them down*. `config/application.rb` is the file every Rails application
+  has and no other kind of project does — the marker `Features::resolve` detects `auto` by — and it
+  is the file that holds the one thing the generator actually reads. A full path and not a suffix,
+  unlike the schema and routes lists: `application.rb` alone is `app/models/application.rb` in three
+  of the six corpora.
+- **The eighth list has no key of its own, and that is a decision.** Every other key lets a project
+  decline a body of knowledge that does not apply to *it* — its own schema, its own macros, its own
+  routes. There is nothing project-specific here to decline: a workspace whose bundle holds railties
+  cannot sensibly say `Rails.root` is not a `Pathname`, and one whose bundle does not is already
+  declaring nothing. So it is gated by `rails.enabled` alone, it is absent from
+  `each_switch_turns_off_its_own_family_and_nothing_else`, and it is the sixth family in
+  `rails_off_takes_all_six_rails_families_and_leaves_the_two_that_are_not_rails`.
+- **Two bounds the sweep found, both stated rather than fixed.** **solidus gains nothing at all**
+  — 0 of 111 — because it is a gem monorepo with no `config/application.rb`, so the list is empty
+  and nothing is written. That is the host choice's price, and a second host for a project that has
+  none is a change with its own measurement rather than a line added here. And of
+  `Rails.application`'s 682 calls, 240 do not move: **50 already answered exactly** before the
+  table existed, by a name rung whose match happened to be unique (`Rails::Application#reloader`);
+  **91 answered nothing before and nothing after**, most of them `Rails.application.routes` in
+  chatwoot; and **99 stay on a name-based list**. The largest single group inside the 240 is a
+  method the application writes in `class << Rails.application` — a singleton reopened on the
+  *object*, which belongs to no class rubydex can name. No class-based type reaches those, and
+  none should claim to.
 
 ## The rest of ActiveRecord's vocabulary
 

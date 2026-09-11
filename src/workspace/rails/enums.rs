@@ -32,6 +32,7 @@ use ruby_prism::{AssocNode, CallNode, Node};
 
 use super::inflect::pluralize;
 use super::relation_of;
+use super::relations::Chained;
 use super::syntax::{header, symbol_or_string};
 use crate::generated::{Declared, Facts, Owner, Source};
 
@@ -305,7 +306,14 @@ impl Enum {
     /// same condition a `has_many` carries, and for the same reason: `Story.draft`
     /// returns a `Story::Relation`, and a project that wrote its own `Story::Relation` meant
     /// something by it. Without one the class-side pair is declined and the rest stands.
-    pub(super) fn declare(&self, facts: &mut Facts, file: &str, class: &str, relation: bool) {
+    pub(super) fn declare(
+        &self,
+        facts: &mut Facts,
+        chained: &mut Chained,
+        file: &str,
+        class: &str,
+        relation: bool,
+    ) {
         let instance = Owner::Instance(class.to_owned());
         let singleton = Owner::Singleton(class.to_owned());
         let whole = Some((self.at, self.name_at));
@@ -397,19 +405,26 @@ impl Enum {
                 (label.method.clone(), "is"),
                 (format!("not_{}", label.method), "is not"),
             ] {
-                facts.declare(Declared {
-                    owner: singleton.clone(),
-                    name,
-                    returns: relation_of(class),
-                    parameters: "()".to_owned(),
-                    because: format!(
-                        "From `{file}`, `enum :{}`: every record whose `{}` {sense} `{}`.",
-                        self.name, self.name, label.value
-                    ),
-                    at,
-                    from: Source::Enum,
-                    overloads: Vec::new(),
-                });
+                // On the relation as well as the class object, because this pair really is a
+                // `scope` and Rails delegates every scope to the relation:
+                // `Article.published.draft` is the spelling an `enum` exists to make short.
+                chained.declare(
+                    facts,
+                    class,
+                    Declared {
+                        owner: singleton.clone(),
+                        name,
+                        returns: relation_of(class),
+                        parameters: "()".to_owned(),
+                        because: format!(
+                            "From `{file}`, `enum :{}`: every record whose `{}` {sense} `{}`.",
+                            self.name, self.name, label.value
+                        ),
+                        at,
+                        from: Source::Enum,
+                        overloads: Vec::new(),
+                    },
+                );
             }
         }
     }
@@ -418,6 +433,7 @@ impl Enum {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use crate::analysis::testing::*;
     use crate::generated::declaring;
     use std::collections::BTreeSet;
 
@@ -463,6 +479,10 @@ mod tests {
     /// Pinned as a document for the reason the schema's and the model's are: 3 + 4N is a claim
     /// about Rails, and asserting it one predicate at a time is how a change to the shape passes
     /// ten green tests. Every name here was read out of `_enum` and `define_enum_methods`.
+    ///
+    /// 4N names and 6N declarations: the class-side pair really is a `scope`, so it is on the
+    /// relation class too — see [`Chained`]. `Story.draft.published` is what the second copy
+    /// buys, and the whole of the second body is why it is written in one run.
     #[test]
     fn the_rbs_an_enum_declares() {
         assert_eq!(
@@ -491,6 +511,16 @@ class Story
   def self.published: () -> Story::Relation
   # From `app/models/story.rb`, `enum :status`: every record whose `status` is not `published`.
   def self.not_published: () -> Story::Relation
+end
+class Story::Relation
+  # From `app/models/story.rb`, `enum :status`: every record whose `status` is `draft`.
+  def draft: () -> Story::Relation
+  # From `app/models/story.rb`, `enum :status`: every record whose `status` is not `draft`.
+  def not_draft: () -> Story::Relation
+  # From `app/models/story.rb`, `enum :status`: every record whose `status` is `published`.
+  def published: () -> Story::Relation
+  # From `app/models/story.rb`, `enum :status`: every record whose `status` is not `published`.
+  def not_published: () -> Story::Relation
 end
 "
         );
@@ -679,6 +709,12 @@ end
                 "_x!",
                 "self._x",
                 "self.not__x",
+                // The class-side pair again, on the relation class: a declined label is declined
+                // on both sides, which is the property a second home could have lost.
+                "rsa",
+                "not_rsa",
+                "_x",
+                "not__x",
             ]
         );
     }
@@ -767,6 +803,13 @@ end
                 ("published: 1", "published"),
                 ("published: 1", "published"),
                 ("published: 1", "published"),
+                // The relation class' copy of the two class-side names, each landing on the
+                // same label as its twin: `Story.draft.published` jumps where `Story.published`
+                // does.
+                ("draft: 0", "draft"),
+                ("draft: 0", "draft"),
+                ("published: 1", "published"),
+                ("published: 1", "published"),
             ]
         );
     }
@@ -807,5 +850,127 @@ end
         ] {
             assert_eq!(names(&model(body)), Vec::<String>::new(), "{body}");
         }
+    }
+
+    /// An `enum` in one expression: the four names a value installs, and where each of them says
+    /// it was declared.
+    ///
+    /// `story.published?` is a member, it hovers as `bool`, and the jump lands on the
+    /// `published: 1` *inside* the call with the label selected, which is the side table's
+    /// mapping at its best case. `Story.published` is the same fact on the class side, and it is a `scope`
+    /// because Rails installs it by calling `klass.scope`.
+    #[test]
+    fn an_enum_declares_its_values_and_jumps_to_the_one_that_named_them() {
+        let source = "Story.published.first.published?\n";
+        let (mut harness, _story, _uri) = models_project(source);
+        let model = "\
+class Article < ApplicationRecord
+  enum :status, { draft: 0, published: 1 }
+end
+";
+        let article = harness.write("app/models/article.rb", model);
+        let caller = "Article.new.published?\n";
+        let uri = harness.write("app/reads.rb", caller);
+        harness.watch(&[&article, &uri]);
+
+        assert!(
+            harness.has("Article#published?()"),
+            "the value is not a member"
+        );
+        assert!(harness.has("Article#status()"));
+        assert!(harness.has("Article::<Article>#statuses()"));
+        assert!(harness.has("Article::<Article>#not_published()"));
+
+        let value = card(&mut harness, &uri, caller, "published?");
+        assert!(
+            value.contains("`enum :status`, value `published`"),
+            "{value}"
+        );
+        assert!(!value.contains("guessed from the name"), "{value}");
+
+        // And it answers `bool`, which cannot be read off a hover card: no card in this crate
+        // prints a return type, and `bool` is `true | false` — a union, which
+        // `class_of` deliberately declines — so it is read off the document the pass wrote,
+        // which is the text `Types::harvest` then reads.
+        assert!(
+            harness
+                .generated_for(&article)
+                .is_some_and(|rbs| rbs.contains("def published?: () -> bool")),
+            "{:?}",
+            harness.generated_for(&article)
+        );
+
+        let definition = harness.definition_at(&uri, caller, "published?");
+        assert_eq!(
+            definition[0]["targetUri"],
+            serde_json::json!(article.as_str()),
+            "{definition}"
+        );
+        // Line 1 is the `enum` call; the target is `published: 1` and the selection is the label
+        // — the whole of the call is *not* what a value method was declared by.
+        assert_eq!(
+            (
+                &definition[0]["targetRange"]["start"]["line"],
+                &definition[0]["targetRange"]["start"]["character"],
+                &definition[0]["targetSelectionRange"]["start"]["character"],
+                &definition[0]["targetSelectionRange"]["end"]["character"],
+            ),
+            (
+                &serde_json::json!(1),
+                &serde_json::json!(28),
+                &serde_json::json!(28),
+                &serde_json::json!(37),
+            ),
+            "{definition}"
+        );
+    }
+
+    /// An `enum` re-types the column it is stored in, and does it by the column standing down.
+    ///
+    /// The one place in this pass where a generator's output depends on another generator's
+    /// *input*. `story.status` is the label — a `String` — and the column holds the integer it
+    /// is stored as; the two declarations are in two different generated documents, so `Facts`'
+    /// precedence can never see the pair and the schema has to decline. What that has to
+    /// produce is **one** `Story#status` and a chain that reaches `String`.
+    #[test]
+    fn an_enum_re_types_the_column_it_is_stored_in() {
+        let source = "Story.new.status.upcase\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let schema = harness.write(
+            "db/schema.rb",
+            "\
+ActiveRecord::Schema[7.1].define(version: 2024_01_01_000000) do
+  create_table \"stories\", force: :cascade do |t|
+    t.string \"title\", null: false
+    t.integer \"status\", default: 0, null: false
+  end
+
+  create_table \"widgets\", force: :cascade do |t|
+    t.integer \"status\", default: 0, null: false
+  end
+end
+",
+        );
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  enum :status, { draft: 0 }\nend\n",
+        );
+        let widget = harness.write("app/models/widget.rb", "class Widget\nend\n");
+        harness.watch(&[&schema, &story, &widget]);
+
+        assert_eq!(
+            harness.declarations_of("Story#status()"),
+            1,
+            "a column and an enum of one name is one declaration, not an overload"
+        );
+        let chained = card(&mut harness, &uri, source, "upcase");
+        assert!(
+            chained.contains("String#upcase"),
+            "the label is a String, not the integer it is stored as: {chained}"
+        );
+        // Scoped to the class that wrote the `enum`, so another table's `status` is untouched.
+        let widget = card(&mut harness, &uri, source, "status");
+        assert!(widget.contains("`enum :status`"), "{widget}");
+        assert!(harness.has("Widget#status()"));
     }
 }

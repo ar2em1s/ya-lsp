@@ -660,6 +660,7 @@ fn bare(spelling: &str) -> String {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use crate::analysis::testing::*;
     use crate::generated::declaring;
     use std::collections::BTreeMap;
 
@@ -1501,6 +1502,127 @@ CREATE TABLE public.after (id bigint NOT NULL);
                 .table_names()
                 .next()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_dumped_column_is_a_method_that_types_its_chain_and_jumps_to_the_sql() {
+        // The SQL reader's whole point, and it is the `.rb` schema's test against the other
+        // file. An application that sets `schema_format = :sql` has **zero** column types
+        // without it — a cliff rather than a gradient — and what has to happen is the same
+        // three things at once: the member exists, the chain off it is
+        // typed, and the jump lands on the line of SQL that said so.
+        let source = "Story.new.title.upcase\n";
+        let (mut harness, dump, uri) = sql_project(source);
+
+        assert!(harness.has("Story#title()"), "the column is not a member");
+
+        let chained = card(&mut harness, &uri, source, "upcase");
+        assert!(chained.contains("String#upcase"), "{chained}");
+
+        let definition = harness.definition_at(&uri, source, "title");
+        assert_eq!(
+            definition[0]["targetUri"],
+            serde_json::json!(dump.as_str()),
+            "{definition}"
+        );
+        // `    title character varying NOT NULL` on line 4, revealed whole, name selected.
+        assert_eq!(
+            (
+                &definition[0]["targetRange"]["start"]["line"],
+                &definition[0]["targetRange"]["start"]["character"],
+                &definition[0]["targetSelectionRange"]["start"]["character"],
+            ),
+            (
+                &serde_json::json!(4),
+                &serde_json::json!(4),
+                &serde_json::json!(4),
+            ),
+            "{definition}"
+        );
+
+        // And the card says which file, in the dump's own vocabulary mapped to the schema's.
+        let column = card(&mut harness, &uri, source, "title");
+        assert!(column.contains("db/structure.sql"), "{column}");
+        assert!(column.contains("stories"), "{column}");
+        assert!(column.contains("`null: false`"), "{column}");
+        let nullable = "Story.new.description\n";
+        let other = harness.write("app/other.rb", nullable);
+        harness.watch(&[&other]);
+        let nullable = card(&mut harness, &other, nullable, "description");
+        assert!(nullable.contains("may be `nil`"), "{nullable}");
+    }
+
+    #[test]
+    fn an_array_column_answers_with_an_array_from_either_kind_of_schema() {
+        // Both readers at once. Unread, `array: true` makes a Postgres array column answer its
+        // *element* type — a wrong answer rather than an absent one, and wrong in the direction
+        // that looks right:
+        // `story.tags.upcase` resolved and `story.tags.join` did not. 39 such columns in three
+        // of the six corpora's `schema.rb` alone, before the SQL side was counted.
+        let source = "Story.new.tags.join\n";
+
+        let (mut harness, _schema, uri) = rails_project(source);
+        let ruby = card(&mut harness, &uri, source, "join");
+        assert!(ruby.contains("Array#join"), "from schema.rb: {ruby}");
+
+        let (mut harness, _dump, uri) = sql_project(source);
+        let dumped = card(&mut harness, &uri, source, "join");
+        assert!(
+            dumped.contains("Array#join"),
+            "from structure.sql: {dumped}"
+        );
+        // And the card on the column itself says there are many of them, because a hover shows
+        // a name rather than a return type — the same argument as `null: false`.
+        let column = card(&mut harness, &uri, source, "tags");
+        assert!(column.contains("`string[]`"), "{column}");
+    }
+
+    #[test]
+    fn a_dump_open_in_an_editor_is_read_from_the_buffer() {
+        // `with_text` prefers the buffer, so a client whose document selector is wide enough to
+        // hand a `.sql` over types the models it describes before it is saved. VS Code's is
+        // not — `LANGUAGES` is `ruby` and `erb` — so in that editor the watcher above is the
+        // whole story; this is the other half of the same accessor and it costs nothing to have
+        // right.
+        let source = "Story.new.title\n";
+        let (mut harness, dump, _uri) = sql_project(source);
+        assert!(harness.has("Story#title()"));
+
+        harness.open(&dump, STRUCTURE_SQL);
+        harness.change(
+            &dump,
+            "CREATE TABLE public.stories (\n    headline character varying NOT NULL\n);\n",
+        );
+
+        assert!(harness.has("Story#headline()"), "the buffer was not read");
+        assert!(
+            !harness.has("Story#title()"),
+            "the column the buffer removed still answers"
+        );
+    }
+
+    #[test]
+    fn a_project_that_excluded_its_db_directory_reads_no_dump() {
+        // The one switch this feature has, and it is the switch everything else has.
+        // `index.include` cannot name a `.sql` however it is spelled, so "not indexed and not
+        // read are the same sentence" cannot be the gate here — but `index.exclude` is a thing
+        // the user said, and `Workspace::admits` is that half of `Workspace::indexes` asked on
+        // its own.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            "[gems]\nenabled = false\n\n[index]\nexclude = [\"db/**/*\"]\n",
+        )
+        .unwrap();
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        harness.write("app/models/story.rb", "class Story\nend\n");
+        harness.write("db/structure.sql", STRUCTURE_SQL);
+        harness.index();
+
+        assert!(
+            !harness.has("Story#title()"),
+            "an excluded directory was read anyway"
         );
     }
 }

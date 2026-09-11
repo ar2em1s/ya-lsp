@@ -31,7 +31,7 @@ use crate::{
 /// # Errors
 ///
 /// Returns an error if the LSP handshake fails or the transport breaks.
-pub fn run_stdio() -> anyhow::Result<()> {
+pub fn run_stdio(reload: crate::logging::Reload) -> anyhow::Result<()> {
     // Before the handshake, not after it: a client that sends a malformed `initialize` — or none
     // at all — is exactly when one needs to know which build was answering, and by then `serve`
     // has already returned. Spelled as `--version` spells it, so one pattern finds both.
@@ -42,7 +42,7 @@ pub fn run_stdio() -> anyhow::Result<()> {
     // `serve` takes the connection by value on purpose. lsp-server's writer thread only stops
     // once every clone of `Connection::sender` is dropped, so holding one here would make the
     // join below block forever after a clean shutdown.
-    let result = serve(connection);
+    let result = serve(connection, reload);
 
     // Join the transport threads even on failure, or the process leaks them on exit.
     let joined = io_threads.join();
@@ -51,7 +51,7 @@ pub fn run_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn serve(connection: Connection) -> anyhow::Result<()> {
+fn serve(connection: Connection, reload: crate::logging::Reload) -> anyhow::Result<()> {
     let (initialize_id, initialize_params) = connection
         .initialize_start()
         .context("waiting for the initialize request")?;
@@ -70,16 +70,31 @@ fn serve(connection: Connection) -> anyhow::Result<()> {
     );
 
     let root = workspace_root(&params);
-    let (workspace, problems) =
+    let (workspace, mut problems) =
         Workspace::load(root.clone(), params.initialization_options.clone());
 
+    // Before the first line that describes the workspace, and that ordering is the point: this
+    // is where `[log]` first exists, and everything worth putting in a file — the config, the
+    // Ruby, the bundle, every request — happens after it. A `[log]` that cannot be honoured is a
+    // problem shown beside the config's own.
+    problems.extend(reload.apply(&workspace.config().log, &root));
+    // After the log is pointed and not before: the detection runs inside `Workspace::load`,
+    // which is earlier than `[log]` exists.
+    workspace.say_which_way_rails_went();
+
+    let changed = workspace.config().changed_from_defaults();
     tracing::info!(
-        "workspace {}, position encoding {:?}, config {}",
+        "workspace {}, position encoding {:?}, config {} ({})",
         root.display(),
         encoding,
         workspace
             .config_path()
-            .map_or_else(|| "defaults".to_owned(), |path| path.display().to_string())
+            .map_or_else(|| "defaults".to_owned(), |path| path.display().to_string()),
+        if changed.is_empty() {
+            "nothing set that the defaults do not already say".to_owned()
+        } else {
+            format!("changes {}", changed.join(", "))
+        }
     );
 
     connection
@@ -109,12 +124,21 @@ fn serve(connection: Connection) -> anyhow::Result<()> {
     let config = DocUri::from_path(&root.join(CONFIG_FILE_NAME));
 
     let cancellations = Cancellations::default();
+    // Negotiated here, where the client's capabilities are, and sent from the analysis thread,
+    // which is the only place that ever learns the gem roots. What crosses is the closure rather
+    // than the table behind it, so the thread that answers requests does not have to name the
+    // module that negotiates capabilities — see `analysis::DocumentRegistrar`.
+    let requested = capabilities::dynamic_documents(encoding, &params.capabilities);
+    let documents: analysis::DocumentRegistrar =
+        Box::new(move |prefixes| capabilities::document_registrations(&requested, prefixes));
     let analysis = analysis::spawn(
         workspace,
         encoding,
         ClientSupport::negotiate(&params.capabilities),
+        documents,
         connection.sender.clone(),
         cancellations.clone(),
+        reload,
     );
 
     for problem in problems {
@@ -856,7 +880,8 @@ mod tests {
         /// The same, with the capabilities the client announces spelled out.
         fn start_with(root: &std::path::Path, capabilities: serde_json::Value) -> Self {
             let (server_side, client_side) = Connection::memory();
-            let server = std::thread::spawn(move || serve(server_side));
+            let server =
+                std::thread::spawn(move || serve(server_side, crate::logging::Reload::default()));
             let mut client = Self {
                 connection: client_side,
                 server: Some(server),
@@ -1161,7 +1186,8 @@ mod tests {
         // Nothing has been negotiated yet, so there is no encoding to answer in and no
         // workspace to open. Failing out is the only honest thing left.
         let (server_side, client_side) = Connection::memory();
-        let server = std::thread::spawn(move || serve(server_side));
+        let server =
+            std::thread::spawn(move || serve(server_side, crate::logging::Reload::default()));
         client_side
             .sender
             .send(Message::Request(Request {
@@ -1186,7 +1212,8 @@ mod tests {
         // else as a client that has lost the thread, and the error has to reach `run_stdio`.
         let root = workspace();
         let (server_side, client_side) = Connection::memory();
-        let server = std::thread::spawn(move || serve(server_side));
+        let server =
+            std::thread::spawn(move || serve(server_side, crate::logging::Reload::default()));
         let uri = url::Url::from_file_path(root.path()).unwrap().to_string();
         client_side
             .sender

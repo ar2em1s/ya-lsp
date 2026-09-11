@@ -940,6 +940,7 @@ pub fn source_files(paths: &[PathBuf]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
 
     /// Build a gem root of the canonical shape: one unpacked gem plus its serialised gemspec.
     fn install(root: &Path, full_name: &str, require_paths: &[&str]) {
@@ -2187,5 +2188,271 @@ end
         };
         let gems = discover(&project, &config, &Env::default());
         assert_eq!(gems.gems.len(), 1, "{gems:?}");
+    }
+
+    #[test]
+    fn goto_definition_lands_inside_a_gem() {
+        // Gem indexing in one test: a constant defined only in an installed gem, found with no
+        // Ruby anywhere in the picture.
+        let (dir, _gem_home, env) =
+            project_with_gem("module Shouty\n  class Megaphone\n  end\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "Shouty::Megaphone.new\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        // Before the gems are in, the constant genuinely is not in the graph. Answering `null`
+        // rather than guessing is the correct behaviour, and it is what the user sees during
+        // the first second of a cold start.
+        assert!(
+            harness.definition_at(&uri, source, "Megaphone").is_null(),
+            "a gem that has not been indexed yet must not produce an answer"
+        );
+
+        harness.index_gems();
+
+        let definition = harness.definition_at(&uri, source, "Megaphone");
+        let target = definition[0]["targetUri"].as_str().expect("a target uri");
+        assert!(
+            target.ends_with("gems/shouty-1.2.3/lib/shouty.rb"),
+            "{definition}"
+        );
+    }
+
+    #[test]
+    fn a_require_of_a_gem_navigates_into_it() {
+        let (dir, _gem_home, env) = project_with_gem("module Shouty\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "require \"shouty\"\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        // `shouty` is on no workspace load path; it resolves only because the gem's own `lib`
+        // joined the load path when the gem was found.
+        let definition = harness.definition_at(&uri, source, "shouty");
+        let target = definition[0]["targetUri"].as_str().expect("a target uri");
+        assert!(
+            target.ends_with("gems/shouty-1.2.3/lib/shouty.rb"),
+            "{definition}"
+        );
+    }
+
+    /// A project whose Ruby is installed the way asdf installs one, with a default gem in it.
+    ///
+    /// The shape is the point: `gems/json-2.18.0/` exists and is *empty*, which is exactly what
+    /// RubyGems leaves behind for a gem that ships inside Ruby, and the code is over in
+    /// `lib/ruby/4.0.0/json.rb`.
+    fn project_with_a_default_gem() -> (tempfile::TempDir, tempfile::TempDir, gems::Env) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    json (2.18.0)\n",
+        )
+        .unwrap();
+        // Pins which Ruby the library directory is taken from, so the machine running the test
+        // cannot answer with its own.
+        std::fs::write(dir.path().join(".ruby-version"), "4.0.1\n").unwrap();
+        std::fs::write(dir.path().join("ya-lsp.toml"), "[rbs]\nenabled = false\n").unwrap();
+
+        let ruby = elsewhere.path().join(".asdf/installs/ruby/4.0.1/lib/ruby");
+        std::fs::create_dir_all(ruby.join("gems/4.0.0/gems/json-2.18.0")).unwrap();
+        std::fs::create_dir_all(ruby.join("4.0.0")).unwrap();
+        std::fs::write(
+            ruby.join("4.0.0/json.rb"),
+            "# Ruby's JSON library.\nmodule JSON\n  def self.parse(source)\n  end\nend\n",
+        )
+        .unwrap();
+
+        let env = gems::Env {
+            home: Some(elsewhere.path().to_path_buf()),
+            ..gems::Env::default()
+        };
+        (dir, elsewhere, env)
+    }
+
+    #[test]
+    fn a_default_gem_is_navigable_even_though_its_gem_directory_is_empty() {
+        let (dir, _home, env) = project_with_a_default_gem();
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "require \"json\"\n\nJSON.parse(\"{}\")\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        // The constant, which exists nowhere but inside Ruby.
+        let definition = harness.definition_at(&uri, source, "JSON");
+        let target = definition[0]["targetUri"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected Ruby's own library, got {definition}"));
+        assert!(target.ends_with("lib/ruby/4.0.0/json.rb"), "{definition}");
+
+        // And the `require` that names it. This is the other half of the same gap: the load
+        // path is what `require` resolves against, and Ruby's own library was never on it.
+        let definition = harness.definition_at(&uri, source, "json\"");
+        let target = definition[0]["targetUri"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected require navigation, got {definition}"));
+        assert!(target.ends_with("lib/ruby/4.0.0/json.rb"), "{definition}");
+    }
+
+    #[test]
+    fn default_gems_can_be_turned_off_without_turning_off_the_bundle() {
+        let (dir, _home, env) = project_with_a_default_gem();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            "[gems]\ndefault_gems = false\n\n[rbs]\nenabled = false\n",
+        )
+        .unwrap();
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "JSON.parse(\"{}\")\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        assert!(harness.definition_at(&uri, source, "JSON").is_null());
+    }
+
+    #[test]
+    fn gem_indexing_can_be_turned_off() {
+        let (dir, _gem_home, env) =
+            project_with_gem("module Shouty\n  class Megaphone\n  end\nend\n");
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            "[gems]\nenabled = false\n\n[rbs]\nenabled = false\n",
+        )
+        .unwrap();
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "Shouty::Megaphone.new\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        assert!(harness.definition_at(&uri, source, "Megaphone").is_null());
+    }
+
+    #[test]
+    fn a_gems_own_signatures_are_indexed_and_type_its_methods() {
+        // A gem's own `sig/`, end to end. It is excluded twice over unless both halves are
+        // fixed — by the
+        // `.rb` extension filter and by the walk running over `require_paths`, which never
+        // contains it — so a gem that ships correct, maintained RBS contributed none of it.
+        let (dir, gem_home, env) =
+            project_with_gem("module Shouty\n  class Megaphone\n  end\nend\n");
+        let sig = gem_home.path().join("gems/shouty-1.2.3/sig");
+        std::fs::create_dir_all(&sig).unwrap();
+        std::fs::write(
+            sig.join("shouty.rbs"),
+            "\
+module Shouty
+  class Megaphone
+    def shout: () -> String
+  end
+end
+",
+        )
+        .unwrap();
+        // Ruby's own signatures, so `String` exists to be chained from.
+        let signatures = dir.path().join("rbs");
+        std::fs::create_dir_all(signatures.join("core")).unwrap();
+        std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            format!(
+                "[gems]\ndefault_gems = false\n\n[rbs]\npath = {:?}\n",
+                signatures.display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        let source = "Shouty::Megaphone.new.shout.upcase\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        assert!(
+            harness.has("Shouty::Megaphone#shout()"),
+            "the gem's sig/ was not indexed"
+        );
+
+        // The chain is the assertion, not the declaration: `upcase` resolves at all only because
+        // the table read `-> String` out of a gem's own signature, and the card names the
+        // signature it followed rather than leaving the reader to guess.
+        let markdown = card(&mut harness, &uri, source, "upcase");
+        assert!(markdown.contains("String#upcase"), "{markdown}");
+        assert!(
+            markdown.contains("Shouty::Megaphone#shout()"),
+            "the card has to name the gem signature it followed: {markdown}"
+        );
+
+        let found = harness.declarations_at(&uri, "Shouty::Megaphone.new.shout.~\n");
+        assert!(found.contains(&"upcase".to_owned()), "{found:?}");
+    }
+
+    #[test]
+    fn a_require_never_resolves_against_an_engines_app_directory() {
+        // The teeth of the third-list rule, and the sharpest shape of it: this engine ships
+        // `app/shouty.rb` *and* `lib/shouty.rb`. If `app/` were a load path — the one-line
+        // version of gate 1 — `require "shouty"` would silently start meaning the other file.
+        let (dir, root, env) = project_with_engine(&[("shouty.rb", "class Decoy\nend\n")]);
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        let source = "require \"shouty\"\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        assert!(harness.has("Decoy"), "the decoy really is indexed");
+        let found = harness.definition_at(&uri, source, "shouty").to_string();
+        assert!(
+            found.contains("lib/shouty.rb") && !found.contains("app/shouty.rb"),
+            "the require resolves against lib/ and nothing else: {found}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_engines_associations_declare_members_on_the_engines_own_class() {
+        // Gate 2, end to end. `ActiveStorage::Blob` writes `has_many :attachments, class_name:
+        // "ActiveStorage::Attachment"` and an application chains off it. Without gate 2 the pass
+        // skips the file because `is_own_code` says no, so an engine's whole declarative surface
+        // stays invisible even once gate 1 has indexed it.
+        let (dir, root, env) = project_with_engine(&[
+            (
+                // `< ActiveRecord::Base` because the host test asks whether it is a model, and
+                // because it is what an engine really writes: `ActiveStorage::Blob` reaches the
+                // base through `ActiveStorage::Record`, one file away in the same `app/`.
+                "models/shouty/message.rb",
+                "class Shouty::Message < ActiveRecord::Base\n  \
+                 belongs_to :horn, class_name: \"Shouty::Horn\"\n\
+                 end\n",
+            ),
+            (
+                "models/shouty/horn.rb",
+                "class Shouty::Horn\n  def toot\n  end\nend\n",
+            ),
+        ]);
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        let uri = harness.write("app/main.rb", "Shouty::Message.new\n");
+        harness.index();
+        harness.index_gems();
+
+        assert!(
+            harness.has("Shouty::Message#horn()"),
+            "the engine's belongs_to declared nothing"
+        );
+        let found = harness.declarations_at(&uri, "Shouty::Message.new.horn.~\n");
+        assert!(
+            found.contains(&"toot".to_owned()),
+            "and the chain runs on through it: {found:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -7,6 +7,12 @@
 
 /** The server's `PartialConfig`. Field names are its wire format, not VS Code's. */
 export interface ServerOptions {
+  log?: {
+    level?: string;
+    file?: boolean;
+    file_path?: string;
+    file_level?: string;
+  };
   index?: {
     include?: string[];
     exclude?: string[];
@@ -21,7 +27,17 @@ export interface ServerOptions {
     paths?: string[];
   };
   rbs?: { enabled?: boolean; stdlib?: boolean; path?: string };
-  types?: { guess_from_names?: boolean };
+  rails?: {
+    enabled?: string | boolean;
+    schema?: boolean;
+    models?: boolean;
+    routes?: boolean;
+    entrypoints?: boolean;
+    views?: boolean;
+  };
+  trees?: { test?: string[]; test_support?: string[]; migration?: string[] };
+  types?: { structs?: boolean; annotations?: boolean; guess_from_names?: boolean };
+  hints?: { block_parameters?: boolean; locals?: boolean; returns?: boolean };
   diagnostics?: { enabled?: boolean; rules?: Record<string, string> };
 }
 
@@ -90,6 +106,35 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
     options.index = index;
   }
 
+  // `logLevel` is the one setting whose editor name does not map onto its TOML name: it shipped
+  // as `ya-lsp.logLevel` when it was an environment variable, and a rename would cost a
+  // deprecation, a migration and a window where both keys are read. So the key stays and the
+  // value now travels in the layer like every other setting — which is what took it off
+  // `RESTART_REQUIRED`, because a level the server is *told* can change while it runs.
+  const log: NonNullable<ServerOptions['log']> = {};
+  const level = settings.explicit<string>('logLevel');
+  if (typeof level === 'string' && level.trim() !== '') {
+    log.level = level.trim();
+  }
+  const logFile = settings.explicit<boolean>('log.file');
+  if (typeof logFile === 'boolean') {
+    log.file = logFile;
+  }
+  // Unlike `gems.rubyVersion` and `rbs.path`, an empty string here is not "work it out
+  // yourself" — there is no discovery to fall back on — so it is dropped as the mistake it is
+  // rather than sent as a path called "".
+  const logFilePath = settings.explicit<string>('log.filePath');
+  if (typeof logFilePath === 'string' && logFilePath.trim() !== '') {
+    log.file_path = logFilePath.trim();
+  }
+  const logFileLevel = settings.explicit<string>('log.fileLevel');
+  if (typeof logFileLevel === 'string' && logFileLevel.trim() !== '') {
+    log.file_level = logFileLevel.trim();
+  }
+  if (Object.keys(log).length > 0) {
+    options.log = log;
+  }
+
   const gems: NonNullable<ServerOptions['gems']> = {};
   const gemsEnabled = settings.explicit<boolean>('gems.enabled');
   if (typeof gemsEnabled === 'boolean') {
@@ -132,9 +177,77 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
     options.rbs = rbs;
   }
 
+  // `enabled` is a word rather than a boolean and the server takes both, so it is sent as
+  // written: the drop-down offers `auto`, which has no boolean spelling at all.
+  const rails: NonNullable<ServerOptions['rails']> = {};
+  const railsEnabled = settings.explicit<string>('rails.enabled');
+  if (typeof railsEnabled === 'string' && railsEnabled.trim() !== '') {
+    rails.enabled = railsEnabled.trim();
+  }
+  for (const key of ['schema', 'models', 'routes', 'entrypoints', 'views'] as const) {
+    const value = settings.explicit<boolean>(`rails.${key}`);
+    if (typeof value === 'boolean') {
+      rails[key] = value;
+    }
+  }
+  if (Object.keys(rails).length > 0) {
+    options.rails = rails;
+  }
+
+  // **An empty list is a value here and is sent as one**, unlike `gems.rubyVersion` and
+  // `rbs.path` where `""` spells "work it out yourself". `trees.test = []` turns the suite
+  // fence off and `trees.migration = []` turns the migration fence off; both are things a
+  // project may legitimately mean, and dropping them would turn a deliberate setting into one
+  // that silently does nothing.
+  const trees: NonNullable<ServerOptions['trees']> = {};
+  const testTrees = strings(settings, 'trees.test');
+  if (testTrees) {
+    trees.test = testTrees;
+  }
+  const testSupport = strings(settings, 'trees.testSupport');
+  if (testSupport) {
+    trees.test_support = testSupport;
+  }
+  const migration = strings(settings, 'trees.migration');
+  if (migration) {
+    trees.migration = migration;
+  }
+  if (Object.keys(trees).length > 0) {
+    options.trees = trees;
+  }
+
+  const types: NonNullable<ServerOptions['types']> = {};
   const guessFromNames = settings.explicit<boolean>('types.guessFromNames');
   if (typeof guessFromNames === 'boolean') {
-    options.types = { guess_from_names: guessFromNames };
+    types.guess_from_names = guessFromNames;
+  }
+  const structs = settings.explicit<boolean>('types.structs');
+  if (typeof structs === 'boolean') {
+    types.structs = structs;
+  }
+  const annotations = settings.explicit<boolean>('types.annotations');
+  if (typeof annotations === 'boolean') {
+    types.annotations = annotations;
+  }
+  if (Object.keys(types).length > 0) {
+    options.types = types;
+  }
+
+  const hints: NonNullable<ServerOptions['hints']> = {};
+  const blockParameters = settings.explicit<boolean>('hints.blockParameters');
+  if (typeof blockParameters === 'boolean') {
+    hints.block_parameters = blockParameters;
+  }
+  const locals = settings.explicit<boolean>('hints.locals');
+  if (typeof locals === 'boolean') {
+    hints.locals = locals;
+  }
+  const returns = settings.explicit<boolean>('hints.returns');
+  if (typeof returns === 'boolean') {
+    hints.returns = returns;
+  }
+  if (Object.keys(hints).length > 0) {
+    options.hints = hints;
   }
 
   const diagnostics: NonNullable<ServerOptions['diagnostics']> = {};
@@ -156,26 +269,25 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
 /**
  * The environment the server process is started with.
  *
- * The log filter is read once, by `EnvFilter::try_from_env`, before the server has a client to
- * be configured by — so it is an environment variable rather than a setting, and changing it
- * means starting a new process. The extension does that restart rather than leaving the setting
- * quietly inert.
+ * **`YA_LSP_LOG` is deliberately not set from `ya-lsp.logLevel` any more.** The level used to be
+ * read once by `EnvFilter::try_from_env`, before the server had a client to be configured by,
+ * which is why changing it restarted the process; it is a setting in the layer now and the
+ * server re-points its own log when it arrives. What the variable is left to mean is what
+ * somebody debugging from a terminal typed, and the server treats it as outranking both the
+ * setting and `ya-lsp.toml` — so passing the setting through here as well would take that away
+ * from the one person it exists for.
+ *
+ * The shell's own environment is passed on untouched.
  */
-export function serverEnvironment(
-  settings: Settings,
-  base: NodeJS.ProcessEnv
-): NodeJS.ProcessEnv {
-  const level = settings.explicit<string>('logLevel');
-  if (!level) {
-    // Leave an inherited `YA_LSP_LOG` alone when the setting says nothing; someone debugging
-    // from a terminal should not have it silently overridden by a default.
-    return { ...base };
-  }
-  // `off` included, and that is the fix rather than an oversight. It is a valid `EnvFilter`
-  // directive; treating it as "the user said nothing" fell through to the server's own fallback,
-  // which is `info` — louder than the `error` or `warn` the same user could have picked instead.
-  return { ...base, YA_LSP_LOG: `ya_lsp=${level}` };
+export function serverEnvironment(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...base };
 }
 
-/** Settings whose value only reaches the server through a fresh process. */
-export const RESTART_REQUIRED = ['ya-lsp.serverPath', 'ya-lsp.logLevel'];
+/**
+ * Settings whose value only reaches the server through a fresh process.
+ *
+ * `logLevel` was on this list for as long as it was an environment variable. It is one entry
+ * and not a pair on purpose: a list of one still has to be a list, because `serverPath` is
+ * genuinely one of these and the next setting like it should land beside it.
+ */
+export const RESTART_REQUIRED = ['ya-lsp.serverPath'];

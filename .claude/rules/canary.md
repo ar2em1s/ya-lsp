@@ -44,15 +44,19 @@ paths:
   a project whose headline is that it needs no Ruby. The run leaves gem settings at their defaults,
   finding some gems on a developer machine and none on CI, and *nothing asserted depends on which*:
   `collect_diagnostics` filters to own code before grouping, and the index line is written before
-  gem indexing starts. Gem numbers stay manual — see `benchmarking.md`.
+  gem indexing starts. Gem numbers stay manual.
 - **It is cloned, never vendored, and that is what makes the licence free.** The canary repository
   is BSD-3-Clause, whose condition is notice retention on redistribution. No artifact ya-lsp ships
   contains any of it, so no notice is owed (`licensing.md`: per artifact, not per repository). That
   is a property of *how it is used*: copy one file into `tests/` or cache a tarball here and the
   obligation attaches, in `THIRD-PARTY-NOTICES.txt`.
 - **The SHA is pinned for the same reason the tool versions are.** An unpinned target makes every
-  asserted number meaningless across runs, and flakes the first time upstream commits.
-- **Ask git about `$(CANARY_DIR)/.git`, never `git -C $(CANARY_DIR)`.** The workspace lives under
+  asserted number meaningless across runs, and flakes the first time upstream commits. **It lives
+  in `scripts/corpora.toml` and not here**: lobsters is one of the six corpora, `make canary-clone`
+  delegates to `scripts/corpora.py clone --only lobsters`, and a second copy of a commit in the
+  `Makefile` would be the copy that goes stale. The counts stay in the `Makefile`; the pin does not.
+- **Ask git about `$(CANARY_DIR)/.git`, never `git -C $(CANARY_DIR)`** — now enforced in one place,
+  `scripts/corpora.py`, which every corpus including this one clones through. The workspace lives under
   `tmp/`, inside this repository, and **git searches upwards**: `git -C tmp/x rev-parse --git-dir`
   in an empty `tmp/x` succeeds and answers about *ya-lsp*. The obvious spelling of "is this a
   repository yet?" therefore skips the `init`, adds a remote to ya-lsp, fetches the canary into

@@ -1,0 +1,275 @@
+{
+  "chatwoot": {
+    "positions": {
+      "app/policies/label_policy.rb:20": {
+        "hash": "8a3125c8636aca12",
+        "line": 1,
+        "shape": "constant",
+        "verdict": "wrong",
+        "why": "a gem's generator template tree is indexed as if it were loadable code. ApplicationPolicy resolves to two places: the application's own, and pundit-2.3.0/lib/generators/pundit/install/templates/application_policy.rb:3, which is a file pundit copies into a host app and never loads itself. 8 positions across chatwoot and forem. This is the tree question raised on the storefront route helpers and answered there as moot because those helpers reached nothing - it is not moot, it reaches constants. A generator template tree is not distinguishable from real source by path shape alone, which is what makes it a design question rather than a filter"
+      }
+    },
+    "sha": "8314676d1bece93d24293e87e80c94e7f5494d67"
+  },
+  "lobsters": {
+    "positions": {
+      "app/controllers/filters_controller.rb:336": {
+        "hash": "65e11da487fdc6d4",
+        "line": 13,
+        "shape": "member",
+        "verdict": "wrong",
+        "why": "same gap on the class side: Category.includes returns 0 from all three servers. includes is installed by delegate :includes, ... to: :all at querying.rb:16 and forwards to def includes at query_methods.rb:250, both indexed. 161 positions over five corpora carry a Resolved or Derived card with no place"
+      },
+      "app/controllers/filters_controller.rb:359": {
+        "hash": "1f7c6c321fec4ecb",
+        "line": 14,
+        "shape": "member",
+        "verdict": "wrong",
+        "why": "generated declaration carries no source mapping: .where on a relation returns 0 targets although def where is indexed at activerecord query_methods.rb:1033. synthesized.rs is the side table for where a generated declaration was really declared and the Rails query-interface generator never writes into it, so no mapping means no place fires correctly on an absent mapping. Measured: ya-lsp 0, solargraph 0, ruby-lsp 10 unranked name matches with the right one 6th and no hedge"
+      },
+      "app/controllers/inbox_controller.rb:481": {
+        "hash": "8e7d4ad5ce7cac8c",
+        "line": 22,
+        "shape": "member",
+        "verdict": "wrong",
+        "why": "avoidable ivar name-guess downgrades a whole Derived chain. The card for .limit carries two footnotes: derived through User#notifications() and 'Type guessed from the name @user alone', so the tier is guessed because of the weakest rung. But @user is assigned at application_controller.rb:99 (@user = User.where(...).first) and authenticatable.rb:19, both in InboxController's ancestry, so the type is derivable. Measured over the residue: 95 cards guess a type from an ivar name, 87 of them assign that ivar somewhere in app/, and 39 assign it in the very same file"
+      },
+      "app/controllers/inbox_controller.rb:742": {
+        "hash": "b699ea283e72805c",
+        "line": 27,
+        "shape": "ivar",
+        "verdict": "wrong",
+        "why": "ivar read is silent while the assignment resolves: at @page the cursor on line 56 or 58 returns both assignment lines, a cursor on any read returns nothing, and documentHighlight lights all 7 from the same buffer. 262 of 263 read positions over five corpora, 120 with the assignment in the same file"
+      },
+      "app/controllers/invitations_controller.rb:523": {
+        "hash": "801b6579ef614010",
+        "line": 19,
+        "shape": "ivar",
+        "verdict": "correct",
+        "why": "a typed card naming a handful of places, where every place is real. Two shapes, 92 of the 121 positions in this class. 61 have every place in one file and are an ivar's assignments counted accurately - 40 ivar, 11 call, 10 member. 31 name genuinely different files and are reopened constants: ActiveRecord::Base is declared at activerecord base.rb:282 and reopened by super_diff monkey_patches.rb:4, ActionView's FormBuilder across five actionview and actiontext files. Ruby really does declare the constant in each, so a list of them is the right answer and the count is right"
+      },
+      "app/controllers/login_controller.rb:3208": {
+        "hash": "69b7fff5d8aced70",
+        "line": 121,
+        "shape": "ivar",
+        "verdict": "correct",
+        "why": "an ivar's places are its assignments, and all of them are named. The controller assigns this ivar in seven actions, the card names the class it is on, every place is in this one file and the count matches. Same shape as the 61-position group ruled correct under the 2-to-5-places class; these four differ only by crossing the six-place threshold the audit's bucketing drew, which is a property of the bucketing and not of the answer. 4 positions, all ivar, across lobsters and forem"
+      },
+      "app/controllers/mod/mails_controller.rb:29": {
+        "hash": "b7b256fc58d42ea2",
+        "line": 1,
+        "shape": "constant",
+        "verdict": "wrong",
+        "why": "implicit namespace resolves to nothing. Every file opening Mod:: declares Mod by the operational test \u2014 deleting any one leaves the constant, only deleting all 13 removes it \u2014 so all openers must resolve, with an explicit module X ranked first where one exists (solidus Spree: 539 explicit, already returned). Measured: ya-lsp 0, ruby-lsp 0, solargraph 14 (lobsters Mod) and 145 (mastodon Api)"
+      },
+      "app/jobs/notify_mod_mail_message_job.rb:659": {
+        "hash": "a8ff8b5f63859323",
+        "line": 18,
+        "shape": "constant",
+        "verdict": "correct",
+        "why": "constant reference to the one class that declares it, at email_mod_mail_message_mailer.rb:3; single target and the card shows the declaration with its superclass"
+      },
+      "app/jobs/prefill_page_cache_job.rb:375": {
+        "hash": "7ca769aa78807477",
+        "line": 9,
+        "shape": "member",
+        "verdict": "correct",
+        "why": "ActiveJob is a literal constant; one target, and the def at enqueuing.rb:14 matches the card"
+      },
+      "app/jobs/restic_job.rb:341": {
+        "hash": "153b4885fd638ab4",
+        "line": 11,
+        "shape": "member",
+        "verdict": "wrong",
+        "why": "the chain breaks on a framework singleton whose return type is a fixed, known constant. The head resolves to Pathname and the member is Pathname's one join, and 41 places were offered under a footnote saying the receiver's type is unknown. About six names carry this - root, cache, logger, env, application, credentials - each with a fixed return and nothing to infer; railties ships no RBS so types.rs has nothing to read, but workspace/rails exists to emit RBS for what Rails knows and Ruby does not, and already does it for 17 macro families. The same shape one level up is ActiveSupport::CurrentAttributes, where a subclass declares its readers by macro - a tail.rs read. Measured over the five corpora with chain heads taken by bracket matching: 62 of 368 chain positions start from one of these, Rails 38, Current 16, I18n 5, Time 3. Examples of the cost: root.join 41 places, cache.fetch 62, application.config 68"
+      },
+      "app/mailers/application_mailer.rb:326": {
+        "hash": "34f3b802263464da",
+        "line": 9,
+        "shape": "member",
+        "verdict": "correct",
+        "why": "Rails is a literal constant and error is defined once on it at railties rails.rb:92; the cursor sits inside a rescue_from block and that did not confuse the receiver"
+      },
+      "app/models/comment.rb:3032": {
+        "hash": "88c846d043209be5",
+        "line": 78,
+        "shape": "member",
+        "verdict": "correct",
+        "why": "Story is a literal constant, so the receiver is the class object; arel_table is ActiveRecord's one class method and core.rb:392 is it"
+      },
+      "app/models/concerns/token.rb:95": {
+        "hash": "53fe3e949e381546",
+        "line": 6,
+        "shape": "member",
+        "verdict": "wrong",
+        "why": "defect 17, upstream: a member write with ||= records its method reference at the operator rather than at the message. rubydex ruby_indexer.rs visit_call_or_write_node:2279 and visit_call_and_write_node:2243 pass node.operator_loc() to index_method_reference, while visit_call_operator_write_node:2260 passes node.call_operator_loc(); all three should pass message_loc(). Verified by sweeping every offset of one such line: the member's own columns answer nothing and the two columns of the operator answer the right declaration with one place. The += spelling works only by accident, its reference sitting on the dot one byte before the message where an end-inclusive covers() picks it up, which is defect 9. Measured 0 of 6 ||= sites answering against 3 of 3 += sites, over four corpora; the ivar spelling answers normally"
+      },
+      "app/models/keystore.rb:438": {
+        "hash": "fc303561c5e65f3a",
+        "line": 15,
+        "shape": "symbol",
+        "verdict": "wrong",
+        "why": "validates names an existing attribute rather than installing one, and id is a column with a real declaration in db/schema.rb; ya-lsp answers columns elsewhere (72 of 72 on lobsters) but says nothing here"
+      },
+      "app/models/mastodon_app.rb:486": {
+        "hash": "b55408f04d5cd7e9",
+        "line": 13,
+        "shape": "member",
+        "verdict": "wrong",
+        "why": "an RBS signature is offered as a place the method is defined. The card says Defined in 3 places and the three are Ruby's own copy of the file, the default gem's copy of the same file, and rbs-4.2.0 stdlib/cgi-escape/0/escape.rbs - a signature, not a definition, and jumping to it lands the reader in a stub with no body. Two consequences: the jump is wrong, and Defined in N places overstates N, which is the same counter defect 13 names from a different cause. 21 of 121 positions in this class, 11 member and 10 constant"
+      },
+      "app/models/mod_mail.rb:115": {
+        "hash": "4577fece1a9527d3",
+        "line": 3,
+        "shape": "symbol",
+        "verdict": "wrong",
+        "why": "has_many :x, through: installs a reader and hover says nothing about it; the same association is silent at its call site too (mod_mail.rb:23). Planned feature, so silence is a gap rather than a limitation"
+      },
+      "app/models/search.rb:2034": {
+        "hash": "2259efc032b22d71",
+        "line": 96,
+        "shape": "member",
+        "verdict": "correct",
+        "why": "the chain breaks at the first link whose return type nobody wrote down, which is the design rather than a defect: rubydex models no types and types.rs reads RBS, so a chain through unannotated Ruby cannot continue and the card says the receiver's type is unknown. Covers 306 of the 368 chain positions - 181 headed by a local, 53 by a corpus class whose class methods carry no annotation, 20 by an ivar, 10 by a literal, 2 by self, 40 my scanner could not parse. Distinct from the 62 framework singletons ruled wrong, where the return is fixed and known. The list size is defect 14's problem, not this one"
+      },
+      "app/models/search.rb:3435": {
+        "hash": "fd7b31b24e99b5a4",
+        "line": 144,
+        "shape": "call",
+        "verdict": "correct",
+        "why": "receiverless call inside class Search resolving to the def at search.rb:47 in the same class; the neutral key excludes the name as too generic, so lane 3 is where it belongs"
+      },
+      "app/models/story_text.rb:92": {
+        "hash": "27e39cc0c4300459",
+        "line": 6,
+        "shape": "symbol",
+        "verdict": "wrong",
+        "why": "declaration-site-only gap: the same belongs_to answers admissibly at call sites (Rails key, 27 of 29 on lobsters) but the cursor on the name inside the macro call gets no card and no target"
+      },
+      "app/models/user.rb:6824": {
+        "hash": "1ed837430cf54989",
+        "line": 211,
+        "shape": "ivar",
+        "verdict": "wrong",
+        "why": "class instance variable: @system_user inside def self.system_user is an assignment, and assignments otherwise resolve (217 of 222). 3 of the 5 silent assignments over five corpora are inside def self., so the singleton slot is not tracked at all \u2014 a distinct mechanism from the silent-read defect"
+      },
+      "app/views/comments/_threads.html.erb:4046": {
+        "hash": "80fa2d770a38e6de",
+        "line": 105,
+        "shape": "call",
+        "verdict": "correct",
+        "why": "bare helper call in a template resolving to the def in app/helpers/hats_helper.rb:4; correctly Derived rather than Resolved, since nothing in the template names HatsHelper and the footnote says so"
+      },
+      "app/views/inbox/_message.html.erb:351": {
+        "hash": "9344decaec9b63f0",
+        "line": 8,
+        "shape": "member",
+        "verdict": "correct",
+        "why": "right target and the Guessed label is required, not a shortfall: message is a partial local, so the type cannot be proven and the card must say the answer is a logical guess. One def author_username exists in lobsters and it is the one returned. Where several models define the same name the answer should be the list of them"
+      },
+      "app/views/login/index.html.erb:1410": {
+        "hash": "4ae5bd2e0e2740bf",
+        "line": 41,
+        "shape": "ivar",
+        "verdict": "correct",
+        "why": "ruled wrong 2026-09-11 for the defect it named \u2014 a template's instance-variable read answered nothing while the two assignments behind it resolved \u2014 and re-ruled 2026-09-15, after that was fixed. The jump now names both writes, login_controller.rb:33 and :116, in the class the template's path names; one function answers which class that is for the card and the jump alike, so the two cannot name different ones. The card is silent at this cursor and that is the rung's stated ceiling rather than this position's defect: both assignments take their value from a gem that ships no RBS, so nothing declares a type to put on one. Measured over the six corpora, template reads answering definition went 4 of 1,301 to 870; the sweep after it was 0 findings new and 39 disagree findings gone, this position among them."
+      },
+      "app/views/login/index.html.erb:696": {
+        "hash": "771444f97d312c88",
+        "line": 20,
+        "shape": "route",
+        "verdict": "correct",
+        "why": "generated helper, so no def; Derived with both footnotes naming the route and the view context, and it lands on the :as clause that produces the name"
+      },
+      "app/views/moderations/_table.html.erb:198": {
+        "hash": "f21f370481fde494",
+        "line": 8,
+        "shape": "member",
+        "verdict": "correct",
+        "why": "the tier is right and the list is not. The receiver is a partial local, so nothing in any file names its type and the card says exactly that - the same shape ledger row 16 already ruled correct. Checked the one thing that could have made it wrong: 77 of these 468 have an assignment above the cursor in the same file, and the assignment rung is working (it fires 62 times elsewhere in this residue); only 2 of the 77 have a right-hand side whose type is directly nameable, the rest being calls into unannotated code or gems that ship no RBS. What is left is the list - 188 places offered here, and 33 percent of the 468 offer more than 40. Third appearance of the same defect 14 complaint in this session, after the anonymous ids filling every visible slot and the six unrelated gem matches for a name ending _path: the name rung has no ranking and no floor"
+      }
+    },
+    "sha": "6d15d8f118e305b1de5190662a9651bf90132784"
+  },
+  "mastodon": {
+    "positions": {
+      "app/lib/scope_parser.rb:147": {
+        "hash": "dec318c253b7652b",
+        "line": 5,
+        "shape": "call",
+        "verdict": "correct",
+        "why": "a closure in a class body has two live scopes and the name is in the second one. parser.rb:31 writes include Parslet plainly and parslet.rb:156/159 defines the member with module_function, so it is a private instance method; the class's own singleton side (parser.rb:33) has none. Correct today because nothing statically says the block is instance-exec'd. Proposed rung, defect 16: walk the whole singleton ancestry first and the instance ancestry second, as one ordered lookup rather than a fallback - found in one scope answers with no hedge, found in both is ambiguous and hedges class-first, found in neither falls through to the name rung exactly as now. It can only fire where the answer is already a name list, so it cannot make a correct answer worse. Applies to a closure only, never to a bare statement in the class body where self is certainly the class: 57 such positions in the residue against 12"
+      },
+      "app/models/admin/base_action.rb:523": {
+        "hash": "37df3657a2b97c18",
+        "line": 21,
+        "shape": "member",
+        "verdict": "wrong",
+        "why": "defect 18, upstream and distinct from defect 17: a member call whose result is used as a constant path parent gets no method reference at all. rubydex ruby_indexer.rs visit_constant_path_node:1747 calls index_constant_reference and never visits the node's children, so the CallNode that Prism puts in the parent slot is never indexed. Verified by sweeping every offset of the expression: nothing answers anywhere, unlike defect 17 where the operator's columns do answer. The control is the same member with a dot after it instead of the colons, in the same corpus and on the same receiver spelling, which answers with one place. 66 occurrences of receiver.member::CONST in indexable Ruby over the five corpora - chatwoot 38, forem 16, solidus 8, mastodon 4, lobsters 0. Only the member cursor is at fault: resolving the constant needs the member's type, and where the member has none, answering nothing about the constant is right"
+      },
+      "app/workers/publish_scheduled_status_worker.rb:76": {
+        "hash": "9c22206c414fb8fc",
+        "line": 4,
+        "shape": "constant",
+        "verdict": "wrong",
+        "why": "a wide namespace's declaration list has no ranking at all - it is alphabetical by path. On Sidekiq (69 targets) rank 1 is an rspec-sidekiq test helper and sidekiq.rb is 4th; on Rails (145) railties/lib/rails.rb is 23rd, behind 22 files that only wrap Rails::Generators or Rails::Conductor. RULING: prioritise explicit declarations, and within that group rank by how close the file's BASENAME is to the constant's own name - normalise both to letters and digits only, case-insensitive, separators stripped, then substring inclusion first and the difference in length second. There is no other clue available. Measured over all 134 wide-constant positions: 82 change rank 1, 52 were already right, and 131 of 134 land on an exact filename match. The 3 that do not are cases where no file is named after the constant at all - rubocop's lib/rubocop.rb is a require manifest that declares nothing, and forem's Admin namespace has no admin.rb"
+      }
+    },
+    "sha": "0a32b4a831838ef1f363a915c2e71e2a1b52cf0d"
+  },
+  "solidus": {
+    "positions": {
+      "admin/app/controllers/solidus_admin/store_credit_reasons_controller.rb:90": {
+        "hash": "9ee264feab457c63",
+        "line": 4,
+        "shape": "constant",
+        "verdict": "wrong",
+        "why": "same namespace defect, partially masked by explicit declarations existing: SolidusAdmin has 52 explicit module lines and 182 files that only open it, and ya-lsp returns exactly the 52. Deleting all 52 would not remove the constant, so the openers are declarations too. Measured on the equivalent cursor in shipping_categories_controller.rb:4 \u2014 ya-lsp 52, ruby-lsp 52, solargraph 228"
+      },
+      "api/app/controllers/spree/api/line_items_controller.rb:934": {
+        "hash": "07f33ced25ea8c2c",
+        "line": 32,
+        "shape": "call",
+        "verdict": "correct",
+        "why": "receiverless call in a def whose method is injected at runtime: responders.rb:38 is ActiveSupport.on_load(:action_controller) do include ActionController::RespondWith end, so no file writes the edge and no static walk can reach it. Two candidates offered and the right one is among them, under a footnote that says the receiver's type is unknown - which is true. Representative of 49 of the 51 in this class: 25 in a concern module where self is whichever class includes it, 9 reached by base.send :include plus a define_method loop, 8 by this hook, 2 by include Rails.application.routes.url_helpers which views.md already records as a module this reader cannot name, and 5 singletons each traced to a runtime extend, a DSL block or a shared_examples body"
+      },
+      "backend/app/views/spree/admin/adjustments/_adjustments_table.html.erb:138": {
+        "hash": "dcb768a638f8cd47",
+        "line": 4,
+        "shape": "member",
+        "verdict": "wrong",
+        "why": "the receiver can be derived precisely and was not: Spree::Adjustment is a literal constant, Spree::Adjustment < Spree::Base < ActiveRecord::Base which extends ActiveModel::Translation, so human_attribute_name resolves to translation.rb:48 alone. ya-lsp name-matched instead, returning translation.rb:48 plus an unrelated component_preview.rb:19 on a Guessed card; ruby-lsp and solargraph return 0. The ancestry is not walked for class-level methods"
+      },
+      "backend/app/views/spree/admin/adjustments/_adjustments_table.html.erb:692": {
+        "hash": "c9407d9af5e17f26",
+        "line": 16,
+        "shape": "call",
+        "verdict": "wrong",
+        "why": "the view context has a third half nobody wrote. views.rs models app/helpers and the helper_method proxies and states the rest as a bare fact - plus every helper module ActionView ships, which this crate does not model - with no argument for it in views.rs or views.md. Nothing blocks it: actionview's lib is indexed (definition already returns action_view/helpers/translation_helper.rb:110), and the list is 24 plain include lines at action_view/helpers.rb:40-66, so reading the installed gem is more correct than a name list and self-updating. Resolution takes the first answer, so ActionView goes last and an application helper still shadows it. One design note: this half applies to mailer templates too, unlike the app/helpers half, whose gate is ActionController::Base's include_all_helpers. 121 positions over five corpora, 86 in templates and 34 in app/helpers; 59 of them are the translation helper"
+      },
+      "legacy_promotions/app/views/spree/promotion_code_batch_mailer/promotion_code_batch_finished.text.erb:78": {
+        "hash": "9e4de01b7f244c4b",
+        "line": 2,
+        "shape": "member",
+        "verdict": "wrong",
+        "why": "rubydex's invented name for an anonymous class reaches the hover card verbatim: the possible-definitions list prints entries like <file-id>:<offset>anonymous and, being sorted alphabetically, numeric ids win every one of the ten visible slots. render::is_nameable exists for exactly this and says a name with angle brackets cannot be typed; hierarchy.rs:203, completion.rs:1162 and search.rs:179 all call it and hover's list does not. Two fixes, both wanted: (1) where the block is assigned to a constant, name the class by it - measured 68 of 185 distinct anonymous declarations reached by these 99 cards, 37%; (2) where there is no constant - 25 bound to a local, 92 to nothing at all, 63% together - render a plain display name rather than an id. 99 positions over five corpora, all guessed tier, 97 member"
+      },
+      "storefront/templates/app/controllers/locale_controller.rb:430": {
+        "hash": "a7a0336a7d3541f4",
+        "line": 15,
+        "shape": "route",
+        "verdict": "correct",
+        "why": "correct to find no route: storefront/templates is a Rails application template, copied into a host app by storefront/template.rb:62-67 via Thor source_paths, and solidus never loads it. Reading its config/routes/storefront.rb would resolve this one cursor and put roughly 60-100 helper names - devise_for, eight resources, and about twenty named routes - into a monorepo where core, backend, admin and api cannot call any of them. Measured: 0 solidus answers land in that file today against 25 in backend/config/routes.rb and 3 in api/config/routes.rb, so the pollution is not happening. conventions.rs accepts the path by shape, since any prefix may precede config/routes/, and nothing distinguishes a generator template tree from an engine - moot while those helpers reach nothing, live if anyone widens that edge. The caveat is not about routes: a name ending _path with no matching route was answered with six unranked name-matches in unrelated gems rather than declined, which is defect 14's missing ranking and floor on the name rung"
+      },
+      "storefront/templates/app/controllers/products_controller.rb:268": {
+        "hash": "7420b84bbdd7c4ab",
+        "line": 11,
+        "shape": "member",
+        "verdict": "correct",
+        "why": "not the constant-path defect it looked like. The control - the same member call written without the trailing colons, elsewhere in the same tree - answers nothing either, so the colons are not what breaks it. The member is installed by solidus' own preference DSL, which this crate does not model, putting it with the runtime-injected group already ruled correct: nothing static says the member exists, and the card says the receiver's type is unknown"
+      }
+    },
+    "sha": "a8218a0855b38a30e7336ab41fbf5036c89f43d0"
+  },
+  "version": 1
+}

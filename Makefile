@@ -52,6 +52,19 @@ MIN_FILE_LINES ?= 90
 #   diagnostics.rs   the rule -> severity table; a transposed row squiggles working code, and a
 #                    renamed rule silently stops matching the user's ya-lsp.toml keys.
 #   licenses.rs      what `--licenses` prints. Wrong here is a licence nobody granted.
+#   features.rs      which bodies of knowledge apply to a project. On this list for `config.rs`'s
+#                    reason: it decides what every later answer is made of, and being wrong is
+#                    silent in both directions — a family switched off answers nothing with no
+#                    error anywhere, and `auto` guessing wrong brings Rails' conventions to a
+#                    project that is not Rails and cites a controller that does not exist. Pure
+#                    decisions over a path and a lockfile, like bundler.rs.
+#   logging.rs       where the log goes. On this list for `config.rs`'s reason rather than a new
+#                    one: it decides whether anything is written at all, and being wrong there is
+#                    silent by construction — a filter that came out one level too quiet, or a
+#                    file sink that never opened, looks exactly like a server with nothing to
+#                    say. It is also the module a bug report is assembled from, so a defect in
+#                    it is a defect in every later diagnosis. The one line that cannot be tested
+#                    — installing the global subscriber — is deliberately in `main.rs` instead.
 #   ruby_version.rs  which Ruby, and therefore which stdlib. Pure text; the failure it exists to
 #                    prevent is macOS's vestigial 2.6 answering for a 4.0 project.
 #   bundler.rs       Gemfile.lock -> sources and specs. Pure text, no I/O, so there is nothing it
@@ -118,6 +131,25 @@ MIN_FILE_LINES ?= 90
 #                    are silent — a member on the wrong constant answers confidently about a
 #                    class the user is not looking at, and a call it declines looks exactly like
 #                    a project that writes no structs. Pure text and no I/O, like bundler.rs.
+#   hints.rs         the one answer nobody asked for, which is what turns the first question
+#                    yes: a label is painted into the margin of every line whether anybody
+#                    wanted it or not and is read as fact, so a guess that reaches one is the
+#                    widest and quietest thing this crate can be wrong about — and nobody files
+#                    a bug saying "this type was inferred from six letters". The guard is one
+#                    `retain` on the tier and one predicate on the shape, both of them
+#                    *refusals*, which is `code_actions.rs`' argument: an untested refusal is a
+#                    label still being drawn where it should not be. Pure decisions over a
+#                    buffer and a graph, no I/O; it landed at 100 of lines and branches on its
+#                    first release.
+#   environment.rs   the test-tree tag and the one place the rule is written down, read by five
+#                    surfaces of which three must never act on it. Both ways it goes wrong are
+#                    silent: a rule that fires too widely deletes a row nobody knows to look
+#                    for — its first spelling dropped every declaration with no definitions,
+#                    which is the top of the object model — and one that stops firing restores
+#                    a leak whose whole symptom is a list that is a little longer than it
+#                    should be. No lane of the audit scores it either, so the suite is the only
+#                    instrument there is. Pure decisions over a path and a set, no I/O, like
+#                    bundler.rs; it landed at 100 of lines and branches on its first release.
 #   rails/           the *whole* of what ya-lsp knows about Rails — which is the reason it is
 #                    one directory and the reason every file of it is on this list: a
 #                    convention that reaches the wrong class answers confidently and wrongly
@@ -157,16 +189,22 @@ COVERAGE_FLOORS ?= \
   analysis/code_actions.rs=100:100 \
   analysis/scopes.rs=100:100 \
   analysis/erb.rs=100:100 \
+  analysis/environment.rs=100:100 \
   analysis/structs.rs=100:100 \
+  analysis/hints.rs=100:100 \
   workspace/rails/conventions.rs=100:100 \
   workspace/rails/inflect.rs=100:100 \
   workspace/rails/schema.rs=100:100 \
   workspace/rails/structure.rs=100:100 \
   workspace/rails/attributes.rs=100:100 \
+  workspace/rails/concerns.rs=100:100 \
+  workspace/rails/associations.rs=100:100 \
   workspace/rails/models.rs=100:100 \
+  workspace/rails/relations.rs=100:100 \
   workspace/rails/delegates.rs=100:100 \
   workspace/rails/enums.rs=100:100 \
   workspace/rails/entrypoints.rs=100:100 \
+  workspace/rails/framework.rs=100:100 \
   workspace/rails/routes.rs=100:100 \
   workspace/rails/syntax.rs=100:100 \
   workspace/rails/tail.rs=100:100 \
@@ -177,7 +215,9 @@ COVERAGE_FLOORS ?= \
   workspace/bundler.rs=100:100 \
   workspace/ruby_version.rs=100:100 \
   server/capabilities.rs=100 \
-  licenses.rs=100
+  licenses.rs=100 \
+  logging.rs=100:100 \
+  workspace/features.rs=100:100
 
 # cargo-llvm-cov builds into its own target directory. Mixing stable- and nightly-built objects
 # in it merges nightly counters against a stable covmap and reports a plausible, entirely wrong
@@ -240,6 +280,22 @@ fmt-check:
 lint:
 	$(CARGO) clippy --all-targets -- -D warnings
 
+# Only the **broken** class is denied, and the other two rustdoc lints are allowed here on
+# purpose. `private_intra_doc_links` fires 101 times and every one of them is correct: this crate
+# is private modules almost end to end, and the only ways to silence one are to make an internal
+# item `pub` or to downgrade a link that works in an editor into plain text — both worse than the
+# warning. `redundant_explicit_links` is 13 more of pure style. What is left is the class that
+# points at **nothing**, and that is a rename whose comment did not follow it: `List::Concerns`
+# outlived the enum it named by three commits, and of the 17 found the day this target was added,
+# 8 were names moved by the last three refactors and 2 had never resolved at all. A grep finds
+# those only if somebody already suspects them; rustdoc finds them every run.
+## docs-check: fail on a doc link that points at nothing
+.PHONY: docs-check
+docs-check:
+	RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links \
+	  -A rustdoc::private_intra_doc_links -A rustdoc::redundant_explicit_links" \
+	  $(CARGO) doc --no-deps --quiet
+
 ## test: the Rust suite
 .PHONY: test
 test:
@@ -298,6 +354,60 @@ coverage-html:
 coverage-clean:
 	rm -rf $(COV_TARGET) target/llvm-cov
 
+# ---------------------------------------------------------------------------- the corpora
+
+# The six benchmark corpora, pinned. `scripts/corpora.toml` is the table — repository, commit,
+# Ruby and licence — and `scripts/corpora.py` is what makes a machine match it. The reasoning
+# lives in both of those files and in `.claude/rules/corpora.md`; what belongs here is only the
+# entry point.
+#
+# **This target needs a network and a Ruby toolchain, so it is not in `make ci` and is not a CI
+# job either.** The canary is one 12 MB clone; this is six applications and their bundles.
+#
+# **It never installs a Ruby.** Each corpus declares one and the script resolves it against what
+# asdf has, printing the `asdf install ruby X` line when it cannot. `--allow-nearest` accepts
+# another patch of the same MAJOR.MINOR, preferring one whose bundle already resolves, and says
+# so in the manifest.
+#
+# `make corpora-status ARGS=--json` is the manifest a measurement carries beside its numbers:
+# without it an absolute count taken today cannot be compared with one taken last week, because
+# nothing recorded which commit or how much of the bundle was installed.
+
+## corpora: clone, pin, bundle and configure all six benchmark corpora
+.PHONY: corpora
+corpora:
+	python3 scripts/corpora.py setup $(ARGS)
+
+## corpora-clone: fetch every corpus at its pinned commit, and nothing else
+.PHONY: corpora-clone
+corpora-clone:
+	python3 scripts/corpora.py clone $(ARGS)
+
+## corpora-gems: bundle install each corpus under its own Ruby
+.PHONY: corpora-gems
+corpora-gems:
+	python3 scripts/corpora.py gems $(ARGS)
+
+## corpora-lsps: install ruby-lsp, solargraph and solargraph-rails into each corpus' Ruby
+.PHONY: corpora-lsps
+corpora-lsps:
+	python3 scripts/corpora.py lsps $(ARGS)
+
+## corpora-solargraph: write .solargraph.yml and compose the bundle solargraph is measured from
+.PHONY: corpora-solargraph
+corpora-solargraph:
+	python3 scripts/corpora.py solargraph $(ARGS)
+
+## corpora-docs: cache solargraph's gem documentation and warm ruby-lsp's composed bundle
+.PHONY: corpora-docs
+corpora-docs:
+	python3 scripts/corpora.py docs $(ARGS)
+
+## corpora-status: what is on disk against what is pinned (ARGS=--json for the manifest)
+.PHONY: corpora-status
+corpora-status:
+	@python3 scripts/corpora.py status $(ARGS)
+
 # ---------------------------------------------------------------------------- the canary
 
 # A real Rails application, opened the way an editor opens it. `scripts/canary.py` carries the
@@ -312,7 +422,7 @@ coverage-clean:
 # **It does not cover gems**, and the reason is a cost rather than an oversight: resolving
 # lobsters' bundle needs `bundle install`, which needs Ruby 4.0.0 and a hand-built `sqlite3`.
 # That is a large amount of CI for a project whose headline is that it needs no Ruby. The gem
-# numbers stay manual — `.claude/rules/benchmarking.md` — and a green canary does not cover them.
+# numbers stay manual, and a green canary does not cover them.
 #
 # lobsters is BSD-3-Clause, (c) 2012-2019 Joshua Stein. It is **cloned, never vendored**: no
 # artifact this project ships contains any of it, so no notice is owed, which is
@@ -325,9 +435,11 @@ coverage-clean:
 # 20.99 ms measured on 2026-09-03: a shared runner with a cold page cache is not that machine,
 # and what this catches — the accidental quadratic, the discovery rule that stops matching —
 # moves the number by a factor rather than by a percent.
-CANARY_REPO     ?= https://github.com/lobsters/lobsters.git
-CANARY_SHA      ?= 6d15d8f118e305b1de5190662a9651bf90132784
-CANARY_DIR      ?= tmp/lobsters
+# The repository, the commit and the Ruby live in `scripts/corpora.toml`, which pins all six
+# corpora and is where `make corpora` reads them from. They are deliberately not repeated here:
+# `canary.md`'s rule is that the asserted *counts* live in the `Makefile` and nowhere else, and a
+# second copy of a SHA is a second copy that goes stale. `CANARY_DIR` is the one path both need.
+CANARY_DIR      ?= tmp/corpora/lobsters
 CANARY_FILES    ?= 606
 CANARY_WARNINGS ?= 14
 CANARY_MAX_MS   ?= 500
@@ -340,38 +452,85 @@ canary: release canary-clone
 	  --files $(CANARY_FILES) --parse-warnings $(CANARY_WARNINGS) \
 	  --max-index-ms $(CANARY_MAX_MS)
 
-# Fetches one commit rather than cloning a history, and never deletes what is already there: a
-# working tree with local edits fails the checkout instead of losing them. `--depth 1` on a
-# 12 MB repository, and a no-op once the pin is present.
+# One implementation of "fetch a pinned commit", in `scripts/corpora.py`, which this delegates
+# to. It fetches one commit rather than cloning a history, and never deletes what is already
+# there: a working tree with local edits fails the checkout instead of losing them.
 #
-# **Every question here is asked of `$(CANARY_DIR)/.git` and never of `git -C`'s answer, because
-# the canary workspace lives inside this repository and git searches *upwards*.** `git -C
-# tmp/x rev-parse --git-dir` in an empty `tmp/x` succeeds and answers about **ya-lsp** — so the
-# obvious spelling of "is this a repo yet?" skips the `init`, adds a remote to ya-lsp, fetches
-# lobsters into ya-lsp's object store and then runs `checkout --detach` on the working tree
-# being developed in. It was written that way once; what stopped it was an unrelated dirty tree.
-# The `-e` test cannot walk up, and the toplevel comparison refuses the case where somebody
-# points `CANARY_DIR` at the repository root itself.
+# **Every question it asks is asked of `<dir>/.git` and never of `git -C`'s answer, because the
+# corpus workspaces live inside this repository and git searches *upwards*.** `git -C tmp/x
+# rev-parse --git-dir` in an empty `tmp/x` succeeds and answers about **ya-lsp** — so the obvious
+# spelling of "is this a repo yet?" skips the `init`, adds a remote to ya-lsp, fetches lobsters
+# into ya-lsp's object store and then runs `checkout --detach` on the working tree being
+# developed in. It was written that way once; what stopped it was an unrelated dirty tree.
 ## canary-clone: fetch the pinned commit of the canary workspace
 .PHONY: canary-clone
 canary-clone:
-	@set -e; \
-	dir='$(CANARY_DIR)'; \
-	if [ -e "$$dir/.git" ] \
-	   && [ "$$(git -C "$$dir" rev-parse HEAD 2>/dev/null)" = "$(CANARY_SHA)" ]; then \
-	  echo "canary: $$dir is at $(CANARY_SHA)"; \
-	else \
-	  mkdir -p "$$dir"; \
-	  if [ "$$(cd "$$dir" && pwd -P)" = "$$(pwd -P)" ]; then \
-	    echo "canary: CANARY_DIR is the ya-lsp working tree; refusing"; exit 2; \
-	  fi; \
-	  echo "canary: fetching $(CANARY_SHA) into $$dir"; \
-	  [ -e "$$dir/.git" ] || git -C "$$dir" init -q; \
-	  git -C "$$dir" remote get-url canary >/dev/null 2>&1 \
-	    || git -C "$$dir" remote add canary $(CANARY_REPO); \
-	  git -C "$$dir" fetch -q --depth 1 canary $(CANARY_SHA); \
-	  git -C "$$dir" checkout -q --detach FETCH_HEAD; \
-	fi
+	@python3 scripts/corpora.py clone --only lobsters
+
+# ---------------------------------------------------------------------------- the audit
+
+# `scripts/audit/` opens every sweepable corpus, asks a stratified sample of real cursors, and
+# scores the answers. `.claude/rules/audit.md` is the rule; what belongs here is the entry point
+# and the one path both halves of it need.
+#
+# **Two commands and not one, because the second needs no server.** `score` sweeps and records;
+# `report` diffs that recording against the committed baseline. Splitting them is what lets a diff
+# be re-read, re-cut and re-run in CI from an artifact long after the machine that swept is gone —
+# and a report that had to re-sweep to say what moved could only ever be run where the corpora are.
+#
+# **It needs the corpora, so it is not in `make ci` and is not a CI job.** `make corpora` is six
+# applications and their bundles; the audit itself needs only the clones, and a corpus that is
+# missing or has drifted from its pin is skipped by name rather than measured. That is the same
+# reason `canary` is out of `ci`, one order of magnitude further along.
+#
+# The baseline is committed and the ledger is committed, and **neither holds a word of corpus
+# source** — `corpora.md`'s licence rule, which is blanket. A finding travels into the baseline as
+# a path and a byte offset, a ledger row as `sha256(line)`. The identifier under the cursor reaches
+# the terminal and stops there.
+AUDIT_RUN ?= tmp/audit-run.json
+
+# `ARGS` reaches `score` and **not** `report`, because the two take different flags — `-n` is not
+# a thing you can report on — and because it would be the wrong knob anyway: the record is already
+# only the corpora that were swept, so `ARGS=--only lobsters` restricts the diff by restricting
+# what there is to diff.
+## audit: sweep all six corpora, then diff against the committed baseline
+.PHONY: audit
+audit: release
+	python3 scripts/audit score --record $(AUDIT_RUN) $(ARGS)
+	@python3 scripts/audit report $(AUDIT_RUN)
+
+## audit-sample: the draw only, and its mix against the stated one; no server, no requests
+.PHONY: audit-sample
+audit-sample:
+	@python3 scripts/audit sample $(ARGS)
+
+## audit-cost: what one position costs, and the sample size the budget buys
+.PHONY: audit-cost
+audit-cost: release
+	@python3 scripts/audit cost $(ARGS)
+
+## audit-prefix: what the untyped completion list costs and buys at each prefix length
+.PHONY: audit-prefix
+audit-prefix: release
+	@python3 scripts/audit prefix $(ARGS)
+
+## audit-rank: where the member sits in a typed completion list, at each prefix length
+.PHONY: audit-rank
+audit-rank: release
+	@python3 scripts/audit rank $(ARGS)
+
+## audit-ledger: what is in audit/ledger.json, and whether it still applies
+.PHONY: audit-ledger
+audit-ledger:
+	@python3 scripts/audit ledger $(ARGS)
+
+# Blessing the last sweep as the new baseline is a **separate** target and never a flag on
+# `audit`, because it is the one step that changes what a future run is judged against. It merges:
+# a run over one corpus keeps the other four's recorded numbers and says which it carried.
+## audit-baseline: record the last `make audit` sweep as the committed baseline
+.PHONY: audit-baseline
+audit-baseline:
+	python3 scripts/audit report $(AUDIT_RUN) --save
 
 # ---------------------------------------------------------------------------- notices
 
@@ -429,6 +588,10 @@ setup-coverage:
 	rustup toolchain install nightly --component llvm-tools-preview
 	$(CARGO) install cargo-llvm-cov --locked --version $(CARGO_LLVM_COV_VERSION)
 
+# `docs-check` is in here for the reason `fmt-check` is: it is hermetic, it costs a `cargo doc`
+# over a tree that is already built, and the thing it catches is invisible to every other target.
+# A doc link that points at nothing breaks no build, fails no test and moves no coverage number.
+#
 # `notices-check` is in here because the `server` job runs it, and the header above promises a
 # green `make ci` means a green CI run. It costs `make setup` — cargo-about — the same way
 # `coverage` costs nightly and cargo-llvm-cov, and it is the target most likely to fail on a
@@ -440,7 +603,7 @@ setup-coverage:
 # runs it as its own job, where the name in the checks list says what it covers.
 ## ci: everything CI checks about the server
 .PHONY: ci
-ci: fmt-check lint test notices-check coverage
+ci: fmt-check lint docs-check test notices-check coverage
 
 ## clean: cargo clean
 .PHONY: clean

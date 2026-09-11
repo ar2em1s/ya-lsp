@@ -1008,6 +1008,7 @@ fn normalize_name(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
     use crate::generated::declaring;
 
     /// Every shape of the DSL this reader understands, in one file.
@@ -1713,5 +1714,237 @@ namespace :x do\n  concerns :searchable\nend\n";
              module ApplicationHelper\n  include RouteHelpers\nend\n"
         );
         assert!(mixins(&BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn an_engines_routes_reach_the_applications_controllers_only_when_they_draw_into_it() {
+        // The routes reader, over a gem's own `config/routes.rb`. `activestorage` writes
+        // `Rails.application.routes.draw` and its `rails_direct_uploads_path` really is a method
+        // on this application's controllers; `blazer` writes `Blazer::Engine.routes.draw` and
+        // its helpers are reached as `blazer.queries_path` after a `mount`, which is a spelling
+        // this crate does not read and which zero of six applications use.
+        let (dir, root, env) = project_with_engine(&[]);
+        let gem = root.join("gems/shouty-1.2.3/config");
+        std::fs::create_dir_all(&gem).unwrap();
+        std::fs::write(
+            gem.join("routes.rb"),
+            "Rails.application.routes.draw do\n  \
+             resources :megaphones, only: [:show]\n  \
+             resources :stories, only: [:index]\n\
+             end\n",
+        )
+        .unwrap();
+
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        // The application names one of the two itself, which is the collision that decides
+        // whether "the project's own routes file first" is load-bearing or cosmetic.
+        harness.write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :stories\nend\n",
+        );
+        harness.write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        );
+        let source = "class StoriesController < ApplicationController\n                        def show\n    megaphone_path\n    stories_path\n  end\nend\n";
+        let uri = harness.write("app/controllers/stories_controller.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        let engine = harness.hover_at(&uri, source, "megaphone_path").to_string();
+        assert!(
+            engine.contains("shouty-1.2.3/config/routes.rb"),
+            "the engine's helper is a method on this application's controller: {engine}"
+        );
+
+        // And the application's own routes file declares the name they share, so the jump lands
+        // in the project rather than in somebody's bundle.
+        let own = harness.hover_at(&uri, source, "stories_path").to_string();
+        assert!(
+            own.contains("config/routes.rb") && !own.contains("shouty-1.2.3"),
+            "the project's own file wins the collision: {own}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_engine_that_draws_into_its_own_route_set_declares_no_helper() {
+        // The three of seven that would otherwise put a helper on every controller in the
+        // project: blazer, pghero and mission_control-jobs. The decline is `rails::Whose`, and
+        // it has to survive the whole pass rather than only the reader — `Reader::call` walks an
+        // unknown call's block transparently, so a fall-through would read this body as though
+        // the application had written it.
+        let (dir, root, env) = project_with_engine(&[]);
+        let gem = root.join("gems/shouty-1.2.3/config");
+        std::fs::create_dir_all(&gem).unwrap();
+        std::fs::write(
+            gem.join("routes.rb"),
+            "Shouty::Engine.routes.draw do\n  resources :megaphones, only: [:show]\nend\n",
+        )
+        .unwrap();
+
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :stories, only: [:index]\nend\n",
+        );
+        harness.write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        );
+        let uri = harness.write(
+            "app/controllers/stories_controller.rb",
+            "class StoriesController < ApplicationController\n  def index\n  end\nend\n",
+        );
+        harness.index();
+        harness.index_gems();
+
+        let found = harness.declarations_at(
+            &uri,
+            "class StoriesController < ApplicationController\n  def index\n    ~\n  end\nend\n",
+        );
+        assert!(
+            found.contains(&"stories_path".to_owned()),
+            "the application's own helpers are still there: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|name| name.starts_with("megaphone")),
+            "and the engine's own route set contributes none: {found:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_route_helper_is_a_method_on_every_controller_and_jumps_to_the_routing_dsl() {
+        // `story_path` in a controller resolves through the `include` this pass wrote — an
+        // `include` nobody's code contains, which is what `Facts::mixins` exists for — and the
+        // jump lands on the
+        // `resources :stories` line that named it.
+        let (mut harness, _uri) = routes_project("");
+        let source = "class StoriesController < ApplicationController\n  def index\n    redirect_to story_path\n  end\nend\n";
+        let controller = harness.write("app/controllers/stories_controller.rb", source);
+        harness.watch(&[&controller]);
+
+        let card = card(&mut harness, &controller, source, "story_path");
+        // No return type: a hover card prints the signature and the provenance, never the
+        // `-> String`, which is true of every card here.
+        assert!(card.contains("RouteHelpers#story_path"), "{card}");
+        assert!(
+            !card.contains("Matched on the method name alone"),
+            "the ancestry is exact, not a name match: {card}"
+        );
+        assert!(card.contains("resources :stories"), "{card}");
+
+        let jump = harness.definition_at(&controller, source, "story_path");
+        let target = jump[0]["targetUri"].as_str().unwrap_or_default();
+        assert!(target.ends_with("config/routes.rb"), "{jump}");
+        let selected = &jump[0]["targetSelectionRange"];
+        assert_eq!(selected["start"]["line"], 2, "the `resources` line: {jump}");
+    }
+
+    #[test]
+    fn a_route_helper_answers_in_a_helper_module_and_in_a_template() {
+        // The other two contexts a helper is called from. A helper module is a host, so the
+        // answer inside one is exact. A template has no enclosing class at all, so without a
+        // view context its `story_path` reaches the same module by the *name* rung — enough for
+        // the jump and not for completion. It is exact there too, by a route neither convention
+        // planned: the route helpers go into one module that is
+        // `include`d into every `app/helpers` module, and the view context *is* those modules,
+        // so the chain from a template to `resources :stories` is two conventions long and has
+        // no guess in it.
+        let (mut harness, _uri) = routes_project("");
+        let helper = "module StoriesHelper\n  def link\n    story_path\n  end\nend\n";
+        let uri = harness.write("app/helpers/stories_helper.rb", helper);
+        let template = "<%= link_to \"x\", story_path %>\n";
+        let view = harness.write("app/views/stories/index.html.erb", template);
+        harness.watch(&[&uri, &view]);
+
+        let inside = card(&mut harness, &uri, helper, "story_path");
+        assert!(
+            inside.contains("RouteHelpers#story_path"),
+            "a helper module is a host: {inside}"
+        );
+        assert!(
+            !inside.contains("Matched on the method name alone"),
+            "{inside}"
+        );
+
+        let in_template = card(&mut harness, &view, template, "story_path");
+        assert!(
+            in_template.contains("RouteHelpers#story_path"),
+            "{in_template}"
+        );
+        assert!(
+            !in_template.contains("Matched on the method name alone"),
+            "the view context reaches it through `StoriesHelper`, not by the name: {in_template}"
+        );
+        assert!(
+            in_template.contains("Reached through the view context"),
+            "and the card says which convention it came through: {in_template}"
+        );
+        let jump = harness.definition_at(&view, template, "story_path");
+        assert!(
+            jump[0]["targetUri"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("config/routes.rb"),
+            "and it still lands on the DSL: {jump}"
+        );
+    }
+
+    #[test]
+    fn a_drawn_routes_file_is_read_at_the_prefix_it_was_drawn_at() {
+        // `draw :admin` is the only thing that says where `config/routes/admin.rb` sits, and
+        // its declarations go into **its own** generated document, because a span is a byte
+        // range with no URI and one recorded against the drawer would open the wrong line.
+        let (harness, _uri) = routes_project("");
+        assert!(harness.has("RouteHelpers#admin_flags_path()"));
+        let drawn = harness.generated_rbs("config/routes/admin.rb");
+        assert!(drawn.contains("def admin_flags_path:"), "{drawn}");
+        assert!(
+            drawn.contains("`resources :flags, only: [:index]`"),
+            "{drawn}"
+        );
+        let main = harness.generated_rbs("config/routes.rb");
+        assert!(!main.contains("admin_flags"), "{main}");
+        assert!(main.contains("def story_path:"), "{main}");
+    }
+
+    #[test]
+    fn the_helpers_are_included_once_into_every_controller_mailer_and_helper_module() {
+        // Rails installs them with an `inherited` hook on `ActionController::Base`, so every
+        // controller really does get its own copy — and writing one `include` per host is what
+        // bounds that gap at zero: an application whose base is a *gem's* class has no
+        // base this pass defines, and every one of its controllers is still a host.
+        let (mut harness, _uri) = routes_project("");
+        let mailer = harness.write("app/mailers/user_mailer.rb", MAILERS);
+        let model = harness.write("app/models/plain.rb", "class Plain\nend\n");
+        harness.watch(&[&mailer, &model]);
+
+        let main = harness.generated_rbs("config/routes.rb");
+        for host in [
+            "class StoriesController\n  include RouteHelpers",
+            "class UserMailer\n  include RouteHelpers",
+            "module StoriesHelper\n  include RouteHelpers",
+        ] {
+            assert!(main.contains(host), "{main}");
+        }
+        assert!(
+            !main.contains("class Plain\n"),
+            "a class that is neither is not a host: {main}"
+        );
+        // One document holds them all, so a second routes file adds no second copy.
+        let drawn = harness.generated_rbs("config/routes/admin.rb");
+        assert!(!drawn.contains("include RouteHelpers"), "{drawn}");
+        // …and a plain model still cannot see them, which is what makes the module worth having
+        // instead of declaring two thousand helpers on `Object`.
+        let source = "class Plain\n  def go\n    story_path\n  end\nend\n";
+        let plain = harness.write("app/models/plain.rb", source);
+        harness.watch(&[&plain]);
+        let card = card(&mut harness, &plain, source, "story_path");
+        assert!(
+            card.contains("Matched on the method name alone"),
+            "the name rung, not the ancestry: {card}"
+        );
     }
 }

@@ -4,6 +4,285 @@ The server and the VS Code extension ship as one version. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-09-16
+
+### Added
+
+**Three more requests**
+
+- **Inlay hints, and a tier that is never drawn.** Three families, each with its own switch: what a
+  block parameter receives (`stories.each do |story|`), what a call hands back
+  (`author = story.author`), and what a `def` returns where the source does not say. **A guessed
+  type is never painted into a margin** — a type matched on a name alone is exactly what a margin
+  must not state as fact, and the refusal is a test on the tier rather than a list of shapes, so a
+  rung added below the graph next release is refused by the same line rather than appearing in
+  everybody's margin the day it ships. The tier that would need no footnote turns out to be
+  unreachable: a hint exists exactly where the code does *not* name the type, and where it does the
+  label would only repeat the line. So every hint drawn is *Derived* and carries its footnote in the
+  tooltip.
+  <br>`[hints] block_parameters`, `locals` and `returns`. There is deliberately no fourth switch
+  beside them: a hint is pulled rather than pushed, and every client that asks for one already has a
+  master toggle of its own.
+
+- **Call hierarchy.** `prepareCallHierarchy`, `incomingCalls` and `outgoingCalls`. The two
+  directions are not each other's mirror and the answers say so. An incoming caller is a **name
+  match** — nothing links a call to a declaration — so every row ends in `by name` beside the file
+  it is written in. An outgoing call is a claim that an edge exists, which is a stronger thing to
+  say, so it is drawn only where the call resolves precisely; a name-based fallback would answer
+  `person.name` with forty edges, and forty edges is not a hierarchy.
+
+- **Document links.** Every `require "..."` path is a link, from the same walk that answers
+  go-to-definition on one — a bare `Kernel#require`, never `Foo.require`, never an interpolated
+  path, never one inside a comment or a string. A require the index cannot place produces **no link
+  at all**, because an underline that opens nothing is worse than a path left plain.
+
+**The two things the graph does not model**
+
+- **An `@ivar` read answers.** Hover and go-to-definition at `@title` give every assignment sharing
+  its `self`, which is what occurrence highlighting has answered since it shipped and the other two
+  requests were not asking. The card on `@story` and the card on `@story.title` are now one answer
+  and cannot drift apart.
+
+- **A macro's symbol argument resolves.** `before_action :authenticate` is a `def` in this
+  controller or above it; `validates :title` is the column `db/schema.rb` declared; `belongs_to
+  :user` is the reader the macro wrote. One rule and no table — **a macro's symbol argument is a
+  member of the class the macro is written in** — asked through Ruby's own method lookup, so it
+  holds for the twenty-three macros six real applications write and for a DSL nobody has taught
+  ya-lsp about.
+
+**Rails**
+
+- **A template's `@story` goes to the line that assigns it.** A template has no enclosing class, so
+  the search for a variable's writes found nothing by construction: the card answered and the jump
+  did not. It continues into the one file those writes can be in — the controller or mailer the
+  path names, taken from the same convention the card reads, so a card citing `StoriesController`
+  beside a jump landing elsewhere is not a state this can reach. **Every** write, not only the typed
+  ones: `@stories = Story.where(...)` is exactly the line a reader asked for. Over 1,301 template
+  reads drawn from six applications, the jump went from **4 to 870**, and the card from 759 to 788.
+
+- **A mailer's views hang off the mailer.** `app/views/user_mailer/welcome.html.erb` is `UserMailer`
+  and no `UserMailerController` exists anywhere — **326 of 4,407** template instance-variable reads
+  across six applications are in a mailer's views, and one of the six writes no other kind of
+  template at all. Which class a path renders through is now answered in one place for the view
+  context, the card and the jump alike: the controller first, the mailer only where no controller is
+  declared, which is Rails' own order. The footnote names which convention answered, because *the
+  controller Rails renders this template from* is a false sentence about a mailer.
+
+- **A concern's class methods are declared, in all three spellings** — `class_methods do`, a
+  hand-written `module ClassMethods`, and an `included do ... extend M` whose `def`s are in a file
+  the concern only names. Each `def` is written onto the class side of every class that includes the
+  concern, transitively, and the jump lands on the `def` somebody typed however many classes it was
+  written onto. **Including the ones in your gems**: `validates`, `scope`, `belongs_to` and
+  `has_many` are all a Rails concern's `ClassMethods`, and `ActiveModel::API` installs `model_name`
+  on every model in every application. Over one application's `model_name` and
+  `human_attribute_name` cursors, 20 of 20 left the guessed tier and every one lands in
+  `active_model/translation.rb` or `naming.rb`. A per-position tier comparison over 1,200 cursors in
+  each of six applications: **0 worse, 1 better**.
+
+- **`Story.where` has somewhere to jump to.** No file in your project declares it, so a *Resolved*
+  card over it used to send a reader nowhere. The place is now **found rather than read** — looked
+  up in Ruby's own ancestry after the index settles, since a generator cannot ask a graph it is
+  still writing — and answers `activerecord/lib/active_record/relation/query_methods.rb:1033`.
+  Checked against `Method#source_location` under activerecord 7.2.3.1, 8.0.5, 8.0.5.1 and 8.1.3.1:
+  of the 127 names, **125 resolve and all 125 land on the line Ruby names**. One `def` that several
+  declarations name is still one place, so a model no longer offers the same line five times.
+
+- **A namespace a directory declares.** `class Discourse::Utils` where no file declares `Discourse`
+  raises `NameError` in Ruby and runs under Rails, because a directory with no matching `.rb` *is*
+  the declaration. ya-lsp reads it, with Rails' own three bounds — the `app` anchor an engine keeps,
+  the `assets`/`javascript`/`views` exclusion, and `app/{*,*/concerns}`. Over six applications, jump
+  targets described as nothing in particular fell from **126 to 18**, and on the largest from 39 to
+  1.
+
+- **`source_type:` is read**, and the keyword beside it no longer guesses. `has_many :records,
+  through: :references, source: :record` names a *member* of the joined model, so camelizing it
+  produces a class the application does not have — on every line in six corpora that writes the
+  pair. `source_type:` is what names the class, and it outranks its neighbour.
+
+- **A `scope` answers one call later.** `Story.recent.visible` jumps to the `scope :visible` line
+  exactly as `Story.visible` does, because one macro line is two declarations now — the class side
+  and the relation — carrying one span. `enum`'s class-side pair is a `scope` Rails writes itself
+  and gets the same two.
+
+- **A constant is not the class it holds.** `ENV.fetch` types from Ruby's own signature; where
+  nothing will ever ship a signature — an application's own `Spree::Config =
+  Spree::AppConfiguration.new` — the Ruby that assigns it says the type as plainly as RBS would, and
+  is resolved in the nesting of the file that wrote it.
+
+- **The framework's own singletons.** `Rails.root` is a `Pathname`, `Rails.cache` an
+  `ActiveSupport::Cache::Store`, `Time.zone` an `ActiveSupport::TimeZone`. railties and activesupport
+  ship no `sig/`, so every chain written on one used to die at the first `.`.
+
+- **A decline is a declaration rather than a silence.** `belongs_to :owner, polymorphic: true` and a
+  `class_name:` naming a class that is not there declare `owner` as untyped, spanned onto the macro
+  line: go-to-definition lands on the `belongs_to` you wrote, hover says the type is not known, and
+  the name-based guess is never reached rather than reached and refused.
+
+**Configuration**
+
+- **Eleven keys for what a project can turn off, and four for the log.** `[rails] enabled` is
+  `auto`, `true` or `false` — `auto` looks for `config/application.rb`, then railties in
+  `Gemfile.lock`, and says in the log which way it went — with `schema`, `models`, `routes`,
+  `entrypoints` and `views` under it; `[types] guess_from_names`, `structs` and `annotations`;
+  `[hints]`' three families; and `[trees] test`, `test_support` and `migration`, which say where
+  *this* project keeps the trees the fences are about. A project that is not Rails should not be
+  told about Rails, and one with an `app/views/` should not get a card citing a controller it does
+  not have.
+  <br>`[log] file` writes a second copy to disk at its own level, for a bug report. VS Code exposes
+  every one of these, with the TOML key in each description, and a committed `ya-lsp.toml` still
+  wins over all of them.
+
+### Changed
+
+- **An untyped receiver no longer answers with the universe.** Where nothing types the receiver,
+  completion built a query that every method name in the graph matched — 26,073 candidates on the
+  smallest application tested to 45,953 on the largest — sliced to 512 by a cap, with the word the
+  file actually wrote sitting at median rank 4,070. There are two ceilings now: over 512 candidates
+  nothing is offered at all, and under it the best 128. That is one rule seen at two prefix lengths,
+  so **nothing is offered for the first three keystrokes and the list reappears as the word narrows
+  it**: 0% of untyped cursors fit under the bound at two characters, 45% at three, 74% at four, 95%
+  at five. The list stays marked incomplete on the decline, so your editor asks again inside the
+  word rather than filtering an empty list locally.
+  <br>**Cost, measured:** 159 cursors lost a list that held the word, and **17 of them — 0.8% of
+  the 2,143 sampled — would have shown it in the top ten**.
+
+- **What your application can actually load decides every list that answers *what can I call*.** A
+  deny-list of four directory names lived in one module and one rung read it; every other surface
+  was free to send a reader into a spec, and most of them did. It is one rule now, with an
+  exhaustive table of who reads it: completion, the name and root rungs of hover and
+  go-to-definition, the place list those two answer from, signature help and the outgoing callee
+  **drop** what the application cannot load; workspace symbol search and the subtype list **rank**
+  it down, because a drop makes a real declaration unfindable by the only means of looking for it;
+  and find-references, rename, occurrence highlighting, incoming callers and supertypes **never
+  ask** — a use under `spec/` is a use, and three tests exist to fail if anyone wires the fence into
+  them.
+  <br>Measured over six applications: of 4,251 answered bare calls outside the test trees, **31
+  resolved onto a spec-only member of `Object`, `Module` or `Class` and all 31 were wrong** — now 0,
+  falling through to the name rung rather than to silence. Completion's test-only rows per
+  application went 28, 455, 947, 1,780, 3,267 and 4,390 to five zeroes and a 20, with no list
+  emptied. 24,143 places under a test tree left the jump lists of 413 cursors, and **no list was
+  emptied and none grew**.
+
+- **A migration is real Ruby that nothing autoloads, and it is no longer offered.** One application
+  had **581 of its 2,387 generated `def`s coming out of two files in `db/old_migrations/`** — 24% of
+  what the Rails readers write, in a directory a rake task loads one file of, in a process of its
+  own, which is exactly why people write a private copy of a model inside one. `db/migrate`,
+  `db/post_migrate` and `db/old_migrations` are all matched, and the fence is on the **cursor's**
+  side only: inside a migration the constant really does resolve to the copy at the top of that
+  file.
+  <br>Measured: 261 places left 20 jump lists, **every one of them a migration and none emptied**;
+  1,265 rows left the symbol picker and **not one of them was real**; 232 completion labels went,
+  over 41 names, all declared only inside a migration — and **not one list on any application
+  changes its first row**.
+
+- **A gem's library directory called `test` is a library.** `rack/test/`, railties'
+  `rails/commands/test/`, `rbs`'s `sig/test/` and the vendored minitest signatures every project
+  has were all being read as somebody's test suite, so the members in them answered nothing. The
+  fence carries the workspace layout beside the cursor now, because those two halves coming apart
+  *was* the defect. Over 6,836 drawn call cursors: **1,939 lists grew, 0 shrank, and 2,906 places
+  came back across 95 files.**
+
+- **A generator's template is in neither environment.** Ruby a gem ships in order to *copy* it, one
+  day, into a project that does not exist yet — it loads nowhere, ever, so no load-path rule could
+  settle it. Of 5,859 drawn cursors, 731 lists shrank and **767 places were dropped, all 767 of them
+  a template**: no list lost a real place.
+
+- **A Ruby file you jump into answers like any other file.** Go-to-definition into a gem, Ruby's own
+  library or the signatures beside them landed you in a file where every further request was dead,
+  with nothing on screen to say so — a document selector naming the workspace folder is the only
+  gate there is. The server now registers the roots it has answers about, over the channel the file
+  watcher already uses, because it is the only side that knows where a bundle is; a client that
+  declines dynamic registration keeps what it had and is told once. In a multi-root workspace each
+  folder's server registers its own and one of them claims each shared root, so two folders on one
+  Ruby produce **one hover card, not two**.
+
+- **Typing costs less on a large application, and the bigger it is the more it saves.** Two
+  measurements, on the largest application tested. The walk that decides what the Rails readers see
+  was one function called 25,900 times every time the index settles, whose answer for 25,899 of them
+  was the answer it gave last time; it remembers them now, keyed on what the index actually re-read, and goes
+  **275 ms to 70** with the pass around it 340 to 132. And a generated document is now one per
+  *body* rather than one per file, so **a keystroke that re-types a column goes 2.46 s to 0.31** —
+  it re-indexes one table rather than all 3,180 columns.
+  <br>**Cost:** a cold open pays 1.4% (8.82 s to 8.94) for having more documents, and resident
+  memory does not move. The objection — a migration that moves every table at once — was checked
+  against 1,007 real migrations: **a median of 1 table, 92.8% exactly one, 98.4% one or two.**
+
+- **Which of a wide constant's places the jump opens.** Where a name is written in dozens of files,
+  the file named after the constant now wins — squashed to letters and digits, an exact match first
+  — applied to namespaces only, because a file is conventionally named after the class in it while a
+  method's file is named after its class rather than after the method.
+
+- **A span that begins at the cursor wins.** Where several spans cover one offset, one that *starts*
+  there is preferred and the rest are dropped before narrowest-wins runs. The obvious rule —
+  anything containing the cursor — was written first and regressed 29 cursors, because a method
+  reference is recorded over the whole call expression as well as over the name.
+
+### Fixed
+
+- **A template's hover no longer cites an assignment that is not there.** Hovering `@messages` in a
+  view printed *Type taken from the assignment on line 7*, naming a line of that template that holds
+  no assignment — and, in one real application, holds markup. The offset was the controller's: the
+  chain is resolved over there, and every consumer turns that offset into a line against the file
+  the cursor is in. The view rung drops it; the footnote below it already names the controller *and*
+  the line, which is the line that assignment is really written on.
+
+- **`Story.select` is not `IO.select`.** Looking a generated member up in Ruby's ancestry can hit
+  the object model, where `Kernel` alone declares `select`, `format`, `open` and `test` — four
+  positions answered the query interface with `IO`'s method. A hit on Ruby's own object model is not
+  an answer.
+
+- **A jump no longer lands on a private method the code cannot call.** Ruby permits a private method
+  with no receiver written, or with one spelled `self`, and raises otherwise — a rule completion
+  applied and navigation did not. The first line of nearly every spec file was the cost: `RSpec.describe`
+  resolved to minitest's private `Kernel#describe` and said *Resolved*, the tier that claims the
+  code names the type, while completion at the same cursor correctly declined to offer it. Measured
+  over six real applications, 90 such cards; now 1, and that one is the completion cap rather than
+  this. Where the refusal leaves nothing — `RSpec.describe` is defined dynamically, so no file
+  declares it — the answer is no card rather than a worse one, and where something public remains
+  the card says which receiver kept the member private instead of claiming the receiver had no type.
+  Signature help went with it, so the popup and the jump cannot disagree about one cursor.
+
+- **A `private` written inside a block no longer hides the public methods below it.** rubydex reads
+  a bare `private` as a statement that governs the body it is written in until that body ends, and a
+  block is not a body to it — so `class_methods do … private … end` in an ordinary Rails concern set
+  the *module's* default visibility, and every method declared below the block was recorded private.
+  Nothing acted on that record until the refusal above shipped; then it took them all. Discourse's
+  `HasCustomFields#upsert_custom_fields` is the measured one: a public method the application calls
+  on explicit receivers, answered with no card, no jump and no place in any completion list. The
+  declaring file is reread at the point the refusal would be made, and the record is overturned
+  where a bare modifier that escaped a block is the whole reason for it. **The card and the outline
+  read it too**, so the word *private* no longer appears beside such a method in a hover card or in
+  the document's symbol tree. A modifier written in a class or module body still governs every
+  method below it, and one written inside a block still governs the methods inside that block.
+
+- **A card and the list beside it agree about a block.** A bare name in a block written straight
+  into a class body — `rule(:colon) { str(':') }`, `scope :recent, -> { where(...) }` — may be on
+  the class object or on an instance, because re-binding `self` is what every DSL taking a block
+  does. Hover had answered from the instance side since the rung shipped; completion at the same
+  byte never left the class object, so **hover named a member that the list beside it did not hold**.
+
+- **`self` inside a block in a method body.** The answer was inverted rather than absent: the
+  innermost namespace and the innermost method were both asked, and the method won whenever there
+  was one. The innermost body decides now, and a namespace can be the inner one.
+
+- **`self` inside `Class.new(base) do ... end`.** Ruby's `self` there really is the new class, which
+  is what the index records — but a `self` written *outside* the block and read inside it was being
+  resolved against the anonymous class rather than against where it was written.
+
+- **A concern's writers.** `self.primary_key = :id` went from answered to guessed, because the
+  check on whether a name can be spelled stripped a trailing `?` or `!` and nothing else, so every
+  **writer** a `ClassMethods` declares was dropped. `==` and `[]=` are still refused.
+
+- **A deferred answer is never less than an eager one.** Hover, completion and go-to-definition
+  answer against the last settled graph and translate the cursor into it; where the receiver itself
+  is what is being typed there are no settled offsets for it, and the request was quietly falling
+  through to the name-matched list instead of declining. It declines now, which makes the server
+  settle and answer again — the same move completion already made.
+
+- **`[types] guess_from_names = false` reaches a completion list.** The switch was read by every
+  rung that draws a *card* and by nothing that builds a *list*, so it silenced the bottom tier in
+  hover and left the same guess answering completion.
+
 ## [0.4.0] — 2026-09-10
 
 ### Added
@@ -720,7 +999,8 @@ name wherever the receiver cannot be named.
   ya-lsp can be confidently wrong rather than merely absent.
 - **A Ruby file outside every workspace folder gets no server**, because there is no root to index.
 
-[Unreleased]: https://github.com/ar2em1s/ya-lsp/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ar2em1s/ya-lsp/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.2.0

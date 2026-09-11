@@ -38,7 +38,7 @@ paths:
   `resolve_at`, or requests answer against an unresolved graph during the index.
 - **`GEM_FILES_PER_STEP` is measured, not chosen.** Its cost is the resolve the *next request* runs
   over what the step added, and that cost rises sharply once the step grows past its current value.
-  Re-measure (`benchmarking.md`) before changing it.
+  Re-measure it by hand against a real bundle before changing it.
 - **`require_paths` comes from `specifications/<full name>.gemspec`**, RubyGems' serialised gemspec,
   a plain array literal. Git and path sources have no such file — only the project's own
   arbitrary-Ruby `.gemspec` — so they fall back to `lib`. Absolute entries are native-extension stubs
@@ -49,9 +49,9 @@ paths:
   `load_paths`.** `load_paths` is what `require "..."` resolves against; `sig/` is on no load path,
   so a `sig/` leaking in would make go-to-definition on a `require` land on a signature rather than
   the code. The gem walk consumes both lists; require resolution consumes one.
-- **RBS adoption in a real bundle is a few per cent, and the item is worth it because of what it
-  costs.** Only a handful of a real bundle's gems ship `sig/` at all, and most of the methods that
-  buys come from two gems no application chains through. No gem ships `.rbs` under a `lib/` require
+- **RBS adoption in a real bundle is a few per cent, and reading `sig/` is worth it because of what
+  it costs.** Only a handful of a real bundle's gems ship `sig/` at all, and most of the methods
+  that buys come from two gems no application chains through. No gem ships `.rbs` under a `lib/` require
   path. The walk is one `is_dir` per gem and the indexing is inside the noise of the background pass.
   Do not repeat "a growing number of gems ship RBS" as if it were measured — measure it.
 - **`engine_paths` is a *third* list, for `signature_paths`' reason and with sharper teeth.** A Rails

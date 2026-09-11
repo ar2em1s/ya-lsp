@@ -15,8 +15,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 use ya_lsp::{
-    DEFAULT_LOG_FILTER, analysis::diagnostics, workspace::Config, workspace::Severity,
-    workspace::config::PartialConfig,
+    DEFAULT_LOG_FILTER,
+    analysis::diagnostics,
+    analysis::{MIGRATION_PAIR, TEST_TREES},
+    workspace::Config,
+    workspace::Severity,
+    workspace::config::{PartialConfig, Switch, Word},
 };
 
 fn manifest() -> Value {
@@ -41,11 +45,44 @@ fn properties(manifest: &Value) -> BTreeMap<String, Value> {
         .collect()
 }
 
+/// Every language the server claims in a registration is one the extension wakes up for.
+///
+/// The server names these because it registers document selectors of its own, over the roots the
+/// client cannot know about — a gem's source, Ruby's library — and a filter naming a language the
+/// extension never activates for claims nothing at all. Two lists in two languages, and the failure
+/// is the silent one: a Rails engine's templates would simply never answer, with nothing logged.
+#[test]
+fn every_language_the_server_claims_is_one_the_extension_activates_for() {
+    let manifest = manifest();
+    let events: BTreeSet<&str> = manifest["activationEvents"]
+        .as_array()
+        .expect("the manifest declares its activation events")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    for language in ya_lsp::server::capabilities::LANGUAGE_IDS {
+        assert!(
+            events.contains(format!("onLanguage:{language}").as_str()),
+            "the server claims {language} and the extension never wakes up for it"
+        );
+    }
+    assert_eq!(
+        events.len(),
+        ya_lsp::server::capabilities::LANGUAGE_IDS.len(),
+        "an activation event for a language no registration claims is a server started for nothing"
+    );
+}
+
 #[test]
 fn every_documented_default_is_the_one_the_server_actually_uses() {
     let manifest = manifest();
     let properties = properties(&manifest);
     let config = Config::default();
+
+    // `"auto"` is written out below because `Switch` cannot be serialized; this is what holds
+    // the word to the server's own default, so the two cannot drift apart in silence.
+    assert_eq!(config.rails.enabled, Switch::Word(Word::Auto));
 
     // An empty map is what `{}` in the manifest documents, and it is the only default here that
     // cannot be written as a `json!` of the field itself — `Severity` is deserialized, never
@@ -57,6 +94,9 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
     // documentation and nothing else — and documentation of a default rots without being noticed.
     let expected: Vec<(&str, Value)> = vec![
         ("ya-lsp.logLevel", json!(DEFAULT_LOG_FILTER)),
+        ("ya-lsp.log.file", json!(config.log.file)),
+        ("ya-lsp.log.filePath", json!(config.log.file_path)),
+        ("ya-lsp.log.fileLevel", json!(config.log.file_level)),
         ("ya-lsp.gems.enabled", json!(config.gems.enabled)),
         ("ya-lsp.gems.defaultGems", json!(config.gems.default_gems)),
         // `None` is spelled `""`. "Detect it" and "find one yourself" have no value to show, and
@@ -76,6 +116,32 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
             "ya-lsp.types.guessFromNames",
             json!(config.types.guess_from_names),
         ),
+        ("ya-lsp.types.structs", json!(config.types.structs)),
+        ("ya-lsp.types.annotations", json!(config.types.annotations)),
+        // `Switch` is deserialized and never serialized — nothing in the server ever sends one
+        // back — so the word is written out here, the way `diagnostics.rules`' empty map is.
+        // What holds it to the server is the line below rather than this one.
+        ("ya-lsp.rails.enabled", json!("auto")),
+        ("ya-lsp.rails.schema", json!(config.rails.schema)),
+        ("ya-lsp.rails.models", json!(config.rails.models)),
+        ("ya-lsp.rails.routes", json!(config.rails.routes)),
+        ("ya-lsp.rails.entrypoints", json!(config.rails.entrypoints)),
+        ("ya-lsp.rails.views", json!(config.rails.views)),
+        // The two lists the manifest shows are the built-in ones, and they are read from the
+        // code rather than written out: a project *replaces* them, so what the settings UI puts
+        // in front of somebody about to do that has to be what they are actually replacing.
+        // `Config::default()` holds `None` for both, which is the same rule said as an absence.
+        ("ya-lsp.trees.test", json!(TEST_TREES)),
+        ("ya-lsp.trees.migration", json!([MIGRATION_PAIR])),
+        // Additive, so its default really is empty: the built-in name is documented in the
+        // description because a list that shows it would read as replaceable.
+        ("ya-lsp.trees.testSupport", json!(config.trees.test_support)),
+        (
+            "ya-lsp.hints.blockParameters",
+            json!(config.hints.block_parameters),
+        ),
+        ("ya-lsp.hints.locals", json!(config.hints.locals)),
+        ("ya-lsp.hints.returns", json!(config.hints.returns)),
         (
             "ya-lsp.diagnostics.enabled",
             json!(config.diagnostics.enabled),
@@ -192,16 +258,33 @@ fn every_setting_the_server_reads_is_one_the_editor_can_set() {
     // `gems.max_files` is the deliberate omission. It is a ceiling on gem files nobody has needed
     // to tune, `index.max_files` is the one that actually fires, and every exposed setting is a
     // branch in `config.ts` and a test forever.
+    // `log.level` is the one key whose editor spelling is not its TOML spelling: it shipped as
+    // `ya-lsp.logLevel` while it was an environment variable, and the extension is on the
+    // Marketplace, so the key stays where it is rather than costing a deprecation and a window
+    // in which two keys can disagree.
+    let renamed = [("log.level", "ya-lsp.logLevel")];
     let file_only = ["gems.max_files"];
 
     let mut missing = Vec::new();
-    for table in ["index", "gems", "rbs", "types", "diagnostics"] {
+    for table in [
+        "index",
+        "log",
+        "gems",
+        "rbs",
+        "types",
+        "hints",
+        "diagnostics",
+    ] {
         for field in fields_of(table) {
             let key = format!("{table}.{field}");
             if file_only.contains(&key.as_str()) {
                 continue;
             }
-            if !declared.contains_key(&format!("ya-lsp.{}", camel(&key))) {
+            let setting = renamed.iter().find(|(field, _)| *field == key).map_or_else(
+                || format!("ya-lsp.{}", camel(&key)),
+                |(_, name)| (*name).to_owned(),
+            );
+            if !declared.contains_key(&setting) {
                 missing.push(key);
             }
         }

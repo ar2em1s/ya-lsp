@@ -55,6 +55,22 @@ paths:
   assignment as a declaration and records no reference to one — and the walk has to win, because the
   graph would answer with the one place the variable is written and none of the reads, which is a
   highlight that looks like it worked.
+- **Three requests ask it in that order now, not one.** `definition` and `hover` reach the same
+  walk through `locator::variable_at`, before either of them asks `locate`. The rule above is
+  what they are keeping: two requests deciding differently which half speaks for `@name = 1`
+  means a jump and a highlight that disagree about the same span, at a cursor where both of them
+  believe they worked. `navigation.md` has the navigating side.
+- **A macro's `:symbol` is the third source, and it is asked last.** rubydex records a call and
+  not its arguments, so a symbol is the opposite case from `@name = 1`: there is no span the
+  graph answers for wrongly, there is one it does not answer for at all. `locate` therefore goes
+  first, and where it does speak at a symbol — `attr_reader :count` files a definition whose name
+  span *is* the symbol — it is already naming the declaration the buffer walk would have found.
+- **The symbol's own span is added by hand, because half the macros do not record it.** A macro
+  that *declares* a name has already put that span there as the declaration's place, and arrives
+  as a write; one that only *names* an existing method leaves the cursor's own word unlit, and it
+  goes in as the read it is. Without it `definition` lands on a span nothing highlighted, which is
+  precisely the disagreement the `@name = 1` rule above exists to prevent — one cursor shape over,
+  and the one lane 2 of the audit counts as `missed`.
 - **`null`, never `[]`.** An empty list tells a client ya-lsp answered; `null` tells it nothing was
   known, which leaves the client's word matching in play for the comments and strings this
   deliberately says nothing about. Advertising the provider takes that fallback away everywhere

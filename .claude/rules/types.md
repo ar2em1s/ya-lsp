@@ -44,6 +44,76 @@ paths:
   through an ancestor nobody meant. It reads the receiver's **name** — `Story::Relation` is
   `relation_of`'s spelling and `Story::<Story>` is rubydex's for a singleton — because the name is
   the only thing the two shapes have in common.
+- **A signature is also the only thing that says what a *constant* holds, and that is the third
+  table.** `ENV` and `URI::RFC2396_PARSER` hold an **object**: the constant is not the class, so
+  the graph has a `Declaration::Constant` with no singleton to walk — and worse, rubydex promotes
+  a constant used as a receiver into a `Namespace::Todo`, whose singleton's ancestors are `Class`,
+  `Module` and `Object`, so `ENV.` once answered `alias_method`. `ENV: RBS::Unnamed::ENVClass`
+  declares the type as plainly as a `-> String` does. `Types::constants` is keyed by the
+  constant's own `DeclarationId` — the hash of its qualified name, so two `INFINITY`s in two
+  classes are two keys — and holds the class **and the constant's own name**, because a hash
+  cannot be read back and the card has to name what was followed two rungs later in
+  `ENV.fetch("HOME").upcase`.
+- **It is asked before the `Todo` and before the singleton, and that order is the fix.** The
+  `Todo` is the *absence* of evidence and the signature is evidence; the singleton is the
+  namespace rubydex invented for a constant that never had one. It takes nothing from a real
+  class object, because no name is declared both ways: measured over `vendor/rbs`, **0** of 2,473
+  constant declarations spell one of the 945 `class`/`module` declarations. Only a class instance type is
+  kept — `class_of` decides, so a union, `untyped` or a literal falls through to the arms that
+  were there before, which is what makes the rung purely additive. The two types that name the
+  declaring class, `instance` and `class`, cannot reach it: RBS's grammar refuses both in a
+  constant's type and the whole document fails to parse, which is pinned rather than assumed.
+- **Derived, and the card says which constant said so.** `Derivation::constant` is a field of its
+  own rather than a row in `signatures`, because that line reads "from what those *methods*
+  declare" and a constant is not one. Same strength of evidence, same tier. Measured over a
+  3,600-cursor draw of `Const.member` positions across the six corpora: **47 of the 346 guessed
+  cursors became derived, none moved the other way**, and every one of them was a *wrong* answer
+  before — `ENV.fetch` resolved to `Net::HTTPHeader#fetch`, one confident place, in another
+  class entirely.
+- **And where no signature says so, the Ruby that assigns it does — the same rung, the other
+  language.** No signature anybody ships will declare an application's own configuration
+  object, and the `CONFIG = Settings.new` that builds it states the type as plainly as RBS would.
+  `assigned_to` is asked **last** of the three arms a `Receiver::Constant` has: a class object is
+  the type outright, a signature is a type somebody wrote down, an assignment is a line that will
+  have run. It is reached from both arms that used to answer nothing — the `Todo`, and a plain
+  `Declaration::Constant` with no singleton.
+- **Keyed by the span of the name, never by the name itself.** rubydex files a
+  `Definition::Constant` under the span of the name it writes — the **last segment alone**, so
+  `Foo::BAR = x` is recorded at the `BAR` — and `cursor::constant_assignment` finds that exact
+  span in the text. Two `HANDLE`s in two namespaces are two spans and never each other's answer.
+  Four shapes carry a definition upstream and so four are collected here: `A = v`, `A ||= v`, and
+  both as a path. `A &&= v` and `A += v` record a *reference* and no definition, so no caller ever
+  holds a span that names one.
+- **It is the one rung whose rebase runs graph → buffer.** Every other reads a buffer and
+  translates what it found *into* the graph; this starts from a span the graph recorded and has to
+  find it in text the user may have edited since, so it is `Rebase::span_to_buffer` and a `None` means
+  the span overlaps an unsettled edit. The assignment is then resolved in **its own document's
+  coordinates and its own nesting**: a `CONFIG = Settings.new` written inside `module Store`
+  names `Store::Settings`, and reading that constant against the caller's nesting would resolve
+  it somewhere else or nowhere.
+- **`Sources::constant_hops` is a cycle guard and not a tuning knob.** This is the only rung in the
+  module that can arrive back at the constant it started from — `A = B.new` beside `B = A.new` —
+  and a stack overflow is the one failure the per-request bulkhead cannot contain, because it
+  aborts the process rather than unwinding. Three hops, because `THING = FACTORY.build` over
+  `FACTORY = Builder.new` is two and ordinary; `Sources` is `Copy` so the rung hands the ones below
+  it a raised copy rather than sharing a counter with sibling branches.
+- **Derived, in its own field, and the footnote names a file.** `Derivation::assigned_constant`
+  sits beside `Derivation::constant` rather than replacing it: both say a constant holds an object
+  and they differ in what said so, which is the one thing a reader has to go and check. It carries
+  the file as well as the line, which `FromRenderer` does not need — a template names no
+  controller, so naming the class is news, whereas the constant here is the word the user just
+  hovered and the initializer that builds it is what they do not have.
+- **Measured, on the same 3,600-cursor draw as the signature half and against that binary: 90
+  guessed → derived, 0 the other way, 0 Resolved cards moved, 0 same-tier cards changed text.**
+  solidus 38, chatwoot 15, forem 14, lobsters 13, mastodon 7, discourse 3. **76 of the 90 replaced
+  a list of candidates** — 2 to 412 rows, 29.9 on average, 2,276 rows in total — **with one place**;
+  13 already pointed at the right place and only gained the label; 1 moved, from
+  `Spree::Variant::PriceSelector.pricing_options_class` to the `delegate` on
+  `Spree::AppConfiguration` that forwards to it, which is the hop the call actually makes. It
+  reaches well past `Klass.new`, because the value goes through `Finder::receiver_of` like any
+  other shape: a constant holding an integer answers `Numeric`, one holding an array `Array`, one
+  holding a regexp `Regexp`. Half the move is literals rather than constructor calls, which is
+  why the estimate that named only `Klass.new` was low by more than half.
 - **A generic's head is not an approximation, it is the answer to a different question.** Method
   lookup on `Array[Integer]` and `Array[String]` reaches the same declarations, so offering `Array`'s
   members is exactly right for what a `.` asks. The element type is a different question this module
@@ -143,9 +213,14 @@ paths:
 
 ## The five rungs, in order
 
-rubydex naming the receiver → a signature or an assignment → the controller a template's path names
-→ the receiver's own spelling → the name-based list.
+rubydex naming the receiver → a signature or an assignment → the class a template's path names, a
+controller or a mailer → the receiver's own spelling → the name-based list.
 
+- **And one fence below all five.** Whatever the last rung answers, a candidate whose every
+  definition sits in a test tree is dropped on the way out — `locator::loadable_from`, stated in
+  `navigation.md`. It is not a sixth rung: it says nothing about types and cannot promote an
+  answer, only empty one. A guess that leaves the application for a `spec/` is the one shape of
+  wrong answer a resolver never has and a name matcher always does.
 - **The order is the whole safety argument.** `locator::resolve_typed` only reaches past the first
   when rubydex came back imprecise; `types::named` asks the convention before the guess; and `cursor`
   never lets a bare name count as an assignment's answer — `type_the_local` and
@@ -163,13 +238,29 @@ rubydex naming the receiver → a signature or an assignment → the controller 
   rubydex resolved pays nothing — and hover and go-to-definition are user-triggered rather than
   per-keystroke. Completion pays it on `@foo.` and nowhere else. Moving this rung above the rubydex
   one would cost a parse on every hover in the project and buy a worse answer.
-- **`resolve_typed` classifies the cursor once and dispatches, and the two rungs below it can never
-  both answer.** A call with a receiver written reaches `types::method_receiver`; a call with none
-  reaches `views::Reachable::member`, which answers a **member** rather than a receiver's type —
-  there is no type for a template's implicit `self` to have, which is why the view context is not
-  declared in RBS. `cursor::at` runs here rather than inside `typed_receiver` (which is why that
-  function is gone): asking the same classification twice was a second parse on a path that already
-  pays for one. `Derivation::view` is how the card says which convention answered.
+- **`resolve_typed` classifies the cursor once and dispatches, and no two of the rungs below it can
+  answer the same cursor.** A call with a receiver written reaches `types::method_receiver`; a call
+  with none reaches `views::Reachable::member`, which answers a **member** rather than a receiver's
+  type — there is no type for a template's implicit `self` to have, which is why the view context is
+  not declared in RBS — and then `locator::in_a_closure`, which answers a member too and for a
+  cursor a template cannot hold, because a template has no class body to write a block in. The order
+  between the last two states which is the better answer rather than settling a contest: a view
+  context is a fact about how Rails loads the file, and a closure's `self` is an inference about what
+  somebody's DSL does with a block. `cursor::at` runs here rather than inside `typed_receiver`
+  (which is why that function is gone): asking the same classification twice was a second parse on a
+  path that already pays for one. `Derivation::view` and `Derivation::closure` are how the card says
+  which convention answered.
+- **A block in a class body is the one cursor where `self` is not what the file says, and the
+  evidence is two halves neither of which is worth acting on alone.** rubydex has no notion of a
+  block, so a bare call inside one in a class body carries the receiver a *statement* of that body
+  carries — the singleton class — which is Ruby's own answer for a block nobody re-binds and wrong
+  for every block a DSL takes. `locator::in_a_closure` asks the graph first (is the member on the
+  attached class's instance side) and the buffer second (`cursor::closure_in_a_body`), in that order
+  because the syntax half costs a parse and the graph half costs a walk already half done. Both have
+  to answer: the name being **absent** from the class object and **present** on an instance is the
+  whole of the evidence, and a file that meant the class object there would not run. A **class** and
+  never a module, because the card's sentence is *run against an instance of this* and a module has
+  none. `Tier::Derived` and never `Resolved` — nothing in the file says the block is re-bound.
 - **`resolve_typed` is for callers that have the document's text; `resolve` is for the rest, and that
   is not a gap to close.** `hover` and `definition` go through the first, so a jump and a card cannot
   disagree about what `person.` is. `references`, the type hierarchy and `rename` stay on the second
@@ -177,6 +268,37 @@ rubydex naming the receiver → a signature or an assignment → the controller 
   thing in it that could be wrong. `signature_help` and keyword-argument completion likewise go
   through `locator::precise_call` — extending them to the derived tier is a real option, not taken,
   because a parameter list is believed.
+- **A `Receiver` reaching `types::method_receiver` is in the graph's coordinates, and every
+  caller owes that.** A `Receiver` is parsed out of a *buffer* and the offsets inside it —
+  `Constant`, `Instance` — are graph keys, handed to `locator::locate`. The two texts are one
+  string on a document nobody is typing in and are not between a keystroke and the settle that
+  indexes it, so `cursor::Receiver::rebased` is the translation and refusing is what it does
+  instead of guessing. `completion` had it and the three navigation callers did not: the symptom
+  was a card that knew `@order` was a `Spree::Order` until any keystroke anywhere in the file and
+  then guessed it from the six letters of the variable's own name — the deferred path answering
+  *less* than the eager one, which is the one thing `concurrency.md` says it may never do.
+  **`Receiver::Assigned`'s offset is the exception and stays untranslated**: it is provenance,
+  rendered against the buffer to name a line a reader goes to, so mapping it would move the line
+  every card prints.
+- **`Derivation::assignment` names a line in the document the cursor is in, and `from_renderer`
+  is the one rung that has to clear it.** The field is a bare offset with no document attached;
+  `hover` and `hints` both turn it into a line against the text the *request* holds, which is
+  right for every rung that read that same text and wrong for the only one that does not. A
+  controller writing `@messages = @mod_mail.…` resolves through a nested `Receiver::Assigned`,
+  and the offset it carries is the controller's — drawn against the template it renders as a
+  line of markup. Found on lobsters: `@messages` in `app/views/mod_mails/_mail.html.erb` cited
+  `@mod_mail`'s offset 182 from `mod_mails_controller.rb` as **line 7** of the template, which
+  is an `if` over two `any?` calls and assigns nothing. Dropping it costs nothing a reader had:
+  `FromRenderer` already names the controller *and* the line of the assignment that typed the
+  variable, which is the line the inner hop is written on. Every other field that names another
+  file — `FromAssignment`, `FromRenderer` — carries a line rather than an offset for this
+  reason, and this one is an offset only because every other rung stays inside one document.
+- **The renderer rung carries the other document's map, not the caller's.** `from_renderer` reads
+  the *other* document's buffer on purpose — an unsaved controller should type the template it
+  renders — and that is exactly when that document's offsets stop naming the graph's text. So
+  `Sources::read` hands back the text and its `Rebase` as one value: a reader that takes the
+  first cannot forget the second, and the map that is needed here is never the one the request's
+  own document would have supplied.
 - **An instance variable is wrapped in `Receiver::Assigned` and a local is not.** `person =
   Person.new` is a line the reader can see from where they stand, and it is exact. `@user` is typed
   from an assignment that can be in another method, twenty lines away, in a branch that never runs —
@@ -234,33 +356,49 @@ rubydex naming the receiver → a signature or an assignment → the controller 
   both had to reach `completion`, the locator and `types` alike. The closure keeps the reading in
   `analysis::mod`, where the open buffers are.
 
-## The view↔controller convention
+## The view↔renderer convention
 
 - **It is the only Rails knowledge in the crate, and it is one directory.** `workspace/rails/` is
   pure text with no I/O and no graph, like `bundler.rs`, and it is on the 100% list for one reason:
   being framework-aware is a surface with no natural edge, so the edge is drawn where it can be read
   in forty lines. A reviewer asking how much Rails is in ya-lsp reads one list — the convention
   tables in `rails/mod.rs`, the directory's only public surface.
-- **Bounded to the controller the path names; answers nothing when that class does not exist.** Not
+- **Bounded to the class the path names; answers nothing when that class does not exist.** Not
   its ancestors — `@user` is set in `ApplicationController` in a real application, and walking up
   would find it and then fail to type it anyway, because what it is assigned is an ActiveRecord
   chain. Not something similarly named either: `declared` is an exact lookup, and a template under
   `app/views/comments/` with no `CommentsController` falls to the rung below rather than reaching for
   `StoriesController`.
+- **A mailer's views hang off the mailer, and that is the second half of the convention.**
+  `ActionMailer::Base` derives its view path from the class it renders for, so
+  `app/views/user_mailer/welcome.html.erb` is `UserMailer` and no `UserMailerController` exists
+  anywhere — **326 of the 4,407** template instance-variable reads across the six corpora are in
+  a mailer's views, and mastodon is **101 of its 101**, because the only `.erb` that application
+  ships are mailer views. The controller is tried first and the mailer only where there is no
+  controller, which is the order Rails resolves them in and not a preference: an application that
+  really writes a `UserMailerController` has said where the template renders from. **The mailer
+  half is gated and the controller half is not** — `controller_of` produces a name nothing but a
+  controller is called, `mailer_of` produces whatever the directory spells and
+  `app/views/shared/` spells `Shared` — so it answers only for a class the application defines
+  that `rails::is_mailer` recognises, which is the list the view-context pass already holds.
+  **One function answers it for both modules**: `views::Views::rendered_by`, so a view context, a
+  card and a jump cannot name three classes for one path. **The card says which of the two
+  answered**, because a footnote is read as a claim about the class it names and `UserMailer` is
+  not a controller. The tier does not move: one rung, *Derived* either way.
 - **`cursor::assignments_in` returns every assignment and lets the graph pick.** The same-file path
   takes "the textually last that produced a shape", which it can, because a shape is all `cursor` can
   see. Across a file boundary "produced a type" is a question only the graph can answer — an
   assignment naming a class nothing declares has to fall through to the one above it — so the list
-  comes back in file order and `from_controller` walks it in reverse.
+  comes back in file order and `from_renderer` walks it in reverse.
 - **Which `@story` the controller means is still `scopes`'s question.** `scopes::writes_to` is
   `variable` entered by name instead of by offset, because a template has no cursor in the file it
   needs to ask about. A `def self.` and a `class << self` hold a different variable of the same name
   and are excluded there, exactly as for a cursor.
-- **The controller's text is read through the buffer, not off disk.** `Analysis::text_of` goes
+- **The renderer's text is read through the buffer, not off disk.** `Analysis::text_of` goes
   through `with_text`, so a controller being edited types the template it renders before it is saved.
   It is the only accessor in `analysis` that clones, and it is reached only when a receiver in a
   *template* was nothing but a name.
-- **What the last two rungs buy, over a real application.** The view↔controller convention types
+- **What the last two rungs buy, over a real application.** The view↔renderer convention types
   receivers only in templates, and most of those find the method the call names; the rest are
   ActiveRecord attributes with no `def`. The name guess types many more receivers than it changes
   answers for. In a hand audit of the changed ones, **every one named the class the code means**
@@ -274,6 +412,13 @@ rubydex naming the receiver → a signature or an assignment → the controller 
   every gem's `sig/` also end. There is no rung for "a column", none for "a `belongs_to`", none for
   "a `sig` block" — `types.rs` cannot tell them apart and must not learn to. `synthesized.md` has
   each generator's rules.
+- **The framework's own singletons go through it too, and that is the point of them being here.**
+  railties and activesupport ship no `sig/`, so `Rails.root`, `Rails.cache`, `Rails.application`
+  and `Time.zone` had no return type and every chain written on one died at the `?` on
+  `Types::returns`. What was missing was never the member — rubydex has railties' own `def
+  self.root` — only what it hands back, which is a sentence that can be written in advance. So it
+  is RBS through `Types::harvest` like a column or an association, and `types.rs` learns no word
+  for it. `synthesized.md` has which four and the four declined.
 - **A generated answer is `derived`, never `resolved`.** The schema is ground truth about the
   database and an inference about the Ruby; a macro is what ActiveRecord will do at run time; a `sig`
   or a tag is what somebody believed. All three are correct-if-true, and the card says which — through
@@ -333,8 +478,46 @@ rubydex naming the receiver → a signature or an assignment → the controller 
   `ApiKeyScopes`, finds none, and offers a page of possible definitions — while `self.api_key_scopes.first`
   one word longer resolves to `ApiKeyScope::Relation#first` exactly. `cursor::returned_by`'s
   no-receiver branch returns `Returned { on: SelfObject, .. }`; `Receiver::SelfObject` is the variant
-  a *written* `self` produces, and `types::method_receiver` types it as the enclosing class. No rung
-  is added and nothing new is declared.
+  a *written* `self` produces, and `types::method_receiver` types it as the class enclosing that
+  `self` — see the bullet below for which `self` that is. No rung is added and nothing new is
+  declared.
+- **A `self` is placed by where it was *written*, never by where the cursor is.**
+  `Receiver::SelfObject` carries that offset, and `method_receiver` resolves it with
+  `sources.scope_at` rather than with the `scope` every other rung reads. The two are the same
+  offset for a written `self.` and for the implicit one a bare call has, which is every receiver
+  but one: a `self` captured into a variable above a block that rebinds it. rubydex records a
+  `Class.new(base) do … end` body as an **anonymous class**, so `held = self` outside one and
+  `held.` inside it were two different `self`s, and the cursor's won. The captured instance's
+  members went missing and `locator::missed` would not name an anonymous class, so `hover` said
+  *the receiver's type is unknown* while `completion`, typing the same receiver through the same
+  function, listed the anonymous class's members **at the same byte**. Both halves are fixed: the
+  receiver is placed correctly here, and `missed` now spells the name rather than refusing it —
+  `navigation.md`. A plain block rebinds
+  nothing and a `def` inside one ends the question, so `[1].map do … end` and
+  `define_method(:x) { … }` were right all along and stay exactly as they were.
+- **That one is the audit's, not a test's.** Two chatwoot positions in one file, raised by check 6
+  — the check that holds a card against the completion list at the same byte — and neither shape
+  had a test until the fix brought one. It is the first defect this project found by asking two
+  of its own answers to agree rather than by asking one of them to be right.
+- **Which body a cursor is in is decided innermost-first, and the same file taught that a day
+  later.** Ruby refuses a `class` keyword in a method body, so `Class.new(base) do … end` is the
+  only way one is ever written there — and rubydex records the block as a class all the same. It is
+  `class_eval`'d, so `self` inside it is the new class *object*, exactly as in a written class body,
+  and the `def` around it says nothing about it. `self_of` read the innermost `def` unconditionally
+  and answered its **instance** side: at a `define_method` in one the list was a single row,
+  `define_singleton_method` arriving from `Object`, while the card beside it said
+  `Module#define_method` and was right — the two surfaces disagreeing again, one request over from
+  34 and in the same chatwoot file. **Bodies nest and never overlap, so the one that starts later is
+  the inner one and it is the one that decides**, which keeps a `def` written *inside* the block on
+  the instance side without a second rule. The six applications write 23 such blocks in their
+  loadable code and **14 are inside a `def`**; the audit's draw reached one of them.
+- **The placement costs a document walk, so the caller with many cursors hands its own down.**
+  `Sources::bodies` is that walk and `Sources::scope_at` is the only thing that may read it: a
+  request with one cursor leaves it `None` and pays `Scope::at` once, `inlayHint` sets it and
+  pays a containment test per hint. `Bodies` carries the `UriId` it walked because the rungs
+  below take a `uri_id` of their own, and a containment test against another document's spans
+  would answer confidently and wrongly. This is the same quadratic `Scope::bodies` was written
+  for — see `hints.md` — with a second caller now inside it.
 - **The name rung is kept below the lookup rather than beside it**, which is what
   `Receiver::Spelled` already existed for: a bare name becomes
   `Spelled { was: Returned { on: SelfObject, … }, name: method }`, so `types` asks the graph first
@@ -402,6 +585,31 @@ rubydex naming the receiver → a signature or an assignment → the controller 
   is added, ask what it *displaces* as well as what it answers, and ask it on the completion sweep**:
   `sweep.tier` scores every one of them as an improvement, because `list -> derived` is a rank it
   counts upward.
+- **The fifth time it was asked *before* the rung shipped, and it declined half of what it could
+  have declared.** The framework-singleton table — what `Rails.root`, `Rails.cache`,
+  `Rails.application` and `Time.zone` return — was scored against the members six corpora really
+  call one hop later, on a real bundle, before a line of it was written. Four candidates passed and
+  **four were declined on this rule alone**, every one for the same mechanism: the class Rails
+  really returns answers those calls through `method_missing` or `define_method`, which rubydex
+  cannot see. `Rails.logger` is the one to remember, because it is the largest population of the
+  eight: `ActiveSupport::BroadcastLogger` is what Rails returns and answers **5%** of its 1,395
+  chained calls, while `ActiveSupport::Logger` answers **94%** and is the wrong class. A rank that
+  is correct-if-true cannot be bought by naming the wrong class, so the whole row was left on the
+  name rung. What shipped moved **3,693 of 6,659 positions from a name-based list to one exact
+  answer, 0 the other way, 0 silent**, with the four declined chains byte-identical across the two
+  binaries as the control. `synthesized.md` has the table and the per-chain numbers.
+- **The sixth time the navigation half cost nothing and the *completion* half is where the price
+  was.** The view context's third half — ActionView's own helper modules, `views.md` — moved
+  **4,697 of 8,732 bare-word positions from a candidate list to one exact answer, 0 the other way,
+  0 silent, 0 places lost**, because it sits under the two halves an application writes and can
+  only displace the name rung. The list beside it is a different question, and asking it found the
+  one real cost: a template's completion rows went 266 to 285 on average with **0 lists
+  shrinking**, but 37 of 297 were already at the 512-item ceiling and **312 rows were pushed past
+  it, 79 of them route-helper labels**. That is the cap and the ranking behaving as specified, and
+  it is recorded rather than repaired because the obvious repair measured worse: filtering the
+  view context to public methods lost 932 rows across 135 lists instead. **The lesson the rule
+  gains is that "what does it displace" has two answers, and the navigation sweep can read clean
+  while the list under the same cursor is the one that paid.**
 - **The remaining two have no repair available.** A variable with **two assignments naming two
   classes** picks one: a corpus writes a `Status` or a `ScheduledStatus` into one `@status`
   depending on a branch, and once `Relation#new` and `Relation#create!` existed the assignments

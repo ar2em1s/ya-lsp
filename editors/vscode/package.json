@@ -2,7 +2,7 @@
   "name": "yalsp",
   "displayName": "ya-lsp",
   "description": "A standalone Ruby language server. No Ruby runtime required.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "license": "MIT",
   "icon": "images/logo.png",
   "publisher": "ar2em1s",
@@ -59,9 +59,46 @@
               "Everything, this crate and its libraries. For diagnosing the server itself."
             ],
             "default": "info",
-            "markdownDescription": "How much the server writes to the **ya-lsp** output channel. Read from the environment once, when the server starts, so changing it restarts the server. Left unset it does not override a `YA_LSP_LOG` inherited from your shell.",
+            "markdownDescription": "How much the server writes to the **ya-lsp** output channel. Applied while the server runs, so changing it takes effect on the next request rather than restarting anything. A `YA_LSP_LOG` inherited from your shell outranks it, and so does `[log] level` in a workspace `ya-lsp.toml`.",
             "scope": "machine-overridable",
             "order": 2
+          },
+          "ya-lsp.log.file": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "Also write the log to a file, so a bug report can carry one instead of a screenshot of an output channel. Off by default: a server you installed for hover should not start writing into your repository. Overridden by `[log] file` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 3
+          },
+          "ya-lsp.log.filePath": {
+            "type": "string",
+            "default": "tmp/ya-lsp.log",
+            "markdownDescription": "Where that file goes, relative to the workspace folder or absolute. Two windows on one project write to one file and each line says which process wrote it; nothing is ever truncated, so the session you are trying to report survives a restart. Overridden by `[log] file_path` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 4
+          },
+          "ya-lsp.log.fileLevel": {
+            "type": "string",
+            "enum": [
+              "off",
+              "error",
+              "warn",
+              "info",
+              "debug",
+              "trace"
+            ],
+            "enumDescriptions": [
+              "Nothing at all.",
+              "Only what stopped working.",
+              "Also what was skipped or guessed — an unreadable file, a gem that could not be found.",
+              "Also what it did: which Ruby it picked, how many files it indexed, how long that took.",
+              "Also the work behind each request: which method, which document and position, how long it took and what it answered.",
+              "Everything, this crate and its libraries. For diagnosing the server itself."
+            ],
+            "default": "debug",
+            "markdownDescription": "How much goes in the file, which is its own setting rather than `#ya-lsp.logLevel#` — the reason to turn the file on is the per-request detail the output channel does not carry. Overridden by `[log] file_level` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 5
           },
           "ya-lsp.trace.server": {
             "type": "string",
@@ -78,7 +115,7 @@
             "default": "off",
             "markdownDescription": "Log the LSP traffic between VS Code and the server. For debugging this extension — to read what the server itself found, use `#ya-lsp.logLevel#`.",
             "scope": "window",
-            "order": 3
+            "order": 6
           }
         }
       },
@@ -156,12 +193,53 @@
             "markdownDescription": "Answer from a receiver's own name when nothing else can — `@user` is a `User`, `person` is a `Person`. The only answer ya-lsp gives that is allowed to be wrong: it is always labelled as a guess in the hover card and on a completion row, and it never displaces a type the code states or one derived from a signature or an assignment. Turn it off to keep only checkable answers. Overridden by `[types] guess_from_names` in a workspace `ya-lsp.toml`.",
             "scope": "resource",
             "order": 1
+          },
+          "ya-lsp.types.structs": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Read `Struct.new` and `Data.define`, so the members they install complete and hover like any other. Plain Ruby, not Rails: off, `Point = Struct.new(:x)` has nothing to offer on `point.x`. Overridden by `[types] structs` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 2
+          },
+          "ya-lsp.types.annotations": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Read a Sorbet `sig` and a YARD `@return` as the type they declare, where the Ruby itself cannot say. Off, a method annotated and not signed hovers as unknown. Overridden by `[types] annotations` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 3
+          }
+        }
+      },
+      {
+        "title": "Inlay hints",
+        "order": 5,
+        "properties": {
+          "ya-lsp.hints.blockParameters": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Draw what a block parameter holds, where the method the block was passed to declares it — the `story` in `stories.each do |story|`. Overridden by `[hints] block_parameters` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 1
+          },
+          "ya-lsp.hints.locals": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Draw what a local holds where it is assigned the result of a call — the `author` in `author = story.author`. Not where the assignment already names the class: `x = Story.new` and `x = 1` say it themselves. Overridden by `[hints] locals` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 2
+          },
+          "ya-lsp.hints.returns": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Draw what a method returns where a signature declares it and the Ruby cannot say so — from the project's `sig/`, a gem's, or a Sorbet `sig` or YARD `@return` in another file. Overridden by `[hints] returns` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 3
           }
         }
       },
       {
         "title": "Problems",
-        "order": 5,
+        "order": 6,
         "properties": {
           "ya-lsp.diagnostics.enabled": {
             "type": "boolean",
@@ -392,8 +470,109 @@
         }
       },
       {
+        "title": "Rails",
+        "order": 7,
+        "properties": {
+          "ya-lsp.rails.enabled": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "on",
+              "off"
+            ],
+            "enumDescriptions": [
+              "On when the folder holds config/application.rb, or Gemfile.lock locks railties.",
+              "Always on, for a project detection does not recognise.",
+              "Never. Nothing in this project is read as Rails."
+            ],
+            "default": "auto",
+            "markdownDescription": "Bring Rails' conventions to this project: the schema, the model macros, the routes, mailers and jobs, and what a template can call. Off is about **answers rather than speed** — a project that is not Rails should not be told about Rails, and one with an `app/views/` gets a hover citing a controller that does not exist. Overridden by `[rails] enabled` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 1
+          },
+          "ya-lsp.rails.schema": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Read `db/schema.rb` or `db/structure.sql`, so a column completes and hovers with its type. Includes the macros that rename a table — `self.table_name=` and `isolate_namespace`. Overridden by `[rails] schema` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 2
+          },
+          "ya-lsp.rails.models": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Read the model macros: `belongs_to` and `has_many`, `enum`, `attribute`, `delegate`, `scope` and 17 more. This is also what types `Story.where(...)` as a relation rather than as nothing. Overridden by `[rails] models` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 3
+          },
+          "ya-lsp.rails.routes": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Read `config/routes.rb`, so `stories_path` is a name your controllers and views can complete and jump to. Overridden by `[rails] routes` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 4
+          },
+          "ya-lsp.rails.entrypoints": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Read mailers, jobs and Sidekiq workers, so `UserMailer.welcome` and `ImportJob.perform_later` are calls ya-lsp knows about. Overridden by `[rails] entrypoints` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 5
+          },
+          "ya-lsp.rails.views": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Answer inside a template: which helpers a bare word can call, and what the `@story` the controller assigned is. The one to turn off in a **Sinatra or Hanami** project with an `app/views/`, where the controller ya-lsp would cite does not exist. Overridden by `[rails] views` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 6
+          }
+        }
+      },
+      {
+        "title": "Trees",
+        "order": 8,
+        "properties": {
+          "ya-lsp.trees.test": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "spec",
+              "test",
+              "tests",
+              "features"
+            ],
+            "markdownDescription": "Directory names that hold your test suite. A `def` written in one is offered and jumped to only from inside another — it exists while the suite is loaded and nowhere else. This **replaces** the list rather than adding to it, because a name here *removes* answers: add `lib` and your whole project stops completing. `[]` turns the fence off. Uses of a name are still found everywhere: `references`, `rename` and highlight never fence. Overridden by `[trees] test` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 1
+          },
+          "ya-lsp.trees.testSupport": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "markdownDescription": "Extra directory names that count as test scaffolding **for the cursor only** — somewhere a developer is, rather than somewhere answers are removed from. Added to the built-in `testing_support`, never replacing it, because a wrong name here costs nothing but the protection it was going to give. Overridden by `[trees] test_support` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 2
+          },
+          "ya-lsp.trees.migration": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "db/migrat"
+            ],
+            "markdownDescription": "Where migrations live, as `parent/mark` pairs: the directory above, then anything the directory's own name contains. `db/migrat` covers `db/migrate`, `db/post_migrate` and `db/old_migrations` in one rule. A migration is loaded by path, alone, by the task that runs it — so a backfill copy of a model written inside one is reachable from nothing. **Replaces** the pair; `[]` turns the fence off. Overridden by `[trees] migration` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 3
+          }
+        }
+      },
+      {
         "title": "Indexing",
-        "order": 6,
+        "order": 9,
         "properties": {
           "ya-lsp.index.include": {
             "type": "array",
@@ -487,7 +666,7 @@
     ]
   },
   "scripts": {
-    "compile": "tsc -p .",
+    "compile": "node -e \"require('fs').rmSync('out', { recursive: true, force: true })\" && tsc -p .",
     "lint": "tsc -p . --noEmit",
     "bundle": "node esbuild.mjs",
     "test": "yarn compile && yarn bundle && node --test \"out/**/*.test.js\"",

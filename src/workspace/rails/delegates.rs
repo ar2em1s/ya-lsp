@@ -255,8 +255,8 @@ impl Delegate {
                 name: declared,
                 returns,
                 // What Rails writes is `def #{name}(...)`, so every argument is forwarded and
-                // whatever arity the target takes is accepted — which `(*untyped)` is, and item
-                // 8's partition is why it has to be: a `def` claiming the wrong arity answers
+                // whatever arity the target takes is accepted — which `(*untyped)` is, and the
+                // arity partition is why it has to be: a `def` claiming the wrong arity answers
                 // for a call nobody made. A setter is the one shape that takes exactly one
                 // value however the target is written, so it says so. **RBS accepts either** —
                 // `def name=: (*untyped) -> String` parses — so this is the signature being
@@ -308,6 +308,7 @@ impl Delegate {
 mod tests {
     use super::super::read_model;
     use super::*;
+    use crate::analysis::testing::*;
     use crate::generated::declaring;
 
     /// The facts a schema and a `belongs_to` would have written before phase two runs.
@@ -787,5 +788,180 @@ class Story
 end
 "
         );
+    }
+
+    /// A schema, two models and a `delegate` between them — the two hops, end to end.
+    ///
+    /// `Story#user` is a `belongs_to` the model generator writes, `User#username` is a column
+    /// the *schema* generator writes into a different file's generated document, and nothing has
+    /// resolved when either of them is asked. That is the two-phase seam in a fixture.
+    fn delegates_project(caller: &str) -> (Harness, DocUri, DocUri) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let signatures = dir.path().join("sig");
+        std::fs::create_dir_all(signatures.join("core")).unwrap();
+        std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            format!(
+                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
+                signatures.display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  \
+             belongs_to :user\n  \
+             delegate :username, :description, to: :user\n  \
+             delegate :username, to: :user, prefix: true\n  \
+             delegate :title, to: :user\n  \
+             delegate :name=, to: :user\n  \
+             delegate :anything, to: :@config\n\
+             end\n",
+        );
+        harness.write(
+            "app/models/user.rb",
+            "class User < ApplicationRecord\nend\n",
+        );
+        harness.write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[7.1].define(version: 2024_01_01_000000) do\n  \
+             create_table \"stories\", force: :cascade do |t|\n    \
+             t.string \"title\", null: false\n  \
+             end\n\n  \
+             create_table \"users\", force: :cascade do |t|\n    \
+             t.string \"username\", null: false\n  \
+             end\n\
+             end\n",
+        );
+        let uri = harness.write("app/main.rb", caller);
+        harness.index();
+        harness.index_gems();
+        (harness, story, uri)
+    }
+
+    #[test]
+    fn a_delegate_types_through_two_hops_and_jumps_to_its_own_symbol() {
+        // A `delegate` in one expression, and the three things that have to happen at
+        // once are the same three every generator in this half is asked for: the member exists,
+        // the chain off it is typed — which needs *both* hops, an association in this file and a
+        // column in another — and the jump lands on the `:username` symbol inside the call
+        // rather than anywhere else in the class.
+        let source = "Story.new.username.upcase\n";
+        let (mut harness, story, uri) = delegates_project(source);
+
+        assert!(
+            harness.has("Story#username()"),
+            "the delegated name is not a member"
+        );
+
+        let card = card(&mut harness, &uri, source, "upcase");
+        assert!(card.contains("String#upcase"), "{card}");
+
+        let definition = harness.definition_at(&uri, source, "username");
+        assert_eq!(
+            definition[0]["targetUri"],
+            serde_json::json!(story.as_str()),
+            "{definition}"
+        );
+        // `  delegate :username, :description, to: :user` on line 2, revealed whole, with the
+        // one name of the two that was asked for selected past its colon.
+        assert_eq!(
+            (
+                &definition[0]["targetRange"]["start"]["line"],
+                &definition[0]["targetRange"]["start"]["character"],
+                &definition[0]["targetSelectionRange"]["start"]["character"],
+            ),
+            (
+                &serde_json::json!(2),
+                &serde_json::json!(2),
+                &serde_json::json!(12),
+            ),
+            "{definition}"
+        );
+    }
+
+    #[test]
+    fn a_hover_on_a_delegated_name_says_which_file_and_which_call_it_came_from() {
+        // The provenance rule again, and it is load-bearing here in a way it is not for a
+        // column: a delegated type is two derivations deep, so a card that did not say so would
+        // be presenting the *target's* schema as though this class declared it.
+        let source = "Story.new.username\n";
+        let (mut harness, _story, uri) = delegates_project(source);
+
+        let card = card(&mut harness, &uri, source, "username");
+        assert!(card.contains("Story#username"), "{card}");
+        assert!(card.contains("app/models/story.rb"), "{card}");
+        assert!(card.contains("delegate :username"), "{card}");
+        assert!(card.contains("to: :user"), "{card}");
+    }
+
+    #[test]
+    fn what_a_delegate_declares_and_what_it_declines_to_type() {
+        // The decline direction, which is the one thing this reader does differently from every
+        // other one in the directory: what is declined is the **type** and never the member.
+        // Rails defines all four of these methods whatever `to:` holds at run time, so all four
+        // exist — and the two that cannot be typed simply carry no return type, which
+        // `Types::harvest` drops rather than believing.
+        let source = "Story.new.username.upcase\nStory.new.description.length\n";
+        let (mut harness, _story, uri) = delegates_project(source);
+
+        assert!(harness.has("Story#username()"), "both hops answered");
+        assert!(harness.has("Story#user_username()"), "prefix: true");
+        assert!(
+            harness.has("Story#description()"),
+            "a name the target's schema does not hold is still a member"
+        );
+        assert!(
+            harness.has("Story#anything()"),
+            "an ivar target is still a member"
+        );
+        assert!(
+            harness.has("Story#name=()"),
+            "a setter is a name RBS takes, and one this document would be refused whole for"
+        );
+
+        // The chain is what tells the two apart, and it is the whole reason an untyped
+        // declaration is safe: `untyped` is dropped from the return table, so `.upcase` off the
+        // one that could not be typed falls to the name rung exactly as it would have with no
+        // declaration at all — while the one that could be typed resolves.
+        let derived = card(&mut harness, &uri, source, "upcase");
+        assert!(derived.contains("String#upcase"), "{derived}");
+        assert!(
+            !derived.contains("Matched on the method name alone"),
+            "{derived}"
+        );
+        let guessed = card(&mut harness, &uri, source, "length");
+        assert!(
+            guessed.contains("Matched on the method name alone"),
+            "an untyped delegation must add no entry to the return table: {guessed}"
+        );
+    }
+
+    #[test]
+    fn a_column_outranks_a_delegate_of_the_same_name() {
+        // Rank 3 over rank 8, and the reason a rank has to be spendable from *outside* one
+        // document. `Story` has a `title` column and a `delegate :title, to: :user`; the column
+        // is what the database is and the delegation is a claim about another class that does
+        // not even hold the name. The two land in two different generated documents, where
+        // `Facts`' own precedence can never see the pair — so without the decline this is two
+        // `def title:` lines, one place too many in the card, and a type decided by whichever
+        // document `Types::harvest` read last.
+        let source = "Story.new.title.upcase\n";
+        let (mut harness, _story, uri) = delegates_project(source);
+
+        let column = card(&mut harness, &uri, source, "title");
+        assert!(
+            column.contains("db/schema.rb"),
+            "the delegate won: {column}"
+        );
+        assert!(!column.contains("delegate :title"), "{column}");
+        assert!(!column.contains("Defined in"), "two declarations: {column}");
+        // And the type is the column's, rather than the `untyped` the delegation would have
+        // carried into the same key.
+        let chained = card(&mut harness, &uri, source, "upcase");
+        assert!(chained.contains("String#upcase"), "{chained}");
     }
 }

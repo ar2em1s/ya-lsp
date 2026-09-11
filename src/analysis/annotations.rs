@@ -591,6 +591,7 @@ fn spelling(source: &str, node: &Node<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
     use crate::generated::declaring;
 
     /// The RBS one snippet declares, with the provenance lines dropped.
@@ -1026,5 +1027,133 @@ end
         // A `def` on the file's first line: the walk back for a comment block has nothing to
         // walk back over, which is the one way that loop is entered zero times.
         assert!(read("class W; def go; end; end\n", "app/widget.rb").is_empty());
+    }
+
+    #[test]
+    fn a_sig_block_and_a_yard_tag_each_type_a_receiver_and_say_which_they_read() {
+        // Both halves of an annotation. A card says which of the two it read, because a
+        // comment is not a signature and the tiers already have a place to say so.
+        let source = "Widget.new.name.upcase\nWidget.new.label.upcase\n";
+        let (mut harness, _story, uri) = models_project(source);
+        let widget = harness.write(
+            "app/models/widget.rb",
+            "class Widget\n  \
+             extend T::Sig\n\n  \
+             sig { returns(String) }\n  \
+             def name\n    \"x\"\n  end\n\n  \
+             # @return [String]\n  \
+             def label\n    \"y\"\n  end\n\
+             end\n",
+        );
+        harness.watch(&[&widget]);
+
+        let sorbet = card(&mut harness, &uri, source, "name");
+        assert!(sorbet.contains("a Sorbet `sig` block"), "{sorbet}");
+        assert!(sorbet.contains("app/models/widget.rb"), "{sorbet}");
+
+        let yard = card(&mut harness, &uri, source, "label");
+        assert!(yard.contains("a YARD `@return` tag"), "{yard}");
+
+        // And both type the chain, which is the only reason to read either.
+        let chained = card(&mut harness, &uri, "Widget.new.name.upcase\n", "upcase");
+        assert!(chained.contains("String#upcase"), "{chained}");
+    }
+
+    #[test]
+    fn an_annotation_is_not_a_second_place_the_method_is_declared() {
+        // The `def` is already in the graph at the offset an editor should jump to, so what an
+        // annotation adds is a *type* and nothing else. A span here would put the same location
+        // in a go-to-definition list twice.
+        let source = "Widget.new.name\n";
+        let (mut harness, _story, uri) = models_project(source);
+        let widget = harness.write(
+            "app/models/widget.rb",
+            "class Widget\n  # @return [String]\n  def name\n    \"x\"\n  end\nend\n",
+        );
+        harness.watch(&[&widget]);
+
+        let definition = harness.definition_at(&uri, source, "name");
+        assert_eq!(definition.as_array().map(Vec::len), Some(1), "{definition}");
+        assert_eq!(
+            definition[0]["targetUri"],
+            serde_json::json!(widget.as_str()),
+            "{definition}"
+        );
+    }
+
+    #[test]
+    fn a_sorbet_sig_wins_over_a_yard_tag_that_disagrees_with_it() {
+        // Both are "a human wrote the type down" and one of them is machine-checked. A `sig` is
+        // Ruby the parser validates and `srb` checks; a comment rots quietly.
+        let (mut harness, _story, _uri) = models_project("");
+        let widget = harness.write(
+            "app/models/widget.rb",
+            "class Widget\n  \
+             # @return [Integer]\n  \
+             sig { returns(String) }\n  \
+             def name\n    \"x\"\n  end\n\
+             end\n",
+        );
+        harness.watch(&[&widget]);
+
+        let rbs = harness.generated_rbs("app/models/widget.rb");
+        assert!(rbs.contains("def name: () -> String"), "{rbs}");
+    }
+
+    #[test]
+    fn an_annotation_naming_something_that_is_not_a_class_declares_nothing() {
+        // The decline list, as behaviour. A union `Types` cannot key, a duck type that names a
+        // method rather than a class, and a shape — none of them has a spelling this crate can
+        // write exactly, and a method it cannot spell exactly is one it says nothing about.
+        let (mut harness, _story, _uri) = models_project("");
+        let widget = harness.write(
+            "app/models/widget.rb",
+            "class Widget\n  \
+             sig { returns(T.any(String, Integer)) }\n  \
+             def either\n  end\n\n  \
+             # @return [#read]\n  \
+             def duck\n  end\n\n  \
+             # @return [Hash{Symbol=>String}]\n  \
+             def shape\n  end\n\n  \
+             # @param count [Integer] how many\n  \
+             def untagged(count)\n  end\n\
+             end\n",
+        );
+        harness.watch(&[&widget]);
+
+        assert_eq!(
+            harness.generated_rbs("app/models/widget.rb"),
+            String::new(),
+            "a type this crate cannot spell exactly is a method it says nothing about"
+        );
+    }
+
+    #[test]
+    fn an_annotated_method_keeps_the_arity_it_was_written_with() {
+        // An answer is partitioned by how many positional arguments the *call* wrote, so a
+        // generated signature that claims the wrong arity does not merely display wrongly — it
+        // answers nothing, or answers for a call nobody made. Every parameter shape Ruby has,
+        // rendered, and then asked the only question that matters about it.
+        let source = "Widget.new.go(1, 2, 3, key: 4).upcase\n";
+        let (mut harness, _story, uri) = models_project(source);
+        let widget = harness.write(
+            "app/models/widget.rb",
+            "class Widget\n  \
+             # @return [String]\n  \
+             def go(a, b = 1, *rest, key:, opt: 2, **kw, &block)\n  end\n\
+             end\n",
+        );
+        harness.watch(&[&widget]);
+
+        let rbs = harness.generated_rbs("app/models/widget.rb");
+        assert!(
+            rbs.contains(
+                "def go: (untyped, ?untyped, *untyped, key: untyped, ?opt: untyped, **untyped) \
+                 ?{ (*untyped) -> untyped } -> String"
+            ),
+            "{rbs}"
+        );
+        let card = card(&mut harness, &uri, source, "upcase");
+        assert!(card.contains("String#upcase"), "{card}");
     }
 }

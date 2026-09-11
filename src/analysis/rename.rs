@@ -351,6 +351,9 @@ impl<'pr> Visit<'pr> for Assigned<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::position::TextDocument;
+    use crate::analysis::requests::file_name;
+    use crate::analysis::testing::*;
 
     #[test]
     fn prism_decides_what_a_ruby_name_is_and_it_is_not_what_a_pattern_would_say() {
@@ -439,5 +442,884 @@ mod tests {
         assert!(!is_shorthand("mod::CONST", 3));
         // The end of the file: a name is the last thing in it, so there is no byte to read.
         assert!(!is_shorthand("name", 4));
+    }
+
+    #[test]
+    fn a_class_a_generated_document_declares_is_refused_by_rename() {
+        // The existing guard covers this with nothing added. Renaming reads *every* definition of a
+        // name and refuses unless all of them are somewhere ya-lsp is willing to edit — the case it
+        // was written for is `class String` reopened beside Ruby's own signatures — and a generated
+        // definition is not the user's own code by exactly the same test.
+        //
+        // The refusal is the safe answer and not a placeholder for a better one: the alternative
+        // is a rename that reaches through the mapping and edits `db/schema.rb`, which is a
+        // generated file whose column is not renamed by rewriting it.
+        let source = "Story.new.title\n";
+        let (mut harness, schema, uri) = synthetic_project(source);
+        harness.synthesize(&schema, SCHEMA_RBS, title_only(&schema));
+        harness.open(&uri, source);
+
+        let renamed = harness.ask(
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": position_of(source, "Story"),
+                "newName": "Article",
+            }),
+        );
+        assert!(renamed.is_null(), "{renamed}");
+        assert!(
+            harness
+                .messages()
+                .iter()
+                .any(|message| message.contains("Story")),
+            "a refusal is said out loud"
+        );
+    }
+
+    /// One spelling, `name`, used as five different variables in one file.
+    ///
+    /// The point of the fixture is that a word search cannot tell any of them apart. `name` is a
+    /// method parameter, a block parameter shadowing it, a lambda parameter shadowing it again,
+    /// a local in an unrelated method, and a word inside a comment and a string. A rename of any
+    /// one of them must leave the other four exactly as they were, and the drawing is where that
+    /// is read.
+    const LOCALS: &str = "\
+def greet(name)
+  greeting = \"Hi #{name}\" # the name goes here
+  [1, 2].each { |name| puts name }
+  shout = ->(name) { name.upcase }
+  \"name\" + greeting + shout.call(name)
+end
+
+def unrelated
+  name = 1
+  name + 1
+end
+";
+
+    #[test]
+    fn renaming_a_local_changes_its_own_scope_and_nothing_that_merely_spells_it() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+
+        // The parameter of `greet`, which is read twice: inside the interpolation, and in the
+        // last line's argument. Everything else spelled `name` belongs to something else.
+        assert_eq!(
+            harness.renamed(&uri, LOCALS, "name)", "person"),
+            "\
+--- greet.rb ---
+def greet(person)
+  greeting = \"Hi #{person}\" # the name goes here
+  [1, 2].each { |name| puts name }
+  shout = ->(name) { name.upcase }
+  \"name\" + greeting + shout.call(person)
+end
+
+def unrelated
+  name = 1
+  name + 1
+end
+"
+        );
+    }
+
+    #[test]
+    fn renaming_a_block_parameter_stops_at_the_block() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+
+        // The block's own `name`, which shadows the parameter. Prism resolves the two to
+        // different scopes and that indexing is the whole of the rule — nothing here knows the
+        // word "shadow".
+        assert_eq!(
+            harness.renamed(&uri, LOCALS, "name| puts", "each_one"),
+            "\
+--- greet.rb ---
+def greet(name)
+  greeting = \"Hi #{name}\" # the name goes here
+  [1, 2].each { |each_one| puts each_one }
+  shout = ->(name) { name.upcase }
+  \"name\" + greeting + shout.call(name)
+end
+
+def unrelated
+  name = 1
+  name + 1
+end
+"
+        );
+    }
+
+    #[test]
+    fn a_word_in_a_comment_or_a_string_is_not_a_position_a_rename_answers_for() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+
+        // The two places an editor's own word matching would offer to rename. `null` from
+        // `prepareRename` is what stops the box from opening at all, and nothing is said about
+        // it: the cursor is on prose, and there is no refusal to explain.
+        for needle in ["name goes here", "\"name\" +"] {
+            assert!(
+                harness.prepare_rename(&uri, LOCALS, needle).is_null(),
+                "{needle:?} is not renameable"
+            );
+        }
+        assert!(harness.messages().is_empty());
+    }
+
+    const ADMIN: &str = "\
+class Admin
+  def hire
+    HR::Person.build
+  end
+end
+
+module Other
+  class Person
+  end
+end
+
+def elsewhere
+  Other::Person.new
+end
+";
+
+    #[test]
+    fn a_rename_edits_the_suite_and_is_never_fenced_by_a_test_tree() {
+        // The surface where dropping a test tree would do real damage rather than merely hide a
+        // row: a completion list that leaves out a spec-only name costs a keystroke, and a
+        // rename that leaves out the spec's uses costs a red suite and a diff the user has
+        // already accepted. `environment` names this request as one that must never ask, and
+        // this is where that is pinned. A constant, because a method rename is declined here
+        // for an unrelated and much older reason — see this module's header.
+        let mut harness = Harness::new();
+        let source = "class Store\n  def ship\n  end\nend\n";
+        let store = harness.write("app/models/store.rb", source);
+        harness.write(
+            "spec/models/store_spec.rb",
+            "describe Store do\n  it \"ships\" do\n    Store.new.ship\n  end\nend\n",
+        );
+        harness.index();
+
+        assert_eq!(
+            harness.renamed(&store, source, "Store", "Depot"),
+            "\
+--- store.rb ---
+class Depot
+  def ship
+  end
+end
+--- store_spec.rb ---
+describe Depot do
+  it \"ships\" do
+    Depot.new.ship
+  end
+end
+"
+        );
+    }
+
+    #[test]
+    fn renaming_a_constant_follows_the_resolution_across_files_and_namespaces() {
+        let mut harness = Harness::new();
+        let hr = harness.write("app/hr.rb", HR);
+        harness.write("app/admin.rb", ADMIN);
+        harness.index();
+
+        // Every spelling of the one constant changes: the `class` line, the bare `Person`
+        // inside its own namespace, the superclass of `Boss`, and the qualified `HR::Person` in
+        // both files. Only the last segment of a qualified reference moves, which is a fact
+        // about how rubydex records them rather than anything this had to arrange.
+        //
+        // `Other::Person` and the `class Person` inside `module Other` are the control, and
+        // they are in the drawing rather than in a second assertion: `admin.rb` is shown whole,
+        // so the two names that did not change are as visible as the one that did.
+        assert_eq!(
+            harness.renamed(&hr, HR, "Person\n", "Employee"),
+            "\
+--- admin.rb ---
+class Admin
+  def hire
+    HR::Employee.build
+  end
+end
+
+module Other
+  class Person
+  end
+end
+
+def elsewhere
+  Other::Person.new
+end
+--- hr.rb ---
+module HR
+  class Employee
+    ROLE = \"staff\"
+
+    def self.build
+      Employee.new
+    end
+  end
+
+  class Boss < Employee
+    def peer
+      HR::Employee.new
+    end
+  end
+end
+"
+        );
+    }
+
+    #[test]
+    fn renaming_a_constant_from_a_use_of_it_answers_the_same_as_from_where_it_is_written() {
+        let mut harness = Harness::new();
+        let hr = harness.write("app/hr.rb", HR);
+        let admin = harness.write("app/admin.rb", ADMIN);
+        harness.index();
+
+        let from_the_class_line = harness.renamed(&hr, HR, "Person\n", "Employee");
+        // The `Person` in `HR::Person` in the *other* file: a constant reference rather than a
+        // definition, which reaches the plan down a different arm of `locate`.
+        let from_a_qualified_use = harness.renamed(&admin, ADMIN, "Person.build", "Employee");
+        assert_eq!(from_a_qualified_use, from_the_class_line);
+    }
+
+    #[test]
+    fn a_constant_assigned_rather_than_declared_moves_with_its_namespace() {
+        let mut harness = Harness::new();
+        let source = "\
+module HR
+  MAX_STAFF = 10
+
+  def self.room?
+    HR::MAX_STAFF > 1 && MAX_STAFF < 100
+  end
+end
+";
+        let uri = harness.write("app/limits.rb", source);
+        harness.index();
+
+        // `MAX_STAFF = 10` is a constant rather than a namespace, and rubydex records no name
+        // span for one — `locator::spans` falls back to the whole construct, which for this
+        // kind is exactly the name and nothing else. Worth a test rather than a comment,
+        // because the *next* fixture is the kind where that fallback is not the name.
+        assert_eq!(
+            harness.renamed(&uri, source, "MAX_STAFF = ", "MAX_HEADCOUNT"),
+            "\
+--- limits.rb ---
+module HR
+  MAX_HEADCOUNT = 10
+
+  def self.room?
+    HR::MAX_HEADCOUNT > 1 && MAX_HEADCOUNT < 100
+  end
+end
+"
+        );
+    }
+
+    #[test]
+    fn a_class_made_with_class_new_is_narrowed_to_its_name_rather_than_replaced_whole() {
+        let mut harness = Harness::new();
+        let source = "\
+module HR
+  Failure = Class.new(StandardError)
+  Shim = Module.new
+
+  def self.fail!
+    raise Failure
+  end
+end
+";
+        let uri = harness.write("app/errors.rb", source);
+        harness.index();
+
+        // The case that makes the confirmation step load-bearing rather than defensive.
+        // rubydex promotes `Failure = Class.new(StandardError)` to a class, and the *name* span
+        // it records for it is the whole assignment — so a rename that trusted the span would
+        // write `raise BuildFailed` and, on the line above, replace the entire
+        // `Failure = Class.new(StandardError)` with `BuildFailed`, deleting the class.
+        //
+        // `StandardError` is in the drawing on purpose: it ends in the very name being narrowed
+        // to, and it is why the search inside the span is for a whole word.
+        assert_eq!(
+            harness.renamed(&uri, source, "Failure = ", "BuildFailed"),
+            "\
+--- errors.rb ---
+module HR
+  BuildFailed = Class.new(StandardError)
+  Shim = Module.new
+
+  def self.fail!
+    raise BuildFailed
+  end
+end
+"
+        );
+        assert!(harness.messages().is_empty(), "nothing to explain");
+    }
+
+    #[test]
+    fn a_name_written_twice_inside_one_span_refuses_rather_than_guessing_which_is_which() {
+        let mut harness = Harness::new();
+        let source = "\
+Registry = Class.new { include Registry }
+";
+        let uri = harness.write("app/registry.rb", source);
+        harness.index();
+
+        // The other side of the narrowing rule. Two whole-word occurrences inside the one span
+        // rubydex hands back, either of which could be the one being defined, so nothing is
+        // changed and the sentence says which file to look at.
+        assert_eq!(
+            harness.renamed(&uri, source, "Registry = ", "Catalogue"),
+            "null"
+        );
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_could_not_confirm(
+                "Registry",
+                "registry.rb"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_method_is_refused_out_loud_rather_than_renamed_by_a_name_match() {
+        let mut harness = Harness::new();
+        let source = "\
+class Person
+  def shout
+    :loud
+  end
+end
+
+class Siren
+  def shout
+    :louder
+  end
+end
+
+Person.new.shout
+";
+        let uri = harness.write("app/shout.rb", source);
+        harness.index();
+
+        // Two classes define `shout`, which is the ordinary reason a method rename would go
+        // wrong: `references` matches a method by name, so a rename built on it would edit
+        // `Siren#shout` and the call below along with the one asked about, and would look as
+        // though it had worked.
+        //
+        // From the `def` line and from the call site alike, since those reach the plan down
+        // different arms of `locate`.
+        for needle in ["shout\n    :loud", "shout\n"] {
+            assert!(harness.prepare_rename(&uri, source, needle).is_null());
+            assert_eq!(harness.messages(), vec![messages::rename_refuses_methods()]);
+        }
+    }
+
+    #[test]
+    fn an_instance_variable_is_refused_because_a_subclass_can_share_it() {
+        let mut harness = Harness::new();
+        let source = "\
+class Person
+  def initialize
+    @name = \"anon\"
+  end
+
+  def name
+    @name
+  end
+end
+";
+        let uri = harness.write("app/person.rb", source);
+        harness.index();
+
+        // The scope walk answers for `@name` — `documentHighlight` lights both of these up —
+        // and the refusal is the plan's rather than a limit of the walk: what makes it unsafe
+        // is a subclass or an included module in another file writing the same name, which one
+        // file cannot see.
+        assert!(harness.prepare_rename(&uri, source, "@name = ").is_null());
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_refuses_instance_variables()]
+        );
+    }
+
+    #[test]
+    fn a_parameter_ruby_supplies_has_nowhere_to_put_a_new_name() {
+        let mut harness = Harness::new();
+        let source = "\
+[1, 2].each { it + 1 }
+[3, 4].each { _1 * 2 }
+";
+        let uri = harness.write("app/implicit.rb", source);
+        harness.index();
+
+        // `it` and `_1` are read everywhere and written nowhere, because the block declares
+        // them rather than the file naming them. Renaming one would mean writing a parameter
+        // list that is not there, which is a refactoring rather than a rename.
+        for (needle, name) in [("it +", "it"), ("_1 *", "_1")] {
+            assert!(harness.prepare_rename(&uri, source, needle).is_null());
+            assert_eq!(
+                harness.messages(),
+                vec![messages::rename_refuses_implicit_parameters(name)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_variable_that_is_also_a_keyword_or_a_hash_key_is_refused() {
+        let mut harness = Harness::new();
+        let source = "\
+def call(host:, port:)
+  config = { host:, port: port }
+  connect(host:)
+  config
+end
+
+def other(host)
+  host.to_s
+end
+";
+        let uri = harness.write("app/call.rb", source);
+        harness.index();
+
+        // Three ordinary Ruby spellings put a name somewhere it means more than the variable,
+        // and all three are in this fixture. `host:` in the parameter list is the method's
+        // interface, so renaming it changes what every caller writes; `{ host:, ... }` and
+        // `connect(host:)` are Ruby 3.1's shorthand, where the one word is the key *and* a read
+        // of the local — replacing the span renames the key with it, which changes the hash and
+        // still parses.
+        for needle in ["host:, port:)", "host:, port: port", "host:)"] {
+            assert!(
+                harness.prepare_rename(&uri, source, needle).is_null(),
+                "{needle:?}"
+            );
+            assert_eq!(
+                harness.messages(),
+                vec![messages::rename_refuses_shorthand("host")]
+            );
+        }
+
+        // `port` is written out in full at its one read, and refused all the same: the keyword
+        // parameter that declares it is the interface either way.
+        assert!(harness.prepare_rename(&uri, source, "port }").is_null());
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_refuses_shorthand("port")]
+        );
+
+        // And the control: the same spelling in a method that takes it positionally renames,
+        // because nothing about a positional parameter's name reaches a caller.
+        assert_eq!(
+            harness.renamed(&uri, source, "host)", "hostname"),
+            "\
+--- call.rb ---
+def call(host:, port:)
+  config = { host:, port: port }
+  connect(host:)
+  config
+end
+
+def other(hostname)
+  hostname.to_s
+end
+"
+        );
+    }
+
+    #[test]
+    fn a_local_before_a_double_colon_renames_because_that_colon_is_a_lookup() {
+        let mut harness = Harness::new();
+        let source = "\
+def read
+  source = Object
+  source::NAME
+end
+";
+        let uri = harness.write("app/read.rb", source);
+        harness.index();
+
+        // The reason the shorthand test is for one colon rather than for a colon. `source` here
+        // is a local with a constant looked up on it, which is the commonest legitimate
+        // spelling of a name followed by a colon and must not be caught by the rule above.
+        assert_eq!(
+            harness.renamed(&uri, source, "source =", "holder"),
+            "\
+--- read.rb ---
+def read
+  holder = Object
+  holder::NAME
+end
+"
+        );
+    }
+
+    #[test]
+    fn a_new_name_ruby_would_not_read_as_a_name_changes_nothing() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+
+        // The prepare said yes, so the position is fine and it is the *name* that is not. LSP
+        // has nowhere to put a validation rule, so the client asks with whatever was typed and
+        // this is the only place it can be answered.
+        assert!(harness.prepare_rename(&uri, LOCALS, "name)").is_object());
+        for candidate in ["Person", "nil", "shout!", "two words", ""] {
+            assert_eq!(
+                harness.renamed(&uri, LOCALS, "name)", candidate),
+                "null",
+                "{candidate:?}"
+            );
+            assert_eq!(
+                harness.messages(),
+                vec![messages::rename_needs_a_ruby_name(candidate, false)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_constant_cannot_be_renamed_to_something_that_is_not_one() {
+        let mut harness = Harness::new();
+        let hr = harness.write("app/hr.rb", HR);
+        harness.write("app/admin.rb", ADMIN);
+        harness.index();
+
+        // The other half of the rule, and the reason the plan carries which kind it is: a
+        // constant renamed to a lowercase name is not a constant any more, and every reference
+        // to it would stop resolving. `HR::Employee` is refused too — it is a path rather than
+        // a name, and only the last segment of a reference is ever replaced, so splicing one in
+        // would write `HR::HR::Employee` at the qualified use sites.
+        for candidate in ["employee", "HR::Employee", "@Employee"] {
+            assert_eq!(
+                harness.renamed(&hr, HR, "Person\n", candidate),
+                "null",
+                "{candidate:?}"
+            );
+            assert_eq!(
+                harness.messages(),
+                vec![messages::rename_needs_a_ruby_name(candidate, true)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_defined_in_a_gem_is_refused_from_the_project_that_uses_it() {
+        let (dir, _gem_home, env) =
+            project_with_gem("module Shouty\n  class Megaphone\n  end\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "Shouty::Megaphone.new\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        // Renaming this would edit the gem, or edit the project and leave the gem defining the
+        // old name. Both are wrong, and the sentence says which it is rather than leaving the
+        // editor to report that nothing can be renamed here.
+        assert!(harness.prepare_rename(&uri, source, "Megaphone").is_null());
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_refuses_foreign("Megaphone")]
+        );
+    }
+
+    #[test]
+    fn a_class_the_project_reopens_from_a_gem_is_refused_along_with_it() {
+        let (dir, _gem_home, env) =
+            project_with_gem("module Shouty\n  class Megaphone\n  end\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "\
+module Shouty
+  class Megaphone
+    def blast
+      :loud
+    end
+  end
+end
+";
+        let uri = harness.write("lib/reopen.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        // The case the rule is really about, and the one a "is any of it mine?" test would get
+        // wrong: the project reopens a class the gem defines, so one of the two places the name
+        // is written is a file ya-lsp will not edit. Renaming the project's half alone would
+        // leave the gem defining `Megaphone` and the project defining something else.
+        assert!(harness.prepare_rename(&uri, source, "Megaphone").is_null());
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_refuses_foreign("Megaphone")]
+        );
+    }
+
+    #[test]
+    fn nothing_inside_a_gem_is_renameable_even_from_a_position_that_would_be_exact() {
+        let (dir, gem_home, env) = project_with_gem(
+            "module Shouty\n  def self.blast(volume)\n    volume * 2\n  end\nend\n",
+        );
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/main.rb", "Shouty.blast(1)\n");
+        harness.index();
+        harness.index_gems();
+
+        // `volume` is a local, which is exact wherever it is written — so the refusal is not
+        // about precision, it is that ya-lsp never proposes an edit to a file that is not the
+        // user's own. Silently, as every other request inside a bundle is: a gem is opened to
+        // be read, and nobody pressing rename in one expects it to work.
+        let inside = DocUri::from_path(&gem_home.path().join("gems/shouty-1.2.3/lib/shouty.rb"))
+            .expect("a gem file");
+        let source = "module Shouty\n  def self.blast(volume)\n    volume * 2\n  end\nend\n";
+        assert!(harness.prepare_rename(&inside, source, "volume)").is_null());
+        assert!(harness.messages().is_empty(), "nothing said, deliberately");
+    }
+
+    #[test]
+    fn an_edit_carries_the_version_it_was_computed_against_when_the_client_takes_one() {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+        harness.open(&uri, LOCALS);
+
+        let answer = harness.ask(
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": position_of(LOCALS, "name)"),
+                "newName": "person",
+            }),
+        );
+        // The richer shape, and the reason it is worth negotiating for: the version pins the
+        // text the edit was computed against, so a client can reject a rename the user has
+        // typed past rather than applying it to text that has moved.
+        assert_eq!(answer["changes"], serde_json::Value::Null);
+        assert_eq!(answer["documentChanges"][0]["textDocument"]["version"], 1);
+        assert_eq!(
+            answer["documentChanges"][0]["textDocument"]["uri"],
+            serde_json::json!(uri.to_lsp().expect("an LSP uri")),
+        );
+    }
+
+    #[test]
+    fn a_client_that_did_not_ask_for_document_changes_gets_the_older_map() {
+        let mut harness = Harness::new();
+        harness.analysis.client.versioned_edits = false;
+        let uri = harness.write("app/greet.rb", LOCALS);
+        harness.index();
+
+        // A client that did not advertise `documentChanges` may not merely ignore the shape it
+        // did not ask for; it can fail to apply the edit at all. The older map has no version
+        // in it, which is exactly what advertising the newer one buys.
+        let answer = harness.ask(
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": position_of(LOCALS, "name)"),
+                "newName": "person",
+            }),
+        );
+        assert_eq!(answer["documentChanges"], serde_json::Value::Null);
+        let edits = &answer["changes"][uri.to_lsp().expect("an LSP uri").as_str()];
+        assert_eq!(edits.as_array().map(Vec::len), Some(3), "{answer}");
+    }
+
+    #[test]
+    fn the_prepare_range_is_the_word_under_the_cursor_and_not_the_span_it_was_found_in() {
+        let mut harness = Harness::new();
+        let source = "Failure = Class.new(StandardError)\n";
+        let uri = harness.write("app/errors.rb", source);
+        harness.index();
+
+        // The editor puts its rename box over exactly this range and pre-fills it with the text
+        // inside, so the range has to be the name rather than the span rubydex recorded — which
+        // for this shape is the whole assignment.
+        assert_eq!(
+            harness.prepare_rename(&uri, source, "Failure"),
+            serde_json::json!({
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 7 },
+            })
+        );
+        // And a cursor inside the recorded span but outside the name answers `null` rather than
+        // offering to rename something the cursor is not on. Here it lands on the `=`.
+        assert!(harness.prepare_rename(&uri, source, "= Class").is_null());
+    }
+
+    #[test]
+    fn a_singleton_class_is_not_a_name_anybody_typed() {
+        let mut harness = Harness::new();
+        let source = "\
+class Person
+  class << self
+    def build
+      new
+    end
+  end
+end
+";
+        let uri = harness.write("app/person.rb", source);
+        harness.index();
+
+        // A cursor on `class << self` resolves to the singleton, whose name the graph spells
+        // `Person::<Person>`. Asked of the *old* name, the same check that vets a new one rules
+        // that out — and silently, because nobody meant to rename it.
+        // The name span rubydex records for `class << self` is the `self`, which is where a
+        // cursor has to be for this to be reached at all.
+        assert!(harness.prepare_rename(&uri, source, "self\n").is_null());
+        assert!(harness.messages().is_empty());
+    }
+
+    #[test]
+    fn a_constant_that_resolves_to_nothing_is_nothing_to_rename() {
+        let mut harness = Harness::new();
+        let source = "Missing::Gone.new
+";
+        let uri = harness.write("app/typo.rb", source);
+        harness.index();
+
+        // Both halves of a name nothing in the graph defines — a typo, or a gem that did not
+        // resolve. There is no set of places it is written to change, so there is nothing to
+        // refuse either: the answer is the same `null` a comment gets.
+        for needle in ["Missing", "Gone"] {
+            assert!(harness.prepare_rename(&uri, source, needle).is_null());
+        }
+        assert!(harness.messages().is_empty());
+    }
+
+    /// A rename drawn over the file the user actually has, markup and all.
+    ///
+    /// `Harness::renamed` draws what `with_text` hands out, which for a template is the blanked
+    /// view — right for a Ruby file, and the thing that would hide the whole question here. The
+    /// ranges a rename returns are the *template's* own offsets, so applying them to the real
+    /// file is both the honest drawing and the assertion that byte-preserving blanking works.
+    fn renamed_on_disk(
+        harness: &mut Harness,
+        uri: &DocUri,
+        source: &str,
+        needle: &str,
+        to: &str,
+    ) -> String {
+        let answer = harness.ask(
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": position_of(source, needle),
+                "newName": to,
+            }),
+        );
+        if answer.is_null() {
+            return "null".to_owned();
+        }
+        let mut drawn = Vec::new();
+        for (at, edits) in edits_in(&answer) {
+            let at = DocUri::from_uri_str(&at).expect("a document URI");
+            let on_disk = std::fs::read_to_string(at.to_path().expect("a path")).expect("readable");
+            let mut text = TextDocument::new(on_disk, harness.analysis.encoding);
+            for edit in edits.iter().rev() {
+                text.apply(Some(edit.range), &edit.new_text);
+            }
+            drawn.push(format!("--- {} ---\n{}", file_name(&at), text.text()));
+        }
+        drawn.join("")
+    }
+
+    #[test]
+    fn a_local_renames_across_the_tag_it_was_declared_in() {
+        // `rename` is the only module in the crate that writes, and `COVERAGE_FLOORS` holds it
+        // at 100 for that reason — so the template path ships with its own fixtures or not at
+        // all. The block parameter is declared in one tag and read in another, and what makes
+        // the two edits land on the real file is that blanking moved no byte.
+        let mut harness = Harness::new();
+        harness.write("app/models/story.rb", STORY);
+        let view = harness.write("app/views/stories/index.html.erb", VIEW);
+        harness.index();
+
+        assert_eq!(
+            renamed_on_disk(&mut harness, &view, VIEW, "story| %>", "item"),
+            "\
+--- index.html.erb ---
+<h1>Stories</h1>
+<% @stories.each do |item| %>
+  <p><%= item.title %> &mdash; <%= Story::TAGLINE %></p>
+<% end %>
+"
+        );
+    }
+
+    #[test]
+    fn a_constant_a_template_names_renames_with_its_declaration() {
+        // The half that reaches out of the template: the
+        // declaration is in a Ruby file this rename has to edit as well, at coordinates from
+        // two different coordinate systems that are the same coordinate system.
+        let mut harness = Harness::new();
+        harness.write("app/models/story.rb", STORY);
+        let view = harness.write("app/views/stories/index.html.erb", VIEW);
+        harness.index();
+
+        assert_eq!(
+            renamed_on_disk(&mut harness, &view, VIEW, "TAGLINE %>", "STRAPLINE"),
+            "\
+--- story.rb ---
+class Story
+  STRAPLINE = \"news\"
+
+  def title
+    @title
+  end
+end
+--- index.html.erb ---
+<h1>Stories</h1>
+<% @stories.each do |story| %>
+  <p><%= story.title %> &mdash; <%= Story::STRAPLINE %></p>
+<% end %>
+"
+        );
+    }
+
+    #[test]
+    fn a_namespace_nothing_writes_down_is_refused_and_what_it_holds_is_not() {
+        let mut harness = Harness::new();
+        let source = "\
+Ghost::Thing = 1
+
+def read
+  Ghost::Thing
+end
+";
+        let uri = harness.write("app/ghost.rb", source);
+        harness.index();
+
+        // `Ghost::Thing = 1` with no `module Ghost` anywhere leaves rubydex holding a `Ghost`
+        // that is written down in no file at all. Renaming it would change every use of a name
+        // whose one definition is somewhere ya-lsp cannot see — an excluded file, a gem that
+        // did not resolve, a constant some metaprogramming makes — so it is refused for the
+        // same reason a gem's name is, and with the same sentence.
+        assert!(harness.prepare_rename(&uri, source, "Ghost").is_null());
+        assert_eq!(
+            harness.messages(),
+            vec![messages::rename_refuses_foreign("Ghost")]
+        );
+
+        // And the control, which is what makes that a rule about the namespace rather than
+        // about the line: the constant inside it is written down here, so it renames.
+        assert_eq!(
+            harness.renamed(&uri, source, "Thing = ", "Wraith"),
+            "\
+--- ghost.rb ---
+Ghost::Wraith = 1
+
+def read
+  Ghost::Wraith
+end
+"
+        );
     }
 }

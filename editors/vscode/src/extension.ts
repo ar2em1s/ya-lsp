@@ -20,13 +20,56 @@ import {
   DidChangeConfigurationNotification,
   LanguageClient,
   LanguageClientOptions,
+  RegistrationParams,
   ServerOptions,
   TransportKind,
 } from 'vscode-languageclient/node';
 
+import { Claims, DocumentFilter, Registration } from './claims';
 import { RESTART_REQUIRED, Settings, serverEnvironment, serverOptions } from './config';
 import { FolderFiles, RUBOCOP_EXTENSION, usesRubocop } from './rubocop';
 import { resolveServer } from './server';
+
+/**
+ * The language ids this extension serves.
+ *
+ * `erb` is contributed by the manifest, with the same id and the same extensions ruby-lsp uses, so
+ * a workspace that has an ERB grammar installed keeps it: a grammar binds to the id, and two
+ * contributions of one id merge. ya-lsp ships no grammar of its own — it is a language client, not
+ * a syntax — and semantic tokens colour the Ruby either way.
+ */
+export const LANGUAGES = ['ruby', 'erb'];
+
+/**
+ * Which documents a folder's client claims: that folder's, and nothing else.
+ *
+ * The selector is the only gate on what the client sends. `LanguageClientOptions.workspaceFolder`
+ * sets the `rootUri` and does not filter documents, so whatever this returns is exactly the set of
+ * files the client will `didOpen` and answer requests for; everything else scores 0 in
+ * `languages.match` and the server is never told the document exists.
+ *
+ * **Nothing here names a file outside the folder, and that is deliberate.** A gem's source, Ruby's
+ * stdlib and the RBS beside them live outside every workspace folder, and the server indexes and
+ * answers about all three — but which directories those are is `workspace/gems.rs`: the bundle
+ * parse, `require_paths`, the vendored-versus-installed choice, an engine's `app/`. A second copy
+ * of that in TypeScript would drift in the one direction nothing reports, since a file the client
+ * does not claim produces silence rather than an error. So the server names its own roots after the
+ * handshake, over `client/registerCapability`, and `claims.ts` decides which client takes each one.
+ *
+ * The pattern is the protocol's own shape — a `baseUri` **string** — rather than a
+ * `vscode.RelativePattern`: the client runs every selector through `asDocumentSelector`, which
+ * recognises only this form and silently converts anything else to `undefined`, and an undefined
+ * pattern does not narrow, it *widens* to language and scheme alone. Given this shape the client
+ * builds the `vscode.RelativePattern` itself, which is what makes the path separator right on
+ * Windows by construction.
+ */
+export function documentSelector(folderUri: string): DocumentFilter[] {
+  return LANGUAGES.map((language) => ({
+    scheme: 'file',
+    language,
+    pattern: { baseUri: folderUri, pattern: '**/*' },
+  }));
+}
 
 const clients = new Map<string, LanguageClient>();
 const channels = new Map<string, vscode.LogOutputChannel>();
@@ -34,6 +77,14 @@ const channels = new Map<string, vscode.LogOutputChannel>();
 const reported = new Set<string>();
 /** Folders already asked about RuboCop, so the hint is once per session and not per Ruby file. */
 const suggested = new Set<string>();
+/**
+ * Which folder's server answers about each root outside every folder.
+ *
+ * One ledger for the window, because the question only exists between clients: two folders on one
+ * Ruby register the same gem roots, and two providers over one file is the same server answering
+ * the same hover twice.
+ */
+const claims = new Claims();
 
 let context: vscode.ExtensionContext;
 
@@ -71,16 +122,6 @@ export async function activate(extensionContext: vscode.ExtensionContext): Promi
 export async function deactivate(): Promise<void> {
   await Promise.all([...clients.keys()].map(stop));
 }
-
-/**
- * The language ids this extension serves.
- *
- * `erb` is contributed by this manifest, with the same id and the same extensions ruby-lsp uses,
- * so a workspace that has an ERB grammar installed keeps it: a grammar binds to the id, and two
- * contributions of one id merge. ya-lsp ships no grammar of its own — it is a language client,
- * not a syntax — and semantic tokens colour the Ruby either way.
- */
-const LANGUAGES = ['ruby', 'erb'];
 
 async function startForDocument(document: vscode.TextDocument): Promise<void> {
   if (!LANGUAGES.includes(document.languageId) || document.uri.scheme !== 'file') {
@@ -123,26 +164,31 @@ async function start(folder: vscode.WorkspaceFolder): Promise<void> {
     command: resolved.command,
     args: ['--stdio'],
     transport: TransportKind.stdio,
-    options: { env: serverEnvironment(settings, process.env) },
+    options: { env: serverEnvironment(process.env) },
   };
 
   const options: LanguageClientOptions = {
-    // The pattern is the only thing that keeps this client from also claiming files in a sibling
-    // folder — `workspaceFolder` below sets the `rootUri` and nothing else. It is written in the
-    // protocol's own shape (a `baseUri` string, LSP 3.18's `RelativePattern`) rather than as a
-    // `vscode.RelativePattern`: the client runs every selector through `asDocumentSelector`,
-    // which recognises only this form and silently converts anything else to `undefined` — and
-    // an undefined pattern matches on language and scheme alone, so every folder's client would
-    // claim every folder's files. Given this form it builds the `vscode.RelativePattern` itself,
-    // which is also what makes the path separator right on Windows by construction.
-    documentSelector: LANGUAGES.map((language) => ({
-      scheme: 'file',
-      language,
-      pattern: { baseUri: folder.uri.toString(), pattern: '**/*' },
-    })),
+    documentSelector: documentSelector(key),
     workspaceFolder: folder,
     outputChannel: channelFor(folder),
     initializationOptions: serverOptions(settings),
+    middleware: {
+      // The one place every client is visible at once, which is what this decision needs. The
+      // server registers the roots it has answers about; `claims` drops the ones another folder's
+      // server got to first, and forwards everything it does not recognise — the file watcher's
+      // registration carries no selector and has to arrive exactly as sent.
+      handleRegisterCapability: (params, next): Promise<void> => {
+        const narrowed = claims.narrow(key, params.registrations as Registration[]);
+        // `next` is typed as the protocol's `RequestHandler`, which takes a cancellation token as
+        // its second argument — but the client builds it as `nextParams =>
+        // this.doRegisterCapability(nextParams)` and there is no token anywhere to pass. Narrowed
+        // to the shape it actually has rather than handed an invented one.
+        const forward = next as unknown as (
+          forwarded: RegistrationParams
+        ) => void | Promise<void>;
+        return Promise.resolve(forward({ registrations: narrowed }));
+      },
+    },
     // No `synchronize.fileEvents`. The server registers its own watchers through
     // `client/registerCapability` — `ya-lsp.toml` and everything `index.include` covers —
     // which is what makes reload and on-disk freshness work in editors
@@ -158,6 +204,7 @@ async function start(folder: vscode.WorkspaceFolder): Promise<void> {
     await client.start();
   } catch (error) {
     clients.delete(key);
+    claims.release(key);
     void vscode.window.showErrorMessage(`ya-lsp failed to start: ${describe(error)}`);
     return;
   }
@@ -226,18 +273,29 @@ function filesIn(folder: vscode.WorkspaceFolder): FolderFiles {
   };
 }
 
-async function stop(key: string): Promise<void> {
+/**
+ * Stop one folder's client and give up the roots it had claimed.
+ *
+ * The roots are released here rather than by the caller because every route out of a running client
+ * comes through this function, and a root still marked as owned by a process that has gone is a gem
+ * file nobody answers about. Whether anyone should be rebuilt to pick it up is the caller's
+ * question: a client on its way to being restarted claims its own roots back a moment later, and
+ * `onFoldersChanged` is the one place where the loss is permanent.
+ */
+async function stop(key: string): Promise<string[]> {
   const client = clients.get(key);
   if (!client) {
-    return;
+    return [];
   }
   clients.delete(key);
+  const orphaned = claims.release(key);
   try {
     await client.stop();
   } catch {
     // A server that has already died cannot be stopped politely, and there is nothing the user
     // would do with the news.
   }
+  return orphaned;
 }
 
 async function restartAll(): Promise<void> {
@@ -252,16 +310,33 @@ async function restartAll(): Promise<void> {
 }
 
 async function onFoldersChanged(event: vscode.WorkspaceFoldersChangeEvent): Promise<void> {
+  const orphaned = new Set<string>();
   for (const folder of event.removed) {
     const key = folder.uri.toString();
-    // `stop` takes the client with it; the channel is this function's to close.
-    await stop(key);
+    // `stop` takes the client with it, and hands back whoever else wanted what it was holding;
+    // the channel is this function's to close.
+    for (const waiting of await stop(key)) {
+      orphaned.add(waiting);
+    }
     channels.get(key)?.dispose();
     channels.delete(key);
     reported.delete(key);
     suggested.delete(key);
   }
-  // Added folders start lazily, the same as the ones that were there at startup.
+
+  // Nothing here varies with the number of folders — the selector is the same shape for one folder
+  // and for twelve — so the only thing a removal can invalidate is a *claim*. The folder that went
+  // may have been the one answering about the gems, and a client that lost a root the first time
+  // cannot pick it up later: a selector is fixed at construction. So the clients that asked for a
+  // root nobody owns any more are rebuilt, and only those.
+  for (const key of orphaned) {
+    const folder = vscode.workspace.workspaceFolders?.find((f) => f.uri.toString() === key);
+    if (folder) {
+      await stop(key);
+      await start(folder);
+    }
+  }
+  // Added folders otherwise start lazily, the same as the ones that were there at startup.
 }
 
 async function onConfigurationChanged(event: vscode.ConfigurationChangeEvent): Promise<void> {

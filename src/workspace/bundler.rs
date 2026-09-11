@@ -135,6 +135,19 @@ enum Section {
     Other,
 }
 
+/// The file Bundler writes, which is the only one this module ever reads.
+pub const LOCKFILE_NAME: &str = "Gemfile.lock";
+
+/// Whether a lockfile locks `gem`, at any version and from any source.
+///
+/// Pure text over the parse this module already does, so there is nothing it cannot be asked.
+/// Its one caller is Rails detection, which must not go through `Workspace::gems()`: that
+/// returns early when `gems.enabled` is false and never reads a lockfile at all.
+#[must_use]
+pub fn locks(text: &str, gem: &str) -> bool {
+    parse(text).specs().any(|(_, spec)| spec.name == gem)
+}
+
 /// Parse a `Gemfile.lock`. Never fails: a malformed file yields whatever was still legible.
 #[must_use]
 pub fn parse(text: &str) -> Lockfile {
@@ -267,6 +280,15 @@ fn parse_ruby_version(line: &str) -> Option<String> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_locked_gem_is_found_by_name_whatever_its_version_or_source() {
+        let text = "GIT\n  remote: https://github.com/rails/rails\n  specs:\n    railties                     (8.1.0.alpha)\n\nGEM\n  specs:\n    rake (13.0.6)\n";
+        assert!(locks(text, "railties"));
+        assert!(locks(text, "rake"));
+        assert!(!locks(text, "rails"), "the metapackage is not railties");
+        assert!(!locks("", "railties"), "an empty lockfile locks nothing");
+    }
+
     use super::*;
 
     const REAL: &str = "\

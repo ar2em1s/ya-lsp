@@ -10,17 +10,24 @@
 
 use rubydex::model::{
     comment::Comment,
+    declaration::{Declaration, Namespace},
     definitions::{Parameter, Signatures},
     graph::Graph,
+    ids::DeclarationId,
 };
+use std::borrow::Cow;
 
 /// Turn a rubydex declaration name into Ruby.
 ///
 /// `Person::<Person>#build()` is how rubydex says `Person.build`, because it models singleton
 /// methods as members of a synthetic singleton class. Instance methods keep the `#` spelling,
 /// which is Ruby documentation's own spelling.
+///
+/// The graph is here for the other name rubydex invents — an anonymous `Class.new`, which is
+/// keyed by number and has to be looked up before it can be spelled. See [`spelled`].
 #[must_use]
-pub fn qualified_name(name: &str) -> String {
+pub fn qualified_name(graph: &Graph, name: &str) -> String {
+    let name = &*spelled(graph, name);
     let Some((owner, method)) = name.rsplit_once('#') else {
         return name.to_owned();
     };
@@ -45,7 +52,8 @@ pub fn qualified_name(name: &str) -> String {
 /// whether it was found in one file or across the project. The container is the *full* path —
 /// `self.baz` alone is ambiguous, and the picker has a column for exactly this.
 #[must_use]
-pub fn split_qualified(name: &str) -> (String, Option<String>) {
+pub fn split_qualified(graph: &Graph, name: &str) -> (String, Option<String>) {
+    let name = &*spelled(graph, name);
     if let Some((owner, method)) = name.rsplit_once('#') {
         let method = simple_name(method);
         return match singleton_parts(owner) {
@@ -77,6 +85,18 @@ fn singleton_parts(owner: &str) -> Option<(&str, &str)> {
     (prefix.is_empty() || prefix.ends_with(singleton)).then_some((prefix, singleton))
 }
 
+/// The class a singleton class hangs off: `Foo::Bar::<Bar>` -> `Foo::Bar`, `<Foo>` -> `Foo`.
+///
+/// `None` for every name that is not one, which is every name rubydex spells without angle
+/// brackets. A third caller of [`singleton_parts`] rather than a second copy of the rule: a
+/// sentence naming the receiver of `Foo.bar` and the container a symbol list prints beside
+/// `self.bar` are the same question about the same string.
+#[must_use]
+pub fn class_object_of(name: &str) -> Option<&str> {
+    let (prefix, singleton) = singleton_parts(name)?;
+    Some(if prefix.is_empty() { singleton } else { prefix })
+}
+
 fn non_empty(name: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
@@ -85,6 +105,87 @@ fn non_empty(name: &str) -> Option<String> {
 #[must_use]
 pub fn simple_name(raw: &str) -> &str {
     raw.strip_suffix("()").unwrap_or(raw)
+}
+
+/// rubydex's suffix for a class or module it had nothing to call.
+const ANONYMOUS: &str = "<anonymous>";
+
+/// Whether rubydex named this one by number because nothing named it in Ruby.
+///
+/// `Class.new` and `Module.new` are expressions, so what they build has no name until something
+/// binds it to a constant — and where nothing does, rubydex keys it by the document and the
+/// offset it was written at: `15613248007104500482:144<anonymous>`.
+#[must_use]
+pub fn is_anonymous(name: &str) -> bool {
+    name.contains(ANONYMOUS)
+}
+
+/// A name with every number rubydex invented replaced by the call that built it.
+///
+/// **There is nothing better to print.** Measured over the five corpora, 571 anonymous
+/// namespaces own a method — the only ones a hover card or a picker row can reach — and not one
+/// of them is bound to a constant that names it: rubydex already names `Foo = Class.new do …
+/// end` `Foo`, in a method body, a block, a `class << self` and under any superclass path, so
+/// what is left anonymous is what Ruby left anonymous. The 31 written `Foo = Class.new { … }.new`
+/// are not the exception they look like — there the constant is an *instance* of the class, and
+/// lending its name to the class would print something untrue.
+///
+/// **Every occurrence, not the first.** A singleton method of one is
+/// `<id>:<offset><anonymous>::<<id>:<offset><anonymous>>#call`, and replacing both halves with
+/// the same string is what lets [`singleton_parts`] recognise the shape and spell the whole of
+/// it `Class.new.call`.
+///
+/// Borrowed unless there is something to replace: this runs once per completion item, and a
+/// list is capped at 512 of them.
+fn spelled<'n>(graph: &Graph, name: &'n str) -> Cow<'n, str> {
+    if !is_anonymous(name) {
+        return Cow::Borrowed(name);
+    }
+    let mut spelled = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(marker) = rest.find(ANONYMOUS) {
+        let end = marker + ANONYMOUS.len();
+        match keyed_at(&rest[..marker]) {
+            Some(start) => {
+                spelled.push_str(&rest[..start]);
+                spelled.push_str(constructor(graph, &rest[start..end]));
+            }
+            // A suffix with no key in front of it is not a name rubydex wrote. Left alone
+            // rather than guessed at: a display name is the one thing that must not invent.
+            None => spelled.push_str(&rest[..end]),
+        }
+        rest = &rest[end..];
+    }
+    spelled.push_str(rest);
+    Cow::Owned(spelled)
+}
+
+/// Where the `15613248007104500482:144` in front of an [`ANONYMOUS`] suffix begins — a document
+/// id, a colon, and an offset, each at least one digit.
+///
+/// The prefix is what a name is *keyed* by, so it is also what the graph is asked for. Digits
+/// and one colon, never more: a `::` walked back over would swallow the namespace in front of
+/// it and spell `Foo::<id>:<offset><anonymous>` as though the `Foo` were not there.
+fn keyed_at(head: &str) -> Option<usize> {
+    let offset = head.trim_end_matches(|character: char| character.is_ascii_digit());
+    let document = offset.strip_suffix(':')?;
+    let start = document.trim_end_matches(|character: char| character.is_ascii_digit());
+    (offset.len() < head.len() && start.len() < document.len()).then_some(start.len())
+}
+
+/// Which of the two calls built it.
+///
+/// rubydex spells both the same way, so the declaration it keyed is the only thing that says
+/// which — and across the five corpora 365 of the 571 that own a method are modules, so a
+/// spelling that guessed would be wrong more often than right. Nothing guarantees the owner
+/// survived the walk that reached its member, and a key the graph has lost is still spelled
+/// rather than printed: `Class.new` names the construct either way, and a module is a narrower
+/// claim to make about something no longer there.
+fn constructor(graph: &Graph, keyed: &str) -> &'static str {
+    match graph.declarations().get(&DeclarationId::from(keyed)) {
+        Some(Declaration::Namespace(Namespace::Module(_))) => "Module.new",
+        _ => "Class.new",
+    }
 }
 
 /// Whether a declaration has a name a person could have written.
@@ -627,7 +728,17 @@ fn is_directive(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rubydex::model::declaration::{ClassDeclaration, ModuleDeclaration};
     use rubydex::offset::Offset;
+
+    /// An empty graph, for the spellings that never reach one.
+    ///
+    /// Every name below is one Ruby wrote, and [`spelled`] leaves those alone without asking —
+    /// so the graph these are handed is only there to satisfy the signature that the anonymous
+    /// `Class.new` needs. The tests that do reach it build a real one.
+    fn no_graph() -> Graph {
+        Graph::new()
+    }
 
     fn comments(lines: &[&str]) -> Vec<Comment> {
         lines
@@ -796,8 +907,28 @@ Option examples:
         // The path is what a nested class needs (`Foo::Bar.baz`), and a top-level class has no
         // path at all — there the singleton *is* the whole name. Prepending an empty prefix
         // would spell it `.build`.
-        assert_eq!(qualified_name("<Person>#build()"), "Person.build");
-        assert_eq!(qualified_name("Object::<Object>#puts()"), "Object.puts");
+        assert_eq!(
+            qualified_name(&no_graph(), "<Person>#build()"),
+            "Person.build"
+        );
+        assert_eq!(
+            qualified_name(&no_graph(), "Object::<Object>#puts()"),
+            "Object.puts"
+        );
+    }
+
+    #[test]
+    fn a_singleton_class_is_named_by_the_class_it_hangs_off() {
+        // The same three cases `qualified_name` has for a singleton *method*, asked of the
+        // class itself: a nested one answers the path, a top-level one answers the whole name,
+        // and everything else is not a singleton at all. `locator::missed` is the caller — a
+        // card saying what a receiver turned out to be has to name something a reader can open,
+        // and `Person::<Person>` is not that.
+        assert_eq!(class_object_of("Foo::Bar::<Bar>"), Some("Foo::Bar"));
+        assert_eq!(class_object_of("<Person>"), Some("Person"));
+        assert_eq!(class_object_of("Person"), None);
+        // And the shape `singleton_parts` refuses: angle brackets naming somebody else.
+        assert_eq!(class_object_of("Foo::<Bar>"), None);
     }
 
     #[test]
@@ -831,14 +962,120 @@ Option examples:
     fn singleton_methods_are_spelled_the_way_ruby_writes_them() {
         // rubydex models `def self.build` as a member of a synthetic singleton class. Showing
         // that spelling to a user would be showing them an implementation detail.
-        assert_eq!(qualified_name("Person::<Person>#build()"), "Person.build");
-        assert_eq!(qualified_name("Person#shout()"), "Person#shout");
+        assert_eq!(
+            qualified_name(&no_graph(), "Person::<Person>#build()"),
+            "Person.build"
+        );
+        assert_eq!(
+            qualified_name(&no_graph(), "Person#shout()"),
+            "Person#shout"
+        );
         // The whole path, the same as the instance-method spelling above it: hover on two
         // methods of one class must not name the class two different ways.
-        assert_eq!(qualified_name("Foo::Bar::<Bar>#baz()"), "Foo::Bar.baz");
+        assert_eq!(
+            qualified_name(&no_graph(), "Foo::Bar::<Bar>#baz()"),
+            "Foo::Bar.baz"
+        );
         // Not a method at all: namespaces and constants pass through untouched.
-        assert_eq!(qualified_name("Person::MAX_AGE"), "Person::MAX_AGE");
-        assert_eq!(qualified_name("Person"), "Person");
+        assert_eq!(
+            qualified_name(&no_graph(), "Person::MAX_AGE"),
+            "Person::MAX_AGE"
+        );
+        assert_eq!(qualified_name(&no_graph(), "Person"), "Person");
+    }
+
+    /// A graph holding one namespace under the key rubydex would have filed it under.
+    fn graph_holding(key: &str, namespace: Namespace) -> Graph {
+        let mut graph = Graph::new();
+        graph
+            .declarations_mut()
+            .insert(DeclarationId::from(key), Declaration::Namespace(namespace));
+        graph
+    }
+
+    const KEY: &str = "12345:678<anonymous>";
+
+    #[test]
+    fn a_class_ruby_never_named_is_spelled_as_the_call_that_built_it() {
+        // `Class.new` with nothing binding it to a constant: rubydex keys it by document and
+        // offset, which is a number an editor was printing straight at the user.
+        let graph = graph_holding(
+            KEY,
+            Namespace::Class(Box::new(ClassDeclaration::new(
+                KEY.to_owned(),
+                DeclarationId::from("Object"),
+            ))),
+        );
+        assert_eq!(qualified_name(&graph, KEY), "Class.new");
+        assert_eq!(
+            qualified_name(&graph, &format!("{KEY}#call()")),
+            "Class.new#call"
+        );
+        // Both halves of a singleton owner, which is the whole reason every occurrence is
+        // replaced rather than the first: one spelling on both sides is what `singleton_parts`
+        // recognises, and it turns the pair back into a `.`.
+        assert_eq!(
+            qualified_name(&graph, &format!("{KEY}::<{KEY}>#call()")),
+            "Class.new.call"
+        );
+        // The picker splits the same name into the same two halves.
+        assert_eq!(
+            split_qualified(&graph, &format!("{KEY}#call()")),
+            ("call".to_owned(), Some("Class.new".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_module_is_not_spelled_as_a_class() {
+        // rubydex spells both the same, and over the five corpora 365 of the 571 anonymous
+        // namespaces that own a method are modules — so the declaration decides. Assuming
+        // would be wrong more often than right.
+        let graph = graph_holding(
+            KEY,
+            Namespace::Module(Box::new(ModuleDeclaration::new(
+                KEY.to_owned(),
+                DeclarationId::from("Object"),
+            ))),
+        );
+        assert_eq!(qualified_name(&graph, KEY), "Module.new");
+        assert_eq!(
+            qualified_name(&graph, &format!("{KEY}#call()")),
+            "Module.new#call"
+        );
+    }
+
+    #[test]
+    fn a_key_the_graph_does_not_hold_is_still_not_a_number() {
+        // A name is rendered from whatever the request is holding, and nothing guarantees the
+        // owner survived the walk that reached its member. The commoner reading beats the key.
+        assert_eq!(
+            qualified_name(&no_graph(), &format!("{KEY}#call()")),
+            "Class.new#call"
+        );
+    }
+
+    #[test]
+    fn a_suffix_with_no_key_in_front_of_it_is_left_alone() {
+        // rubydex writes the key and the suffix together, so none of these is a name it wrote.
+        // They are here because the alternative — walking back over whatever precedes the
+        // suffix — swallows a namespace that is really there, and the last line is the one
+        // that proves it does not.
+        assert_eq!(
+            qualified_name(&no_graph(), "Foo<anonymous>"),
+            "Foo<anonymous>"
+        );
+        assert_eq!(
+            qualified_name(&no_graph(), "12:<anonymous>"),
+            "12:<anonymous>"
+        );
+        assert_eq!(
+            qualified_name(&no_graph(), ":5<anonymous>"),
+            ":5<anonymous>"
+        );
+        assert_eq!(
+            qualified_name(&no_graph(), "Foo::12:3<anonymous>"),
+            "Foo::Class.new"
+        );
     }
 
     #[test]
@@ -859,24 +1096,27 @@ Option examples:
         // The label matches the outline's spelling; the container is the *whole* path, because
         // `self.baz` on its own does not say which class it hangs off.
         assert_eq!(
-            split_qualified("Foo::Bar::<Bar>#baz()"),
+            split_qualified(&no_graph(), "Foo::Bar::<Bar>#baz()"),
             ("self.baz".to_owned(), Some("Foo::Bar".to_owned()))
         );
         // A top-level `class << Foo` has no prefix to fall back on, only the attached name.
         assert_eq!(
-            split_qualified("<Person>#build()"),
+            split_qualified(&no_graph(), "<Person>#build()"),
             ("self.build".to_owned(), Some("Person".to_owned()))
         );
         assert_eq!(
-            split_qualified("Person#shout()"),
+            split_qualified(&no_graph(), "Person#shout()"),
             ("shout".to_owned(), Some("Person".to_owned()))
         );
         assert_eq!(
-            split_qualified("Person::MAX_AGE"),
+            split_qualified(&no_graph(), "Person::MAX_AGE"),
             ("MAX_AGE".to_owned(), Some("Person".to_owned()))
         );
         // Top level: a container of `""` would render as an empty column.
-        assert_eq!(split_qualified("Person"), ("Person".to_owned(), None));
+        assert_eq!(
+            split_qualified(&no_graph(), "Person"),
+            ("Person".to_owned(), None)
+        );
     }
 
     #[test]

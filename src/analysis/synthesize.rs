@@ -31,558 +31,267 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Instant;
 
 use rubydex::model::{
     definitions::{Definition, Mixin, Receiver},
     document::Document,
-    ids::{NameId, StringId, UriId},
+    graph::Graph,
+    ids::{DeclarationId, NameId, StringId, UriId},
     name::ParentScope,
 };
+use rubydex::query::{self, MatchMode};
 
-use super::{Analysis, annotations, locator::Site, render, structs, synthesized, views::Views};
-use crate::generated::{Facts, Owner};
-use crate::workspace::{DocUri, rails};
+use super::{
+    Analysis, environment, locator, locator::Site, render, synthesized, synthesized::Synthesized,
+    views::Views,
+};
+use crate::generated::{At, Named, candidates};
+use crate::knowledge::{self, Context, Contribution, ListId, Registry, Seen, Wants};
+use crate::workspace::DocUri;
 
-/// Which projection of the user's own documents a generator reads.
-///
-/// A generator names one of these rather than writing its own loop, which is what keeps
-/// [`Analysis::walk`] one pass over the graph however many generators there are. The
-/// projections are not disjoint and are not meant to be: a model file with a `@return` tag is
-/// on two of these lists and feeds two generators.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) enum List {
-    /// Documents whose name ends `schema.rb`. Whether one really *is* a schema is
-    /// [`rails::is_schema`]'s decision, not this list's — the suffix is the cheap half.
-    Schemas,
-    /// Documents that say something about the **name** of a table rather than about its
-    /// columns: `self.table_name=`, which is the escape from every naming convention the schema
-    /// generator applies, and the two ways a namespace declares the prefix every table under
-    /// it carries.
+impl Analysis {
+    /// Find the file Rails writes each generated query method in, now the graph can say.
     ///
-    /// One list and not two, because [`rails::read_table_names`] is one walk: a file that says
-    /// both would otherwise be parsed twice to be told the same thing.
-    Renamed,
-    /// Documents that call one of [`rails::MACROS`].
-    Models,
-    /// Documents holding a `sig` call, or a `@return`/`@param` tag above a `def`.
-    Annotated,
-    /// Documents defining a class that [`rails::convention_of`] recognises — a mailer, a job or
-    /// a Sidekiq worker. The only list filled by what a class *inherits* rather than by
-    /// anything the file calls, because these two conventions have no macro to look for.
-    Entrypoints,
-    /// Documents that reference the constant `Struct` or `Data`.
+    /// **Run after the resolve and never inside the pass**, which is not a preference: the
+    /// generators write the text rubydex is about to link, so while one is running the graph
+    /// holds four declarations — `Object`, `BasicObject`, `Module` and `Class` — and every
+    /// question about a gem's classes answers nothing. The pass therefore states *names* and
+    /// this answers them, one step later in the same settle.
     ///
-    /// The one list filled by a **constant** reference rather than by a call, a path or a
-    /// superclass, and it has to be: what puts a document here is `Struct.new`, whose *method*
-    /// name is `new` — a filter no file in any corpus would fail. The constant is the rare half
-    /// (136 of discourse's 11,875 `.rb` files mention either name) and rubydex records it at
-    /// index time exactly as it records a method reference.
-    Structs,
-    /// Documents named `routes.rb`. Whether one really is an application's routes is
-    /// [`rails::is_routes`]' decision, exactly as the schema list defers to [`rails::is_schema`];
-    /// the files a routes file *draws* are not on this list at all, because which they are is
-    /// something only the file that draws them says.
-    Routes,
+    /// Asked again on every settle rather than cached across one, for the reason the rest of
+    /// this module gives about stale answers: a bundle can change under a workspace, and a jump
+    /// into the version that went away is silent. What bounds the cost is that the answers are
+    /// memoised **within** a settle — the class side is written onto every base in the project
+    /// and states the same names on each, so a project with six bases asks the graph once and
+    /// reads the memo five times.
+    pub(super) fn place_generated_members(&mut self) {
+        if self.synthesized.named().next().is_none() {
+            return;
+        }
+        let started = Instant::now();
+        let mut rails = Owners::new(&self.graph, &self.knowledge);
+        let layout = self.layout();
+        // Collected before anything is written, because resolving reads the table a place is
+        // written into — `locator::places` consults it to tell a generated definition from one
+        // on disk, and it must see the same table for every member in one settle.
+        let placed: Vec<(UriId, Vec<synthesized::Mapping>)> = self
+            .synthesized
+            .named()
+            .map(|(document, named)| {
+                (
+                    document,
+                    rails.mappings(&self.graph, &self.synthesized, layout, named),
+                )
+            })
+            .collect();
+        let found = placed.iter().map(|(_, found)| found.len()).sum::<usize>();
+        let asked = placed.len();
+
+        for (document, found) in placed {
+            self.synthesized.place(document, found);
+        }
+        tracing::debug!(
+            "{found} of the members {asked} generated documents declare themselves have a \
+             definition in the bundle, in {:.2?}",
+            started.elapsed()
+        );
+    }
 }
 
-/// The test that puts a document on one list.
+/// Where a generated member is really defined, for the ones whose place is somebody else's file.
 ///
-/// Three predicates, and the whole of what a generator may ask the graph for before anything is
-/// resolved. Each is a filter over the definitions and references indexing already recorded, so
-/// none of them opens a file: the count of files a generator then reads is the count of files
-/// that really do call one of these.
-struct Wants {
-    list: List,
-    /// Receiverless call names that put a document on the list.
-    calls: &'static [&'static str],
-    /// Constant names that put a document on the list, matched on the last segment.
+/// # The one kind of generated member whose place is not a line the generator read
+///
+/// Every other generator's place is a line in the document it just read: a column's is the
+/// `t.string "title"` in `db/schema.rb`, an association's the `has_many :comments`. Some members
+/// have no such line — nothing in a project declares `Story.where` — which is why they were
+/// written with no span at all and why a *Resolved* card over one sent a reader nowhere.
+///
+/// They do have a definition, and the bundle is already indexed: `where` is a `def` in
+/// activerecord's `relation/query_methods.rb`. So the place is found rather than read, by asking
+/// the graph the question Ruby asks — walk this class' ancestors for this name — and the answer
+/// is `Method#owner`'s by construction, because rubydex built those ancestors out of the
+/// framework's own `include` line.
+///
+/// **This is a lookup and never a name match.**
+/// [`Knowledge::places_members_on`](crate::knowledge::Knowledge::places_members_on) is where the
+/// classes come from, one list per module and per side; a member is found on one of them or it is
+/// not found, and not found means no place, exactly as before. Two things follow that are worth
+/// saying out loud. A framework that moves a name loses its place and gains nothing wrong; and a
+/// project with no bundle indexed is where it was.
+///
+/// # What is deliberately not looked up
+///
+/// The callbacks. `before_save` is built by `define_model_callbacks`, and a jump into the
+/// machinery that defines a *family* of methods tells a reader nothing about the one they asked
+/// about — `workspace/rails/relations.rs`'s own argument, written before this existed and not
+/// overturned by it. The line is between *the file that defines this method* and *the file that
+/// defines methods*.
+struct Owners {
+    /// The owners to walk, in order, for a member on each side: instance, then class object.
+    owners: [Vec<DeclarationId>; 2],
+    /// `(singleton, name)` -> where Rails writes it, or that nothing does.
     ///
-    /// The fourth predicate. Matching the last segment rather than the whole
-    /// path means somebody's own `Foo::Struct` puts its file on the list too, which costs one
-    /// parse and declines — the direction every filter here errs in, because the alternative is
-    /// missing `::Struct` and every spelling of a reference nobody has thought of.
-    constants: &'static [&'static str],
-    /// Singleton method names whose **definition** puts a document on the list.
-    ///
-    /// The fifth predicate, and the only one that reads a `def` rather than a reference. It has to: `def self.table_name_prefix` is how a module says every class
-    /// under it reads a prefixed table, and a module that writes it calls nothing at all — it
-    /// would be on no list by any of the four tests above. The receiver is checked because an
-    /// instance method of that name is a different method.
-    defines: &'static [&'static str],
-    /// A file-name suffix that puts a document on the list.
-    path: Option<&'static str>,
-    /// Whether a `@return`/`@param` tag in a comment above a `def` puts it on the list.
-    tags: bool,
-    /// Whether a class this document defines being one of [`rails::convention_of`]'s puts it on
-    /// the list.
-    inherits: bool,
-    /// Whether a **Rails engine's** document may go on this list, or only the user's own code.
-    ///
-    /// One sentence: a list is open to an engine when what it reads
-    /// declares members on a class the reader can name, and closed when it declares something
-    /// scoped to an application. `has_many` on `ActiveStorage::Blob` is the first; a
-    /// `db/schema.rb` is the second — it is *this application's* database, and an engine ships
-    /// migrations rather than a dump of one anyway.
-    ///
-    /// An engine's `config/routes.rb` is the case that looks like the second and is the first,
-    /// which is why gate 1 walks a gem's `config/` and this row is open. Four of the seven
-    /// engines that ship one draw into `Rails.application.routes`, whose helpers really are the
-    /// application's; the other three draw into their own, reached as `blazer.queries_path`
-    /// after a `mount`. [`rails::Whose`] is the discriminator, and it is receiver **and** file
-    /// location rather than either alone.
-    engines: bool,
+    /// A miss is cached as eagerly as a hit. Most of what arrives here is a miss — a project's
+    /// bases are many and its query interface is one list — and re-asking the graph for a name
+    /// that was not there last time is the commonest thing this could get wrong about cost.
+    found: HashMap<(bool, String), Option<Site>>,
 }
 
-/// Every list, and what fills it. A generator that wants a new list adds a row.
-const WANTS: [Wants; 7] = [
-    Wants {
-        list: List::Schemas,
-        calls: &[],
-        constants: &[],
-        defines: &[],
-        path: Some("schema.rb"),
-        tags: false,
-        inherits: false,
-        // an engine ships migrations, never a `schema.rb`, and gate 1 does not walk a gem's `db/`
-        engines: false,
-    },
-    Wants {
-        list: List::Renamed,
-        calls: &["table_name=", "isolate_namespace"],
-        constants: &[],
-        defines: &["table_name_prefix", "table_name_suffix"],
-        path: None,
-        tags: false,
-        inherits: false,
-        // the input to a generator that is itself closed
-        engines: false,
-    },
-    Wants {
-        list: List::Models,
-        calls: &rails::MACROS,
-        constants: &[],
-        defines: &[],
-        path: None,
-        tags: false,
-        inherits: false,
-        // `has_many` on `ActiveStorage::Blob` is a member of a class the user names
-        engines: true,
-    },
-    Wants {
-        list: List::Annotated,
-        calls: &["sig"],
-        constants: &[],
-        defines: &[],
-        path: None,
-        tags: true,
-        inherits: false,
-        // a `@return` an engine's author wrote is about the engine's own method
-        engines: true,
-    },
-    Wants {
-        list: List::Entrypoints,
-        calls: &[],
-        constants: &[],
-        defines: &[],
-        path: None,
-        tags: false,
-        inherits: true,
-        // `ActiveStorage::AnalyzeJob` really does get `perform_later`
-        engines: true,
-    },
-    Wants {
-        list: List::Routes,
-        calls: &[],
-        constants: &[],
-        defines: &[],
-        path: Some("routes.rb"),
-        tags: false,
-        inherits: false,
-        // an engine's `config/routes.rb` may name the *host application's* helpers, and
-        // `rails::Whose` is what decides whether this one does
-        engines: true,
-    },
-    Wants {
-        list: List::Structs,
-        calls: &[],
-        constants: &["Struct", "Data"],
-        defines: &[],
-        path: None,
-        tags: false,
-        inherits: false,
-        // `Point = Struct.new(:x)` in a gem's `app/` declares `Point#x`, which is the engine
-        // rule read straight: the members are on a class the reader can name, and nothing about
-        // the call is scoped to an application
-        engines: true,
-    },
-];
+impl Owners {
+    /// Every registered module's own, resolved once per settle.
+    ///
+    /// The names come from [`knowledge::Knowledge::places_members_on`] and the lookup is core's:
+    /// this runs **after** the resolve, so the graph can answer, which is the one thing a module
+    /// may not assume while it is declaring.
+    fn new(graph: &Graph, knowledge: &Registry) -> Self {
+        let resolve = |names: &[&str]| -> Vec<DeclarationId> {
+            names
+                .iter()
+                .flat_map(|name| query::declaration_search(graph, &[name], &MatchMode::Exact))
+                .collect()
+        };
+        let mut owners: [Vec<DeclarationId>; 2] = [Vec::new(), Vec::new()];
+        for module in knowledge.modules() {
+            let [instance, singleton] = module.places_members_on();
+            owners[0].extend(resolve(instance));
+            owners[1].extend(resolve(singleton));
+        }
+        Self {
+            owners,
+            found: HashMap::new(),
+        }
+    }
+
+    /// One `Mapping` per member this can place, and nothing at all for the rest.
+    fn mappings(
+        &mut self,
+        graph: &Graph,
+        synthesized: &Synthesized,
+        layout: environment::Layout<'_>,
+        named: &[Named],
+    ) -> Vec<synthesized::Mapping> {
+        named
+            .iter()
+            .filter_map(|member| {
+                let declared = self.site(graph, synthesized, layout, member)?;
+                Some(synthesized::Mapping {
+                    generated: member.generated,
+                    declared,
+                })
+            })
+            .collect()
+    }
+
+    fn site(
+        &mut self,
+        graph: &Graph,
+        synthesized: &Synthesized,
+        layout: environment::Layout<'_>,
+        member: &Named,
+    ) -> Option<Site> {
+        let key = (member.singleton, member.name.clone());
+        if let Some(cached) = self.found.get(&key) {
+            return cached.clone();
+        }
+        let site = self.walk(graph, synthesized, layout, member);
+        self.found.insert(key, site.clone());
+        site
+    }
+
+    fn walk(
+        &self,
+        graph: &Graph,
+        synthesized: &Synthesized,
+        layout: environment::Layout<'_>,
+        member: &Named,
+    ) -> Option<Site> {
+        // rubydex spells a method that takes anything at all `where()` and one that takes
+        // nothing `first`, and the spelling is not derivable from this side: what ya-lsp wrote is
+        // an RBS parameter list and what Rails wrote is a `def`. Both are asked, which is what
+        // `references` already does with the same two spellings for the same reason.
+        let spellings = [
+            StringId::from(member.name.as_str()),
+            StringId::from(&*format!("{}()", member.name)),
+        ];
+        self.owners[usize::from(member.singleton)]
+            .iter()
+            .find_map(|owner| {
+                // **A hit on the object model is not an answer**, the same rule and the same
+                // reason as [`locator::ruby_s_own`]: every ancestor walk terminates at `Object`,
+                // and `Kernel` alone declares `select`, `format`, `open` and `test`. The
+                // corpora found this and the suite could not have: four positions over the six
+                // answered `select` with `IO.select` in `core/kernel.rbs`, each of them a
+                // *Resolved* or *Derived* card pointing at a method nobody was asking about —
+                // the one failure this whole lookup has to be incapable of.
+                //
+                // Written inside the spelling loop rather than around it so that a root hit for
+                // one spelling cannot suppress the other's real answer. No fixture distinguishes
+                // the two placements; this is the conservative one.
+                let found = spellings.iter().find_map(|spelling| {
+                    query::find_member_in_ancestors(graph, *owner, *spelling, false)
+                        .ok()
+                        .filter(|found| !locator::ruby_s_own(graph, *found))
+                })?;
+                // The same list a jump would offer, so a borrowed place obeys every rule a read
+                // one does: an `.rbs` stub loses to the source beside it, and a second copy of
+                // one library under a later load path is not a second place. No cursor, because
+                // this is decided once for the project and not per request — which leaves the
+                // test-tree fence off, the direction that keeps more rather than less.
+                locator::places(graph, synthesized, layout, found, None)
+                    .into_iter()
+                    .next()
+            })
+    }
+}
 
 /// The `StringId`s one document is filtered against, hashed once.
 ///
 /// A struct rather than two locals inside the loop because the loop body is callable for
 /// **one** document: the gate re-asks [`Analysis::contribution`] of the document a keystroke
-/// touched, and building the filter per call would hash all of [`rails::MACROS`] to answer about
+/// touched, and building the filter per call would hash every registered row's names to answer
 /// a single file.
 struct Filters {
-    /// Per [`WANTS`] row, the hashes of its `calls`.
+    /// Per registered row, the hashes of its `calls`.
     calls: Vec<Vec<StringId>>,
-    /// Per [`WANTS`] row, the hashes of its `constants`.
+    /// Per registered row, the hashes of its `modules`.
+    modules: Vec<Vec<StringId>>,
+    /// Per registered row, the hashes of its `constants`.
     constants: Vec<Vec<StringId>>,
 }
 
 impl Filters {
-    fn new() -> Self {
+    fn new(knowledge: &Registry) -> Self {
+        let hashes = |of: fn(&Wants) -> &'static [&'static str]| -> Vec<Vec<StringId>> {
+            knowledge
+                .wants()
+                .iter()
+                .map(|want| of(want).iter().map(|name| StringId::from(*name)).collect())
+                .collect()
+        };
         Self {
-            calls: WANTS
-                .iter()
-                .map(|want| {
-                    want.calls
-                        .iter()
-                        .map(|name| StringId::from(*name))
-                        .collect()
-                })
-                .collect(),
-            constants: WANTS
-                .iter()
-                .map(|want| {
-                    want.constants
-                        .iter()
-                        .map(|name| StringId::from(*name))
-                        .collect()
-                })
-                .collect(),
+            calls: hashes(|want| want.calls),
+            modules: hashes(|want| want.modules),
+            constants: hashes(|want| want.constants),
         }
     }
 }
 
-/// What **one document** contributes to a [`Context`], and nothing else.
+/// How many documents each generator was handed, for the one line that says the pass ran.
 ///
-/// The walk is a projection — every field below is filled from this one document — and it is
-/// callable per document rather than being one loop that writes straight into the merged
-/// [`Context`], because otherwise the cheapest question in the pass is unanswerable: *did the
-/// document a keystroke touched contribute anything different?* [`Context::absorb`] is the only
-/// thing that merges one.
-///
-/// **`Hash` is the point of the type rather than a convenience.** What is stored per document is
-/// [`fingerprint`]'s eight bytes, so the gate compares those instead of the strings; and it is a
-/// hash of *what the document contributes* and not of the document, so a comment, a local
-/// variable, a whole method body — anything no field here reads — moves nothing.
-///
-/// Every field is a `Vec` in the order the document's definitions are recorded, which is
-/// deterministic for a given file. The **merge** is what must not depend on the order documents
-/// are visited in, and [`Context::absorb`] and [`Context::settle`] are where that is paid for.
-#[derive(Debug, Default, PartialEq, Eq, Hash)]
-struct Contribution {
-    /// Which [`WANTS`] lists this document joins.
-    lists: Vec<List>,
-    /// `(table, the top-level class whose own name implies it)`.
-    claims: Vec<(String, String)>,
-    /// The nested classes it defines.
-    nested: Vec<String>,
-    /// The route-helper hosts it defines.
-    hosts: Vec<Owner>,
-    /// The helper modules it defines, when the document is one of Rails' helper files.
-    helpers: Vec<String>,
-    /// `(class, the superclass it names)` — the input to both `superclasses` and `defined_in`,
-    /// which are filled by one `if let` and must stay that way.
-    superclasses: Vec<(String, String)>,
-    /// `(name, whether the line said `module`)`, feeding `classes`, `modules` and `namespaces`.
-    declared: Vec<(String, bool)>,
-    /// `(the body that wrote the `include`, the constant it spelled)`.
-    included: Vec<(String, String)>,
-}
-
-/// The eight bytes stored per document, so the walk can be skipped.
-///
-/// `DefaultHasher` rather than anything stronger because the comparison is always *this
-/// document against its own previous value* within one process: a collision would have to be
-/// between two contributions of one file, at 2^-64 per keystroke.
-fn fingerprint(contribution: &Contribution) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    contribution.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Everything the generators need from the graph, gathered in one pass.
-///
-/// Nothing here is a decision: which schema files are really schemas, which class claims which
-/// table and which association may be believed are all settled by the generator that asks, so
-/// that this stays one loop over the documents rather than one per generator.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct Context {
-    /// The documents on each list, sorted. Absent means empty.
-    pub(super) documents: BTreeMap<List, Vec<String>>,
-    /// Every class or module the application defines — **and every one a Rails engine defines
-    /// under its `app/`** — fully spelled.
-    ///
-    /// The bound on what a macro may name, widened by exactly one directory per gem. A gem that happens to define `class Story` in its `lib/` is still not this
-    /// application's model, so an association naming it declares nothing — the same answer a
-    /// misspelled one gets, reached without asking whether the spelling was a mistake. What
-    /// changed is that `ActiveStorage::Blob` *is* nameable now, because an engine's `has_many
-    /// :variant_records` has to reach `ActiveStorage::VariantRecord` and both sit under `app/`.
-    ///
-    /// Two of this struct's fields deliberately did **not** widen with it — `claims` and
-    /// `hosts` — because they mean "the application" rather than "a class the reader can name".
-    /// Their docstrings say so at the point they are filled.
-    pub(super) classes: BTreeSet<String>,
-    /// The subset of `classes` written as `module` rather than as `class`.
-    ///
-    /// **Not read by the macro reader.** Whether a body is a module is a property of the file
-    /// a generator is already reading, so `read_model` learns it from the source and never asks
-    /// the graph. What needs this is a question about a name's **namespace**, which is somebody
-    /// else's file: `Facts::render` asks it here, because a segment may be joined onto a
-    /// generated name only where the application declares it. The concern fan-out wants it for
-    /// the other reason — deciding that an `include Storyish` names a concern *this application
-    /// defines* is a question about the graph and not about the file the `include` is written
-    /// in.
-    pub(super) modules: BTreeSet<String>,
-    /// A class the application defines, and the superclass it names, spelled as written.
-    ///
-    /// A mailer and a job have no macro at all and are recognised by what
-    /// they inherit. Spelled as written rather than qualified, because the test is a suffix —
-    /// `ApplicationMailer` — and a lexical nesting the reference does not have would only make
-    /// the string longer.
-    pub(super) superclasses: BTreeMap<String, String>,
-    /// A class the application defines, and the document that says what it inherits.
-    ///
-    /// A document that names a **superclass** rather than any document that reopens the name:
-    /// a model reopened in a second file to nest something under it writes its own name twice,
-    /// and only one of the two says what it is. It is the same defect `claims` has to guard
-    /// against, and the same `if let Some(superclass)` answers both.
-    ///
-    /// Where more than one still does — solidus reopens `class Spree::Product < Spree::Base` in
-    /// its specs — the **lowest URI** wins rather than the last one walked, because this loop
-    /// visits the graph's documents in no defined order and a generated document that moves
-    /// between runs is a difference waiting to matter. It is `settle`'s rule applied one field
-    /// earlier.
-    ///
-    /// What it is for is emission, and only for a model no macro names: a class no macro
-    /// anywhere asks about has no document that asked for its relation, so its own is where the
-    /// relation goes. Every element that already had a home **keeps it** —
-    /// [`Analysis::model_declarations`] has what moving them cost.
-    pub(super) defined_in: BTreeMap<String, String>,
-    /// Every ActiveRecord model the application defines, fully spelled.
-    ///
-    /// [`models_of`] is the walk and its docstring is the argument. Computed once after the
-    /// loop below rather than asked per name, because the question is a *chain* — `Spree::Order`
-    /// is two hops from `ActiveRecord::Base` and 15 of solidus' models are four or five — and a
-    /// chain can only be walked when every link is in `superclasses`.
-    pub(super) models: BTreeSet<String>,
-    /// Table name -> the top-level classes whose own name implies it.
-    pub(super) claims: BTreeMap<String, Vec<String>>,
-    /// Every **nested** class the application's own code defines, fully spelled.
-    ///
-    /// The table-name reader's input, and it is a second list rather than a widening of `claims` because the
-    /// table a nested class reads cannot be computed here at all: `compute_table_name` puts
-    /// `full_table_name_prefix` in front of it, and that is a `def self.table_name_prefix` in
-    /// somebody else's file — a *document*, which no projection of the definitions can read.
-    /// So the inflection moves to [`Analysis::model_tables`], which is where the prefixes are,
-    /// and this list is only the names that are eligible to have one.
-    ///
-    /// `own` for `claims`' own reason: a table is the *application's* database table. It is not
-    /// filtered to models here either, because whether a class is one is a walk up
-    /// `superclasses`, and that map is only complete when this loop is.
-    pub(super) nested: BTreeSet<String>,
-    /// The classes a **gem** declares that the long-tail macro table names, and that this
-    /// bundle has.
-    ///
-    /// [`rails::framework_classes`] is the list — three of them — and this is the subset the
-    /// graph actually holds. It cannot come from the loop below, which visits the application's
-    /// own documents and an engine's `app/`: `ActiveStorage::Attached::One` is in
-    /// activestorage's `lib/`, one directory from `Blob` and on the far side of the engine
-    /// gate. So it is three lookups rather than a projection, asked once per pass, and a
-    /// workspace whose bundle has no Active Storage declares no `has_one_attached` rather than
-    /// one typed as a class nothing can reach.
-    pub(super) framework: BTreeSet<String>,
-    /// The `db/*structure.sql` files under the workspace root, if any.
-    ///
-    /// The one input in this struct that is **not** a projection of the graph, and it has to be:
-    /// a `.sql` file is not a document, so no [`WANTS`] row can reach one however it is spelled.
-    /// It is a path under the root rather than a URI out of the graph — one `read_dir` of
-    /// `<root>/db` per settle, which is the same rule the file watcher registers
-    /// (`db/*structure.sql`) so that what is watched and what is read cannot disagree.
-    ///
-    /// Held here rather than found by the generator so that [`Context::is_empty`] can count it:
-    /// an application with a `structure.sql`, models that write no macro and no routes file has
-    /// nothing on any of the six lists, and the pass would otherwise return before reading it.
-    pub(super) dumps: Vec<DocUri>,
-    /// What may be spelled around a generated owner, and by whose authority.
-    ///
-    /// **`classes` and `modules` above answer "may a macro name this"; this answers "may a
-    /// generated name be spelled around this", and they are not one question.** Everything in `classes` is in here too, and then
-    /// [`Analysis::bundle_namespaces`] adds what the **bundle** declares about the namespaces
-    /// *above* those names — which is the only place a generated name can introduce a segment
-    /// nobody wrote.
-    ///
-    /// The two are deliberately not merged, and the corpus is the argument rather than caution:
-    /// at 3,979 association sites over six applications, 541 name a class no file in the
-    /// application declares and the whole graph supplies **21 of them, every one a Ruby core
-    /// class matched by accident** — `has_many :objects` camelizes to `Object`, nineteen times
-    /// in mastodon alone. A macro names this application's models; a namespace belongs to
-    /// whoever wrote it.
-    pub(super) namespaces: crate::generated::Namespaces,
-    /// A concern, and every **class** that includes it — directly, or through another module.
-    ///
-    /// The one projection here whose value is a set rather than a name: `scope :expired` in
-    /// `Expireable` is `Poll.expired` *and* `Invite.expired`, six different relation types for
-    /// one line, which is exactly why the macro reader refuses to write it down. A module cannot own the declaration; the includers can, one each.
-    ///
-    /// **Transitive, and the closure measures nothing.** `ActiveSupport::Concern` chains its
-    /// dependencies — a concern that includes a concern hands the inner one's `included` block
-    /// to whatever includes the outer — so a one-hop reading would be a rule that is wrong and
-    /// cheap. Over the six corpora it changes **0** of the 143 pairs, which makes the closure a
-    /// correctness property rather than a count.
-    ///
-    /// Only classes are values. A module that includes a concern is walked *through* and is
-    /// never a target: `Bigger.expired` is not a thing anybody can call, and the class that
-    /// includes `Bigger` is where the members really land.
-    pub(super) includers: BTreeMap<String, BTreeSet<String>>,
-    /// Every module under `app/helpers/**/*_helper.rb` the application's own code defines.
-    ///
-    /// The one projection here that is a question about a **path** rather than
-    /// about a definition: [`rails::is_helper`] is Rails' own glob, and what makes a module a
-    /// helper is which file it is written in and nothing it says. `own` and not
-    /// `is_generator_source`, because an engine's helpers are included into the engine's
-    /// controllers, not into this application's views.
-    pub(super) helpers: BTreeSet<String>,
-    /// Every body the route helpers are `include`d into, as the owner of that `include`.
-    ///
-    /// Collected here rather than by the generator because the question is about the *graph* —
-    /// which classes this application defines and what each inherits — and a generator in
-    /// `workspace::rails` never sees one. [`rails::hosts_routes`] is the rule, asked once per
-    /// definition on the same walk that already reads the superclass for the entry points.
-    pub(super) hosts: BTreeSet<Owner>,
-}
-
-impl Context {
-    /// The documents on one list, or nothing.
-    pub(super) fn documents(&self, list: List) -> &[String] {
-        self.documents.get(&list).map_or(&[], Vec::as_slice)
-    }
-
-    /// Whether `name` is an ActiveRecord model.
-    ///
-    /// The gate on a new claimant, and it is load-bearing rather than tidy: `claims` is every
-    /// top-level class the application defines and not only its models, which costs nothing
-    /// while a table has one claimant. Once a nested class may claim one it costs a great deal
-    /// — the six corpora hold **75** nested non-model classes whose name inflects onto a real
-    /// table under a different last segment, and every one of them would take that table away
-    /// from the model that reads it. A gate on the superclass chain declines all 75 and keeps
-    /// every legitimate claimant.
-    ///
-    /// A lookup rather than a walk, because it is asked of every class the application defines
-    /// rather than of the nested few: [`models_of`] does the walk once.
-    /// A name this application does not define at all is in neither, which is the same answer
-    /// either way.
-    fn is_model(&self, name: &str) -> bool {
-        self.models.contains(name)
-    }
-
-    /// Whether any generator has anything to read.
-    ///
-    /// [`List::Renamed`] is deliberately not counted: `self.table_name=` on its own declares
-    /// nothing at all — it renames a table for a schema that has to exist somewhere else.
-    fn is_empty(&self) -> bool {
-        self.documents(List::Schemas).is_empty()
-            && self.dumps.is_empty()
-            && self.documents(List::Models).is_empty()
-            && self.documents(List::Annotated).is_empty()
-            && self.documents(List::Entrypoints).is_empty()
-            && self.documents(List::Routes).is_empty()
-            && self.documents(List::Structs).is_empty()
-    }
-
-    /// Every file some generator opens, for the pass gate.
-    ///
-    /// Every list, including [`List::Renamed`] which [`Context::is_empty`] leaves out: that list
-    /// declares nothing on its own and is still *read*, and this question is about reading. The
-    /// dumps are here too — a `db/*structure.sql` is not a graph document, and it can still be
-    /// open in an editor, which is the one way it reaches this pass without the watcher.
-    fn read_by_a_generator(&self) -> impl Iterator<Item = &str> {
-        self.documents
-            .values()
-            .flatten()
-            .map(String::as_str)
-            .chain(self.dumps.iter().map(DocUri::as_str))
-    }
-
-    /// Merge what one document contributes — the **only** place a [`Contribution`] becomes part
-    /// of a `Context`.
-    ///
-    /// **Every line here must be order-independent.** A fingerprint per document is only sound if the merged answer
-    /// is a function of the *set* of contributions and not of the order the graph's map happens
-    /// to hand them over in — so the two fields that were not are fixed here and in
-    /// [`Context::settle`]:
-    ///
-    /// - **`superclasses` now takes the lowest URI**, which is the rule `defined_in`'s own
-    ///   docstring states two lines below where it was written. The two maps are filled by one
-    ///   `if let Some(superclass)`, and only one of them was deterministic: solidus really does
-    ///   reopen `class Spree::Product < Spree::Base` in its specs, and which of the two lines
-    ///   won was whatever the walk reached last.
-    /// - **`claims` is sorted** by `settle`, because it is pushed per definition.
-    ///
-    /// Everything else is a `BTreeSet`, a `BTreeMap` keyed by a name, or a list `settle` sorts.
-    fn absorb(
-        &mut self,
-        uri: &str,
-        contribution: Contribution,
-        included: &mut Vec<(String, String)>,
-    ) {
-        for list in contribution.lists {
-            self.documents.entry(list).or_default().push(uri.to_owned());
-        }
-        for (table, name) in contribution.claims {
-            self.claims.entry(table).or_default().push(name);
-        }
-        self.nested.extend(contribution.nested);
-        self.hosts.extend(contribution.hosts);
-        self.helpers.extend(contribution.helpers);
-        for (name, superclass) in contribution.superclasses {
-            // `<=` and not `<`: a document that already holds the entry is writing its *second*
-            // `class Story < ...`, which is one file disagreeing with itself and where the last
-            // line is the one Ruby runs.
-            if self
-                .defined_in
-                .get(&name)
-                .is_none_or(|held| uri <= held.as_str())
-            {
-                self.superclasses.insert(name.clone(), superclass);
-                self.defined_in.insert(name, uri.to_owned());
-            }
-        }
-        for (name, module) in contribution.declared {
-            self.namespaces.declare(name.clone(), module);
-            if module {
-                self.modules.insert(name.clone());
-            }
-            self.classes.insert(name);
-        }
-        included.extend(contribution.included);
-    }
-
-    /// Sort every list, so that a project answers the same way on every run whatever order the
-    /// graph's map happens to iterate in. Which file writes a shared relation class depends on
-    /// this, and so does which of two schemas is read first.
-    fn settle(&mut self) {
-        for documents in self.documents.values_mut() {
-            documents.sort_unstable();
-        }
-        // The other half of [`Context::absorb`]'s argument. `claims` is pushed once per
-        // *definition* in the graph's iteration order, which is a `HashMap`'s and therefore
-        // nobody's. It changes no answer — `model_tables` sorts and dedups its own copy before
-        // it reads one — and what it does change is that two walks over one workspace produce
-        // the same `Context`, which is what the outer gate compares and the per-document
-        // fingerprints stand on.
-        for classes in self.claims.values_mut() {
-            classes.sort_unstable();
-        }
-        // A `read_dir` has no defined order either, and for the same reason: which of two
-        // schema sources is read first decides nothing here only because the ambiguity rule
-        // runs first, and a list that varies per run is a difference waiting to matter.
-        self.dumps.sort_unstable();
+/// Only the lists that have anything on them. A project with no `db/schema.rb` and no
+/// `config/routes.rb` should read as *models 412* rather than as five zeroes, because the
+/// zeroes are the ordinary case and the non-zeroes are the answer.
+fn asked_for<'a>(documents: impl Iterator<Item = (&'a ListId, &'a Vec<String>)>) -> String {
+    let named: Vec<String> = documents
+        .filter(|(_, on)| !on.is_empty())
+        .map(|(list, on)| format!("{list} {}", on.len()))
+        .collect();
+    if named.is_empty() {
+        "no documents on any list".to_owned()
+    } else {
+        named.join(", ")
     }
 }
 
@@ -594,158 +303,13 @@ impl Context {
 /// declaration is written — which is why it sits beside the pass rather than in it: what
 /// `helper_method` hands over is a permission, and the `def` it names is already indexed.
 ///
-/// The mailers come out of `superclasses` rather than out of a list of their own, because the
-/// question is exactly [`rails::is_mailer`]'s and asking it of a map this pass already holds is
-/// cheaper than a seventh row in [`WANTS`] that would read the same definitions again.
-fn view_context(context: &Context, models: &[(DocUri, String, Arc<rails::Model>)]) -> Views {
-    let mut exports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut included: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (_, _, model) in models {
-        for (owner, names) in model.exports() {
-            exports
-                .entry(owner.to_owned())
-                .or_default()
-                .extend(names.iter().cloned());
-        }
-        for (owner, modules) in model.helper_modules() {
-            included
-                .entry(owner.to_owned())
-                .or_default()
-                .extend(modules.iter().cloned());
-        }
-    }
-    let mailers: BTreeSet<String> = context
-        .superclasses
-        .iter()
-        .filter(|(_, superclass)| rails::is_mailer(superclass))
-        .map(|(name, _)| name.clone())
-        .collect();
-    Views::new(
-        context.helpers.iter().cloned().collect(),
-        exports,
-        included,
-        mailers,
-    )
-}
-
-/// Every ActiveRecord model, by climbing what each class says it inherits.
-///
-/// The chain and not one hop: solidus writes 101 models two hops from `ActiveRecord::Base` and
-/// 15 four or five, so a one-hop test would call `Spree::Order` no model at all. Each hop
-/// resolves the spelling the way Rails does — [`rails::candidates`] is `compute_type`'s own
-/// list, innermost nesting first and the bare name last — because `class Address < Spree::Base`
-/// inside `module Spree` says `Spree::Base` and means it, while `class LineItem < Base` says
-/// `Base` and means the same class.
-///
-/// `seen` is not caution about Ruby, which cannot have a superclass cycle — it is about
-/// *source*, which can be written with one, and this walks the text rather than the run.
-///
-/// **The chain stops at a name the application does not define**, which is not a defect and is
-/// worth stating because the relation set turns on it: forem's `Tag < ActsAsTaggableOn::Tag`
-/// and `EmailMessage < Ahoy::Message` are real models whose base class is in a gem, and this
-/// answers `false` for both. It is why that set is a **union** with what the macros ask for
-/// rather than a replacement of it — 11 classes over six corpora are a collection element and
-/// not a model by this walk, and deleting their relation classes is the one way this could make
-/// an answer worse rather than absent.
-fn models_of(superclasses: &BTreeMap<String, String>) -> BTreeSet<String> {
-    let mut models: BTreeSet<String> = BTreeSet::new();
-    for name in superclasses.keys() {
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        let mut current = name.as_str();
-        while seen.insert(current) {
-            let Some(written) = superclasses.get(current) else {
-                break;
-            };
-            if rails::is_record_base(written) {
-                models.insert(name.clone());
-                break;
-            }
-            // The candidate list is owned and `current` outlives it, so the name it walks on to
-            // has to be the map's own copy rather than the list's.
-            let Some((next, _)) = rails::candidates(current, written)
-                .into_iter()
-                .find_map(|candidate| superclasses.get_key_value(&candidate))
-            else {
-                break;
-            };
-            current = next;
-        }
-    }
-    models
-}
-
-/// The class a model's class side goes on: the topmost model of its own superclass chain.
-///
-/// Where the class side goes, and it is [`models_of`]'s walk with a
-/// different stopping rule. That one climbs until it reaches `ActiveRecord::Base` and answers
-/// *whether*; this one climbs while the next class up is a model the application itself
-/// declares and answers *which* — so `Spree::Order` under `Spree::Base` under
-/// `ApplicationRecord` answers `ApplicationRecord`, and `Story` directly under it answers the
-/// same. One copy of the query interface there is inherited by every model beneath it, which is
-/// what Rails does and is why 119 declarations per model become 119 per application.
-///
-/// **The base has to be a class the application declares.** forem's `Tag < ActsAsTaggableOn::Tag`
-/// stops at `Tag` itself, because the chain leaves the application and nothing may be declared
-/// on a gem's class — so such a model is its own base and pays for its own copy. The walk is
-/// bounded the same way [`models_of`]'s is, and for the same reason: `seen` is about *source*,
-/// which can be written with a cycle.
-///
-/// Each hop resolves the spelling the way Rails does — [`rails::candidates`] is
-/// `compute_type`'s own list — because `class Address < Spree::Base` inside `module Spree` says
-/// one thing and means another.
-fn base_of(
-    name: &str,
-    superclasses: &BTreeMap<String, String>,
-    models: &BTreeSet<String>,
-    namespaces: &crate::generated::Namespaces,
-) -> String {
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    let mut current = name;
-    let mut top = None;
-    while seen.insert(current) {
-        let Some(written) = superclasses.get(current) else {
-            break;
-        };
-        top = Some(written);
-        let Some((next, _)) = rails::candidates(current, written)
-            .into_iter()
-            .find_map(|candidate| superclasses.get_key_value(&candidate))
-        else {
-            break;
-        };
-        if !models.contains(next) {
-            break;
-        }
-        current = next;
-    }
-    // One hop past the application, and only ever onto `ActiveRecord::Base` itself. Discourse
-    // has no `ApplicationRecord` at all, so every one of its models is its own base and the
-    // walk above saves it nothing; the class Rails really installs the interface on is in a
-    // gem. Reopening somebody else's class is safe for the `MessageDelivery` stub's reason —
-    // nothing declared here is mapped, so the gem keeps every place it has — and the gate is the
-    // namespace rule: the **bundle** has to declare the name, or a generated body would
-    // introduce a constant nothing wrote.
-    //
-    // `ActiveRecord::Base` **exactly**, and not [`rails::is_record_base`]'s other spelling. An
-    // `ApplicationRecord` the application declares is reached by the walk above, because a
-    // class that inherits `ActiveRecord::Base` is a model; one it does *not* declare is a name
-    // this pass may not write on at all. The two are not one question and reading them as one
-    // put the interface on a bare `class ApplicationRecord` that inherits nothing.
-    if let Some(written) = top.filter(|written| *written == rails::RECORD_BASE)
-        && let Some(resolved) = rails::candidates(current, written)
-            .into_iter()
-            .find(|candidate| namespaces.declares(candidate) && namespaces.spellable(candidate))
-    {
-        return resolved;
-    }
-    current.to_owned()
-}
+impl Analysis {}
 
 /// Which classes each concern's macros really land on, resolved and then closed over.
 ///
 /// Two steps, and both are somebody else's rule copied rather than invented. An `include` names
 /// a constant, and Ruby resolves it against the nesting of the body that wrote it — which is
-/// [`rails::candidates`], the same list `compute_type` gives an association's `class_name`. A module the application does not define resolves to nothing and
+/// [`candidates`], the same list `compute_type` gives an association's `class_name`. A module the application does not define resolves to nothing and
 /// contributes nothing, which is the decline every reader in this pass makes and is why
 /// `include Sidekiq::Worker` adds no row here.
 ///
@@ -762,7 +326,7 @@ fn includers_of(
 ) -> BTreeMap<String, BTreeSet<String>> {
     let mut direct: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (owner, written) in included {
-        let Some(target) = rails::candidates(owner, written)
+        let Some(target) = candidates(owner, written)
             .into_iter()
             .find(|candidate| known.contains(candidate))
         else {
@@ -803,14 +367,14 @@ fn includers_of(
 /// itself — plus the four constants this crate invents or looks for by name. That is exactly the
 /// set of namespaces a generated owner can *introduce*: an owner is either a name `Context`
 /// already holds, a name derived from one (`Comment::Relation`), or
-/// [`rails::MESSAGE_DELIVERY`], and no other segment can appear above one.
+/// a module's own spellable names, and no other segment can appear above one.
 ///
 /// Bounding it is the whole reason this is affordable. Measured over lobsters, spelling **every**
 /// class and module in the graph costs 20.7 ms a settle against a resolve of 19–23; filtering on
 /// the last segment first, and spelling only what matches, costs **2.5 ms** — because the filter
 /// is a `StringId` compare and the walk never touches the name of the 26,514 namespaces nobody
 /// asked about. Discourse is 27.2 ms against 3.6.
-fn wanted_namespaces(context: &Context) -> BTreeSet<String> {
+fn wanted_namespaces(context: &Context, knowledge: &Registry) -> BTreeSet<String> {
     fn prefixes(name: &str, into: &mut BTreeSet<String>) {
         for (at, _) in name.match_indices("::") {
             into.insert(name[..at].to_owned());
@@ -820,20 +384,26 @@ fn wanted_namespaces(context: &Context) -> BTreeSet<String> {
     for name in &context.classes {
         prefixes(name, &mut wanted);
     }
-    for name in rails::framework_classes() {
-        prefixes(name, &mut wanted);
-        wanted.insert(name.to_owned());
+    // Whatever each module writes onto that is not the application's own — the names it needs
+    // spellable and cannot get from `classes`. Asked of the registry, so a build with nothing
+    // registered asks the bundle about nothing but its own prefixes.
+    for module in knowledge.modules() {
+        for name in module.spellable_names() {
+            prefixes(name, &mut wanted);
+            wanted.insert(name.to_owned());
+        }
     }
-    prefixes(rails::MESSAGE_DELIVERY, &mut wanted);
-    wanted.insert(rails::MESSAGE_DELIVERY.to_owned());
-    wanted.insert(rails::ROUTE_HELPERS.to_owned());
-    wanted.insert(rails::RELATION_BASE.to_owned());
-    // The class side's own base. An application with no `ApplicationRecord`
-    // of its own — discourse writes `class Post < ActiveRecord::Base` 217 times — has no shared
-    // base in its own code, and the one Rails uses is in a gem. Asking whether the bundle
-    // declares it is what decides whether this pass may write there at all.
-    prefixes(rails::RECORD_BASE, &mut wanted);
-    wanted.insert(rails::RECORD_BASE.to_owned());
+    // **Every class a concern's class methods are written onto**, which is where this pass reaches
+    // furthest outside the application: `ActionController::Base` includes a dozen concerns and no
+    // file of the user's declares it, so without this its namespace is never asked about and
+    // `Namespaces::spellable` declines the owner — silently, and for every member of every concern
+    // it includes. Only the *prefixes* are needed, because `spellable` asks about the namespaces
+    // above a name and never about the name itself.
+    for includers in context.includers.values() {
+        for name in includers {
+            prefixes(name, &mut wanted);
+        }
+    }
     // A name the application declares needs no second opinion, and asking for one would let a
     // gem's `class Story` overrule the `module Story` this workspace wrote.
     wanted.retain(|name| !context.classes.contains(name));
@@ -855,158 +425,6 @@ pub(super) fn gem_relative(path: &Path) -> Option<std::path::PathBuf> {
         here = parent;
     }
     None
-}
-
-/// Add one generator's facts to the document its source file names.
-///
-/// A file that feeds two generators — a model with a `has_many` and a `@return` tag — gets one
-/// generated document holding both, because the side table is keyed by generated URI and a
-/// second `record` for one source would replace the first rather than add to it. Merging here
-/// is also where precedence is enforced: a member two generators both name is decided by
-/// [`Facts`]' rank rather than written twice as a silent overload. A
-/// generator that said nothing adds no entry, so a source none of them had anything to say
-/// about is not recorded and is not kept.
-fn merge(into: &mut BTreeMap<String, (DocUri, Facts)>, uri: &DocUri, facts: Facts) {
-    if facts.is_empty() {
-        return;
-    }
-    into.entry(uri.as_str().to_owned())
-        .or_insert_with(|| (uri.clone(), Facts::default()))
-        .1
-        .extend(facts);
-}
-
-/// Which columns a model file re-types, keyed by the class the macro is written on.
-///
-/// The whole of what one generator in this pass tells another, and it is an *input* rather than
-/// a fact: `Facts::returns` answers within a document, and these two declarations are never in
-/// one. `story.status` is the label `enum :status` names — a `String` — and the column it is
-/// stored in is an `Integer`, so the schema has to be told to say nothing about it.
-///
-/// The second macro is on the same wire, and Rails' own documentation is why: an
-/// `attribute` with a cast type "will override the type of existing attributes if needed". Only
-/// the calls that name a type this crate has a class for are here, so `attribute :payload, :json`
-/// leaves a `t.string "payload"` answering exactly as it did.
-/// Every `(class, member)` some document already holds, as `Elsewhere::columns` wants it.
-///
-/// Called once, between the schemas and the models, so what it holds is exactly the schemas'.
-fn declared_members(generated: &BTreeMap<String, (DocUri, Facts)>) -> BTreeSet<(String, String)> {
-    generated
-        .values()
-        .flat_map(|(_, facts)| facts.declared())
-        .filter_map(|(owner, name)| match owner {
-            Owner::Instance(class) => Some((class.clone(), name.to_owned())),
-            _ => None,
-        })
-        .collect()
-}
-
-fn retyped_columns(
-    models: &[(DocUri, String, Arc<rails::Model>)],
-) -> BTreeMap<String, BTreeSet<String>> {
-    let mut columns: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (_, _, model) in models {
-        for (class, attribute) in model.retyped_columns() {
-            columns
-                .entry(class.to_owned())
-                .or_default()
-                .insert(attribute.to_owned());
-        }
-    }
-    columns
-}
-
-/// How the text of one source file was identified when a reader last parsed it.
-///
-/// Two variants because the pass has two authorities for what a file says and they cannot be
-/// compared the same way. A file on disk is identified by [`stamp_of`], which is the pass
-/// gate's own evidence and not a second mechanism: that gate earns "the answer is a function of
-/// what is on disk" by looking at the disk, and a memo that trusted anything weaker would take
-/// it away.
-/// A file the editor holds has no useful stamp at all — the disk is behind the buffer — so it
-/// is identified by its text, hashed. Not by the version: a client may send `didChange` with no
-/// version, and two versions of one buffer would then look like no change at all.
-#[derive(Debug, PartialEq, Eq)]
-enum Fresh {
-    Disk(Option<(std::time::SystemTime, u64)>),
-    Buffer(u64),
-}
-
-/// Which of the readers one document's place on the lists calls for.
-///
-/// A document is usually on one list and may be on five, and the reads are per *document*
-/// rather than per list — which is a saving in its own right: read per list, a model file that
-/// also carries a `@return` tag and a `self.table_name=` is read three times.
-///
-/// Compared as a whole, so a document that has joined a list since the last pass is read again
-/// rather than topped up. That is not only simpler: **a document can join a list without its own
-/// text changing.** [`Analysis::walk`] puts every file that *defines* a class some other file's
-/// macro names onto [`List::Models`], so writing `has_many :widgets` in one file adds
-/// `widget.rb` to a list it was not on — and if `widget.rb` was already read for a `@return`
-/// tag, its entry is fresh and holds the wrong things.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Wanted {
-    model: bool,
-    /// Whether the schema reader is wanted, and whether the file is a dump rather than a
-    /// `schema.rb` — which decides which of the two readers runs, and is a property of the path.
-    schema: Option<bool>,
-    names: bool,
-    entrypoints: bool,
-    annotated: bool,
-}
-
-/// One source file as the readers last saw it, and the evidence it has not changed.
-///
-/// **The memo is deliberately of the *parse* rather than of the [`Facts`].** Memoising the
-/// facts is the obvious seam and the worse one: they are a function of the text *and* the
-/// `Context`, so the whole memo has to be dropped whenever the `Context` moves. `read_model`
-/// and the four beside it take **nothing but the text**, so there is no second input to
-/// compare, no invalidation rule to get wrong, and a keystroke that adds a class somewhere else
-/// in the project does not throw the memo away. What the `Context` is an argument to is
-/// `signatures`, measured at **12 ms of a 1,220 ms pass**.
-#[derive(Debug)]
-pub(super) struct Cached {
-    fresh: Fresh,
-    /// The readers this entry was built for — see [`Wanted`] for why a document can start
-    /// wanting more of them without its own text changing.
-    wanted: Wanted,
-    /// The path every reader writes into its provenance, which is a function of the URI.
-    name: String,
-    model: Option<Arc<rails::Model>>,
-    schema: Option<Arc<rails::Schema>>,
-    names: Option<Arc<rails::TableNames>>,
-    entrypoints: Option<Arc<rails::Entrypoints>>,
-    /// The annotations reader ends at [`Facts`] directly rather than at a syntax type, so this
-    /// is what it produced. Handed to [`merge`] by value, and cloning a hundred-odd files'
-    /// worth of facts is the parse this saves several hundred times over.
-    annotated: Option<Facts>,
-}
-
-impl Cached {
-    /// Run every reader `wanted` asks for, once, over text just read.
-    fn read(fresh: Fresh, wanted: Wanted, name: String, source: &str) -> Self {
-        let annotated = wanted.annotated.then(|| annotations::read(source, &name));
-        Self {
-            fresh,
-            wanted,
-            name,
-            model: wanted.model.then(|| Arc::new(rails::read_model(source))),
-            schema: wanted.schema.map(|dumped| {
-                Arc::new(if dumped {
-                    rails::read_structure(source)
-                } else {
-                    rails::read_schema(source)
-                })
-            }),
-            names: wanted
-                .names
-                .then(|| Arc::new(rails::read_table_names(source))),
-            entrypoints: wanted
-                .entrypoints
-                .then(|| Arc::new(rails::read_entrypoints(source))),
-            annotated,
-        }
-    }
 }
 
 /// What one file looked like when the pass last read it: when it was written, and how long.
@@ -1034,13 +452,20 @@ impl Analysis {
     /// [`synthesized::Synthesized::record`] hands nothing over when neither the text nor the
     /// mappings changed.
     ///
-    /// **Six generators, one pass, one generated document per source file.** The schema —
-    /// `db/*schema.rb` and `db/*structure.sql`, which are one generator because they end at one
-    /// `rails::Schema` — the model macros, the annotations somebody wrote by hand, the mailer
-    /// and job conventions, the routing DSL and `delegate` all end at a [`Facts`], and a file
-    /// that feeds two of them has both merged into the one document its URI names. The last is
-    /// a second *phase* and runs last, because what it derives from is what the other five
-    /// said.
+    /// **Six generators, one pass, one [`Facts`] per source file — and one generated document
+    /// per *body* out the far end.** The schema — `db/*schema.rb` and `db/*structure.sql`, which
+    /// are one generator because they end at one syntax type — the model macros, the
+    /// annotations somebody wrote by hand, the mailer and job conventions, the routing DSL and
+    /// `delegate` all end at a [`Facts`], and a file that feeds two of them has both merged into
+    /// the one table its URI names. The last is a second *phase* and runs last, because what it
+    /// derives from is what the other five said.
+    ///
+    /// The cut into documents is [`Facts::split`], and it happens **after** all of that, at the
+    /// render step: precedence is settled on the whole file's facts and only the rendering is
+    /// partitioned, so no generator knows about it. It is there because
+    /// [`synthesized::Synthesized::record`] is charged per declaration it re-indexes, which makes
+    /// the document the unit of invalidation — 2.2 s of a 2.49 s keystroke on discourse when a
+    /// schema is one document, and one table's worth when it is one per body.
     ///
     /// A project with none of the three pays one pass over its own documents for the guarantee.
     /// A project whose files are deliberately outside `index.include` pays the same: not
@@ -1053,8 +478,8 @@ impl Analysis {
         // and answering the first with the second is right about the generators and says
         // nothing about the walk: a keystroke in
         // a model file changes what the file *says* and not what the projection *is*, so the
-        // generators have to run and the walk does not. On discourse the walk is 105 ms of
-        // every such keystroke.
+        // generators have to run and the walk does not. On discourse the walk is 70 ms of
+        // every such keystroke and on lobsters 22.
         // Both questions are asked of the projection already held, and the borrow of it has to
         // end before either branch below writes to `self` — so they are answered first and
         // acted on after. `None` is the first pass, where nothing is known about either.
@@ -1078,16 +503,15 @@ impl Analysis {
             return;
         }
         let walked = Instant::now();
-        let (context, contributions) = if same {
-            // The projection is the one already held, and the fingerprints beside it are still
-            // its own. **Taken and not cloned**: every path out of this function from here on
-            // ends at `remember`, which puts both back.
-            (
-                self.generated_from
-                    .take()
-                    .expect("`context_would_be_the_same` answered about a projection it holds"),
-                std::mem::take(&mut self.contributions),
-            )
+        let context = if same {
+            // The projection is the one already held. **Taken and not cloned**: every path out
+            // of this function from here on ends at `remember`, which puts it back. The
+            // per-document contributions stay where they are — the gate has just proved that
+            // every document it could have asked about contributes what it contributed last
+            // time, which is the same sentence as "the memo is still good".
+            self.generated_from
+                .take()
+                .expect("`context_would_be_the_same` answered about a projection it holds")
         } else {
             self.walk()
         };
@@ -1103,12 +527,12 @@ impl Analysis {
                 started.elapsed(),
                 self.touched.len()
             );
-            // The walk just ran, so the fingerprints are fresh and the `Context` they belong to
-            // is the one already held — `previous == context` is what got us here. Keeping them
-            // is what lets the *next* keystroke take the gate above: a document whose
-            // contribution moved without moving the merged answer would otherwise re-fail
-            // the cheap comparison for the rest of the session.
-            self.contributions = contributions;
+            // The walk just ran, so the per-document contributions are fresh and the `Context`
+            // they belong to is the one already held — `previous == context` is what got us
+            // here. `Analysis::walk` has already put them back, which is what lets the *next*
+            // keystroke take the gate above: a document whose contribution moved without moving
+            // the merged answer would otherwise re-fail the cheap comparison for the rest of the
+            // session.
             self.touched.clear();
             return;
         }
@@ -1116,74 +540,98 @@ impl Analysis {
         // Every file any generator is about to open, read and parsed here and only here — and
         // only where the text has moved since the last pass.
         self.refresh_sources(&context);
-        if context.is_empty() && self.generated.is_empty() {
-            // The view context is rebuilt here too, and with no model sources rather than not
-            // at all: its helpers half is a projection of the walk above and costs nothing, and a
-            // workspace that has just had its last macro deleted has to *lose* the exports it
-            // had rather than keep them. There are none to find — a `helper_method` is on
-            // `MACROS`, so a file that writes one is on `List::Models` and this branch is not
-            // reached — and passing the empty list says that once instead of asserting it.
-            self.views = view_context(&context, &[]);
-            self.remember(context, contributions);
+        if context.is_empty(&self.knowledge) && self.generated.is_empty() {
+            // The view context is rebuilt here too, and with no sources rather than not at all:
+            // its helpers half is a projection of the walk above and costs nothing, and a
+            // workspace that has just had its last macro deleted has to *lose* the exports it had
+            // rather than keep them.
+            self.views = self.view_context(&context);
+            self.remember(context);
             return;
         }
 
-        let mut generated: BTreeMap<String, (DocUri, Facts)> = BTreeMap::new();
-        // The model files are read before the schema and not after it, which is the one ordering
-        // in this pass that is a data dependency rather than a habit: an `enum` and a typed
-        // `attribute` each re-type the column they are stored in, the two declarations land in
-        // two different generated documents, and `Facts`' precedence is per document — so the
-        // rank is spent by the schema declining to declare the column at all.
-        let sources = self.model_sources(&context);
-        self.views = view_context(&context, &sources);
-        let retyped = retyped_columns(&sources);
-        let schemas = self.schema_declarations(&context, &retyped, &mut generated);
-        // What the schemas just said, so an untyped `attribute` of the same name can
-        // decline to it. The rank says the column wins — `Source::Column` is 4 and
-        // `Source::Attribute` 7 — and `Facts::declare` settles a collision *inside* one
-        // document, which these two are not; so the loser declines, exactly as an `enum` and a
-        // `delegate` do.
-        let columns = declared_members(&generated);
-        let models = self.model_declarations(&context, &sources, &columns, &mut generated);
-        let annotations = self.annotation_declarations(&context, &mut generated);
-        let entrypoints = self.entrypoint_declarations(&context, &mut generated);
-        let routes = self.route_declarations(&context, &mut generated);
-        let structs = self.struct_declarations(&context, &mut generated);
-        // Phase two, and it is last because it reads the other five. Nothing after it may
-        // declare, or a `delegate` would be deriving from a fact that had not been said when it
-        // asked, which is the ordering assumption `Facts::returns` exists to remove.
-        let delegated = self.delegate_declarations(&sources, &mut generated);
+        let mut generated = knowledge::Declared::new();
+        self.views = self.view_context(&context);
+        // **Every registered module, through the three phases**, and core knows nothing else about
+        // the order: what a module's own generators owe each other is the module's business, and
+        // what they owe *another* module's is what the phases are. Taken out and put back for
+        // `refresh_sources`' reason — the view below borrows the rest of `self` while a module
+        // writes to itself.
+        let mut knowledge = std::mem::take(&mut self.knowledge);
+        let counted = {
+            let context = &context;
+            let declaring = knowledge::Declaring {
+                context,
+                features: self.workspace.features(),
+                text: &|uri| self.with_text(uri, |text| text.text().to_owned()),
+                caption: &|uri| self.workspace_relative(uri),
+                own: &|uri| self.is_own_code(uri),
+                declares: &|wanted| self.declaring_documents(wanted),
+            };
+            let mut counted: knowledge::Counted = Vec::new();
+            for module in knowledge.modules_mut() {
+                counted.extend(module.conjure(&declaring, &mut generated));
+            }
+            for module in knowledge.modules_mut() {
+                counted.extend(module.declare(&declaring, &mut generated));
+            }
+            // Nothing after this may declare, which is what phase three means.
+            for module in knowledge.modules_mut() {
+                counted.extend(module.derive(&declaring, &mut generated));
+            }
+            counted
+        };
+        self.knowledge = knowledge;
 
         let mut kept: HashSet<String> = HashSet::new();
-        for (uri, facts) in generated.values() {
-            // Rendered here and only here: every span in the document is computed against the
+        let mut documents = 0;
+        for (uri, facts) in generated.into_values() {
+            // **Split, then rendered, and one document per body out the other end.** The split
+            // is of the rendering and never of the generation: every generator above has spoken
+            // and every collision is settled, so nothing here can re-decide a rank — see
+            // [`Facts::split`]. What it buys is the unit of invalidation, because
+            // [`Synthesized::record`] is charged per declaration it re-indexes: a column that
+            // changed type re-indexes one table rather than every table in the schema.
+            //
+            // Rendered here and only here: every span in a document is computed against the
             // text as it is finally written, so no generator's offsets have to be shifted by
             // the length of another's.
-            let declarations = facts.render(&context.namespaces);
-            let mappings = declarations
-                .spans
-                .iter()
-                .map(|span| synthesized::Mapping {
-                    generated: span.generated,
-                    declared: Site {
-                        uri: uri.as_str().to_owned(),
-                        full: span.declared,
-                        selection: span.selection,
-                    },
+            let parts: Vec<synthesized::Part> = facts
+                .split()
+                .into_iter()
+                .map(|(body, facts)| {
+                    let declarations = facts.render(&context.namespaces);
+                    let mappings = declarations
+                        .spans
+                        .iter()
+                        .map(|span| synthesized::Mapping {
+                            generated: span.generated,
+                            declared: Site {
+                                uri: uri.as_str().to_owned(),
+                                full: span.declared,
+                                selection: span.selection,
+                            },
+                        })
+                        .collect();
+                    synthesized::Part {
+                        body,
+                        rbs: declarations.rbs,
+                        mappings,
+                        named: declarations.named,
+                    }
                 })
                 .collect();
             if let Ok(needle) = std::env::var("YA_LSP_DUMP")
                 && uri.as_str().contains(&needle)
             {
-                eprintln!("=== {} ===\n{}", uri.as_str(), declarations.rbs);
+                for part in &parts {
+                    eprintln!("=== {} {} ===\n{}", uri.as_str(), part.body, part.rbs);
+                }
             }
-            self.synthesized.record(
-                &mut self.graph,
-                &mut self.types,
-                uri,
-                &declarations.rbs,
-                mappings,
-            );
+            documents += self
+                .synthesized
+                .record(&mut self.graph, &mut self.types, &uri, parts)
+                .len();
             kept.insert(uri.as_str().to_owned());
         }
         self.forget_stale(&kept);
@@ -1191,22 +639,36 @@ impl Analysis {
         // Debug rather than info: this runs before every resolve, so it is one line per settle
         // and it would drown the log of an ordinary editing session. It is the only place these
         // numbers exist, and they are what a report about this feature needs.
+        // `lists` is what the walk handed the generators; the counts after it are what they made
+        // of it. The two together are the whole of "did a generator run, and on what" — which is
+        // the question a switched-off generator has to be answerable in, and the question nobody
+        // could ask before, because the only numbers here were the outputs.
+        let lists = asked_for(context.documents.iter());
+        let declared = counted
+            .iter()
+            .map(|(what, how_many)| format!("{how_many} {what}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         tracing::debug!(
-            "{} files declare {schemas} columns, {models} members, {annotations} annotated \
-             methods, {entrypoints} entry points, {routes} route helpers, {structs} struct \
-             members and {delegated} delegated names, in {:.2?} ({walk:.2?} of it the walk)",
+            "{} files declare {declared}, into {documents} generated documents, from {lists}, in \
+             {:.2?} ({walk:.2?} of it the walk)",
             kept.len(),
             started.elapsed()
         );
-        self.remember(context, contributions);
+        self.remember(context);
     }
 
     /// Whether the generators would write exactly what they wrote last time.
     ///
     /// `settle` calls this pass before every `resolve` and a forced settle sits in front of
     /// every graph-reading request, so without this gate one keystroke in a file with no macro
-    /// in it pays for a whole-workspace regeneration: 262 ms on discourse, in front of
-    /// completion's own 10.
+    /// in it pays for a whole-workspace regeneration: **63 ms on discourse**, in front of
+    /// completion's own 10 — measured 2026-09-16 as a pass whose every one of 977 generated
+    /// documents came out byte-identical, which is what a file no generator reads produces. What
+    /// makes the number an order of magnitude larger is a document whose text really moved:
+    /// [`synthesized::Synthesized::record`] re-indexing one model's 18 KB of RBS into a settled
+    /// graph is 148 ms on its own, and the schema's 450 KB is 2.2 s. `synthesized.md` has the
+    /// breakdown.
     ///
     /// **Two questions, and both have to be no.** The projection above is what the generators
     /// are handed, so an equal `Context` means equal arguments — that half catches a new class
@@ -1217,11 +679,12 @@ impl Analysis {
     /// `has_many :notes` is one document on one list either way.
     ///
     /// What is skipped is the reading, parsing, rendering and recording of every listed file.
-    /// The **walk is not skipped here**, and it was 36% of the pass — 101 ms of 276–285,
-    /// measured on an idle machine — because building the evidence for *this* gate is the walk.
+    /// The **walk is not skipped here**, because building the evidence for *this* gate is the
+    /// walk — 70 ms of a 132 ms pass on discourse, measured 2026-09-16, and 275 ms of a 340 ms
+    /// pass before [`Analysis::walk`] started keeping what each document contributed.
     /// [`Analysis::context_would_be_the_same`] runs before this one and needs no walk at all.
     /// This gate stays because it is strictly wider — it catches a document whose contribution
-    /// moved without moving the merged answer, which eight bytes per document cannot — and it
+    /// moved without moving the merged answer, which a per-document comparison cannot — and it
     /// is only ever asked when a walk really happened, because an equal projection makes the
     /// comparison in it trivially true.
     fn pass_would_repeat_itself(&self, context: &Context) -> bool {
@@ -1266,20 +729,21 @@ impl Analysis {
     ///
     /// [`Analysis::pass_would_repeat_itself`] compares the whole merged `Context`, which is what
     /// the walk **builds** — so it can only be asked after paying for the walk, and on discourse
-    /// that is 101 ms of a 276–285 ms pass. This asks the same question of **one document**.
+    /// that is 70 ms. This asks the same question of **one document**, and pays for one.
     ///
     /// **It must not borrow the other gate's file clause.** "Is a touched file on a generator's
     /// list" is about what a generator *reads* and says nothing at all about what the walk
     /// *builds*; asked on its own, this answers yes for the commonest edit in a Rails
-    /// application and the projection is reused while the generators run — 105 ms of every
-    /// keystroke in a discourse model file, and 7 of one in a lobsters model file.
+    /// application and the projection is reused while the generators run — 70 ms of every
+    /// keystroke in a discourse model file, and 22 of one in a lobsters model file.
     ///
-    /// **Three things make eight bytes per document enough**, and each of them is a property
-    /// something else in this module had to be given:
+    /// **Three things make one document's `Contribution` enough**, and each of them is a
+    /// property something else in this module had to be given:
     ///
     /// 1. The merged `Context` is a function of the *set* of contributions and not of the order
     ///    the graph hands them over in. [`Context::absorb`] and [`Context::settle`] are where
-    ///    that is paid for, and two fields had to change to make it true.
+    ///    that is paid for, and two fields had to change to make it true. [`Analysis::walk`]
+    ///    rests on the same property, for the same reason read the other way round.
     /// 2. A document nothing re-indexed cannot have contributed anything different. Only
     ///    `Analysis::index_buffer` names a document; every bulk route sets `touched_all` and is
     ///    refused here, which is the other gate's own narrowing re-used rather than restated.
@@ -1297,10 +761,10 @@ impl Analysis {
         if self.touched_all {
             return false;
         }
-        let filters = Filters::new();
+        let filters = Filters::new(&self.knowledge);
         for uri in &self.touched {
             // One `let … else` and not two, because "the graph has no such document" and "the
-            // walk does not visit it" are the same answer here: no fingerprint was stored, so
+            // walk does not visit it" are the same answer here: no contribution was stored, so
             // there is nothing to compare against and the pass has to run. Asking them
             // separately would also make the comparison below unsound on its own — two `None`s
             // are equal, and a document with no entry would compare *the same* as one that
@@ -1311,7 +775,6 @@ impl Analysis {
                 .documents()
                 .get(&id)
                 .and_then(|document| self.contribution(document, &filters))
-                .map(|contribution| fingerprint(&contribution))
             else {
                 return false;
             };
@@ -1319,15 +782,28 @@ impl Analysis {
                 return false;
             }
         }
-        // Not a projection of the graph and therefore not covered by anything above — a `.sql`
-        // is not a document, which is why `Context::dumps` exists at all.
-        let mut dumps = self.schema_dumps();
-        dumps.sort_unstable();
-        dumps == previous.dumps
+        // Not a projection of the graph and therefore not covered by anything above — a file
+        // nothing indexed is one no `Contribution` can be about, which is what
+        // `Knowledge::discover` exists for.
+        let reading = knowledge::Reading {
+            root: self.workspace.root(),
+            admits: &|path| self.workspace.admits(path),
+            features: self.workspace.features(),
+        };
+        self.knowledge
+            .modules()
+            .zip(&previous.projections)
+            .all(|(module, projection)| {
+                let mut found = module.discover(&reading);
+                found.sort_unstable();
+                projection
+                    .0
+                    .as_ref()
+                    .is_none_or(|held| held.also_reads() == found)
+            })
     }
 
-    fn remember(&mut self, context: Context, contributions: HashMap<UriId, u64>) {
-        self.contributions = contributions;
+    fn remember(&mut self, context: Context) {
         self.stamps = context
             .read_by_a_generator()
             .filter_map(|uri| DocUri::from_uri_str(uri)?.to_path())
@@ -1348,83 +824,210 @@ impl Analysis {
     /// The projections are [`WANTS`]; the two that no generator reads yet — `modules` and
     /// `superclasses` — are collected here because they cost the same loop, and because a
     /// projection added later is a second loop nobody notices.
-    /// The walk's answer on its own, for the tests that assert on the projection rather than on
-    /// what a generator did with it.
+    /// The walk's answer on its own, **projected cold**, for the tests that assert on what the
+    /// walk builds rather than on what a generator did with it.
+    ///
+    /// The memo is dropped first, so this is the walk with nothing held — which is exactly the
+    /// answer a memoised walk has to equal, and what lets a test assert that it does.
     #[cfg(test)]
     pub(super) fn context(&mut self) -> Context {
-        self.walk().0
+        self.contributions.clear();
+        self.walk()
     }
 
-    /// The same walk, and the eight bytes per document stored beside it.
+    /// The same walk, keeping every document's projection so the next one need not build it
+    /// again.
     ///
-    /// Two returns rather than one because the fingerprints are a *by-product* of the loop and
-    /// must not be a second one: computing them anywhere else would be the walk again, which is
-    /// the cost the gate exists to remove.
-    fn walk(&mut self) -> (Context, HashMap<UriId, u64>) {
+    /// **The loop is incremental and nothing after it is.** [`Analysis::contribution`] was the
+    /// walk's whole cost, and for a document rubydex has not re-indexed its answer is the answer
+    /// it gave last time. What a memo cannot touch is everything below the loop:
+    /// [`Context::absorb`] is a fold with no inverse, and [`includers_of`] and
+    /// [`Analysis::bundle_namespaces`] are folds over the whole projection rather than
+    /// per-document reads — so what is left is a floor rather than a curve.
+    ///
+    /// **Measured 2026-09-16**, release build, median of three keystrokes that each add a *new
+    /// class name* to a model file, which is what makes the projection move and so what makes
+    /// the walk run at all:
+    ///
+    /// | | lobsters, 9,015 documents | discourse, 25,900 documents |
+    /// | --- | ---: | ---: |
+    /// | the walk, projecting every document | 52 ms | 275 ms |
+    /// | the walk, holding them | **22 ms** | **70 ms** |
+    /// | the pass around it | 64 ms → **34** | 340 ms → **132** |
+    ///
+    /// **The walk is over half of that pass, which is why the pass halves with it.** A new class
+    /// name moves the projection and almost never moves a generated document's *text*, so the
+    /// generators all run and every one of discourse's 977 generated documents comes out
+    /// byte-identical: `Synthesized::record` hands nothing over and the walk is what is left.
+    /// The other shape of keystroke is the opposite and this does not touch it — an `attribute`
+    /// added to a model re-declares one document, and re-indexing that one document's 18 KB of
+    /// RBS into a settled graph is 148 ms of a 224 ms pass while the walk does not run at all.
+    ///
+    /// **The key is "has rubydex re-indexed this document", and it must not be a file stamp.**
+    /// [`Analysis::contribution`] reads the graph and never a file, which is the bound this whole
+    /// pass inherits; keying its memo on a `stat` would break that bound and cost one syscall per
+    /// document per settle, which is a large fraction of what the memo is here to remove.
+    /// `self.touched` and `self.touched_all` already carry the right question — so this is not a
+    /// second mechanism beside [`Analysis::context_would_be_the_same`], it is the same one asked
+    /// of every document rather than of the one a keystroke named, and it needs no invalidation
+    /// rule that did not already exist.
+    ///
+    /// **The one input that is not a document is named rather than inferred.** `is_own_code` and
+    /// `is_generator_source` read `engine_prefixes`, which is a property of the bundle and not of
+    /// the graph, so gem discovery drops the whole map where it writes them: a memo that quietly
+    /// survived that would answer with a former engine's `app/` still admitted.
+    fn walk(&mut self) -> Context {
         self.walks += 1;
-        let filters = Filters::new();
-        let mut context = Context::default();
+        let started = Instant::now();
+        // The invalidation, and both halves of it are the gate's own narrowing re-used. A bulk
+        // route says nothing about *which* documents moved, so the whole map goes; only
+        // `Analysis::index_buffer` names one, and that is the keystroke path.
+        if self.touched_all {
+            self.contributions.clear();
+        } else {
+            for uri in &self.touched {
+                self.contributions.remove(&UriId::from(uri.as_str()));
+            }
+        }
+        let filters = Filters::new(&self.knowledge);
+        let mut context = Context::new(&self.knowledge);
         // `(the body that wrote the `include`, the constant it spelled)`, resolved after the
         // loop — see [`Context::includers`].
         let mut included: Vec<(String, String)> = Vec::new();
-        let mut fingerprints: HashMap<UriId, u64> = HashMap::new();
+        // Drained rather than written through, so a document the graph no longer holds takes its
+        // entry with it. Everything still in `held` when the loop ends is a document that was
+        // removed, and it is dropped.
+        let mut held = std::mem::take(&mut self.contributions);
+        let mut contributions: HashMap<UriId, Contribution> = HashMap::with_capacity(held.len());
+        let mut projecting = std::time::Duration::ZERO;
+        let mut projected = 0_usize;
         for (uri_id, document) in self.graph.documents() {
-            let Some(contribution) = self.contribution(document, &filters) else {
-                continue;
+            let contribution = match held.remove(uri_id) {
+                Some(contribution) => contribution,
+                None => {
+                    // Timed around the miss and not around the loop, so the line below costs two
+                    // clock reads per *re-projected* document rather than two per document: on a
+                    // keystroke that is two, and on the cold walk it is 0.6% of a walk that has
+                    // nothing held anyway.
+                    let at = Instant::now();
+                    let fresh = self.contribution(document, &filters);
+                    projecting += at.elapsed();
+                    projected += 1;
+                    match fresh {
+                        Some(contribution) => contribution,
+                        // Not memoised, and absence is why: a document the walk does not
+                        // **visit** must have no entry, because that is the case the gate cannot
+                        // reason about. See [`Analysis::context_would_be_the_same`].
+                        None => continue,
+                    }
+                }
             };
+            context.absorb(document.uri(), contribution.clone(), &mut included);
             // Every document the walk **visits** gets an entry, including one that contributes
-            // nothing: absent has to mean *not visited*, because that is the case the gate
-            // cannot reason about. See [`Analysis::context_would_be_the_same`].
-            fingerprints.insert(*uri_id, fingerprint(&contribution));
-            context.absorb(document.uri(), contribution, &mut included);
+            // nothing.
+            contributions.insert(*uri_id, contribution);
         }
-        context.models = models_of(&context.superclasses);
-        context.includers = includers_of(&included, &context.classes, &context.modules);
-        // A model that writes no macro at all is on no list, and it is exactly the
-        // model whose query interface had to be answered by whatever its abstract parent
-        // happened to own. Its own file is where its relation class belongs, so the file joins
-        // the list that opens it.
-        //
-        // The **only** membership decided after the walk rather than during it, and it has to
-        // be: every predicate in [`WANTS`] is a question about one document, and whether a
-        // class is a model is a question about the chain above it — which is only complete when
-        // every document has been seen. `settle` sorts the list afterwards, so appending here
-        // cannot change which document writes what.
-        let joining: BTreeSet<String> = {
-            let listed: HashSet<&str> = context
-                .documents(List::Models)
-                .iter()
-                .map(String::as_str)
+        let visited = contributions.len();
+        self.contributions = contributions;
+        let absorbed = started.elapsed();
+        // The one place a gem's own names are read. A concern's includer is very often a class
+        // in a gem — `ActiveRecord::Base` includes `ActiveModel::API` — so the chain this walks
+        // runs through names no file of the user's writes.
+        let known: BTreeSet<String> = context
+            .classes
+            .union(&context.foreign_classes)
+            .cloned()
+            .collect();
+        let modules: BTreeSet<String> = context
+            .modules
+            .union(&context.foreign_modules)
+            .cloned()
+            .collect();
+        let at = Instant::now();
+        context.includers = includers_of(&included, &known, &modules);
+        let includers = at.elapsed();
+        // **Files nothing indexed**, found once per pass: a `db/*structure.sql` is not a graph
+        // document, so no contribution can be about it and no list can name it. Taken out and put
+        // back because the discovery reads the workspace while the module writes to itself.
+        let mut knowledge = std::mem::take(&mut self.knowledge);
+        {
+            let reading = knowledge::Reading {
+                root: self.workspace.root(),
+                admits: &|path| self.workspace.admits(path),
+                features: self.workspace.features(),
+            };
+            let found: Vec<Vec<DocUri>> = knowledge
+                .modules()
+                .map(|module| {
+                    let mut found = module.discover(&reading);
+                    found.sort_unstable();
+                    found
+                })
                 .collect();
-            context
-                .models
-                .iter()
-                .filter_map(|name| context.defined_in.get(name))
-                .filter(|uri| !listed.contains(uri.as_str()))
-                .cloned()
-                .collect()
-        };
+            for (module, found) in knowledge.modules_mut().zip(found) {
+                module.discovered(found);
+            }
+        }
+        self.knowledge = knowledge;
+        // **What only the whole walk decides**, and each module's own: whether a class is a model
+        // is a question about the chain above it, and the file that defines one joins the list
+        // that opens it. Before the feature gate below, so a switched-off list drops whatever
+        // joined it here too.
+        for module in self.knowledge.modules() {
+            module.after_the_walk(&mut context);
+        }
+        // **The same gate as `contribution`'s, applied where that one cannot reach.** The hook
+        // above is where a membership is decided *after* the walk rather than during it, so a
+        // document that writes no macro at all lands on the model list without ever passing the
+        // per-document test — and a `[rails] models = false` that only filtered the rows would go
+        // on reading every model in the project. The loop's gate is kept because it is the cheap
+        // half: it is what stops the predicates running per document per switched-off list.
         context
             .documents
-            .entry(List::Models)
-            .or_default()
-            .extend(joining);
+            .retain(|list, _| self.knowledge.wanted(*list, self.workspace.features()));
         // One walk rather than three lookups, because `Graph::get` reads the
         // **declarations**, which `Resolver::resolve` builds and this
         // pass runs before — so it answers a settle late, and over lobsters it holds 2,431
         // entries against 174,919 definitions at the moment it is asked. The definitions are
         // there; only the index over them is not.
-        for (name, module) in self.bundle_namespaces(&wanted_namespaces(&context)) {
+        let at = Instant::now();
+        let namespaces = self.bundle_namespaces(&wanted_namespaces(&context, &self.knowledge));
+        let bundled = at.elapsed();
+        for (name, module) in namespaces {
             context.namespaces.declare(name, module);
         }
-        context.framework = rails::framework_classes()
-            .into_iter()
-            .filter(|name| context.namespaces.declares(name))
-            .map(str::to_owned)
-            .collect();
-        context.dumps = self.schema_dumps();
+        // What a directory conjures is only conjured where **nothing else declares the name** —
+        // a `user.rb` beside the `user/` directory, a `module Chat` in a plugin, a gem. So the
+        // filter runs here, after the application's own names and the bundle's have both been
+        // recorded, and never in the loop above where neither set is complete.
+        //
+        // The survivors are then declared, which is what makes every prefix of a conjured name
+        // spellable: `Chat::Thread::Policy` needs `Chat::Thread`, and `Chat::Thread` is either
+        // declared already or is itself in this map, because the module that conjured it
+        // answers the whole chain rather than its last link.
+        // And what only the **bundle's** answer decides, each module's own again: a namespace a
+        // directory conjures is only conjured where nothing else declares the name, and which
+        // framework classes may be written onto is exactly which of them the bundle holds.
+        let mut conjured: Vec<String> = Vec::new();
+        for module in self.knowledge.modules() {
+            conjured.extend(module.after_the_bundle(&mut context));
+        }
+        for name in conjured {
+            context.namespaces.declare(name, true);
+        }
         context.settle();
-        (context, fingerprints)
+        // The split, and it is the instrument the memo is answerable in: `projected` is how many
+        // of the visited documents the memo could not answer for, and `projecting` is what they
+        // cost — 866 and 0.2 ms on a discourse keystroke, which is the 865 `.rbs` the walk
+        // refuses and therefore never holds, plus the one document that was edited. The three
+        // figures after it are the folds no memo reaches, 32 + 9 + 18 ms, which is the floor.
+        tracing::debug!(
+            "walked {visited} documents in {:.2?} ({projecting:.2?} projecting {projected} of \
+             them, {:.2?} merging, {includers:.2?} includers, {bundled:.2?} bundle namespaces)",
+            started.elapsed(),
+            absorbed.saturating_sub(projecting),
+        );
+        context
     }
 
     /// What one document contributes to a [`Context`], or `None` when the walk does not visit it.
@@ -1436,8 +1039,8 @@ impl Analysis {
     /// definitions, and [`Analysis::bundle_namespaces`] reads *every* definition in the graph —
     /// so an `.rbs` in the project's own `sig/`, or a gem file the user opened and typed in,
     /// can move a `Context` while contributing nothing here. The gate refuses a touched
-    /// document that is not visited for exactly that reason, which is what lets the fingerprint
-    /// stop at this function's own outputs.
+    /// document that is not visited for exactly that reason, which is what lets the gate and the
+    /// memo both stop at this function's own outputs.
     fn contribution(&self, document: &Document, filters: &Filters) -> Option<Contribution> {
         // Ruby only, and the exclusion is a real one rather than a tidiness: an `.rbs` file
         // has `def`s and doc comments like any other document, so a `@return` tag in one
@@ -1449,21 +1052,23 @@ impl Analysis {
         // is `Wants::engines` below, so the difference is one flag per list and never a
         // second loop.
         let own = self.is_own_code(document.uri());
-        if (!own && !self.is_generator_source(document.uri())) || document.uri().ends_with(".rbs") {
+        // **Three widths, and only the widest one is new.** `own` is the user's code; `generator`
+        // adds a Rails engine's `app/`, which is [`Analysis::is_generator_source`]'s whole
+        // purpose; and everything else left after the `.rbs` test is a gem's own Ruby, which
+        // exactly one list admits — see [`Wants::gems`]. A document outside all three does not
+        // exist: the graph holds nothing that is not one of them.
+        let generator = own || self.is_generator_source(document.uri());
+        if document.uri().ends_with(".rbs") {
             return None;
         }
         let mut contribution = Contribution::default();
-        // The suffix test is the whole reason this is not a path parse per document: `_helper.rb` leaves a handful of files in the largest corpus, and
-        // [`rails::is_helper`] — which is the rule, and reads the `app/helpers` anchor as
-        // well — is asked only of those.
-        let helper = own
-            && document.uri().ends_with("_helper.rb")
-            && DocUri::from_uri_str(document.uri())
-                .and_then(|uri| uri.to_path())
-                .is_some_and(|path| rails::is_helper(&path));
         let mut tagged = false;
-        let mut inherits = false;
-        let mut defines = [false; WANTS.len()];
+        let rows = self.knowledge.wants().len();
+        let mut defines = vec![false; rows];
+        let mut declares = vec![false; rows];
+        // One per **module** and not per row: `Wants::inherits` asks the module's own convention,
+        // and two rows of one module share the answer while two modules never do.
+        let mut inherits = vec![false; self.knowledge.len()];
         for definition in document
             .definitions()
             .iter()
@@ -1474,33 +1079,10 @@ impl Analysis {
                     let Some(name) = self.qualified_name(class.name_id()) else {
                         continue;
                     };
-                    // A table is claimed by pluralizing a **top-level** class's name.
-                    // `Admin::Setting`'s table depends on `table_name_prefix`, which is
-                    // Ruby that only runs, so it is declined here and left to
-                    // `self.table_name`, which is the escape that still works for it.
-                    // `own` and not `is_generator_source`: a table is the *application's*
-                    // database table, and an engine that defines a top-level class would
-                    // otherwise claim one by pluralizing its name and compete with the
-                    // model that really owns it. Two of this loop's six outputs mean "the
-                    // application" rather than "a class the reader can name", and this is
-                    // the first; `hosts` is the other.
-                    if own
-                        && !name.contains("::")
-                        && let Some(table) = rails::table_of(&name)
-                    {
-                        contribution.claims.push((table, name.clone()));
-                    }
-                    // The table-name half of the same sentence, and the reason it is a name and
-                    // not a table: `Spree::Order` reads `spree_orders` and the `spree_`
-                    // comes out of a file this loop is not allowed to open.
-                    if own && name.contains("::") {
-                        contribution.nested.push(name.clone());
-                    }
                     // The two entry-point conventions, asked once and for both callers: the
-                    // same `rails::convention_of` the reader itself asks, so which
-                    // documents are worth opening and which classes are worth reading
-                    // cannot disagree. `include` only — an `extend Sidekiq::Worker` puts
-                    // the hook nowhere and is not the shape.
+                    // module's own `claims_by_ancestry`, so which documents are worth opening
+                    // and which classes are worth reading cannot disagree. `include` only — an
+                    // `extend Sidekiq::Worker` puts the hook nowhere and is not the shape.
                     let superclass = class
                         .superclass_ref()
                         .and_then(|id| self.graph.constant_references().get(id))
@@ -1515,7 +1097,12 @@ impl Analysis {
                         .filter_map(|id| self.graph.constant_references().get(id))
                         .filter_map(|reference| self.spelled_name(reference.name_id()))
                         .collect();
-                    inherits |= rails::convention_of(superclass.as_deref(), &mixins).is_some();
+                    // Asked of every registered module and of none of them by name: whether a
+                    // class with this superclass and these mixins is one of *yours* is the one
+                    // predicate in the table whose question core cannot ask.
+                    for (found, module) in inherits.iter_mut().zip(self.knowledge.modules()) {
+                        *found |= module.claims_by_ancestry(superclass.as_deref(), &mixins);
+                    }
                     // The includer edge, read here for `superclasses`' reason: an
                     // `include` is recorded on the definition at index time, so which
                     // module it names is a question about the graph rather than about the
@@ -1525,28 +1112,26 @@ impl Analysis {
                     contribution
                         .included
                         .extend(mixins.iter().map(|written| (name.clone(), written.clone())));
-                    // The other one, and it stays `own`-only even though `List::Routes`
-                    // does not. A host is a class the *application's* route helpers are
-                    // `include`d into: an engine's own controllers are hosts in Rails and
-                    // reach their own helpers by their own mechanism, so `ActiveStorage`'s
-                    // six would each cost an `include` of a module holding nothing for
-                    // them.
-                    if own && rails::hosts_routes(&name, superclass.as_deref(), &mixins, false) {
-                        contribution.hosts.push(Owner::Instance(name.clone()));
-                    }
-                    if let Some(superclass) = superclass {
+                    if generator && let Some(superclass) = superclass {
                         contribution.superclasses.push((name.clone(), superclass));
                     }
-                    contribution.declared.push((name, false));
+                    if generator {
+                        contribution.declared.push((name, false));
+                    } else {
+                        contribution.foreign.push((name, false));
+                    }
                 }
                 Definition::Module(module) => {
+                    // The sixth predicate, asked of the **last segment** and so of the name
+                    // rubydex interned rather than of the joined one: `module ClassMethods` is
+                    // one string compare per module definition, and the walk up its parents is
+                    // the expensive half that only a match may reach.
+                    if let Some(interned) = self.graph.names().get(module.name_id()) {
+                        for (found, names) in declares.iter_mut().zip(&filters.modules) {
+                            *found |= names.contains(interned.str());
+                        }
+                    }
                     if let Some(name) = self.qualified_name(module.name_id()) {
-                        if helper {
-                            contribution.helpers.push(name.clone());
-                        }
-                        if own && rails::hosts_routes(&name, None, &[], true) {
-                            contribution.hosts.push(Owner::Module(name.clone()));
-                        }
                         // A module's own `include`s, for the same edge: a concern that
                         // includes a concern is what the closure below walks through.
                         contribution.included.extend(
@@ -1563,7 +1148,11 @@ impl Analysis {
                                 .filter_map(|reference| self.spelled_name(reference.name_id()))
                                 .map(|written| (name.clone(), written)),
                         );
-                        contribution.declared.push((name, true));
+                        if generator {
+                            contribution.declared.push((name, true));
+                        } else {
+                            contribution.foreign.push((name, true));
+                        }
                     }
                 }
                 // A YARD tag is a comment above a `def`, and indexing already carried the
@@ -1571,7 +1160,11 @@ impl Analysis {
                 // question the graph answers without opening one. The name is read for
                 // `def self.table_name_prefix`, which is the one thing on any of these lists
                 // that a file *defines* rather than calls or references.
-                Definition::Method(method) => {
+                // **Skipped outright for a gem**, which is most of what widening the walk
+                // would otherwise have cost: a method definition is the commonest thing in any
+                // document, and both questions asked here — a YARD tag and
+                // `def self.table_name_prefix` — are about lists no gem may join.
+                Definition::Method(method) if generator => {
                     if !tagged {
                         tagged = method.comments().iter().any(|comment| {
                             comment.string().contains("@return")
@@ -1588,7 +1181,7 @@ impl Analysis {
                         && let Some(spelled) = self.graph.strings().get(method.str_id())
                     {
                         let name = render::simple_name(spelled.as_str());
-                        for (found, want) in defines.iter_mut().zip(&WANTS) {
+                        for (found, want) in defines.iter_mut().zip(self.knowledge.wants()) {
                             *found |= want.defines.contains(&name);
                         }
                     }
@@ -1618,13 +1211,27 @@ impl Analysis {
                     .filter_map(|reference| self.graph.names().get(reference.name_id()))
                     .any(|name| names.contains(name.str()))
         };
-        for (((want, names), constants), defined) in WANTS
+        let features = self.workspace.features();
+        for ((((at, want), names), constants), (defined, declared)) in self
+            .knowledge
+            .wants()
             .iter()
+            .enumerate()
             .zip(&filters.calls)
             .zip(&filters.constants)
-            .zip(defines)
+            .zip(defines.into_iter().zip(declares))
         {
-            if !own && !want.engines {
+            let module = self.knowledge.behind(at);
+            // **The one place a switched-off generator is switched off**, and it is this one
+            // because the rows are the one table that decides which documents any generator ever
+            // sees: an empty list is a generator that does nothing, with no removal path to
+            // write and nothing downstream to teach. A configuration reload re-indexes the
+            // workspace anyway (`analysis/mod.rs`), so declarations a generator produced before
+            // it was turned off are dropped by that rebuild rather than by anything here.
+            if !module.wanted(want.list, features) {
+                continue;
+            }
+            if !own && !(if generator { want.engines } else { want.gems }) {
                 continue;
             }
             // Once per document per list however many of the three tests say yes, which is
@@ -1636,12 +1243,32 @@ impl Analysis {
                     .path
                     .is_some_and(|suffix| document.uri().ends_with(suffix))
                 || (want.tags && tagged)
-                || (want.inherits && inherits)
+                || (want.inherits && inherits[self.knowledge.module_at(at)])
                 || defined
+                || declared
             {
                 contribution.lists.push(want.list);
             }
         }
+        // **Every module's own half, and it is a fold over what is already in hand** — the names
+        // this document declares, the superclass and the `include`s beside each, and the URI.
+        // Nothing here goes back to the graph, which is what keeps a module's projection from
+        // costing a second walk; the one thing that cannot be folded is a byte offset, and
+        // `Seen::confirming` is the closure that answers those.
+        let seen = Seen {
+            uri: document.uri(),
+            own,
+            generator,
+            declared: &contribution.declared,
+            superclasses: &contribution.superclasses,
+            included: &contribution.included,
+            confirming: &|parent, names| self.confirming_path(document, parent, names),
+        };
+        contribution.modules = self
+            .knowledge
+            .modules()
+            .map(|module| knowledge::Contributed(module.contribute(&seen)))
+            .collect();
         Some(contribution)
     }
 
@@ -1715,6 +1342,96 @@ impl Analysis {
     /// this answer the same string a `class_name: "Admin::Setting"` would have to match.
     ///
     /// `None` for a singleton's attached name, which is not a constant anybody writes.
+    /// Where each of `conjured`'s names is written on the line that confirmed the directory.
+    ///
+    /// The generated `module Api` has no member to hang a place on, so its place is the `Api` of
+    /// the `class Api::V1::Foo` this document writes — *the source this generator read*, which
+    /// is the rule every other span in this pass obeys, reached through a body rather than
+    /// through a member.
+    ///
+    /// **Read out of the declaration the chain was confirmed on, and never out of the document
+    /// at large.** A file that names `Api` inside a method body names a *use*, and offering one
+    /// as a place would be a line nothing declared. So the window is that declaration's own
+    /// construct, and within it the **earliest** reference to a name is the one the path wrote:
+    /// a superclass and a body both come after it. `declared` is the parent the caller already
+    /// matched to confirm the chain, passed rather than re-derived so that this function has no
+    /// arm for a chain it cannot have been called with.
+    ///
+    /// Matched by **name** rather than by position. A nested spelling — `module Api` around a
+    /// `class V1::Foo` — writes fewer references than the path has segments, and pairing those
+    /// positionally would put `Api`'s place on `V1`'s line. A conjured name with no reference in
+    /// the window is simply absent here, and [`Analysis::autoloaded_declarations`] then writes
+    /// its body with no span, which is the no-mapping-no-place rule unchanged. That case is not
+    /// hypothetical and it costs nothing: a document that spells the nesting out declares every
+    /// name in the chain, so [`Context::autoloaded`]'s filter drops all of them anyway.
+    ///
+    /// `full` is the namespace the declaration opens — `Api::V1::Accounts` of a
+    /// `class Api::V1::Accounts::CredentialsController` — and `selection` the one segment. The
+    /// class's own name is deliberately outside it: what a reader is being sent to is where the
+    /// namespace is written, and the constant that happens to live in it is a different name.
+    fn confirming_path(
+        &self,
+        document: &Document,
+        declared: &str,
+        names: &BTreeSet<&str>,
+    ) -> HashMap<String, At> {
+        // The first declaration `declared` names, in document order: a second one in the same
+        // file is the same namespace confirmed twice, and the earlier line is the one a reader
+        // sent here would expect to land on.
+        let within = document
+            .definitions()
+            .iter()
+            .filter_map(|id| self.graph.definitions().get(id))
+            .find_map(|definition| {
+                let name = self.qualified_name(definition.name_id()?)?;
+                let (parent, _) = name.rsplit_once("::")?;
+                (parent == declared)
+                    .then(|| (definition.offset().start(), definition.offset().end()))
+            });
+        within.map_or_else(HashMap::new, |(from, to)| {
+            let mut segments: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
+            for reference in document
+                .constant_references()
+                .iter()
+                .filter_map(|id| self.graph.constant_references().get(id))
+                .filter(|reference| {
+                    reference.offset().start() >= from && reference.offset().end() <= to
+                })
+            {
+                let Some(spelled) = self
+                    .qualified_name(reference.name_id())
+                    .and_then(|name| names.get(name.as_str()).copied())
+                else {
+                    continue;
+                };
+                let at = (reference.offset().start(), reference.offset().end());
+                // The path's own segment is the **earliest** occurrence inside the construct,
+                // and earliest is not first: rubydex indexes a `class Mod::A < Mod::B`'s
+                // superclass before the name, so the first reference handed over here is the
+                // one written second. `Ord::min` rather than a comparison, because a file
+                // cannot write a superclass before the name it is a superclass of and an arm
+                // for that would be an arm no fixture can reach.
+                segments
+                    .entry(spelled)
+                    .and_modify(|held| *held = (*held).min(at))
+                    .or_insert(at);
+            }
+            // One `full` serves every segment, because every one of them is part of the one
+            // path: it opens at the outermost and closes at the innermost this file wrote.
+            let opens = segments.values().map(|at| at.0).min();
+            let closes = segments.values().map(|at| at.1).max();
+            opens
+                .zip(closes)
+                .map(|full| {
+                    segments
+                        .into_iter()
+                        .map(|(name, selection)| (name.to_owned(), (full, selection)))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
     fn qualified_name(&self, name_id: &NameId) -> Option<String> {
         let name = self.graph.names().get(name_id)?;
         let own = self.graph.strings().get(name.str())?.as_str();
@@ -1764,591 +1481,119 @@ impl Analysis {
     ///
     /// **Two readers are deliberately not memoised**, and it is the same sentence for both:
     /// neither is a function of its own text. `structs::read` takes the `Context`'s namespaces,
-    /// and `rails::read_routes` takes a prefix that another file's parse computed. A memo for
+    /// and a routes reader takes a prefix that another file's parse computed. A memo for
     /// either would need a second input compared, which is exactly the design this one rejects.
-    fn refresh_sources(&mut self, context: &Context) {
-        let mut wants: BTreeMap<String, Wanted> = BTreeMap::new();
-        for uri in context.documents(List::Models) {
-            wants.entry(uri.clone()).or_default().model = true;
-        }
-        for uri in context.documents(List::Renamed) {
-            wants.entry(uri.clone()).or_default().names = true;
-        }
-        for uri in context.documents(List::Annotated) {
-            wants.entry(uri.clone()).or_default().annotated = true;
-        }
-        for uri in context.documents(List::Entrypoints) {
-            wants.entry(uri.clone()).or_default().entrypoints = true;
-        }
-        // The same filter `schema_declarations` applies, asked here so that a `schema.rb` that
-        // is not one is never read: the suffix puts a document on the list and
-        // [`rails::is_schema`] decides whether it really is a schema.
-        for uri in context.documents(List::Schemas) {
-            if DocUri::from_uri_str(uri)
-                .and_then(|uri| uri.to_path())
-                .is_some_and(|path| rails::is_schema(&path))
-            {
-                wants.entry(uri.clone()).or_default().schema = Some(false);
-            }
-        }
-        for uri in &context.dumps {
-            wants.entry(uri.as_str().to_owned()).or_default().schema = Some(true);
-        }
-
-        // A file that has left every list keeps nothing here. Not an optimisation: the memo is
-        // keyed by URI and a file that is deleted and written again is a different file, so an
-        // entry nothing asks for is an entry nothing will ever check the freshness of.
-        self.sources.retain(|uri, _| wants.contains_key(uri));
-
-        let wants: Vec<(String, DocUri, Wanted)> = wants
-            .into_iter()
-            .filter_map(|(key, wanted)| Some((DocUri::from_uri_str(&key)?, key, wanted)))
-            .map(|(uri, key, wanted)| (key, uri, wanted))
+    /// Which document declares each of these namespaces, for the one generator that has to open a
+    /// file it was not handed.
+    ///
+    /// [`Analysis::bundle_namespaces`]' walk, asked for a URI rather than for a kind, and bounded
+    /// the same way: the last segments are hashed first, so a definition nobody asked about costs
+    /// one compare and never a walk up its parents. A name several files reopen answers with the
+    /// **first in URI order**, which is arbitrary and deterministic — what a module declares in
+    /// its own body is what this reads, and a module spread over two files is one that would need
+    /// both read whichever were picked. Six corpora hold none.
+    ///
+    /// A generated document is skipped, for `bundle_namespaces`' reason: this pass is what wrote
+    /// those, and reading its own output back is how a fact starts deriving from itself.
+    fn declaring_documents(&self, wanted: &BTreeSet<String>) -> BTreeMap<String, DocUri> {
+        let last: HashSet<StringId> = wanted
+            .iter()
+            .map(|name| StringId::from(name.rsplit("::").next().unwrap_or(name)))
             .collect();
-        for (key, uri, wanted) in wants {
-            let fresh = self.freshness(&uri);
-            if self
-                .sources
-                .get(&key)
-                .is_some_and(|held| held.fresh == fresh && held.wanted == wanted)
-            {
-                continue;
-            }
-            // Read before the map is touched at all, because `with_text` borrows the whole of
-            // `self` — and because a file that has gone must take its entry with it rather than
-            // leave a parse nothing can refresh.
-            let Some(source) = self.with_text(&uri, |text| text.text().to_owned()) else {
-                self.sources.remove(&key);
+        let mut found: BTreeMap<String, (String, DocUri)> = BTreeMap::new();
+        for definition in self.graph.definitions().values() {
+            let Definition::Module(module) = definition else {
                 continue;
             };
-            self.reads += 1;
-            let name = self.workspace_relative(&uri);
-            self.sources
-                .insert(key, Cached::read(fresh, wanted, name, &source));
+            let name_id = module.name_id();
+            let Some(name) = self.graph.names().get(name_id) else {
+                continue;
+            };
+            if !last.contains(name.str()) {
+                continue;
+            }
+            let Some(document) = self.graph.documents().get(definition.uri_id()) else {
+                continue;
+            };
+            if document.uri().starts_with(synthesized::GENERATED_SCHEME) {
+                continue;
+            }
+            let Some(spelled) = self.qualified_name(name_id) else {
+                continue;
+            };
+            if !wanted.contains(&spelled) {
+                continue;
+            }
+            let Some(uri) = DocUri::from_uri_str(document.uri()) else {
+                continue;
+            };
+            match found.entry(spelled) {
+                std::collections::btree_map::Entry::Occupied(mut held) => {
+                    if document.uri() < held.get().0.as_str() {
+                        held.insert((document.uri().to_owned(), uri));
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(empty) => {
+                    empty.insert((document.uri().to_owned(), uri));
+                }
+            }
         }
+        found
+            .into_iter()
+            .map(|(name, (_, uri))| (name, uri))
+            .collect()
     }
 
-    /// How the text of one document is identified for [`Cached`] — see [`Fresh`] for why the
-    /// two authorities cannot share one answer.
-    fn freshness(&self, uri: &DocUri) -> Fresh {
+    /// What a template's implicit receiver can answer, asked of every module.
+    ///
+    /// The first answer wins and there is only ever one: this is not a declaration, so there is
+    /// no rank to settle it with, and two modules both claiming to know what a bare word in a
+    /// template means would be a design question rather than a precedence one.
+    fn view_context(&self, context: &Context) -> Views {
+        let declaring = knowledge::Declaring {
+            context,
+            features: self.workspace.features(),
+            text: &|uri| self.with_text(uri, |text| text.text().to_owned()),
+            caption: &|uri| self.workspace_relative(uri),
+            own: &|uri| self.is_own_code(uri),
+            declares: &|wanted| self.declaring_documents(wanted),
+        };
+        self.knowledge
+            .modules()
+            .find_map(|module| module.views(&declaring))
+            .unwrap_or_default()
+    }
+
+    fn refresh_sources(&mut self, context: &Context) {
+        // Taken out and put back, because the closures below borrow the rest of `self` — the open
+        // buffers, the workspace root — while a module writes to itself. The same move
+        // `Analysis::walk` makes with the contributions, for the same reason.
+        let mut knowledge = std::mem::take(&mut self.knowledge);
+        let sources = knowledge::Sources {
+            context,
+            features: self.workspace.features(),
+            fresh: &|uri| self.freshness(uri),
+            text: &|uri| self.with_text(uri, |text| text.text().to_owned()),
+            caption: &|uri| self.workspace_relative(uri),
+        };
+        for module in knowledge.modules_mut() {
+            module.refresh(&sources);
+        }
+        self.knowledge = knowledge;
+    }
+
+    /// How the text of one document is identified for a module's own memo — see
+    /// [`knowledge::Fresh`] for why the two authorities cannot share one answer.
+    fn freshness(&self, uri: &DocUri) -> knowledge::Fresh {
         match self.open.get(uri) {
             Some(open) => {
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 open.text.text().hash(&mut hasher);
-                Fresh::Buffer(hasher.finish())
+                knowledge::Fresh::Buffer(hasher.finish())
             }
-            None => Fresh::Disk(uri.to_path().as_deref().and_then(stamp_of)),
+            None => knowledge::Fresh::Disk(uri.to_path().as_deref().and_then(stamp_of)),
         }
-    }
-
-    fn schema_dumps(&self) -> Vec<DocUri> {
-        let Ok(entries) = std::fs::read_dir(self.workspace.root().join("db")) else {
-            return Vec::new();
-        };
-        entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| rails::is_structure(path) && self.workspace.admits(path))
-            .filter_map(|path| DocUri::from_path(&path))
-            .collect()
-    }
-
-    /// What `db/*schema.rb` and `db/*structure.sql` declare, and how many columns.
-    fn schema_declarations(
-        &self,
-        context: &Context,
-        retyped: &BTreeMap<String, BTreeSet<String>>,
-        into: &mut BTreeMap<String, (DocUri, Facts)>,
-    ) -> usize {
-        // Every one of them before any of them writes a line, because the ambiguity rule below
-        // is about tables *across* files. Both readers end at a `rails::Schema`, so from here
-        // down the ambiguity rule, the claims, the provenance line and
-        // everything downstream cannot tell a dump from a `schema.rb`. Which of the two parsed
-        // it, and whether the suffix on the list really named a schema at all, are
-        // [`Analysis::refresh_sources`]' decisions: a document with no `schema` slot was never
-        // one.
-        let schemas: Vec<(DocUri, String, Arc<rails::Schema>)> = context
-            .documents(List::Schemas)
-            .iter()
-            .map(String::as_str)
-            .chain(context.dumps.iter().map(DocUri::as_str))
-            .filter_map(|key| {
-                let held = self.sources.get(key)?;
-                Some((
-                    DocUri::from_uri_str(key)?,
-                    held.name.clone(),
-                    held.schema.clone()?,
-                ))
-            })
-            .collect();
-        if schemas.is_empty() {
-            return 0;
-        }
-
-        // A table two schemas declare is declared by neither, for the same reason a table two
-        // classes claim is claimed by neither: the model would answer with two schemas at once,
-        // and — worse, because it is silent — `Types::harvest` would keep whichever column was
-        // read last, which is a type that depends on document order.
-        let mut once: HashMap<&str, usize> = HashMap::new();
-        for (_, _, schema) in &schemas {
-            for table in schema.table_names() {
-                *once.entry(table).or_default() += 1;
-            }
-        }
-        let mut tables = self.model_tables(context);
-        tables.retain(|table, _| once.get(table.as_str()) == Some(&1));
-
-        let mut columns = 0;
-        for (uri, name, schema) in &schemas {
-            let facts = schema.signatures(name, &tables, retyped);
-            columns += facts.len();
-            merge(into, uri, facts);
-        }
-        columns
-    }
-
-    /// Every file on the model list, read and parsed once.
-    ///
-    /// Separate from the declaring below because two generators read it: the schema needs
-    /// [`retyped_columns`] before it writes a line, and the models themselves need every file
-    /// parsed before any of them does — which element types need a relation class is a fact
-    /// across files.
-    fn model_sources(&self, context: &Context) -> Vec<(DocUri, String, Arc<rails::Model>)> {
-        context
-            .documents(List::Models)
-            .iter()
-            .filter_map(|key| {
-                let held = self.sources.get(key)?;
-                Some((
-                    DocUri::from_uri_str(key)?,
-                    held.name.clone(),
-                    held.model.clone()?,
-                ))
-            })
-            .collect()
-    }
-
-    /// What the association macros and `enum` declare.
-    ///
-    /// **Exactly one** file may write each relation class. The one that does is the first in URI
-    /// order that asked for it — an arbitrary choice made deterministic, which is all it has to
-    /// be, because a relation class is mapped to no line of anybody's code and so is the same
-    /// class whichever document holds it.
-    fn model_declarations(
-        &self,
-        context: &Context,
-        models: &[(DocUri, String, Arc<rails::Model>)],
-        columns: &BTreeSet<(String, String)>,
-        into: &mut BTreeMap<String, (DocUri, Facts)>,
-    ) -> usize {
-        // A class gets a relation class for either of two reasons: **some macro made it a
-        // collection**, or **it is a model** — every class ActiveRecord will answer `where` and
-        // `first` on, whether or not it writes a macro. Neither implies the other, so this is a
-        // union and deliberately not a replacement; [`models_of`] has the classes that are the
-        // first and not the second.
-        //
-        // Both are then filtered the same way: the application has to define the class itself,
-        // and the name the relation would take has to be one the application has *not* already
-        // used. A project that wrote its own `Comment::Relation` meant something by it, and
-        // shadowing it is the one way this pass can make an answer worse rather than absent.
-        //
-        // The host test asks the union itself, one question earlier: whether the class a macro is
-        // written **on** is a model. The two are the same set and must stay one — a serializer
-        // is not a model because a filter about naming collided, it is not a model because
-        // nothing says it is — so `relations` is derived from this rather than built beside it.
-        let modelled: BTreeSet<String> = models
-            .iter()
-            .flat_map(|(_, _, model)| model.collections(&context.classes))
-            .map(str::to_owned)
-            .chain(context.models.iter().cloned())
-            .filter(|element| context.classes.contains(element))
-            .collect();
-        // The element half is deliberately **not** gated by the host test. A serializer's
-        // `has_many :statuses` is still evidence that `Status` is a collection somewhere in the
-        // application — it is serializing a model's association — and gating the input of the
-        // set the gate reads would make it circular. What the host test removes is the
-        // declaration, never the relation.
-        // **A project that declares [`rails::RELATION_BASE`] itself meant something by it**, and
-        // a class this pass wrote into would answer with both its members and ours — while every
-        // relation in the workspace would inherit whatever they meant. It is the rule
-        // `Comment::Relation` and `ROUTE_HELPERS` follow, asked of the one class the query
-        // interface invents. It withdraws the **relations**, which is that same collision
-        // behaviour reached by a second road rather than a rule of its own: with no
-        // relation class there is nothing for a `has_many` to return, so the whole half declines
-        // together instead of leaving a `-> Comment::Relation` naming a class nothing declares.
-        let interface = !context.namespaces.declares(rails::RELATION_BASE);
-        let relations: BTreeSet<String> = modelled
-            .iter()
-            .filter(|_| interface)
-            .filter(|element| !context.classes.contains(&rails::relation_of(element)))
-            // A name **rubydex invented** is not a constant path, and a generated declaration
-            // on one costs the whole document — see [`generated::is_constant_path`]. An
-            // anonymous `Class.new(Spree::Base)` in a spec is an ActiveRecord model by every
-            // rule this crate has, and solidus writes 38 of them.
-            //
-            // The name and **not** `Namespaces::spellable`, which is the rule about a
-            // *namespace*. A relation class is joined onto whatever namespace its element is
-            // in, and holding it to that rule here would withdraw every relation whose element
-            // sits under a Zeitwerk-conjured
-            // module, which over chatwoot is 21 classes — every `Channel::` and every
-            // `Captain::` — 285 declarations and **173 positions that answer nothing at all**.
-            .filter(|element| crate::generated::is_constant_path(element))
-            .cloned()
-            .collect();
-
-        // Which document writes each relation class: **the first that asks for it**, exactly as
-        // before, and only then — for a model no macro anywhere asks about — the document that
-        // defines the class.
-        //
-        // The order of these two loops is load-bearing and was measured rather than reasoned.
-        // Preferring the defining document for *every* element moves relation classes that
-        // already had a home, and moving them loses answers: over chatwoot it cost **32
-        // positions**, `Channel::Telegram.find_by` among them, which stopped resolving to its
-        // own class side and started resolving to the one it inherits from `ApplicationRecord`
-        // — the very defect the per-model class side exists to fix. Nothing in a relation
-        // class is mapped, so where it lives should not matter and empirically does; **until
-        // that is understood, nothing that already had a home may be relocated.**
-        let index: HashMap<&str, usize> = models
-            .iter()
-            .enumerate()
-            .map(|(at, (uri, _, _))| (uri.as_str(), at))
-            .collect();
-        let mut assigned: Vec<BTreeSet<String>> = vec![BTreeSet::new(); models.len()];
-        let mut written: BTreeSet<&str> = BTreeSet::new();
-        for (at, (_, _, model)) in models.iter().enumerate() {
-            for element in model.collections(&context.classes) {
-                if relations.contains(element) && written.insert(element) {
-                    assigned[at].insert(element.to_owned());
-                }
-            }
-        }
-        for element in &relations {
-            if written.contains(element.as_str()) {
-                continue;
-            }
-            if let Some(at) = context
-                .defined_in
-                .get(element.as_str())
-                .and_then(|uri| index.get(uri.as_str()))
-            {
-                assigned[*at].insert(element.clone());
-            }
-        }
-
-        // The query interface goes in **one** document and it is the first that writes a
-        // relation at all, for the reason exactly one file writes the `MessageDelivery` stub:
-        // it is one class however many relations inherit it, and N copies would be N
-        // declarations of one class saying the same hundred and twenty things. A workspace with
-        // no relation in it writes no base class, because nothing would inherit one.
-        let shared = assigned.iter().position(|elements| !elements.is_empty());
-
-        // The class side's own base. `Story.where` is *inherited* — Ruby
-        // follows a class object's singleton chain up the class chain — so the interface goes
-        // once on each model's **base**, and a project pays for it per base rather than per
-        // model. Which document writes it is the one that defines the base, exactly as an
-        // unasked-for relation class goes in the document that defines its element; a base whose
-        // file is not on this list falls in with the shared half.
-        //
-        // The set is built from `relations` rather than from `modelled` so that the *reach* is
-        // the one that shipped: every class that had a class side has one, through its base.
-        // What it widens is a real gap — a model with no `has_many` and no `scope` is on no
-        // list and inherits one anyway — and that is a consequence of putting the declaration
-        // where Rails puts it rather than a second rule.
-        let mut bases: Vec<BTreeSet<String>> = vec![BTreeSet::new(); models.len()];
-        for element in &relations {
-            let base = base_of(
-                element,
-                &context.superclasses,
-                &context.models,
-                &context.namespaces,
-            );
-            let at = context
-                .defined_in
-                .get(base.as_str())
-                .and_then(|uri| index.get(uri.as_str()))
-                .copied()
-                .or(shared);
-            if let Some(at) = at {
-                bases[at].insert(base);
-            }
-        }
-
-        let mut members = 0;
-        for (at, (uri, name, model)) in models.iter().enumerate() {
-            let mut facts = model.signatures(
-                name,
-                &rails::Elsewhere {
-                    known: &context.classes,
-                    framework: &context.framework,
-                    models: &modelled,
-                    relations: &relations,
-                    emit: &assigned[at],
-                    bases: &bases[at],
-                    includers: &context.includers,
-                    columns,
-                },
-            );
-            if shared == Some(at) {
-                rails::relation_base(&mut facts);
-            }
-            members += facts.len();
-            merge(into, uri, facts);
-        }
-        members
-    }
-
-    /// What a `sig` block or a YARD tag says, and how many methods that typed.
-    fn annotation_declarations(
-        &self,
-        context: &Context,
-        into: &mut BTreeMap<String, (DocUri, Facts)>,
-    ) -> usize {
-        let mut typed = 0;
-        for key in context.documents(List::Annotated) {
-            let Some(facts) = self
-                .sources
-                .get(key)
-                .and_then(|held| held.annotated.clone())
-            else {
-                continue;
-            };
-            let Some(uri) = DocUri::from_uri_str(key) else {
-                continue;
-            };
-            typed += facts.len();
-            merge(into, &uri, facts);
-        }
-        typed
-    }
-
-    /// What a `Struct.new` or a `Data.define` installs on the constant it is assigned.
-    ///
-    /// The same shape as the annotations above and for the same reason — a reader that needs
-    /// nothing but the text and the file's name needs nothing from the graph either — and the
-    /// only generator in the pass that is not Rails'. [`structs::read`] decides which of the
-    /// documents this list holds really writes one; a file that mentions `Struct` and never
-    /// calls it says nothing and is not recorded.
-    fn struct_declarations(
-        &self,
-        context: &Context,
-        into: &mut BTreeMap<String, (DocUri, Facts)>,
-    ) -> usize {
-        let mut members = 0;
-        for uri in context
-            .documents(List::Structs)
-            .iter()
-            .filter_map(|uri| DocUri::from_uri_str(uri))
-        {
-            let Some(source) = self.with_text(&uri, |text| text.text().to_owned()) else {
-                continue;
-            };
-            let facts = structs::read(&source, &self.workspace_relative(&uri), &context.namespaces);
-            members += facts.len();
-            merge(into, &uri, facts);
-        }
-        members
-    }
-
-    /// What a mailer's actions and a job's `perform` install on the class side.
-    ///
-    /// **Exactly one file writes the [`rails::MESSAGE_DELIVERY`] stub**, for the reason exactly
-    /// one file writes a relation class: it is one type however many mailers reach it, and N
-    /// copies of it would be N declarations of one class saying the same four things. The one
-    /// that does is the first mailer in URI order — an arbitrary choice made deterministic,
-    /// which is all it has to be, because nothing in that class is mapped to any file.
-    ///
-    /// An application that declares `ActionMailer::MessageDelivery` itself writes it instead,
-    /// and this says nothing: a project that spelled that constant meant something by it. What
-    /// this cannot ask is whether the *gem* declares it, because declarations do not exist
-    /// until `resolve` — and it does not need to, because both are then one declaration and
-    /// this one carries no place.
-    fn entrypoint_declarations(
-        &self,
-        context: &Context,
-        into: &mut BTreeMap<String, (DocUri, Facts)>,
-    ) -> usize {
-        let sources: Vec<(DocUri, String, Arc<rails::Entrypoints>)> = context
-            .documents(List::Entrypoints)
-            .iter()
-            .filter_map(|key| {
-                let held = self.sources.get(key)?;
-                Some((
-                    DocUri::from_uri_str(key)?,
-                    held.name.clone(),
-                    held.entrypoints.clone()?,
-                ))
-            })
-            .collect();
-        let delivery = (!context.namespaces.declares(rails::MESSAGE_DELIVERY))
-            .then(|| {
-                sources
-                    .iter()
-                    .find(|(_, _, entrypoints)| entrypoints.delivers())
-                    .map(|(uri, _, _)| uri.as_str().to_owned())
-            })
-            .flatten();
-
-        let mut installed = 0;
-        for (uri, name, entrypoints) in &sources {
-            let facts = entrypoints.signatures(name, delivery.as_deref() == Some(uri.as_str()));
-            installed += facts.len();
-            merge(into, uri, facts);
-        }
-        installed
-    }
-
-    /// What the routing DSL names, and where each helper is `include`d.
-    ///
-    /// **Two reads and the second needs the first.** A `draw :admin` is the only thing that says
-    /// where `config/routes/admin.rb` sits in the scope, so a drawn file cannot be read until
-    /// the file that draws it has been, and it is read *at that prefix*. Its declarations then
-    /// go into its **own** generated document, because a span is a byte range with no URI and a
-    /// mapping recorded against the wrong file opens the wrong line confidently.
-    ///
-    /// **Exactly one file declares each helper.** Two routes files naming one — an engine and
-    /// the application, or the same name in `config/routes.rb` and a drawn file — would land in
-    /// two generated documents, where [`Facts`]' precedence cannot see them and RBS holds two
-    /// `def story_path:` lines as an overload set. First in URI order writes it, which is item
-    /// 13's rule for a shared relation class and is arbitrary in the same harmless way.
-    fn route_declarations(
-        &self,
-        context: &Context,
-        into: &mut BTreeMap<String, (DocUri, Facts)>,
-    ) -> usize {
-        // An application that declares the constant itself meant something by it, and a module
-        // this pass wrote into would answer with both its members and ours. The rule for
-        // `Comment::Relation`, and the whole feature is what it costs — which is the right price
-        // for never shadowing a name somebody chose.
-        if context.namespaces.declares(rails::ROUTE_HELPERS) {
-            return 0;
-        }
-        let mains: Vec<DocUri> = context
-            .documents(List::Routes)
-            .iter()
-            .filter_map(|uri| DocUri::from_uri_str(uri))
-            .filter(|uri| uri.to_path().is_some_and(|path| rails::is_routes(&path)))
-            .collect();
-        if mains.is_empty() {
-            return 0;
-        }
-        let mut sources: Vec<(DocUri, String, rails::Routes)> = Vec::new();
-        for uri in mains {
-            let Some(source) = self.with_text(&uri, |text| text.text().to_owned()) else {
-                continue;
-            };
-            // The receiver of a `draw` means nothing in the project's own routes file and
-            // everything in a gem's — `rails::Whose` is the argument for it.
-            let whose = self.whose(&uri);
-            let routes = rails::read_routes(&source, &[], whose);
-            for draw in routes.draws() {
-                if let Some(drawn) = self.drawn(&uri, &draw.name)
-                    && let Some(source) = self.with_text(&drawn, |text| text.text().to_owned())
-                {
-                    let name = self.workspace_relative(&drawn);
-                    // `Whose::Own` however the drawer was reached, and that is not a
-                    // shortcut: a drawn file has no wrapper at all — its statements *are* the
-                    // body — and the file that drew it has already cleared the gate. Asking a
-                    // gem's drawn file for its own `Rails.application.routes.draw` would decline
-                    // every one of them.
-                    sources.push((
-                        drawn,
-                        name,
-                        rails::read_routes(&source, &draw.prefix, rails::Whose::Own),
-                    ));
-                }
-            }
-            let name = self.workspace_relative(&uri);
-            sources.push((uri, name, routes));
-        }
-        // The project's own files first, and it is the first-wins assignment below that makes
-        // this load-bearing rather than cosmetic: an application that names `rails_blob_path`
-        // itself must be the one that declares it, and URI order between a workspace path and a
-        // gem path is whichever string happens to sort lower. It also keeps the `include`s in a
-        // file the user has, since they go in `sources[0]`.
-        sources.sort_by(|left, right| {
-            let key = |uri: &DocUri| (!self.is_own_code(uri.as_str()), uri.as_str().to_owned());
-            key(&left.0).cmp(&key(&right.0))
-        });
-
-        let mut written: BTreeSet<String> = BTreeSet::new();
-        let mut assigned: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
-        for (uri, _, routes) in &sources {
-            for helper in routes.names() {
-                if written.insert(helper.to_owned()) {
-                    assigned
-                        .entry(uri.as_str())
-                        .or_default()
-                        .insert(helper.to_owned());
-                }
-            }
-        }
-
-        let nothing = BTreeSet::new();
-        let mut helpers = 0;
-        for (index, (uri, name, routes)) in sources.iter().enumerate() {
-            let emit = assigned.get(uri.as_str()).unwrap_or(&nothing);
-            let mut facts = routes.signatures(name, emit);
-            // The `include`s go in one document and it is the first, for the reason exactly one
-            // file writes the `MessageDelivery` stub: they are a property of the *application*
-            // rather than of any routes file, and N copies would be N identical declarations.
-            if index == 0 {
-                facts.extend(rails::mixins(&context.hosts));
-            }
-            helpers += facts.len();
-            merge(into, uri, facts);
-        }
-        helpers
-    }
-
-    /// What `delegate` declares, and the two hops each name's type needs.
-    ///
-    /// This is the whole of phase two. `delegate :name, to: :user` on `Story` needs
-    /// `Story#user -> User` and then `User#name -> String`, and both of those are facts the
-    /// generators above wrote — into *other files'* documents, in this same pass, with nothing
-    /// resolved and nothing indexed. [`Facts::returns`] is the question and the union below is
-    /// what it is asked of.
-    ///
-    /// **The union is built once, and only when something asks for it.** Once, because a
-    /// `delegate` may derive from any file's facts and building it per file would be a merge per
-    /// file; only on demand, because a workspace with no `delegate` in it must not pay a merge
-    /// of every fact in the project for a feature it does not use.
-    ///
-    /// **What phase two writes is not in the union**, which is what makes a `delegate` through a
-    /// `delegate` answer `untyped` rather than starting a fixed-point iteration over a graph a
-    /// user can write a cycle into. The declarations still land in the source file's own
-    /// document, where [`Facts`]' precedence can see them: a column named `title` outranks a
-    /// `delegate :title`, because the schema is what the database *is*.
-    fn delegate_declarations(
-        &self,
-        models: &[(DocUri, String, Arc<rails::Model>)],
-        into: &mut BTreeMap<String, (DocUri, Facts)>,
-    ) -> usize {
-        if !models.iter().any(|(_, _, model)| model.derives()) {
-            return 0;
-        }
-        let mut project = Facts::default();
-        for (_, facts) in into.values() {
-            project.absorb(facts);
-        }
-
-        let mut declared = 0;
-        for (uri, name, model) in models {
-            let facts = model.derived(name, &project);
-            declared += facts.len();
-            merge(into, uri, facts);
-        }
-        declared
-    }
-
-    /// The document `draw :admin` reads, which is `config/routes/admin.rb` beside the drawer.
-    ///
-    /// `None` when the path cannot be built or the file is not indexed, and the second is not a
-    /// failure: a routes file that draws something outside `index.include` draws nothing here,
-    /// which is the same answer the rest of this pass gives for a file it was told not to read.
-    fn drawn(&self, drawer: &DocUri, name: &str) -> Option<DocUri> {
-        let path = drawer.to_path()?;
-        DocUri::from_path(&path.parent()?.join("routes").join(format!("{name}.rb")))
     }
 
     /// Drop declarations a source no longer makes.
@@ -2394,200 +1639,62 @@ impl Analysis {
             .to_string_lossy()
             .replace('\\', "/")
     }
-
-    /// Which of the user's own classes read which table, and there is more than one of them.
-    ///
-    /// The direction is the safety argument, and it is the opposite of the obvious one: every
-    /// table is looked up **from** a class that exists, by pluralizing its name, rather than
-    /// singularizing a table name and hoping a class answers to it. Both directions need the
-    /// same irregular rules; only this one fails toward *nothing*. A class whose plural names
-    /// no table declares nothing, and a table no class claims declares nothing — where
-    /// singularizing `statuses` badly could land on a class that exists and is not a model.
-    ///
-    /// # A table really is read by more than one class
-    ///
-    /// Answering a **single** class per table follows from "a table two classes claim is claimed
-    /// by neither". That rule protects against one
-    /// thing — the inflector landing two different names on one table, where at most one of
-    /// them can be right — and it was paying for that protection with a case that is not a
-    /// collision at all. `Account` and `Mastodon::CLI::Maintenance::Account` compute the same
-    /// table because they are the same convention applied twice, and both of them really do
-    /// read `accounts`; mastodon writes **150** such classes.
-    ///
-    /// So the guard is narrowed to exactly what it was built for: several claimants are kept
-    /// when they all **demodulize to the same name**, and a table two *different* names reach
-    /// is still claimed by neither. Measured over six applications that discriminator declines
-    /// four tables — discourse's `GroupUser` against `GroupUsers` three times, which is the
-    /// inflector collision the rule exists for and which was already declined — and keeps all
-    /// **171** of the legitimate extra claimants.
-    ///
-    /// A class that **names its own table** is not inflected at all and never makes anything
-    /// ambiguous: `self.table_name = "settings"` is a fact the author wrote, not a guess this
-    /// crate made. Letting an override *replace* the conventional claimant costs **four models
-    /// in six corpora** their columns — mastodon's throwaway `MoveUserSettings::LegacySetting`
-    /// takes `settings` off the `Setting` model, and discourse's `Post` and `Category` go the
-    /// same way — so the override joins the claim rather than replacing it, unless the class
-    /// whose name implies the table is not a model.
-    fn model_tables(&self, context: &Context) -> BTreeMap<String, Vec<String>> {
-        let names: Vec<Arc<rails::TableNames>> = context
-            .documents(List::Renamed)
-            .iter()
-            .filter_map(|key| self.sources.get(key)?.names.clone())
-            .collect();
-
-        // Rails' own precedence, and it is one clause of `isolate_namespace`:
-        // `unless mod.respond_to?(:table_name_prefix)`. A module that writes the method out
-        // wins over the engine that isolated it, so the isolated ones go in first.
-        let mut prefixes: BTreeMap<&str, String> = BTreeMap::new();
-        for candidates in names.iter().flat_map(|read| &read.isolated) {
-            if let Some(owner) = candidates
-                .iter()
-                .find(|name| context.classes.contains(*name))
-                // `isolate_namespace` names its module by the constant it *resolves to*, so the
-                // prefix cannot be spelled until the candidate list has been settled here.
-                && let Some(prefix) = rails::engine_prefix(owner)
-            {
-                prefixes.insert(owner, prefix);
-            }
-        }
-        for (owner, prefix) in names.iter().flat_map(|read| &read.prefixes) {
-            prefixes.insert(owner, prefix.clone());
-        }
-        let suffixes: BTreeMap<&str, String> = names
-            .iter()
-            .flat_map(|read| &read.suffixes)
-            .map(|(owner, suffix)| (owner.as_str(), suffix.clone()))
-            .collect();
-        let overrides: BTreeMap<&str, &str> = names
-            .iter()
-            .flat_map(|read| &read.overrides)
-            .map(|(class, table)| (class.as_str(), table.as_str()))
-            .collect();
-
-        // The tables some class has *said* it reads, which is the one place an inflected claim
-        // now meets a written one. Letting the written one simply replace it is right where
-        // the writer is the real model — discourse's `TopicViewItem` says
-        // `topic_views` and the `TopicView` whose name implies it is a view object — and wrong
-        // where the writer is a throwaway: mastodon's `MoveUserSettings::LegacySetting` says
-        // `settings` and took them off the `Setting` model, and discourse's three test doubles
-        // say `posts` and take them off `Post`. So the guess survives the meeting only when the
-        // class it is about is a model, and both readings are right for the reason they are
-        // right.
-        let named: BTreeSet<&str> = overrides.values().copied().collect();
-        let mut claimed: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (table, classes) in &context.claims {
-            for class in classes.iter().filter(|class| {
-                !overrides.contains_key(class.as_str())
-                    && (!named.contains(table.as_str()) || context.is_model(class))
-            }) {
-                claimed
-                    .entry(table.clone())
-                    .or_default()
-                    .push(class.clone());
-            }
-        }
-        for name in &context.nested {
-            if overrides.contains_key(name.as_str()) || !context.is_model(name) {
-                continue;
-            }
-            let Some((parent, last)) = name.rsplit_once("::") else {
-                continue;
-            };
-            // `compute_table_name`'s other branch: a model nested inside another *model* is
-            // `parent_singular_child_plural`, which needs the parent's own table and then the
-            // parent's parent's. It is declined rather than approximated, and the decline is
-            // measured: 22 classes in six applications are nested this way and **not one** of
-            // them names a table any of those applications has.
-            if context.is_model(parent) {
-                continue;
-            }
-            // The joined name a declaration on this would be written under must introduce no
-            // namespace. It declines nothing in six corpora and is here because the damage it
-            // prevents is silent.
-            if !context.namespaces.spellable(name) {
-                continue;
-            }
-            let Some(table) = rails::table_of(last) else {
-                continue;
-            };
-            claimed
-                .entry(format!(
-                    "{}{table}{}",
-                    affix(&prefixes, name),
-                    affix(&suffixes, name)
-                ))
-                .or_default()
-                .push(name.clone());
-        }
-
-        let mut tables: BTreeMap<String, Vec<String>> = claimed
-            .into_iter()
-            .map(|(table, mut classes)| {
-                // One class written in two places is **one claimant**. `claims` is filled
-                // per *definition*, so a model reopened to nest something under it pushed its
-                // own name twice — and the old rule, which asked for exactly one entry,
-                // declined it. **Three models in six corpora lost every column to that**:
-                // forem writes `class AuditLog` again in `app/queries/audit_log/`, and
-                // discourse writes `class Reviewable < ActiveRecord::Base` in six
-                // `lib/reviewable/` files. The narrowed rule below already admits them, because
-                // one name demodulizes to itself; this is here so that "one claimant" means one
-                // class rather than one `class` keyword, and so the list handed to the schema
-                // is what it says it is.
-                classes.sort_unstable();
-                classes.dedup();
-                (table, classes)
-            })
-            .filter(|(_, classes)| {
-                // The narrowed ambiguity rule. One `demodulize` shared by every claimant is the
-                // convention applied more than once; two are the inflector having landed two
-                // names on one table, where at most one of them can be right.
-                let mut demodulized = classes
-                    .iter()
-                    .map(|class| class.rsplit("::").next().unwrap_or(class));
-                let first = demodulized.next();
-                demodulized.all(|last| Some(last) == first)
-            })
-            .collect();
-        for (class, table) in overrides {
-            tables
-                .entry(table.to_owned())
-                .or_default()
-                .push(class.to_owned());
-        }
-        tables
-    }
 }
 
-/// The innermost enclosing name that declares one, or nothing at all.
-///
-/// `full_table_name_prefix` is
-/// `(module_parents.detect { |p| p.respond_to?(:table_name_prefix) } || self).table_name_prefix`,
-/// and `module_parents` is innermost first — so `Spree::Admin::Order` asks `Spree::Admin` before
-/// it asks `Spree`. The `|| self` branch is the empty string for every class in an application
-/// that has not set `ActiveRecord::Base.table_name_prefix` globally, which is Ruby that only
-/// runs and is therefore what the empty answer here means.
-fn affix<'a>(affixes: &'a BTreeMap<&str, String>, name: &str) -> &'a str {
-    name.rmatch_indices("::")
-        .find_map(|(at, _)| affixes.get(&name[..at]))
-        .map_or("", String::as_str)
-}
-
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::synthesize;
+    use crate::analysis::testing::*;
+    use crate::knowledge::{
+        annotations as annotations_list, rails as rails_lists, structs as structs_list,
+    };
+
+    /// The registry the server really builds, for the fixtures that merge a `Context` by hand.
+    fn registered() -> Registry {
+        Registry::new(vec![
+            Box::new(rails_lists::Rails::default()),
+            Box::new(annotations_list::Annotations::default()),
+            Box::new(structs_list::Structs),
+        ])
+    }
 
     /// One document's contribution, as [`Analysis::contribution`] would have built it.
+    ///
+    /// The Rails half goes in the module's slot, which is where the walk puts it: the slots are
+    /// positional and `Rails` is registered first.
     fn declaring(name: &str, superclass: &str, table: &str) -> Contribution {
+        claiming(name, superclass, &[(table, name)])
+    }
+
+    /// The same, for a document that claims a table under more than one name.
+    fn claiming(name: &str, superclass: &str, claims: &[(&str, &str)]) -> Contribution {
         Contribution {
-            claims: vec![(table.to_owned(), name.to_owned())],
             superclasses: vec![(name.to_owned(), superclass.to_owned())],
             declared: vec![(name.to_owned(), false)],
+            modules: vec![
+                knowledge::Contributed(Some(Box::new(rails_lists::Contribution {
+                    claims: claims
+                        .iter()
+                        .map(|(table, class)| ((*table).to_owned(), (*class).to_owned()))
+                        .collect(),
+                    ..rails_lists::Contribution::default()
+                }))),
+                knowledge::Contributed(None),
+                knowledge::Contributed(None),
+            ],
             ..Contribution::default()
         }
     }
 
+    /// What Rails made of a merged `Context`, for a test that built one by hand.
+    fn rails_of(context: &Context) -> &rails_lists::Projection {
+        rails_lists::projection_of(context)
+    }
+
     fn merged(order: [(&str, Contribution); 2]) -> Context {
-        let mut context = Context::default();
+        let mut context = Context::new(&registered());
         let mut included = Vec::new();
         for (uri, contribution) in order {
             context.absorb(uri, contribution, &mut included);
@@ -2596,10 +1703,76 @@ mod tests {
         context
     }
 
+    /// Clause 2 of the item, end to end: core's only mention of a module is the line that
+    /// registers it, and that line is not in the pass.
+    ///
+    /// **Enforced rather than asserted.** The registry is swapped for an empty one and the
+    /// workspace is re-indexed: the pass still runs — the walk, both gates, the split, the
+    /// record — and declares nothing at all. A seam that only looked right in the source would
+    /// pass a reading of it and fail this.
+    #[test]
+    fn a_pass_with_no_body_of_knowledge_registered_runs_and_declares_nothing() {
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        assert!(harness.has("Story#title()"), "the fixture declares nothing");
+        let passes = harness.analysis.passes;
+
+        // The registry is swapped and the pass is forced, rather than `rebuild`ing: a rebuild is
+        // a configuration change and puts the registered modules back, which is the right
+        // behaviour and the wrong thing to test with.
+        harness.analysis.knowledge = knowledge::Registry::empty();
+        harness.analysis.mark_dirty();
+        harness.settle();
+
+        assert!(harness.analysis.passes > passes, "the pass did not run");
+        assert!(
+            harness.analysis.synthesized.is_empty(),
+            "a build with nothing registered generated something"
+        );
+        assert!(!harness.has("Story#title()"));
+        // And the walk still walked: what is empty is what the modules would have filled.
+        let context = harness.analysis.context();
+        assert!(context.classes.contains("Story"), "the walk stopped too");
+        assert!(context.documents.is_empty(), "a list nobody registered");
+        assert!(context.projections.is_empty());
+    }
+
+    /// Clause 3 of the item, end to end: a module that is not Rails declares through the same
+    /// seam, and `environment.rs`'s fence is not in its way.
+    #[test]
+    fn a_body_of_knowledge_that_is_not_rails_declares_through_the_same_seam() {
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        let spec = harness.write(
+            "spec/models/story_spec.rb",
+            "RSpec.describe Story do\n  let(:story) { Story.new }\n  let!(:other) { 1 }\nend\n",
+        );
+
+        harness.watch(&[&spec]);
+        harness.analysis.knowledge =
+            knowledge::Registry::new(vec![Box::new(crate::knowledge::rspec::RSpec)]);
+        harness.analysis.mark_dirty();
+        harness.settle();
+
+        // The group is a name this module minted, because `RSpec.describe Foo do` is an anonymous
+        // subclass and RBS cannot declare on one.
+        assert!(
+            harness.has("RSpecExampleGroup::StorySpec#story()"),
+            "{:?}",
+            harness.every_generated_document()
+        );
+        assert!(harness.has("RSpecExampleGroup::StorySpec#other()"));
+        // Its declarations are mapped to the file that implied them like anybody else's, and the
+        // provenance names it.
+        let rbs = harness.generated_for(&spec).expect("the spec declared");
+        assert!(rbs.contains("spec/models/story_spec.rb"), "{rbs}");
+        // And Rails declares nothing, because Rails is not registered in this build.
+        assert!(!harness.has("Story#title()"));
+    }
+
     #[test]
     fn two_documents_merge_to_the_same_context_in_either_order() {
-        // The property the per-document fingerprints stand on, stated where it is decided
-        // rather than asserted through a walk that cannot be made to change its order.
+        // The property the per-document contributions stand on — the gate's and the memo's
+        // alike — stated where it is decided rather than asserted through a walk that cannot be
+        // made to change its order.
         //
         // Both fields here are easy to get wrong and by two different mechanisms:
         // `superclasses` is last-writer-wins over a `HashMap`'s iteration unless it takes the
@@ -2614,11 +1787,11 @@ mod tests {
         // about `superclasses` *and* push different strings into one `claims` list.
         let from_the_model = || declaring("Double", "ApplicationRecord", "doubles");
         let from_the_spec = || {
-            let mut contribution = declaring("Double", "Object", "doubles");
-            contribution
-                .claims
-                .push(("doubles".to_owned(), "Stunt".to_owned()));
-            contribution
+            claiming(
+                "Double",
+                "Object",
+                &[("doubles", "Double"), ("doubles", "Stunt")],
+            )
         };
         let forwards = merged([(model, from_the_model()), (spec, from_the_spec())]);
         let backwards = merged([(spec, from_the_spec()), (model, from_the_model())]);
@@ -2630,7 +1803,7 @@ mod tests {
         );
         assert_eq!(forwards.defined_in["Double"], model);
         assert_eq!(
-            forwards.claims["doubles"],
+            rails_of(&forwards).claims["doubles"],
             vec!["Double".to_owned(), "Double".to_owned(), "Stunt".to_owned()]
         );
     }
@@ -2642,7 +1815,7 @@ mod tests {
         // walk produces, because within one document the loop runs in the order the definitions
         // were recorded.
         let uri = "file:///p/app/models/story.rb";
-        let mut context = Context::default();
+        let mut context = Context::new(&registered());
         let mut included = Vec::new();
         context.absorb(
             uri,
@@ -2662,21 +1835,2396 @@ mod tests {
     }
 
     #[test]
-    fn a_fingerprint_is_of_the_contribution_and_not_of_the_document() {
-        // The property, stated on the function that decides it: two documents whose
-        // contributions are equal have one fingerprint, whatever else is different about them.
-        let one = declaring("Story", "ApplicationRecord", "stories");
-        let two = declaring("Story", "ApplicationRecord", "stories");
-        assert_eq!(fingerprint(&one), fingerprint(&two));
-        assert_ne!(
-            fingerprint(&one),
-            fingerprint(&declaring("Story", "Object", "stories"))
+    fn a_walk_that_holds_every_document_answers_what_a_walk_that_holds_none_does() {
+        // **The memo's whole claim, and the only test that can state it as one sentence.** The
+        // two tests below name the field a stale entry would be visible in; this one compares
+        // the *whole* projection, so a field nobody thought of is covered by the same assertion.
+        //
+        // Both walks run over one graph with nothing in between, which is what makes them
+        // comparable at all: the pass runs *before* the resolve and writes generated documents
+        // the next walk can see, so two walks either side of a settle are legitimately allowed
+        // to differ and would prove nothing.
+        let source = "Story.new.title\n";
+        let (mut harness, _schema, _uri) = rails_project(source);
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  has_many :comments\nend\n",
         );
-        // And an empty contribution is a value like any other, which is what lets the walk
-        // store one for a document that declares nothing.
+        harness.write("app/models/comment.rb", "class Comment\nend\n");
+        harness.write("app/lib/plain.rb", "class Plain\n  def a\n  end\nend\n");
+        harness.index();
+        harness.analysis.settle();
+
+        // The real mixture rather than the easy case: one document marked re-indexed, so the
+        // walk drops that entry and re-projects it while taking every other one from the memo.
+        harness.analysis.touched.insert(story.as_str().to_owned());
+        let mixed = harness.analysis.walk();
+        // And the same graph with nothing held at all.
+        harness.analysis.contributions.clear();
+        let cold = harness.analysis.walk();
+        assert_eq!(mixed, cold);
+        assert!(
+            cold.classes.contains("Story") && cold.classes.contains("Plain"),
+            "and both walks really visited the workspace"
+        );
+    }
+
+    #[test]
+    fn a_document_the_graph_re_indexed_is_projected_again_rather_than_remembered() {
+        // The memo's invalidate arm, and the two routes into it are the two ways a document is
+        // re-indexed: `touched`, which names one, and `touched_all`, which names none and drops
+        // the map whole. Nothing else can make a held `Contribution` wrong.
+        //
+        // `classes` is the field to assert on because it is a set: a stale entry does not merely
+        // fail to add the new name, it goes on asserting the old one — so both halves of each
+        // assertion are the test.
+        let source = "Story.new.title\n";
+        let (mut harness, _schema, _uri) = rails_project(source);
+        let buffered = harness.write("app/lib/buffered.rb", "class First\nend\n");
+        let watched = harness.write("app/lib/watched.rb", "class Third\nend\n");
+        harness.index();
+        harness.analysis.settle();
+
+        // One named document, which only a keystroke ever is.
+        harness.open(&buffered, "class First\nend\n");
+        harness.change(&buffered, "class Second\nend\n");
+        harness.analysis.settle();
+        {
+            let held = harness
+                .analysis
+                .generated_from
+                .as_ref()
+                .expect("a pass has run");
+            assert!(
+                held.classes.contains("Second"),
+                "the edit is not in the walk"
+            );
+            assert!(
+                !held.classes.contains("First"),
+                "the class the edit replaced is still in the walk"
+            );
+        }
+
+        // And a route that names none: the file system moved under a file nobody has open, so
+        // `touched_all` is the whole of what the pass is told.
+        harness.write("app/lib/watched.rb", "class Fourth\nend\n");
+        harness.watch(&[&watched]);
+        harness.analysis.settle();
+        let held = harness
+            .analysis
+            .generated_from
+            .as_ref()
+            .expect("a pass has run");
+        assert!(
+            held.classes.contains("Fourth"),
+            "the file the watcher reported is not in the walk"
+        );
+        assert!(
+            !held.classes.contains("Third"),
+            "the class it replaced is still in the walk"
+        );
+    }
+
+    #[test]
+    fn an_engine_may_not_claim_a_table_or_host_the_route_helpers() {
+        // The two of `Context`'s six outputs that mean "the application" rather than "a class
+        // the reader can name", and each is a way gate 2 could have made an answer worse.
+        //
+        // A table is claimed by pluralizing a top-level class's name, so an engine that defines
+        // one would take a table the application's own model owns — or, as here, a table no
+        // class of the user's has, which would put the schema's columns on somebody's gem. And
+        // an engine's controllers are hosts in Rails and are not hosts here, because
+        // `rails_lists::ROUTES` is closed to engines: there are no helpers for them to be given.
+        let (dir, root, env) = project_with_engine(&[
+            ("models/widget.rb", "class Widget\nend\n"),
+            (
+                "controllers/shouty/base_controller.rb",
+                "class Shouty::BaseController < ActionController::Base\nend\n",
+            ),
+            ("models/shouty/message.rb", "class Shouty::Message\nend\n"),
+            // A module whose name is the one spelling that makes a module a host. Rails does
+            // give an engine's helper modules the application's route helpers; ya-lsp does not,
+            // because `rails_lists::ROUTES` is closed to engines and there is nothing to give them.
+            (
+                "helpers/shouty/blast_helper.rb",
+                "module Shouty::BlastHelper\nend\n",
+            ),
+        ]);
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[8.0].define(version: 1) do\n  \
+             create_table \"widgets\", force: :cascade do |t|\n    \
+             t.string \"name\"\n  \
+             end\n\
+             end\n",
+        );
+        harness.write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :stories\nend\n",
+        );
+        harness.write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        );
+        harness.write(
+            "app/helpers/stories_helper.rb",
+            "module StoriesHelper\nend\n",
+        );
+        harness.index();
+        harness.index_gems();
+
+        let context = harness.analysis.context();
+        assert!(
+            context.classes.contains("Shouty::Message"),
+            "the engine's classes are nameable — that is the widening"
+        );
+        assert!(
+            !rails_of(&context).claims.contains_key("widgets"),
+            "and an engine claims no table: {:?}",
+            rails_of(&context).claims
+        );
+        assert!(
+            !harness.has("Widget#name()"),
+            "so the schema declares nothing on it"
+        );
+        let hosts = format!("{:?}", rails_of(&context).hosts);
+        assert!(
+            hosts.contains("ApplicationController") && hosts.contains("StoriesHelper"),
+            "the application's own base and helper module are hosts: {hosts}"
+        );
+        assert!(
+            !hosts.contains("Shouty::BaseController") && !hosts.contains("Shouty::BlastHelper"),
+            "and neither the engine's controller nor its helper module is: {hosts}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn which_of_the_six_lists_an_engines_document_may_go_on() {
+        // The engine rule, asserted through the real path rather than by reading the table:
+        // a list is open to an engine when what it reads declares members on a class the reader
+        // can name, and closed when it declares something scoped to an application.
+        //
+        // the routes list is open, and what a gem's routes file is *allowed to say* is the
+        // question rather than this list's — the list only decides which documents a generator
+        // may open. The two closed ones are the ones with a consequence: a `schema.rb` is the
+        // *application's* database and an engine ships migrations rather than one, and
+        // `self.table_name=` is the input to a generator that is itself closed. Both files are
+        // staged under `app/` precisely so the list rule is what is being measured rather than
+        // the walk.
+        let (dir, root, env) = project_with_engine(&[
+            (
+                "models/shouty/message.rb",
+                "class Shouty::Message\n  has_many :horns\nend\n",
+            ),
+            (
+                "models/shouty/tagged.rb",
+                "class Shouty::Tagged\n  # @return [String]\n  def tag\n  end\nend\n",
+            ),
+            (
+                "jobs/shouty/blast_job.rb",
+                "class Shouty::BlastJob < ActiveJob::Base\n  def perform\n  end\nend\n",
+            ),
+            (
+                "models/shouty/renamed.rb",
+                "class Shouty::Renamed\n  self.table_name = \"loud\"\nend\n",
+            ),
+            (
+                "misc/schema.rb",
+                "ActiveRecord::Schema[8.0].define(version: 1) do\nend\n",
+            ),
+            (
+                "misc/routes.rb",
+                "Rails.application.routes.draw do\n  resources :blobs\nend\n",
+            ),
+        ]);
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/main.rb", "Shouty::Message.new\n");
+        harness.index();
+        harness.index_gems();
+
+        let context = harness.analysis.context();
+        let on = |list: ListId, needle: &str| {
+            context
+                .documents(list)
+                .iter()
+                .any(|uri| uri.contains("shouty-1.2.3") && uri.ends_with(needle))
+        };
+        assert!(on(rails_lists::MODELS, "message.rb"), "models open");
+        assert!(
+            on(annotations_list::ANNOTATED, "tagged.rb"),
+            "annotations open"
+        );
+        assert!(
+            on(rails_lists::ENTRYPOINTS, "blast_job.rb"),
+            "entry points open"
+        );
+        assert!(on(rails_lists::ROUTES, "routes.rb"), "routes open");
+        assert!(!on(rails_lists::RENAMED, "renamed.rb"), "renames closed");
+        assert!(!on(rails_lists::SCHEMAS, "schema.rb"), "schemas closed");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A line inserted above a column moves the jump and leaves the graph alone.
+    ///
+    /// **The whole claim of the text test, and both halves are needed to make it true.** A
+    /// provenance comment names a file and the macro it read and never a line number, so an
+    /// edit that pushes `t.string "title"` down a line re-derives RBS that is byte-identical
+    /// and mappings that have all moved. Handing that to rubydex makes it drop the generated
+    /// document, invalidate every declaration the old one touched and link it all again to
+    /// arrive at the graph it already had: one keystroke in `app/models/user.rb` cost **940 ms**
+    /// on discourse and 80 on lobsters, and the cost is a function of the workspace rather than
+    /// of the file being edited.
+    ///
+    /// The counter is the only instrument that can say so, for the reason `Analysis::walks` is
+    /// one: a graph rebuilt into exactly the shape it already had answers every question the
+    /// same way. And the second assertion is why the mappings cannot simply be ignored too —
+    /// what moved really did move, and a jump that lands one line high is worse than a slow one.
+    #[test]
+    fn an_edit_that_moves_a_declaration_without_changing_it_leaves_the_graph_alone() {
+        let source = "Story.new.title\n";
+        let (mut harness, schema, uri) = rails_project(source);
+
+        let before = harness.definition_at(&uri, source, "title");
         assert_eq!(
-            fingerprint(&Contribution::default()),
-            fingerprint(&Contribution::default())
+            before[0]["targetRange"]["start"]["line"],
+            serde_json::json!(2),
+            "{before}"
         );
+        let indexed = harness.analysis.synthesized.indexed();
+        assert!(indexed > 0, "the schema declared something to begin with");
+
+        // Opening it changes nothing at all, and then one blank first line puts every column
+        // one line further down without changing a word any of them says.
+        harness.open(&schema, SCHEMA_RB);
+        harness.change(&schema, &format!("\n{SCHEMA_RB}"));
+
+        assert_eq!(
+            harness.analysis.synthesized.indexed(),
+            indexed,
+            "the RBS is byte-identical, so the graph has nothing to learn from it"
+        );
+        let after = harness.definition_at(&uri, source, "title");
+        assert_eq!(
+            after[0]["targetRange"]["start"]["line"],
+            serde_json::json!(3),
+            "and the jump still lands on the line that declares it: {after}"
+        );
+    }
+
+    /// A second database's schema. Rails names it `db/<database>_schema.rb`.
+    const ANIMALS_SCHEMA: &str = "\
+ActiveRecord::Schema[8.0].define(version: 2024_01_01_000000) do
+  create_table \"dogs\", force: :cascade do |t|
+    t.string \"name\", null: false
+  end
+end
+";
+
+    /// The whole of why a generated document is a **body** and not a file.
+    #[test]
+    fn a_column_that_changed_type_re_indexes_its_own_table_and_no_other() {
+        // `Synthesized::record` is charged per declaration it re-indexes, so one document per
+        // file makes a single column's type change cost every column in the project — 2.2 s of a
+        // 2.49 s keystroke on discourse, where the schema is 450 KB. One document per body makes
+        // it cost one table. `synthesized.md` has the measurement.
+        let (mut harness, schema, _uri) = rails_project("Story.new\n");
+        let widget = harness.write("app/models/widget.rb", "class Widget\nend\n");
+        harness.watch(&[&widget]);
+        assert!(harness.has("Story#title()") && harness.has("Widget#name()"));
+        // Two tables, two documents, one file.
+        assert!(harness.analysis.synthesized.len() > 1);
+
+        let indexed = harness.analysis.synthesized.indexed();
+        let before = harness.every_generated_document();
+        harness.write(
+            "db/schema.rb",
+            &SCHEMA_RB.replace("t.string \"name\"", "t.integer \"name\""),
+        );
+        harness.watch(&[&schema]);
+
+        assert!(harness.has("Widget#name()"));
+        // The discriminating half: `stories` is in the same file and its document is
+        // byte-identical, so `record` never hands it over. Before the split there was one
+        // document for the file and every column in it was re-indexed for this one edit.
+        let moved: Vec<_> = harness
+            .every_generated_document()
+            .into_iter()
+            .filter(|(uri, rbs)| before.get(uri) != Some(rbs))
+            .map(|(uri, _)| uri)
+            .collect();
+        assert_eq!(
+            moved,
+            vec![rubydex::model::ids::UriId::from(
+                synthesized::generated_uri(&schema, "class:Widget").as_str()
+            )],
+            "only the table whose column moved was rewritten"
+        );
+        assert_eq!(
+            harness.analysis.synthesized.indexed() - indexed,
+            1,
+            "and only it was handed to the graph again"
+        );
+    }
+
+    #[test]
+    fn a_second_database_s_schema_is_read_and_says_which_file_it_is() {
+        // Rails has had several databases since 6.0, and a new Rails 8 application ships three
+        // secondary schemas — solid_queue, solid_cache, solid_cable — before anybody writes a
+        // line of it. lobsters, which every number in this section comes from, has three of its
+        // own. Reading only `db/schema.rb` misses whole models silently.
+        let source = "Dog.new.name\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let animals = harness.write("db/animals_schema.rb", ANIMALS_SCHEMA);
+        let dog = harness.write("app/models/dog.rb", "class Dog\nend\n");
+        harness.watch(&[&animals, &dog]);
+
+        assert!(
+            harness.has("Dog#name()"),
+            "the second database was not read"
+        );
+        assert!(
+            harness.has("Story#title()"),
+            "and the first one stopped being"
+        );
+        assert_eq!(harness.analysis.synthesized.len(), 2);
+
+        let definition = harness.definition_at(&uri, source, "name");
+        assert_eq!(
+            definition[0]["targetUri"],
+            serde_json::json!(animals.as_str()),
+            "{definition}"
+        );
+        // The provenance line names the file it really came from. Naming `db/schema.rb` above a
+        // column that is not in it would be a confidently wrong answer, which is the one thing
+        // this half of the release is built not to give.
+        let card = card(&mut harness, &uri, source, "name");
+        assert!(card.contains("db/animals_schema.rb"), "{card}");
+        assert!(!card.contains("`db/schema.rb`"), "{card}");
+    }
+
+    #[test]
+    fn a_table_two_schemas_declare_is_declared_by_neither() {
+        // The same rule as two classes claiming one table, for the same reason and one worse:
+        // the model would answer with two schemas at once, and `Types::harvest` would keep
+        // whichever column it read last — a type that depends on the order a `HashMap` iterates.
+        let (mut harness, _schema, _uri) = rails_project("Story.new\n");
+        assert!(harness.has("Story#title()"));
+
+        let replica = harness.write("db/replica_schema.rb", SCHEMA_RB);
+        harness.watch(&[&replica]);
+
+        assert!(
+            !harness.has("Story#title()"),
+            "an ambiguous table answered anyway"
+        );
+        assert!(harness.analysis.synthesized.is_empty());
+    }
+
+    #[test]
+    fn a_schema_that_stops_declaring_anything_takes_its_columns_with_it() {
+        // A generator that reads several files gets no notification when one of them stops
+        // having something to say — the file is still there, still indexed, still a schema. So
+        // the pass that writes is also the pass that prunes.
+        let (mut harness, _schema, _uri) = rails_project("Dog.new\n");
+        let animals = harness.write("db/animals_schema.rb", ANIMALS_SCHEMA);
+        let dog = harness.write("app/models/dog.rb", "class Dog\nend\n");
+        harness.watch(&[&animals, &dog]);
+        assert!(harness.has("Dog#name()"));
+
+        harness.open(&animals, ANIMALS_SCHEMA);
+        harness.change(
+            &animals,
+            "ActiveRecord::Schema[8.0].define(version: 0) do\nend\n",
+        );
+
+        assert!(
+            !harness.has("Dog#name()"),
+            "an emptied schema still answers"
+        );
+        assert!(
+            harness.has("Story#title()"),
+            "and it took the other one with it"
+        );
+        assert_eq!(harness.analysis.synthesized.len(), 1);
+    }
+
+    #[test]
+    fn the_schema_pass_leaves_another_generator_s_work_where_it_is() {
+        // What every generator after this one inherits. They generate from *model* files
+        // through the same side
+        // table, so a pass over `db/*schema.rb` that pruned by "everything I did not just
+        // write" would delete their work on the way past. Which sources belong to which
+        // generator is the caller's question, which is why `Synthesized::sources` hands back
+        // sources rather than deciding.
+        let source = "Story.new.author\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+        let model = DocUri::from_path(&harness.root.path().join("app/models/story.rb"))
+            .expect("a file uri");
+        let rbs = "class Story\n  def author: () -> String\nend\n";
+        harness.synthesize(
+            &model,
+            rbs,
+            vec![synthesized::Mapping {
+                generated: span(rbs, "  def author: () -> String\n"),
+                declared: Site {
+                    uri: model.as_str().to_owned(),
+                    full: (0, 11),
+                    selection: (6, 11),
+                },
+            }],
+        );
+
+        // Both generators' documents, both still answering, after a settle that ran the schema
+        // pass over a workspace whose only schema is `db/schema.rb`.
+        assert_eq!(harness.analysis.synthesized.len(), 2);
+        assert!(
+            harness.has("Story#author()"),
+            "another generator was pruned"
+        );
+        assert!(harness.has("Story#title()"));
+        assert!(
+            harness.definition_at(&uri, source, "author")[0]["targetUri"]
+                .as_str()
+                .is_some_and(|target| target.ends_with("app/models/story.rb")),
+        );
+    }
+
+    #[test]
+    fn a_schema_dump_is_never_a_document_in_the_graph() {
+        // The property `make canary`'s file count depends on, and the reason the plumbing is a
+        // watcher rather than the blanking hook a template gets: on every route this server
+        // takes by itself — the cold walk, the watcher, the pass — rubydex never sees SQL, so
+        // there is no parse error to file, no diagnostics to publish and no document to count.
+        // The *generated* document exists, and it has no file behind it. (A client whose
+        // document selector hands a `.sql` over on `didOpen` indexes it like any other buffer,
+        // which is what every non-Ruby file does; no shipped client does — the extension's `LANGUAGES` is `ruby` and `erb`.)
+        let (harness, dump, _uri) = sql_project("Story.new\n");
+        assert!(
+            !harness.analysis.indexed(&dump),
+            "the dump was indexed as if it were Ruby"
+        );
+        assert!(harness.latest(&dump).is_none(), "the dump got diagnostics");
+        assert_eq!(harness.analysis.synthesized.len(), 1);
+    }
+
+    #[test]
+    fn a_table_a_dump_and_a_ruby_schema_both_declare_is_declared_by_neither() {
+        // The two-schema rule reached by a second road. An application has one format or the other,
+        // so this is a repository that switched and did not delete the old file — and the two
+        // are then two sources for one table, which is the case where answering at all means
+        // answering with whichever was read last.
+        let (mut harness, _dump, _uri) = sql_project("Story.new\n");
+        assert!(harness.has("Story#title()"));
+
+        let schema = harness.write("db/schema.rb", SCHEMA_RB);
+        harness.watch(&[&schema]);
+
+        assert!(
+            !harness.has("Story#title()"),
+            "an ambiguous table answered anyway"
+        );
+    }
+
+    #[test]
+    fn a_dump_written_deleted_and_rewritten_on_disk_re_settles_each_time() {
+        // `refresh`'s third outcome: a `.sql` is neither a document to re-index nor one to
+        // forget, so the branch invalidates and indexes nothing. All three events go through it,
+        // which is why it sits above the `is_file` test as well as above the index gate — a deleted
+        // dump is pruned by `forget_stale` on the settle this triggers, and nothing else would ever
+        // trigger one.
+        let source = "Story.new.title\n";
+        let (mut harness, _dump, _uri) = sql_project(source);
+        let secondary = harness.root.path().join("db/animals_structure.sql");
+        let dog = harness.write("app/models/dog.rb", "class Dog\nend\n");
+        harness.watch(&[&dog]);
+
+        // Written: Rails names every other database's dump `db/<database>_structure.sql`,
+        // exactly as it names the Ruby one `db/<database>_schema.rb`.
+        let animals = harness.write(
+            "db/animals_structure.sql",
+            "CREATE TABLE public.dogs (\n    name character varying NOT NULL\n);\n",
+        );
+        harness.watch(&[&animals]);
+        assert!(harness.has("Dog#name()"), "a new dump was not read");
+        assert_eq!(harness.analysis.synthesized.len(), 2);
+
+        // Deleted. Nothing re-reads a file that is gone, so a column left behind here would
+        // answer for the life of the process.
+        std::fs::remove_file(&secondary).unwrap();
+        harness.watch(&[&animals]);
+        assert!(!harness.has("Dog#name()"), "a deleted dump still answers");
+        assert!(
+            harness.has("Story#title()"),
+            "and it took the other with it"
+        );
+        assert_eq!(harness.analysis.synthesized.len(), 1);
+    }
+
+    #[test]
+    fn a_relation_is_one_class_per_element_type_and_is_not_a_place() {
+        // The two clauses that bound a relation class. Two models declare `has_many
+        // :comments`, and
+        // between them they cost **one** `Comment::Relation` — 38 models cost 38 classes and not
+        // 149. And nothing in it is a jump target: no line of anybody's code declares
+        // `Comment::Relation#first`, so pointing at one of the two `has_many`s would be picking
+        // an arbitrary half of a coin flip.
+        let source = "Story.new.comments.first\n";
+        let (mut harness, _story, uri) = models_project(source);
+
+        assert_eq!(
+            harness
+                .analysis
+                .graph
+                .get("Comment::Relation")
+                .map_or(0, |definitions| definitions.len()),
+            1,
+            "one relation class per element type, whoever asked for it"
+        );
+        assert!(
+            harness.definition_at(&uri, source, "first").is_null(),
+            "a class this crate invented must not be a place a user is sent"
+        );
+    }
+
+    #[test]
+    fn a_relation_class_the_project_already_has_is_not_shadowed() {
+        // The one way the relation classes can make an answer *worse* rather than merely absent. A
+        // project that wrote its own `Comment::Relation` meant something by it, so the pass emits
+        // nothing at all for that element type — the collection loses its type rather than the
+        // user losing their class.
+        let (mut harness, _story, _uri) = models_project("");
+        let own = harness.write(
+            "app/models/comment/relation.rb",
+            "class Comment\n  class Relation\n    def own_method\n    end\n  end\nend\n",
+        );
+        harness.watch(&[&own]);
+
+        assert!(harness.has("Comment::Relation#own_method()"));
+        assert!(!harness.has("Comment::Relation#first()"));
+        assert!(
+            !harness.has("Story#comments()"),
+            "an association whose relation was declined must decline too"
+        );
+    }
+
+    /// The bundle answers on the settle it lands, and not on the settle after that.
+    ///
+    /// **A whole-graph lookup that answers about the previous settle.** `Context::framework` asks
+    /// `Graph::get`, which reads the map `Resolver::resolve` builds — and this pass runs
+    /// immediately *before* the resolve, so it was answering about the previous settle. Measured
+    /// over lobsters at the moment it is asked: 4 declarations against 1,968 definitions on the
+    /// cold settle, **2,431 against 174,919** on the settle the bundle lands, 144,299 only on
+    /// the one after. `has_one_attached` therefore declared nothing until the user's next
+    /// keystroke, which is invisible to every measurement that does not settle twice.
+    ///
+    /// `index_gems` settles exactly once, which is what makes this a test rather than a
+    /// coincidence: that settle is the one a bundle macro has to be answered on.
+    #[test]
+    fn the_bundle_says_which_class_a_macro_names_on_the_settle_it_lands() {
+        let (dir, _gem_home, env) = project_with_gem(
+            "module ActiveStorage\n  module Attached\n    class One\n      def attach\n      \
+             end\n    end\n  end\nend\n",
+        );
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            "[gems]\ndefault_gems = false\n\n[rbs]\nenabled = false\n",
+        )
+        .unwrap();
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        let source = "Story.new.avatar.attach\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.write(
+            "app/models/story.rb",
+            "class Story\n  has_one_attached :avatar\nend\n",
+        );
+        harness.index();
+        assert!(
+            !harness.has("Story#avatar()"),
+            "before the bundle is in, the class the macro names is genuinely not there"
+        );
+
+        harness.index_gems();
+
+        assert!(
+            harness.has("Story#avatar()"),
+            "and the settle the bundle lands on is the one that declares it"
+        );
+        let chained = card(&mut harness, &uri, source, "attach");
+        assert!(
+            chained.contains("ActiveStorage::Attached::One#attach"),
+            "the chain runs on through the gem's own class: {chained}"
+        );
+    }
+
+    /// Two settles over a workspace nobody touched write the same bytes.
+    ///
+    /// **The pass must never read a document it generated.** The graph holds the *previous*
+    /// settle's generated documents at the moment it is read, so a lookup that could see one
+    /// would answer differently on every pass and nothing in the output would say so. The
+    /// filter is a property of the URI **scheme** rather than of a list, which is what a
+    /// non-`file:` scheme is for; this asserts the property rather than the filter.
+    #[test]
+    fn two_settles_over_an_unchanged_workspace_generate_the_same_bytes() {
+        let (mut harness, _schema, _uri) = rails_project("Story.new.title\n");
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  has_many :comments\n  \
+             delegate :name, to: :author\nend\n",
+        );
+        let comment = harness.write(
+            "app/models/comment.rb",
+            "module Reports::Registry\n  Row = Struct.new(:total)\nend\nclass Comment < \
+             ApplicationRecord\n  belongs_to :story\nend\n",
+        );
+        harness.watch(&[&story, &comment]);
+        let before = harness.every_generated_document();
+        assert!(before.len() >= 3, "the fixture feeds several generators");
+
+        harness.analysis.dirty = true;
+        harness.analysis.settle();
+
+        assert_eq!(
+            harness.every_generated_document(),
+            before,
+            "a settle over an unchanged workspace is a settle that changes nothing"
+        );
+    }
+
+    /// A namespace only a **gem** declares is one a generated name may be spelled under.
+    ///
+    /// `Namespaces::spellable` is where it lands: a joined `class Shouty::Thing::Point`
+    /// introduces `Shouty`, which is safe exactly when
+    /// something declares `Shouty` — and *something* has never meant *this application* except
+    /// by accident of what `Context` was allowed to walk. What is **not** widened is which class
+    /// a macro may name; `synthesized.md` has the six-corpus measurement that settles it.
+    #[test]
+    fn a_namespace_only_a_gem_declares_is_one_a_generated_name_may_hang_off() {
+        let (dir, _gem_home, env) = project_with_gem("module Shouty\nend\n");
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            "[gems]\ndefault_gems = false\n\n[rbs]\nenabled = false\n",
+        )
+        .unwrap();
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/main.rb", "Shouty::Thing::Point.new.x\n");
+        harness.write(
+            "app/models/thing.rb",
+            "class Shouty::Thing\n  Point = Struct.new(:x)\nend\n",
+        );
+        harness.index();
+        assert!(
+            !harness.has("Shouty::Thing::Point#x()"),
+            "with nothing declaring `Shouty`, the joined name would introduce it"
+        );
+
+        harness.index_gems();
+
+        assert!(
+            harness.has("Shouty::Thing::Point#x()"),
+            "the gem declares `Shouty`, so the joined name introduces nothing"
+        );
+    }
+
+    /// One document may open the same body twice, and `Synthesized::record` has to keep it.
+    ///
+    /// A file under a namespace **nothing declares** writes its members out one body per
+    /// segment, so a file that declares on the module *and* on a class inside it opens
+    /// `class Ns` twice — once for each. Reopening is legal RBS and the parse gate is where a
+    /// mistake about that goes silent: it costs forem's whole `include` document, with every
+    /// test still green.
+    #[test]
+    fn a_document_that_opens_one_body_twice_is_still_indexed() {
+        let mut harness = Harness::new();
+        let file = harness.write(
+            "app/services/ns/admin.rb",
+            "module Ns::Admin\n  # @return [String]\n  def self.label\n  end\n\n  \
+             class Panel\n    # @return [Integer]\n    def size\n    end\n  end\nend\n",
+        );
+        harness.watch(&[&file]);
+
+        let rbs = harness.generated_rbs("app/services/ns/admin.rb");
+        // Opened twice, in two spellings, and the second spelling is the conjured namespace's
+        // doing: `app/services/ns/` declares `Ns` now, so the singleton body is *wrapped* in it
+        // and `Panel`'s is joined onto it. Two openings either way, which is what the parse gate
+        // is being asked about.
+        assert_eq!(rbs.matches("module Admin\n").count(), 1, "{rbs}");
+        assert_eq!(rbs.matches("module Ns::Admin\n").count(), 1, "{rbs}");
+        assert!(harness.has("Ns::Admin::<Admin>#label()"), "{rbs}");
+        assert!(harness.has("Ns::Admin::Panel#size()"), "{rbs}");
+    }
+
+    /// A `def` inside a compact-path class belongs to that class, and not to `Object`.
+    ///
+    /// The defect the conjured namespace closes, and it is worth stating as a member rather than
+    /// as a declaration because silence was the mild half. `class User::Policy::NotAlreadySilenced`
+    /// in a file Rails loads is ordinary discourse; with nothing declaring `User::Policy`,
+    /// rubydex binds the plain `def`s inside it by walking the lexical chain up past a class
+    /// whose declaration does not exist yet and stopping at `Object` — so `call` lands on every
+    /// object in the workspace, and the `def` line itself answers nothing because the class it is
+    /// asked about does not hold the member. Declaring the namespace the directory names is what
+    /// Ruby is doing anyway, and the binding follows.
+    #[test]
+    fn a_def_in_a_class_the_autoloader_namespaces_is_a_member_of_that_class() {
+        let mut harness = Harness::new();
+        harness.write("app/models/user.rb", "class User\nend\n");
+        let policy = harness.write(
+            "app/services/user/policy/not_already_silenced.rb",
+            "class User::Policy::NotAlreadySilenced\n  def call\n  end\nend\n",
+        );
+        harness.watch(&[&policy]);
+
+        assert!(harness.has("User::Policy"));
+        assert!(harness.has("User::Policy::NotAlreadySilenced#call()"));
+        // The half that is a wrong answer rather than a missing one: every receiver in the
+        // workspace answered `call` before this, and the jump landed in a service object.
+        assert!(!harness.has("Object#call()"));
+    }
+
+    /// The namespace is conjured by the **directory**, so a file that declares it wins instead.
+    ///
+    /// The other side of the filter, and it has to be a `class` to be worth testing: a directory
+    /// conjures a `module`, and a `policy.rb` writing `class User::Policy` would be overruled by
+    /// a generated body spelling the other keyword. rubydex holds one declaration of a constant,
+    /// so the two kinds are not a reopening — they are a coin toss.
+    #[test]
+    fn a_namespace_a_file_declares_is_not_conjured_a_second_time() {
+        let mut harness = Harness::new();
+        let user = harness.write("app/models/user.rb", "class User\nend\n");
+        let declared = harness.write(
+            "app/services/user/policy.rb",
+            "class User::Policy\n  def self.all\n  end\nend\n",
+        );
+        let policy = harness.write(
+            "app/services/user/policy/not_already_silenced.rb",
+            "class User::Policy::NotAlreadySilenced\n  def call\n  end\nend\n",
+        );
+        harness.watch(&[&user, &declared, &policy]);
+
+        assert!(harness.has("User::Policy::NotAlreadySilenced#call()"));
+        // The file's own kind survived, which is the whole of what the filter protects: a
+        // generated `module User::Policy` would have taken this singleton with it.
+        assert!(harness.has("User::Policy::<Policy>#all()"));
+    }
+
+    /// Two directories spelling one namespace: one constant, and a place in each of them.
+    ///
+    /// `app/jobs/reports/` and `app/services/reports/` both name `Reports`, and neither
+    /// directory is a line anybody can be sent to. Both files are, both write the constant, and
+    /// deleting either leaves it — so both declare it and the declaration rubydex merges them
+    /// into has a definition from each. The graph hands the documents over in no order at all,
+    /// which is why `Context::autoloaded` sorts: the *order of the places* is what a reader is
+    /// handed, and two runs over one workspace may not hand over two different orders.
+    #[test]
+    fn one_namespace_two_directories_is_declared_in_both() {
+        let mut harness = Harness::new();
+        let job = harness.write(
+            "app/jobs/reports/nightly.rb",
+            "class Reports::Nightly\n  def perform\n  end\nend\n",
+        );
+        let service = harness.write(
+            "app/services/reports/build.rb",
+            "class Reports::Build\n  def call\n  end\nend\n",
+        );
+        harness.watch(&[&job, &service]);
+
+        assert!(harness.has("Reports::Nightly#perform()"));
+        assert!(harness.has("Reports::Build#call()"));
+        assert!(!harness.has("Object#perform()"));
+        assert!(!harness.has("Object#call()"));
+        // One body per confirming file, and the directory keys nothing at all any more.
+        assert_eq!(
+            harness.generated_rbs("app/jobs/reports/nightly.rb"),
+            "module Reports\nend\n"
+        );
+        assert_eq!(
+            harness.generated_rbs("app/services/reports/build.rb"),
+            "module Reports\nend\n"
+        );
+        assert!(harness.generated_rbs("app/jobs/reports").is_empty());
+    }
+
+    /// A namespace only a directory declares is a place in every file that writes it.
+    ///
+    /// The defect this closed: `hover` read `module Mod` off the conjured declaration while
+    /// `definition` answered nothing at all, because the declaration was keyed by a directory
+    /// and a directory has no line. Measured over six corpora at 93 such names, every one of
+    /// which hovered and none of which could be jumped to.
+    ///
+    /// The places are the `Mod` of each `class Mod::…`, which is where Ruby's own operational
+    /// test puts the declaration — no single file declares it and all of them do — and they
+    /// arrive in path order, which is `Context::autoloaded`'s sort and not the walk's.
+    #[test]
+    fn a_namespace_only_a_directory_declares_is_a_place_in_every_file_that_writes_it() {
+        let mut harness = Harness::new();
+        // Three references to `Mod` in the first file and only the path's may be the place: the
+        // use above the class is outside the construct, and the superclass is inside it but
+        // later. `FLAG` is a declaration whose parent is not `Mod`, which is what the window is
+        // found by skipping.
+        let flagged = "\
+Mod::Audit.record
+class Mod::FlaggedController < Mod::ModController
+  FLAG = 1
+  def index
+    Mod::Audit.record
+  end
+end
+";
+        let notes = "class Mod::NotesController\n  def show\n  end\nend\n";
+        let one = harness.write("app/controllers/mod/flagged_controller.rb", flagged);
+        let two = harness.write("app/controllers/mod/notes_controller.rb", notes);
+        harness.watch(&[&one, &two]);
+
+        let targets = harness.definition_at(&one, flagged, "Mod::FlaggedController");
+        let targets = targets.as_array().expect("an array").clone();
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        assert_eq!(targets[0]["targetUri"], serde_json::json!(one.as_str()));
+        assert_eq!(targets[1]["targetUri"], serde_json::json!(two.as_str()));
+        // The one segment on the `class` line — line 1, not the `Mod::Audit` above it and not
+        // the superclass after it.
+        assert_eq!(
+            targets[0]["targetSelectionRange"],
+            serde_json::json!({
+                "start": { "line": 1, "character": 6 },
+                "end": { "line": 1, "character": 9 },
+            }),
+            "{targets:?}"
+        );
+        // One segment, so the namespace the declaration opens is that segment.
+        assert_eq!(
+            targets[0]["targetRange"], targets[0]["targetSelectionRange"],
+            "{targets:?}"
+        );
+        // And the card still reads the same, which is the half that was never broken.
+        let markdown =
+            harness.hover_at(&one, flagged, "Mod::FlaggedController")["contents"]["value"]
+                .as_str()
+                .expect("markdown")
+                .to_owned();
+        assert!(markdown.contains("module Mod"), "{markdown}");
+
+        // The picker gains it for the same reason, and that is a consequence rather than a
+        // second rule: `search` drops a row whose `locator::site` is `None`, so a namespace
+        // nothing could be sent to was a namespace nobody could search for either.
+        let names: Vec<String> = harness
+            .ask("workspace/symbol", serde_json::json!({ "query": "Mod" }))
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|symbol| symbol["name"].as_str().unwrap_or("?").to_owned())
+            .collect();
+        assert!(names.contains(&"Mod".to_owned()), "{names:?}");
+        // Once, although two files declare it: the picker offers declarations and this is one.
+        assert_eq!(
+            names.iter().filter(|name| *name == "Mod").count(),
+            1,
+            "{names:?}"
+        );
+    }
+
+    /// A chain of directories is a place per segment, and each one is its own bytes.
+    ///
+    /// `app/controllers/api/v1/accounts/` conjures three namespaces from one file, and the
+    /// three spans are three slices of one constant path. `full` is the namespace the
+    /// declaration opens and stops before the class's own name, which is a different constant.
+    #[test]
+    fn every_segment_of_a_conjured_chain_is_its_own_place() {
+        let mut harness = Harness::new();
+        let source = "class Api::V1::Accounts::CredentialsController\n  def show\n  end\nend\n";
+        let uri = harness.write(
+            "app/controllers/api/v1/accounts/credentials_controller.rb",
+            source,
+        );
+        harness.watch(&[&uri]);
+
+        // `Api::V1::Accounts` is bytes 6..23 of the line, and the three segments slice it.
+        for (needle, start, end) in [
+            ("Api::V1::Accounts::Credentials", 6, 9),
+            ("V1::Accounts::Credentials", 11, 13),
+            ("Accounts::Credentials", 15, 23),
+        ] {
+            let targets = harness.definition_at(&uri, source, needle);
+            let targets = targets.as_array().expect("an array").clone();
+            assert_eq!(targets.len(), 1, "{needle}: {targets:?}");
+            assert_eq!(
+                targets[0]["targetSelectionRange"],
+                serde_json::json!({
+                    "start": { "line": 0, "character": start },
+                    "end": { "line": 0, "character": end },
+                }),
+                "{needle}: {targets:?}"
+            );
+            assert_eq!(
+                targets[0]["targetRange"],
+                serde_json::json!({
+                    "start": { "line": 0, "character": 6 },
+                    "end": { "line": 0, "character": 23 },
+                }),
+                "{needle}: {targets:?}"
+            );
+        }
+    }
+
+    /// A namespace some file really declares keeps that file's place and gains no others.
+    ///
+    /// The other half, and the one that bounds the rule: `User::Policy` is conjured only while
+    /// nothing declares it, so a `policy.rb` beside the directory takes the name out of
+    /// `Context::autoloaded` entirely and the `class User::Policy` line answers alone. The
+    /// twelve files under `user/policy/` are not places for it and must not become any.
+    #[test]
+    fn a_namespace_a_file_declares_is_not_given_the_files_that_open_it() {
+        let mut harness = Harness::new();
+        let declared = "class User::Policy\n  def self.all\n  end\nend\n";
+        let opener = "class User::Policy::NotAlreadySilenced\n  def call\n  end\nend\n";
+        let user = harness.write("app/models/user.rb", "class User\nend\n");
+        let policy = harness.write("app/services/user/policy.rb", declared);
+        let silenced = harness.write("app/services/user/policy/not_already_silenced.rb", opener);
+        harness.watch(&[&user, &policy, &silenced]);
+
+        let targets = harness.definition_at(&silenced, opener, "Policy");
+        let targets = targets.as_array().expect("an array").clone();
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0]["targetUri"], serde_json::json!(policy.as_str()));
+    }
+
+    /// A model whose whole namespace the application declares is left joined, and still answers.
+    ///
+    /// The other half of the rule, and the half that is *not* a repair: the damage is done by
+    /// a segment **nothing declares**, so a name every segment of which some file writes down is
+    /// left joined exactly as it is written. Asserting that is what keeps the rule from spreading:
+    /// a body per segment written unconditionally costs real positions on names like
+    /// `Comment::Relation`.
+    #[test]
+    fn a_model_inside_a_module_is_left_joined_and_still_answers() {
+        let source = "Admin.table_name_prefix\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let signatures = dir.path().join("sig");
+        std::fs::create_dir_all(signatures.join("core")).unwrap();
+        std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            format!(
+                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
+                signatures.display().to_string()
+            ),
+        )
+        .unwrap();
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        harness.write(
+            "app/models/user.rb",
+            "class User < ApplicationRecord\nend\n",
+        );
+        harness.write(
+            "app/models/admin.rb",
+            "module Admin\n  def self.table_name_prefix\n    \"admin_\"\n  end\nend\n",
+        );
+        harness.write("app/models/admin/deep.rb", "module Admin::Deep\nend\n");
+        harness.write(
+            "app/models/admin/deep/setting.rb",
+            "class Admin::Deep::Setting < ApplicationRecord\n  has_many :users\nend\n",
+        );
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        let rbs = harness.generated_rbs("app/models/admin/deep/setting.rb");
+        assert!(
+            rbs.contains("module Admin::Deep\nclass Setting\n"),
+            "the parent is a module the application writes down: {rbs}"
+        );
+        assert!(harness.has("Admin::Deep::Setting#users()"), "{rbs}");
+        assert!(
+            harness.has("User::Relation"),
+            "a relation class is named after the element and stays joined: {rbs}"
+        );
+        let card = card(&mut harness, &uri, source, "table_name_prefix");
+        assert!(
+            !card.contains("Matched on the method name alone"),
+            "the module keeps its own singleton: {card}"
+        );
+    }
+
+    #[test]
+    fn exactly_one_routes_file_declares_each_helper() {
+        // Two routes files naming one helper would land in two generated documents, where
+        // `Facts`' precedence cannot see them and RBS holds two `def story_path:` lines as an
+        // overload set. First in URI order writes it, exactly as for a shared relation class.
+        let (mut harness, _uri) = routes_project("");
+        let engine = harness.write(
+            "engines/blog/config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :stories, only: [:index]\n  resources :posts, only: [:index]\nend\n",
+        );
+        harness.watch(&[&engine]);
+
+        assert_eq!(
+            harness
+                .analysis
+                .graph
+                .get("RouteHelpers#stories_path()")
+                .map_or(0, |definitions| definitions.len()),
+            1,
+            "one declaration, however many files name the route"
+        );
+        // Whichever file sorts first keeps it; here that is the application's own.
+        let engine_rbs = harness.generated_rbs("engines/blog/config/routes.rb");
+        let main = harness.generated_rbs("config/routes.rb");
+        assert!(main.contains("def stories_path:"), "{main}");
+        assert!(main.contains("def story_path:"), "{main}");
+        assert!(engine_rbs.contains("def posts_path:"), "{engine_rbs}");
+        assert!(
+            !engine_rbs.contains("def stories_path:"),
+            "`config/` sorts before `engines/`, so the application's own file keeps it: {engine_rbs}"
+        );
+    }
+
+    #[test]
+    fn an_application_that_declares_the_module_itself_keeps_it() {
+        // The rule `Comment::Relation` follows, and here it costs the whole feature: a project
+        // that spelled `RouteHelpers` meant something by it, and a module this pass wrote into
+        // would answer with its members and ours at once.
+        let (mut harness, _uri) = routes_project("");
+        assert!(harness.has("RouteHelpers#story_path()"));
+        let theirs = harness.write(
+            "app/models/route_helpers.rb",
+            "module RouteHelpers\n  def story_path\n  end\nend\n",
+        );
+        harness.watch(&[&theirs]);
+        assert_eq!(
+            harness
+                .analysis
+                .graph
+                .get("RouteHelpers#story_path()")
+                .map_or(0, |definitions| definitions.len()),
+            1,
+            "theirs, and only theirs"
+        );
+        assert!(!harness.has("RouteHelpers#admin_flags_path()"));
+    }
+
+    #[test]
+    fn a_routes_file_that_stops_declaring_takes_its_helpers_with_it() {
+        // The pruning rule, on the one generator whose document also carries the `include`s:
+        // an empty routes file must leave neither a helper nor a host behind.
+        let (mut harness, _uri) = routes_project("");
+        assert!(harness.has("RouteHelpers#story_path()"));
+        let routes = harness.write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\nend\n",
+        );
+        harness.watch(&[&routes]);
+        assert!(!harness.has("RouteHelpers#story_path()"));
+        assert!(!harness.has("RouteHelpers#admin_flags_path()"));
+    }
+
+    /// A project that declares `ActiveRecordRelation` itself keeps it, and loses the feature.
+    ///
+    /// The rule `Comment::Relation` and `ROUTE_HELPERS` follow, asked of the one class the
+    /// query interface invents. What it withdraws is the **relations**, which is that same
+    /// collision behaviour reached by a second road rather than a rule of its own: with no relation class there is nothing for a `has_many` to return, so the whole
+    /// half declines together instead of leaving a `-> Comment::Relation` naming a class nothing
+    /// declares, or a relation inheriting whatever the user meant by the name.
+    #[test]
+    fn a_project_that_declares_the_relation_base_itself_is_not_shadowed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        harness.write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        );
+        harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  has_many :comments\nend\n",
+        );
+        harness.write(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\nend\n",
+        );
+        let own = harness.write(
+            "app/lib/active_record_relation.rb",
+            "class ActiveRecordRelation\n  def mine\n  end\nend\n",
+        );
+        harness.index();
+
+        assert!(
+            harness.has("ActiveRecordRelation#mine()"),
+            "their class stands"
+        );
+        assert!(
+            !harness.has("ActiveRecordRelation#where()"),
+            "and this pass writes nothing into it"
+        );
+        let rbs = harness.generated_rbs("app/models/story.rb");
+        assert!(!rbs.contains("Relation"), "{rbs}");
+        assert!(
+            !rbs.contains("def comments:"),
+            "the whole half declines together: {rbs}"
+        );
+
+        // Take the name away and the whole feature comes back, which is what says the decline
+        // is about the collision rather than about anything else in the fixture.
+        std::fs::remove_file(own.to_path().unwrap()).unwrap();
+        harness.watch(&[&own]);
+        assert!(harness.has("ActiveRecordRelation#where()"));
+        let rbs = harness.generated_rbs("app/models/story.rb");
+        assert!(
+            rbs.contains("class Comment::Relation < ActiveRecordRelation\n"),
+            "{rbs}"
+        );
+        assert!(
+            rbs.contains("def comments: () -> Comment::Relation\n"),
+            "{rbs}"
+        );
+    }
+
+    #[test]
+    fn an_association_added_after_the_index_answers_and_a_deleted_one_stops() {
+        // Both directions of the same property the schema pass has: the generators run before
+        // every resolve, so a macro typed into a model is answerable on the next settle and one
+        // deleted from it takes its member with it.
+        let (mut harness, _story, _uri) = models_project("");
+        assert!(!harness.has("User#stories()"));
+
+        let user = harness.write(
+            "app/models/user.rb",
+            "class User < ApplicationRecord\n  has_many :stories\nend\n",
+        );
+        harness.watch(&[&user]);
+        assert!(harness.has("User#stories()"));
+
+        let user = harness.write(
+            "app/models/user.rb",
+            "class User < ApplicationRecord\nend\n",
+        );
+        harness.watch(&[&user]);
+        assert!(!harness.has("User#stories()"));
+    }
+
+    #[test]
+    fn a_table_no_class_claims_declares_nothing() {
+        // The direction class → table, in the case that decides it. `widgets` is a table with
+        // a column, and there is no `Widget` — so nothing is declared, rather than a class
+        // being invented for it or the table being singularized onto something that exists.
+        let (harness, _schema, _uri) = rails_project("Story.new\n");
+        assert!(harness.has("Story#title()"));
+        assert!(!harness.has("Widget#name()"));
+        assert!(harness.analysis.graph.get("Widget").is_none());
+    }
+
+    #[test]
+    fn a_model_added_after_the_index_makes_its_table_answer() {
+        // The reason the generation runs before every resolve rather than when the schema file
+        // changes: the *other* input is which classes exist, and `rails generate model` writes
+        // a file that has nothing to do with `db/schema.rb`'s mtime.
+        let (mut harness, _schema, _uri) = rails_project("Widget.new\n");
+        assert!(!harness.has("Widget#name()"));
+
+        let widget = harness.write("app/models/widget.rb", "class Widget\nend\n");
+        harness.watch(&[&widget]);
+
+        assert!(harness.has("Widget#name()"), "a new model was not noticed");
+    }
+
+    #[test]
+    fn editing_the_schema_replaces_what_it_declared() {
+        // The same failure the side table exists to prevent, now through the generator that
+        // fills it: a column that is renamed must stop answering under its old name, and it is
+        // silent when it does not.
+        let source = "Story.new.title\n";
+        let (mut harness, schema, uri) = rails_project(source);
+        assert!(harness.has("Story#title()"));
+
+        harness.open(&schema, SCHEMA_RB);
+        harness.change(&schema, &SCHEMA_RB.replace("\"title\"", "\"headline\""));
+
+        assert!(harness.has("Story#headline()"));
+        assert!(
+            !harness.has("Story#title()"),
+            "the column that was renamed is still answering"
+        );
+        assert!(harness.definition_at(&uri, source, "title").is_null());
+    }
+
+    #[test]
+    fn a_project_with_no_schema_generates_nothing_at_all() {
+        // The cost a non-Rails project pays for all of the above, which has to be nothing: one
+        // hash lookup per settle, no document, no entry in the table.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/main.rb", "class Story\nend\n");
+        harness.index();
+
+        assert!(harness.analysis.synthesized.is_empty());
+        assert!(
+            harness.definition_at(&uri, "class Story\nend\n", "Story")[0]["targetUri"].is_string()
+        );
+    }
+
+    #[test]
+    fn a_keystroke_in_a_file_the_pass_does_not_read_does_not_run_the_pass() {
+        // `settle` runs this pass before every `resolve` and a forced settle sits in front of
+        // every graph-reading request, so without a gate one keystroke in a file with no macro
+        // in it pays for a whole-workspace regeneration — 63 ms on discourse, in front of
+        // completion's own 10.
+        //
+        // Three assertions, and the middle one is the gate: nothing is skipped until a pass has
+        // run, a keystroke in a file no generator opens skips it, and every answer is still
+        // there afterwards.
+        let source = "Story.new.title\n";
+        let (mut harness, _schema, _uri) = rails_project(source);
+        assert!(harness.has("Story#title()"));
+
+        let plain = "class Plain\n  def a\n  end\nend\n";
+        let uri = harness.write("app/lib/plain.rb", plain);
+        harness.index();
+        harness.analysis.settle();
+        let before = harness.analysis.passes;
+
+        harness.open(&uri, plain);
+        harness.change(&uri, "class Plain\n  def ab\n  end\nend\n");
+        harness.analysis.settle();
+        assert_eq!(
+            harness.analysis.passes, before,
+            "the generators ran for a file none of them opens"
+        );
+        assert!(
+            harness.has("Story#title()"),
+            "and the columns are still there"
+        );
+
+        // The half a naive "does *this* document declare anything" test would get wrong: a new
+        // class name is a new answer for every macro anywhere that names one, so the projection
+        // moves and the pass runs.
+        harness.change(&uri, "class Renamed\n  def a\n  end\nend\n");
+        harness.analysis.settle();
+        assert!(
+            harness.analysis.passes > before,
+            "a class the workspace did not have before is not nothing"
+        );
+    }
+
+    #[test]
+    fn a_keystroke_in_a_file_the_pass_does_not_read_does_not_walk_the_workspace_either() {
+        // The property the per-document gate rests on: what is held has to be a function of
+        // **what the document contributes** and not of the document, proven by changing a body
+        // without changing what it contributes.
+        //
+        // `passes` cannot see this — the outer gate already stops the generators, and what is
+        // left is the projection they are handed being rebuilt in full to decide that. So
+        // `walks` is the instrument, and the two assertions are the point: an edit that
+        // rewrites most of a file walks nothing, and an edit that renames the class it defines
+        // walks everything.
+        let source = "Story.new.title\n";
+        let (mut harness, _schema, _uri) = rails_project(source);
+
+        let plain = "class Plain\n  def a\n  end\nend\n";
+        let uri = harness.write("app/lib/plain.rb", plain);
+        harness.index();
+        harness.analysis.settle();
+        let walks = harness.analysis.walks;
+
+        harness.open(&uri, plain);
+        // A comment, a rename of a method, a local variable, a whole second method and a string
+        // literal — everything a file is mostly made of, and not one of them is read by any
+        // field of a `Contribution`.
+        harness.change(
+            &uri,
+            "# what this class is for\nclass Plain\n  def ab\n    here = \"and gone\"\n    here\n  end\n\n  def second\n  end\nend\n",
+        );
+        harness.analysis.settle();
+        assert_eq!(
+            harness.analysis.walks, walks,
+            "the workspace was walked for a change no projection of it can see"
+        );
+        assert!(
+            harness.has("Story#title()"),
+            "and the columns are still there"
+        );
+
+        // The other half, and it is the same file: the one line in it the walk *does* read.
+        harness.change(&uri, "class Renamed\nend\n");
+        harness.analysis.settle();
+        assert!(
+            harness.analysis.walks > walks,
+            "a class the workspace did not have before is not nothing"
+        );
+    }
+
+    #[test]
+    fn a_keystroke_in_a_model_file_runs_the_generators_and_does_not_walk_the_workspace() {
+        // **The two gates must not share a clause.** "Would the walk produce the projection
+        // already held" and "has a file some generator reads changed" are different questions,
+        // and the second is right about the generators and says
+        // nothing about the walk: `has_many :comments` becoming `has_many :tags` changes what
+        // the file says and not one thing the projection is made of, so the generators must run
+        // and the walk must not. On discourse the walk is 70 ms of every such keystroke.
+        //
+        // `walks` and `passes` together are the only instrument that can say so, and the two
+        // assertions have to be made in the same breath: a pass that did not run would satisfy
+        // the first one for the wrong reason.
+        let source = "Story.new.title\n";
+        let (mut harness, _schema, _uri) = rails_project(source);
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  has_many :comments\nend\n",
+        );
+        let comment = harness.write("app/models/comment.rb", "class Comment\nend\n");
+        let tag = harness.write("app/models/tag.rb", "class Tag\nend\n");
+        harness.watch(&[&story, &comment, &tag]);
+        harness.open(
+            &story,
+            "class Story < ApplicationRecord\n  has_many :comments\nend\n",
+        );
+        assert!(harness.has("Story#comments()"));
+
+        let (walks, passes) = (harness.analysis.walks, harness.analysis.passes);
+        harness.change(
+            &story,
+            "class Story < ApplicationRecord\n  has_many :tags\nend\n",
+        );
+
+        assert_eq!(
+            harness.analysis.walks, walks,
+            "the workspace was walked for an edit that changed nothing the walk reads"
+        );
+        assert!(
+            harness.analysis.passes > passes,
+            "and the generators did not run for an edit that changed what a file declares"
+        );
+        assert!(harness.has("Story#tags()"), "the new macro took effect");
+        assert!(
+            !harness.has("Story#comments()"),
+            "and the one it replaced stopped answering"
+        );
+    }
+
+    #[test]
+    fn a_keystroke_in_one_model_file_reads_that_file_and_no_other() {
+        // The parse memo: a keystroke in a model file costs the reading of *that* file and
+        // nothing else. Without it, one changed file makes the pass re-read and re-parse every
+        // file on every list to learn what all but one of them said last time — 1,527 files and
+        // 104 ms of Prism on discourse, every settle.
+        //
+        // `reads` is the instrument for the reason `passes` and `walks` are: the memo changes
+        // no answer at all, and a file re-parsed into exactly the tree it already had is
+        // indistinguishable from one that was not opened.
+        let source = "Story.new.title\n";
+        let (mut harness, _schema, _uri) = rails_project(source);
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  has_many :comments\nend\n",
+        );
+        let comment = harness.write(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n  belongs_to :story\nend\n",
+        );
+        harness.watch(&[&story, &comment]);
+        assert!(harness.has("Story#comments()"));
+
+        // A settle over a workspace nobody touched reads nothing at all, which is the wider
+        // claim: the memo is keyed by the file rather than by which file was edited.
+        let reads = harness.analysis.reads();
+        harness.analysis.dirty = true;
+        harness.analysis.settle();
+        assert_eq!(
+            harness.analysis.reads(),
+            reads,
+            "a settle over an unchanged workspace re-read files"
+        );
+
+        // Opening it is not a keystroke and does cost one read of one file: a stamp and a
+        // buffer cannot be compared, so the authority changing hands is a miss by construction.
+        // It happens once per open, of one file, and the alternative is hashing what is on disk
+        // to find out — which is the read.
+        harness.open(
+            &story,
+            "class Story < ApplicationRecord\n  has_many :comments\nend\n",
+        );
+        let reads = harness.analysis.reads();
+
+        // And *then* one keystroke in one of them is one read. The edit changes what the file
+        // declares, so the pass is not gated out — this is the pass running in full and opening
+        // exactly one file.
+        harness.change(
+            &story,
+            "class Story < ApplicationRecord\n  has_many :comments\n  has_many :tags\nend\n",
+        );
+        assert_eq!(
+            harness.analysis.reads(),
+            reads + 1,
+            "a keystroke in one model file read more than that file"
+        );
+        assert!(harness.has("Story#tags()"), "and the new macro took effect");
+        assert!(
+            harness.has("Comment#story()"),
+            "and the file that was not re-read still declares what it declared"
+        );
+    }
+
+    #[test]
+    fn a_file_that_changes_on_disk_with_nobody_watching_is_read_again() {
+        // The guarantee the memo is most able to lose: this pass claims the answer is a
+        // function of what is **on disk**, and it earns that by re-reading everything every
+        // time. A memo is exactly the thing that stops doing that.
+        //
+        // What replaces the re-read is the `stat` — `Fresh::Disk` is the gate's own stamp and
+        // not a second mechanism — so a `git checkout` that rewrites a schema takes effect at the
+        // very next settle, with no watcher notification anywhere in it. Nothing here calls
+        // `watch`, which is the whole test.
+        let source = "Story.new.title\n";
+        let (mut harness, schema, _uri) = rails_project(source);
+        assert!(harness.has("Story#title()"));
+
+        // Sleeping is not an option and does not have to be: `stamp_of` reads the length as
+        // well as the modification time, precisely because a filesystem's clock is coarse and
+        // two writes inside one tick are a real edit.
+        std::fs::write(
+            schema.to_path().expect("a file uri"),
+            SCHEMA_RB.replace("\"title\"", "\"headline\""),
+        )
+        .expect("rewrite the schema");
+
+        harness.analysis.dirty = true;
+        harness.analysis.settle();
+        assert!(
+            harness.has("Story#headline()"),
+            "a schema rewritten behind the server's back never took effect"
+        );
+        assert!(
+            !harness.has("Story#title()"),
+            "and the column it replaced is still answering"
+        );
+
+        // And a file that is *gone* takes its parse with it rather than leaving one nothing can
+        // refresh — the same guarantee at the other end, and the one that would leave a column
+        // answering forever.
+        std::fs::remove_file(schema.to_path().expect("a file uri")).expect("delete the schema");
+        harness.analysis.dirty = true;
+        harness.analysis.settle();
+        assert!(
+            !harness.has("Story#headline()"),
+            "a schema deleted behind the server's back is still declaring columns"
+        );
+    }
+
+    #[test]
+    fn a_file_whose_name_ends_schema_rb_and_is_not_a_schema_is_never_read_as_one() {
+        // The suffix is the cheap half of the test and the module's own reader is the rule: a dump
+        // lives in `db/`, so a file called `legacy_schema.rb` anywhere else is somebody's own
+        // code that happens to end in those nine characters. It is on `rails_lists::SCHEMAS` — the
+        // `Wants` row matches the name — and the reader is never handed it, which is why the
+        // filter sits where the pass decides what to *open* rather than where it declares.
+        let source = "Story.new.title\n";
+        let (mut harness, _schema, _uri) = rails_project(source);
+        //
+        // The decoy is a **copy of the real schema**, which is what makes one assertion enough:
+        // a table two schema sources declare is declared by neither, so reading it would take
+        // `stories` away from both and `Story#title` would stop answering. Asserting that some
+        // table *only* the decoy holds is absent would prove nothing — nothing declares a class
+        // to claim it either way.
+        let decoy = harness.write("lib/legacy_schema.rb", SCHEMA_RB);
+        harness.watch(&[&decoy]);
+
+        assert!(
+            harness.has("Story#title()"),
+            "a file named like a schema and living outside db/ was read as one"
+        );
+    }
+
+    #[test]
+    fn a_file_that_joins_a_list_without_changing_is_read_for_the_reader_it_joined_for() {
+        // The memo compares the readers an entry was built for and not only its text, and
+        // this is the one shape that needs it. Every list but one is a function of a document's
+        // own content; `rails_lists::MODELS` is not, because `Analysis::walk` adds to it, after the
+        // walk, every **model** that writes no macro at all — and whether a class is a model
+        // depends on a superclass chain that runs through *other files*. So `class Widget < Base`
+        // joins the model list the moment a different file makes `Base` a model, with not one
+        // byte of `widget.rb` changed.
+        //
+        // A memo keyed on the text alone would then serve an entry that was read for the
+        // `@return` tag and never ran the model reader, and `Widget` would silently get no
+        // relation class.
+        let source = "Story.new.title\n";
+        let (mut harness, _schema, _uri) = rails_project(source);
+        let base = harness.write("app/models/base.rb", "class Base\nend\n");
+        let widget = harness.write(
+            "app/models/widget.rb",
+            "class Widget < Base\n  # @return [String]\n  def label\n    \"x\"\n  end\nend\n",
+        );
+        harness.watch(&[&base, &widget]);
+        assert!(harness.has("Widget#label()"), "the tag declared its method");
+        assert!(
+            !harness.has("Widget::Relation#first()"),
+            "and nothing has made Widget a model yet"
+        );
+
+        harness.open(&base, "class Base\nend\n");
+        let reads = harness.analysis.reads();
+        harness.change(&base, "class Base < ApplicationRecord\nend\n");
+
+        assert!(
+            harness.has("Widget::Relation"),
+            "the file that joined the model list was not read for the reader it joined for"
+        );
+        assert!(
+            harness.has("Widget#label()"),
+            "and what it was already read for is still declared"
+        );
+        // Two files: the one that was edited, and the one that joined a list because of it.
+        assert_eq!(harness.analysis.reads(), reads + 2);
+    }
+
+    #[test]
+    fn a_document_the_walk_never_visits_is_never_skipped_by_it() {
+        // The clause that makes one `Contribution` per document enough, and the one case it cannot
+        // cover. `Analysis::contribution` declines an `.rbs` outright — a signature file has
+        // `def`s and doc comments and would be handed to a reader that parses Ruby — but
+        // `bundle_namespaces` reads **every** definition in the graph, so a `module` written in
+        // the project's own `sig/` can still move a `Context`. A document with no contribution
+        // is therefore not a document with an unchanged one, and the gate refuses it.
+        let source = "Story.new.title\n";
+        let (mut harness, _schema, _uri) = rails_project(source);
+
+        let signature = "class Plain\nend\n";
+        let uri = harness.write("sig/plain.rbs", signature);
+        harness.index();
+        harness.analysis.settle();
+        let walks = harness.analysis.walks;
+
+        harness.open(&uri, signature);
+        harness.change(&uri, "class Plain\n  def a: () -> String\nend\n");
+        harness.analysis.settle();
+        assert!(
+            harness.analysis.walks > walks,
+            "a signature file was treated as contributing nothing rather than as unreadable"
+        );
+    }
+
+    #[test]
+    fn the_gate_still_looks_at_the_disk_rather_than_trusting_a_notification() {
+        // The guarantee the gate must not weaken, and the suite is what catches it: this
+        // pass claims the answer is a function of what is on disk, and it earns that by
+        // re-reading everything every time. A `git checkout` that deletes a `db/schema.rb`
+        // sends no notification until the watcher gets round to it, so a gate that trusted
+        // notifications alone would keep answering with columns of a file that is gone.
+        let source = "Story.new.title\n";
+        let (mut harness, schema, _uri) = rails_project(source);
+        assert!(harness.has("Story#title()"));
+
+        let plain = "class Plain\nend\n";
+        let uri = harness.write("app/lib/plain.rb", plain);
+        harness.index();
+        harness.analysis.settle();
+
+        // Behind the server's back, and then a keystroke somewhere unrelated.
+        std::fs::remove_file(schema.to_path().unwrap()).unwrap();
+        harness.open(&uri, plain);
+        harness.change(&uri, "class Plain\n  def a\n  end\nend\n");
+        harness.analysis.settle();
+
+        assert!(
+            !harness.has("Story#title()"),
+            "a schema that is gone still declares its columns"
+        );
+    }
+
+    #[test]
+    fn a_structure_dump_that_appears_is_not_a_document_and_is_looked_for_anyway() {
+        // The one input to the pass that is **not** a projection of the graph —
+        // `db/*structure.sql` — and therefore the one thing the contributions cannot cover:
+        // a `.sql` is not a document, so no `WANTS` row can reach one and no contribution can
+        // move when one appears. A `git checkout` that brings one in sends no notification the
+        // gate may trust, exactly as the deletion in the test above sends none.
+        let source = "Story.new.title\n";
+        let (mut harness, schema, _uri) = rails_project(source);
+        std::fs::remove_file(schema.to_path().unwrap()).unwrap();
+
+        let plain = "class Plain\nend\n";
+        let uri = harness.write("app/lib/plain.rb", plain);
+        harness.index();
+        harness.analysis.settle();
+        assert!(!harness.has("Story#title()"), "the schema is gone");
+
+        // Behind the server's back, and then a keystroke in a file that declares nothing.
+        std::fs::write(
+            harness.root.path().join("db/structure.sql"),
+            "CREATE TABLE stories (\n  title character varying\n);\n",
+        )
+        .unwrap();
+        harness.open(&uri, plain);
+        harness.change(&uri, "class Plain\n  def a\n  end\nend\n");
+        harness.analysis.settle();
+
+        assert!(
+            harness.has("Story#title()"),
+            "a dump that appeared was never looked for"
+        );
+    }
+
+    #[test]
+    fn a_schema_that_vanished_under_the_index_declares_nothing() {
+        // Indexed and readable are two different questions, and the gap between them is real:
+        // a `git checkout` removes the file, and the next settle runs before the watcher
+        // notification does. Nothing to read means nothing to say — not the last thing it said.
+        let source = "Story.new.title\n";
+        let (mut harness, schema, uri) = rails_project(source);
+        assert!(harness.has("Story#title()"));
+
+        std::fs::remove_file(schema.to_path().unwrap()).unwrap();
+        harness.open(&uri, source);
+        harness.change(&uri, source);
+
+        assert!(harness.analysis.synthesized.is_empty());
+        assert!(!harness.has("Story#title()"));
+    }
+
+    /// A project with one file from every family the `[rails]` and `[types]` switches govern.
+    ///
+    /// One fixture for eight tests, because what each of those tests is really about is the
+    /// **other seven**: a switch that turns off more than its own family is the failure worth
+    /// catching, and it is only visible where all eight are present at once.
+    fn every_family(config: &str) -> Harness {
+        let mut harness = Harness::configured(config);
+        harness.write("db/schema.rb", SCHEMA_RB);
+        harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  has_many :comments\nend\n",
+        );
+        // The association names a class the application defines, or it declines — which is the
+        // rule rather than the fixture being fussy.
+        harness.write(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\nend\n",
+        );
+        harness.write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :stories\nend\n",
+        );
+        harness.write(
+            "app/jobs/import_job.rb",
+            "class ImportJob < ApplicationJob\n  def perform\n  end\nend\n",
+        );
+        harness.write("app/models/point.rb", "Point = Struct.new(:x)\n");
+        harness.write(
+            "app/models/annotated.rb",
+            "class Annotated\n  # @return [Story]\n  def story\n  end\nend\n",
+        );
+        harness.write(
+            "app/helpers/story_helper.rb",
+            "module StoryHelper\n  def shout\n  end\nend\n",
+        );
+        // The framework family is two files rather than one, and that is what it is: the
+        // `config/application.rb` it is declared from, and the bundle whose constants both ends
+        // of every row are checked against.
+        harness.write(
+            "config/application.rb",
+            "module Shop\n  class Application < Rails::Application\n  end\nend\n",
+        );
+        harness.write("lib/bundle.rb", FRAMEWORK_BUNDLE);
+        harness.index();
+        harness
+    }
+
+    /// What a bundle declares of the four constants the framework table names.
+    ///
+    /// `module Rails` and classes for the rest, because which keyword opens each body is read
+    /// off the graph rather than assumed — a fixture that spelled them all the same way would
+    /// not be testing that.
+    pub(crate) const FRAMEWORK_BUNDLE: &str = "\
+module Rails
+  def self.root; end
+  def self.cache; end
+  def self.application; end
+  class Application
+    def routes; end
+  end
+end
+class Pathname
+  def join(*args); end
+end
+module ActiveSupport
+  class TimeZone
+    def now; end
+  end
+  module Cache
+    class Store
+      def fetch(name); end
+    end
+  end
+end
+class Time
+  def self.zone; end
+end
+";
+
+    /// What each family writes when it is on, named once so eight tests cannot disagree.
+    ///
+    /// The **generated RBS** and not `Harness::has`, because that is the question these tests
+    /// are really asking: did this generator run at all. A declaration can go missing for a
+    /// dozen reasons downstream of the pass, and every one of them would read here as a switch
+    /// working.
+    const FAMILIES: [(&str, &str, &str); 7] = [
+        ("schema", "db/schema.rb", "def title:"),
+        ("models", "app/models/story.rb", "def comments:"),
+        ("routes", "config/routes.rb", "def story_path:"),
+        (
+            "entrypoints",
+            "app/jobs/import_job.rb",
+            "def self.perform_later:",
+        ),
+        ("structs", "app/models/point.rb", "def x:"),
+        ("annotations", "app/models/annotated.rb", "def story:"),
+        // The one family with no key of its own: it is gated by the umbrella, so it is absent
+        // from the per-switch loop below and present in the umbrella's test.
+        ("framework", "config/application.rb", "def self.root:"),
+    ];
+
+    /// Every family but `absent`, asserted present; `absent` asserted gone.
+    fn only_missing(harness: &Harness, absent: &str) {
+        for (family, source, declared) in FAMILIES {
+            let rbs = harness.generated_rbs(source);
+            if family == absent {
+                assert!(
+                    !rbs.contains(declared),
+                    "{family} is off and {source} still declares {declared}: {rbs}"
+                );
+            } else {
+                assert!(
+                    rbs.contains(declared),
+                    "{absent} is off and it took {family}'s {declared} with it: {rbs}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_family_declares_something_with_nothing_configured() {
+        // The guard the two tests below need: a fixture where a family declared nothing anyway
+        // would make every one of them pass by accident.
+        let harness = every_family("");
+        for (family, source, declared) in FAMILIES {
+            let rbs = harness.generated_rbs(source);
+            assert!(rbs.contains(declared), "{family}: {declared} in {rbs}");
+        }
+    }
+
+    #[test]
+    fn each_switch_turns_off_its_own_family_and_nothing_else() {
+        // The claim the whole of `[rails]` rests on. A switch that took a neighbour with it
+        // would be invisible in a project that happens not to use the neighbour, which is most
+        // projects.
+        for (key, family) in [
+            ("[rails]\nschema = false\n", "schema"),
+            ("[rails]\nmodels = false\n", "models"),
+            ("[rails]\nroutes = false\n", "routes"),
+            ("[rails]\nentrypoints = false\n", "entrypoints"),
+            ("[types]\nstructs = false\n", "structs"),
+            ("[types]\nannotations = false\n", "annotations"),
+        ] {
+            let harness = every_family(key);
+            only_missing(&harness, family);
+        }
+    }
+
+    #[test]
+    fn rails_off_takes_all_six_rails_families_and_leaves_the_two_that_are_not_rails() {
+        // `Struct.new` and a `@return` tag are plain Ruby. Putting either under a `rails` table
+        // would have been the first Rails word to leak somewhere it does not belong, and this is
+        // what says it is not just a naming choice.
+        let harness = every_family("[rails]\nenabled = false\n");
+        for (family, source, declared) in FAMILIES {
+            let rbs = harness.generated_rbs(source);
+            if family == "structs" || family == "annotations" {
+                assert!(rbs.contains(declared), "{declared} is not Rails: {rbs}");
+            } else {
+                assert!(!rbs.contains(declared), "{family}: {declared}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_schema_the_configuration_excludes_is_not_read() {
+        // Not indexed and not read are the same sentence. A project that narrowed
+        // `index.include` has said what it wants looked at, and this is not the place to
+        // overrule it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            "[gems]\nenabled = false\n\n[index]\ninclude = [\"app/**/*.rb\"]\n",
+        )
+        .unwrap();
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        harness.write("app/models/story.rb", "class Story\nend\n");
+        harness.write("db/schema.rb", SCHEMA_RB);
+        harness.index();
+
+        assert!(harness.analysis.synthesized.is_empty());
+        assert!(!harness.has("Story#title()"));
+    }
+
+    /// What one pass over the graph collects, including the two projections nothing reads yet.
+    ///
+    /// The registry is the point: four lists, three predicates and one loop, so a reader that
+    /// wants a fifth list adds a row rather than a walk. `modules` and `superclasses` are here
+    /// because the concern, entry-point and routes readers need them and they cost the same
+    /// loop — a projection added later is a second walk over every document in the workspace
+    /// that nobody notices.
+    #[test]
+    fn what_one_pass_over_the_graph_collects() {
+        let mut harness = Harness::new();
+        harness.write("db/schema.rb", "ActiveRecord::Schema[8.0].define do\nend\n");
+        harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  has_many :comments\nend\n",
+        );
+        harness.write("app/models/concerns/storyish.rb", "module Storyish\nend\n");
+        harness.write(
+            "app/models/legacy.rb",
+            "class Legacy < ActiveRecord::Base\n  self.table_name = \"old\"\nend\n",
+        );
+        // Both annotation shapes in one file, which is the case the single loop exists for: a
+        // `sig` *and* a YARD tag put it on the annotated list once, and twice would generate it
+        // twice.
+        harness.write(
+            "app/lib/widget.rb",
+            "class Widget\n  sig { returns(String) }\n  def go\n  end\n\n  \
+             # @return [Integer]\n  def size\n  end\nend\n",
+        );
+        harness.index();
+
+        let context = harness.analysis.context();
+        let named = |list: ListId| -> Vec<String> {
+            context
+                .documents(list)
+                .iter()
+                .map(|uri| {
+                    uri.rsplit('/')
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .collect()
+        };
+        assert_eq!(named(rails_lists::SCHEMAS), ["db/schema.rb"]);
+        // `legacy.rb` writes no macro at all and is on the list anyway: it defines a model, so
+        // it is where that model's relation class and class side belong.
+        // The only membership decided after the walk rather than during it.
+        assert_eq!(
+            named(rails_lists::MODELS),
+            ["models/legacy.rb", "models/story.rb"]
+        );
+        assert_eq!(named(rails_lists::RENAMED), ["models/legacy.rb"]);
+        assert_eq!(named(annotations_list::ANNOTATED), ["lib/widget.rb"]);
+
+        // Every class *and* module, because that is the bound on what a macro may name; and the
+        // modules on their own, because a module is a different thing to declare on.
+        assert!(
+            ["Story", "Storyish", "Legacy", "Widget"]
+                .iter()
+                .all(|name| context.classes.contains(*name)),
+            "{:?}",
+            context.classes
+        );
+        assert_eq!(
+            context
+                .modules
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["Storyish"]
+        );
+
+        // Spelled as written and not qualified: the test applied to it is a suffix, and
+        // a superclass a class does not define is still read — `ApplicationRecord` is the base
+        // and `ActiveRecord::Base` is a gem's.
+        assert_eq!(
+            context.superclasses.get("Story").map(String::as_str),
+            Some("ApplicationRecord")
+        );
+        assert_eq!(
+            context.superclasses.get("Legacy").map(String::as_str),
+            Some("ActiveRecord::Base")
+        );
+        assert_eq!(context.superclasses.get("Widget"), None);
+
+        // A table claimed by exactly one top-level class, which is what the schema generator
+        // then filters for ambiguity.
+        assert_eq!(
+            rails_of(&context).claims.get("stories").map(Vec::as_slice),
+            Some(["Story".to_owned()].as_slice())
+        );
+    }
+
+    /// A class written inside a `class << self` body is not a class this pass can name.
+    ///
+    /// Its lexical nesting is the singleton class, whose own name is `ParentScope::Attached` —
+    /// not a constant anybody writes — so `qualified_name` answers `None` and the walk moves on.
+    /// The rule it protects is the one every generator inherits: a class the application does
+    /// not define declares nothing, and "cannot be spelled" and "is not defined" have to reach
+    /// the same answer.
+    #[test]
+    fn a_class_inside_a_singleton_class_body_is_not_a_class_this_pass_names() {
+        let mut harness = Harness::new();
+        harness.write(
+            "app/models/outer.rb",
+            "class Outer\n  class << self\n    class Inner\n    end\n\n    module Deeper\n    \
+             end\n  end\nend\n",
+        );
+        harness.index();
+
+        let context = harness.analysis.context();
+        assert!(context.classes.contains("Outer"), "{:?}", context.classes);
+        assert!(
+            !context
+                .classes
+                .iter()
+                .any(|name| name.contains("Inner") || name.contains("Deeper")),
+            "{:?}",
+            context.classes
+        );
+        assert!(context.modules.is_empty(), "{:?}", context.modules);
+    }
+
+    /// A class Ruby accepts and Rails' inflector does not claims no table.
+    ///
+    /// `class Ünicode` is legal Ruby — a constant must begin with an uppercase letter, and Ruby
+    /// means Unicode's uppercase — and `underscore` deliberately requires an *ASCII* capital,
+    /// because there is no acronym table here and no way to guess what such a class's table
+    /// would be called. The failure direction is the one the schema is built to have: no claim,
+    /// rather than a claim on a table that does not exist.
+    #[test]
+    fn a_class_whose_name_is_not_ascii_claims_no_table() {
+        let mut harness = Harness::new();
+        harness.write("app/models/unicode.rb", "class Ünicode\nend\n");
+        harness.index();
+
+        let context = harness.analysis.context();
+        assert!(context.classes.contains("Ünicode"), "{:?}", context.classes);
+        assert!(
+            rails_of(&context).claims.is_empty(),
+            "{:?}",
+            rails_of(&context).claims
+        );
+    }
+
+    /// A workspace that stops declaring anything altogether still gets pruned.
+    ///
+    /// The clause is `synthesize`'s first line: it returns early only when there is nothing to
+    /// read **and** nothing it wrote last time. Deleting every model file makes the first true
+    /// and the second false, which is the one shape where an early return would leave a
+    /// `Comment::Relation` in the graph for the life of the process — with no file left that
+    /// could ever be edited to correct it.
+    #[test]
+    fn a_workspace_that_stops_declaring_anything_is_still_pruned() {
+        let mut harness = Harness::new();
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story\n  has_many :comments\nend\n",
+        );
+        let comment = harness.write("app/models/comment.rb", "class Comment\nend\n");
+        harness.index();
+        assert!(harness.has("Comment::Relation"), "nothing generated");
+
+        std::fs::remove_file(story.to_path().unwrap()).unwrap();
+        std::fs::remove_file(comment.to_path().unwrap()).unwrap();
+        harness.watch(&[&story, &comment]);
+        assert!(!harness.has("Comment::Relation"), "left behind");
+        assert!(!harness.has("Story#comments()"), "left behind");
+    }
+
+    /// A file that vanishes between the walk and the read costs its declarations and nothing
+    /// else.
+    ///
+    /// `synthesize` runs before every resolve and reads from the graph's document list, which a
+    /// watcher event has not necessarily caught up with. There is no notification to wait for
+    /// and nothing to recover: the file is skipped, the rest of the pass runs, and the next
+    /// event prunes it properly.
+    #[test]
+    fn a_file_that_vanished_under_the_pass_is_skipped() {
+        let mut harness = Harness::new();
+        let widget = harness.write(
+            "app/lib/widget.rb",
+            "class Widget\n  # @return [String]\n  def go\n  end\nend\n",
+        );
+        harness.write(
+            "app/lib/gadget.rb",
+            "class Gadget\n  # @return [Integer]\n  def size\n  end\nend\n",
+        );
+        harness.index();
+        assert!(harness.has("Widget#go()"));
+
+        // Deleted on disk and *not* announced, so the document is still in the graph and its
+        // text is not.
+        std::fs::remove_file(widget.to_path().unwrap()).unwrap();
+        harness.analysis.synthesize();
+        harness.analysis.resolve();
+        assert!(harness.has("Gadget#size()"), "the pass stopped early");
+    }
+
+    #[test]
+    fn a_second_pass_does_not_derive_from_what_the_first_one_delegated() {
+        // The phase boundary, asserted *across settles* rather than within one — which is the
+        // shape that could rot silently. `synthesize` runs before every resolve, so if the union
+        // ever held phase two's own output the answer would change on the second keystroke and
+        // keep changing: a `delegate` through a `delegate` would type on run two, a chain of
+        // three on run three. It cannot, because the union is built from a map that is fresh
+        // every call and is built before anything is merged into it — and this is what says so.
+        //
+        // `Story#profile` is a delegation that *does* type, through `belongs_to :user` and
+        // `has_one :profile`. `Story#bio` delegates through it, and must stay untyped however
+        // many times the pass runs — which only a chain can show, because a hover card names no
+        // return type.
+        let mut harness = Harness::new();
+        // Every one of them writes `< ApplicationRecord`, because of the host test: a class
+        // that inherits nothing is not an ActiveRecord model and its association macros declare
+        // nothing at all.
+        harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  belongs_to :user\n  \
+             delegate :profile, to: :user\n  delegate :bio, to: :profile\nend\n",
+        );
+        harness.write(
+            "app/models/user.rb",
+            "class User < ApplicationRecord\n  has_one :profile\nend\n",
+        );
+        harness.write(
+            "app/models/profile.rb",
+            "class Profile < ApplicationRecord\n  has_one :bio\nend\n",
+        );
+        harness.write(
+            "app/models/bio.rb",
+            "class Bio < ApplicationRecord\n  has_one :photo\nend\n",
+        );
+        harness.write(
+            "app/models/photo.rb",
+            "class Photo < ApplicationRecord\nend\n",
+        );
+        let source = "Story.new.profile.bio\nStory.new.bio.photo\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        let typed = card(&mut harness, &uri, source, "bio\n");
+        assert!(
+            typed.contains("Profile#bio"),
+            "the delegation that can type did not: {typed}"
+        );
+        let through = card(&mut harness, &uri, source, "photo");
+        assert!(
+            through.contains("Matched on the method name alone"),
+            "phase two derived from itself: {through}"
+        );
+
+        let documents = harness.analysis.synthesized.len();
+        harness.analysis.synthesize();
+        harness.analysis.resolve();
+        assert_eq!(harness.analysis.synthesized.len(), documents);
+        assert_eq!(card(&mut harness, &uri, source, "bio\n"), typed);
+        assert_eq!(card(&mut harness, &uri, source, "photo"), through);
+    }
+
+    #[test]
+    fn a_caption_names_the_gem_a_file_came_from_or_falls_back_to_the_file() {
+        // `workspace_relative` would say nothing outside the root can reach it; an engine makes
+        // that false — an engine's `config/routes.rb` declares helpers now — and the first card
+        // the engine-routes test printed read "From `routes.rb`", the same caption the project's
+        // own routes file gets. The marker is a directory named `gems`, which every layout
+        // `gems::gem_roots` knows ends in.
+        let gem = |path: &str| {
+            synthesize::gem_relative(Path::new(path)).map(|it| it.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            gem("/home/me/.gem/ruby/4.0.0/gems/shouty-1.2.3/config/routes.rb"),
+            Some("shouty-1.2.3/config/routes.rb".to_owned())
+        );
+        // A git source unpacks under `bundler/gems`, and the same marker finds it.
+        assert_eq!(
+            gem("/w/vendor/bundle/ruby/4.0.0/bundler/gems/shouty-abc123/app/models/m.rb"),
+            Some("shouty-abc123/app/models/m.rb".to_owned())
+        );
+        // And a path with no such ancestor gets nothing, so the caller keeps its own fallback
+        // rather than this one guessing at a name.
+        assert_eq!(gem("/somewhere/else/config/routes.rb"), None);
+    }
+
+    /// A bundle, as small as one that still has the shape: `ActiveRecord::Relation` reached
+    /// through an `include`, exactly as `relation.rb` writes it.
+    fn with_a_bundle() -> (Harness, crate::workspace::DocUri) {
+        let harness = Harness::new();
+        harness.write(
+            "lib/active_record/relation/query_methods.rb",
+            "module ActiveRecord\n  module QueryMethods\n    # Filters the rows.\n    def where(*args)\n    end\n  end\nend\n",
+        );
+        harness.write(
+            "lib/active_record/relation.rb",
+            "module ActiveRecord\n  class Relation\n    include QueryMethods\n  end\nend\n",
+        );
+        harness.write(
+            "lib/active_record/persistence.rb",
+            "module ActiveRecord\n  module Persistence\n    module ClassMethods\n      def create(*args)\n      end\n    end\n  end\nend\n",
+        );
+        harness.write(
+            "lib/active_record/base.rb",
+            "module ActiveRecord\n  class Base\n  end\nend\n",
+        );
+        harness.write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        );
+        let story = harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\nend\n",
+        );
+        (harness, story)
+    }
+
+    /// The row this file's [`Owners`] exists for: a member ya-lsp declared itself,
+    /// answering with the `def` Rails really wrote.
+    #[test]
+    fn a_query_method_ya_lsp_wrote_answers_with_rails_own_def() {
+        let (mut harness, _) = with_a_bundle();
+        let source = "Story.where(id: 1)\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        let card = harness.hover_at(&uri, source, "where(id");
+        let card = card["contents"]["value"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            card.contains("query interface"),
+            "the card is still ya-lsp's own declaration: {card}"
+        );
+        let answer = harness.definition_at(&uri, source, "where(id");
+        let places = answer.as_array().map(Vec::len).unwrap_or_default();
+        assert_eq!(places, 1, "one place, and it is Rails': {answer}");
+        assert!(
+            answer[0]["targetUri"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("lib/active_record/relation/query_methods.rb"),
+            "{answer}"
+        );
+    }
+
+    /// And the class side takes its own `def` where Rails writes one, rather than the
+    /// relation's fall-through.
+    #[test]
+    fn the_class_side_prefers_the_def_rails_writes_for_a_class_object() {
+        let (mut harness, _) = with_a_bundle();
+        let source = "Story.create(title: 1)\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        let answer = harness.definition_at(&uri, source, "create(title");
+        assert!(
+            answer[0]["targetUri"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("lib/active_record/persistence.rb"),
+            "{answer}"
+        );
+    }
+
+    /// With no bundle there is nothing to find, and that is the same answer as before this
+    /// existed rather than a worse one.
+    #[test]
+    fn a_query_method_with_no_bundle_indexed_is_still_no_place_and_no_guess() {
+        let mut harness = Harness::new();
+        harness.write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        );
+        harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\nend\n",
+        );
+        let source = "Story.where(id: 1)\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        assert!(
+            harness
+                .definition_at(&uri, source, "where(id")
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "no mapping means no place, and a name match is not a mapping"
+        );
+    }
+
+    /// The bug the corpora found and the suite could not: a name `Kernel` also declares.
+    #[test]
+    fn a_query_method_ruby_s_own_root_also_declares_is_not_answered_with_the_root() {
+        let (mut harness, _) = with_a_bundle();
+        // `select` is the shape: `Kernel#select` is `IO.select`, it is an ancestor of
+        // everything, and it is spelled without parentheses — so the walk finds it one spelling
+        // before it finds `ActiveRecord::QueryMethods#select`.
+        harness.write(
+            "lib/core_ext.rb",
+            "class Object\n  def select\n  end\nend\n",
+        );
+        let source = "Story.select(:id)\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        let answer = harness.definition_at(&uri, source, "select(:id");
+        assert!(
+            answer.as_array().is_none_or(Vec::is_empty),
+            "a `def` on `Object` is a member of every receiver there is, so it is evidence \
+             about nothing: {answer}"
+        );
+
+        // And the other half: rejecting the root may not take the real answer with it. Where
+        // Rails does write the name, that is what a reader gets, with the root's `def` sitting
+        // in the same walk.
+        harness.write(
+            "lib/active_record/relation/query_methods_select.rb",
+            "module ActiveRecord\n  module QueryMethods\n    def select(*fields)\n    end\n  end\nend\n",
+        );
+        harness.index();
+        let answer = harness.definition_at(&uri, source, "select(:id");
+        assert!(
+            answer[0]["targetUri"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("query_methods_select.rb"),
+            "{answer}"
+        );
+    }
+
+    /// And the second: one `def` claimed once, however many generated declarations borrowed it.
+    #[test]
+    fn one_def_borrowed_by_every_relation_class_is_still_one_place() {
+        let (mut harness, _) = with_a_bundle();
+        harness.write(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\nend\n",
+        );
+        harness.write("app/models/tag.rb", "class Tag < ApplicationRecord\nend\n");
+        // An untyped receiver, so the answer is the name rung's list — which holds the query
+        // interface once per relation class and once per base.
+        let source = "def run(thing)\n  thing.where(id: 1)\nend\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        let answer = harness.definition_at(&uri, source, "where(id");
+        let targets: Vec<String> = answer
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| row["targetUri"].as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut once = targets.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(
+            targets.len(),
+            once.len(),
+            "`Defined in N places` may not count one `def` more than once: {targets:?}"
+        );
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod framework_tests {
+    use crate::analysis::testing::*;
+
+    /// A Rails application, with the four constants the framework table names declared the way
+    /// a bundle declares them — `module Rails`, and classes for the rest.
+    const BUNDLE: &str = "\
+module Rails
+  def self.root; end
+  def self.cache; end
+  def self.application; end
+  class Application
+    def routes; end
+  end
+end
+class Pathname
+  def join(*args); end
+end
+module ActiveSupport
+  class TimeZone
+    def now; end
+  end
+  module Cache
+    class Store
+      def fetch(name); end
+    end
+  end
+end
+class Time
+  def self.zone; end
+end
+";
+
+    const APPLICATION_RB: &str = "\
+module Shop
+  class Application < Rails::Application
+    def domain; end
+  end
+end
+";
+
+    fn project(caller: &str) -> (Harness, crate::workspace::DocUri) {
+        let (mut harness, _schema, _uri) = rails_project("");
+        harness.write("lib/bundle.rb", BUNDLE);
+        harness.write("config/application.rb", APPLICATION_RB);
+        let uri = harness.write("app/use.rb", caller);
+        harness.index();
+        (harness, uri)
+    }
+
+    /// The four chains the table is for, each resolved to the class it names.
+    #[test]
+    fn a_framework_singletons_return_types_the_chain_written_on_it() {
+        let source = "\
+Rails.root.join(\"config\")\nRails.cache.fetch(\"k\")\nTime.zone.now\n";
+        let (mut harness, uri) = project(source);
+        for (needle, expected) in [
+            ("join", "Pathname#join"),
+            ("fetch", "ActiveSupport::Cache::Store#fetch"),
+            ("now", "ActiveSupport::TimeZone#now"),
+        ] {
+            let card = card(&mut harness, &uri, source, needle);
+            assert!(card.contains(expected), "{needle}: {card}");
+        }
+    }
+
+    /// `Rails.application` is the project's own class, so what the project hung off it answers.
+    #[test]
+    fn rails_application_is_the_projects_own_application_class() {
+        let source = "Rails.application.domain\n";
+        let (mut harness, uri) = project(source);
+        let card = card(&mut harness, &uri, source, "domain");
+        assert!(card.contains("Shop::Application#domain"), "{card}");
+    }
+
+    /// And it still reaches what `Rails::Application` itself declares.
+    #[test]
+    fn the_frameworks_own_members_are_reached_through_the_projects_class() {
+        let source = "Rails.application.routes\n";
+        let (mut harness, uri) = project(source);
+        let card = card(&mut harness, &uri, source, "routes");
+        assert!(card.contains("Rails::Application#routes"), "{card}");
+    }
+
+    /// A workspace whose bundle declares none of it declares nothing, and the chain is left
+    /// exactly where it was: on the name rung, which is an honest miss rather than a `Rails`
+    /// this crate invented.
+    #[test]
+    fn a_project_with_no_framework_indexed_declares_nothing() {
+        let (mut harness, _schema, _uri) = rails_project("");
+        harness.write("config/application.rb", APPLICATION_RB);
+        let source = "Rails.root.join(\"config\")\n";
+        let uri = harness.write("app/use.rb", source);
+        harness.index();
+        let card = card(&mut harness, &uri, source, "join");
+        assert!(!card.contains("Pathname#join"), "{card}");
+        assert!(card.contains("the method name alone"), "{card}");
     }
 }

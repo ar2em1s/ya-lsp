@@ -222,6 +222,7 @@ fn blank(view: &mut String, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
     use proptest::prelude::*;
 
     /// The shapes a real template is made of, in one file.
@@ -478,5 +479,255 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every request ya-lsp answers, asked at one cursor, drawn as what came back.
+    ///
+    /// The three that take no cursor take what the cursor produced — the item
+    /// `prepareTypeHierarchy` returned and the first row `completion` offered — because asking
+    /// them with something from anywhere else would be asking a different question.
+    fn answers(
+        harness: &mut Harness,
+        uri: &DocUri,
+        position: &serde_json::Value,
+    ) -> Vec<(&'static str, String)> {
+        let document = serde_json::json!({ "uri": uri.as_str() });
+        let at = serde_json::json!({ "textDocument": document, "position": position });
+        let mut drawn = Vec::new();
+
+        for (method, params) in [
+            (
+                "textDocument/documentSymbol",
+                serde_json::json!({ "textDocument": document }),
+            ),
+            ("textDocument/hover", at.clone()),
+            ("textDocument/definition", at.clone()),
+            (
+                "textDocument/references",
+                serde_json::json!({
+                    "textDocument": document,
+                    "position": position,
+                    "context": { "includeDeclaration": false },
+                }),
+            ),
+            ("textDocument/documentHighlight", at.clone()),
+            (
+                "textDocument/selectionRange",
+                serde_json::json!({ "textDocument": document, "positions": [position] }),
+            ),
+            (
+                "textDocument/foldingRange",
+                serde_json::json!({ "textDocument": document }),
+            ),
+            (
+                "textDocument/semanticTokens/full",
+                serde_json::json!({ "textDocument": document }),
+            ),
+            ("workspace/symbol", serde_json::json!({ "query": "title" })),
+            ("textDocument/signatureHelp", at.clone()),
+            ("textDocument/prepareRename", at.clone()),
+            (
+                "textDocument/rename",
+                serde_json::json!({
+                    "textDocument": document,
+                    "position": position,
+                    "newName": "Article",
+                }),
+            ),
+            ("textDocument/completion", at.clone()),
+        ] {
+            let answer = harness.ask(method, params);
+            drawn.push((method, shape(&answer)));
+        }
+
+        // The type hierarchy, and the row a completion list would resolve: three requests whose
+        // input is another request's output.
+        let prepared = harness.ask("textDocument/prepareTypeHierarchy", at.clone());
+        drawn.push(("textDocument/prepareTypeHierarchy", shape(&prepared)));
+        let item = prepared.as_array().and_then(|items| items.first()).cloned();
+        for method in ["typeHierarchy/supertypes", "typeHierarchy/subtypes"] {
+            let answer = match &item {
+                Some(item) => harness.ask(method, serde_json::json!({ "item": item })),
+                None => serde_json::Value::Null,
+            };
+            drawn.push((method, shape(&answer)));
+        }
+
+        let offered = harness.ask("textDocument/completion", at);
+        let row = offered["items"].as_array().and_then(|items| items.first());
+        let resolved = match row {
+            Some(row) => harness.ask("completionItem/resolve", row.clone()),
+            None => serde_json::Value::Null,
+        };
+        drawn.push((
+            "completionItem/resolve",
+            match resolved {
+                serde_json::Value::Null => "\u{2014}".to_owned(),
+                _ => "yes".to_owned(),
+            },
+        ));
+
+        drawn
+    }
+
+    /// The whole protocol, asked twice in one template: once inside a tag, once in the markup.
+    ///
+    /// One table rather than seventeen assertions, for the reason `GALLERY` is one document:
+    /// what has to be legible is *where the answers stop*, and a per-request assertion cannot
+    /// show it. The markup column is the finding — eight of the nine positional requests need no
+    /// template-awareness at all, because blanked markup holds no identifier and they already
+    /// answer nothing. Only `completion` needed a gate, and only `foldingRange` is declined.
+    #[test]
+    fn every_request_asked_inside_a_tag_and_in_the_markup_beside_it() {
+        let mut harness = Harness::new();
+        harness.write("app/models/story.rb", STORY);
+        let view = harness.write("app/views/stories/index.html.erb", VIEW);
+        harness.index();
+
+        // Three characters into `Story`, so that `completion` has a half-typed word to
+        // complete and the row it offers is a real one — the same caret every other request
+        // here is asked at.
+        let inside = position_of(VIEW, "ry::TAGLINE");
+        let markup = position_of(VIEW, "Stories</h1>");
+        let mut table = vec![format!("{:<36}{:>10}{:>10}", "", "in <% %>", "in markup")];
+        for ((method, ruby), (_, html)) in answers(&mut harness, &view, &inside)
+            .into_iter()
+            .zip(answers(&mut harness, &view, &markup))
+        {
+            table.push(format!("{method:<36}{ruby:>10}{html:>10}"));
+        }
+
+        assert_eq!(
+            table.join("\n"),
+            "                                      in <% %> in markup\n\
+             textDocument/documentSymbol                  —         —\n\
+             textDocument/hover                         yes         —\n\
+             textDocument/definition                      1         —\n\
+             textDocument/references                      1         —\n\
+             textDocument/documentHighlight               1         —\n\
+             textDocument/selectionRange                  1         1\n\
+             textDocument/foldingRange                    —         —\n\
+             textDocument/semanticTokens/full             4         4\n\
+             workspace/symbol                             1         1\n\
+             textDocument/signatureHelp                   —         —\n\
+             textDocument/prepareRename                 yes         —\n\
+             textDocument/rename                        yes         —\n\
+             textDocument/completion                      1         —\n\
+             textDocument/prepareTypeHierarchy            1         —\n\
+             typeHierarchy/supertypes                     —         —\n\
+             typeHierarchy/subtypes                       —         —\n\
+             completionItem/resolve                     yes         —"
+        );
+    }
+
+    #[test]
+    fn the_walk_indexes_a_template_nobody_opened_and_its_calls_are_references() {
+        // The decision this test exists for, and the one that was reversed twice while it was
+        // being made. Indexing only the templates the editor has open would pass every other
+        // ERB test here and still be wrong: `references` would be complete or incomplete
+        // depending on which tabs happened to be open, which is worse than a consistently
+        // narrow answer.
+        let mut harness = Harness::new();
+        let model = harness.write("app/models/story.rb", STORY);
+        harness.write("app/views/stories/index.html.erb", VIEW);
+        harness.index();
+
+        assert_eq!(
+            harness.reference_list(&model, STORY, "title", true),
+            ["story.rb:3:6", "index.html.erb:2:15"]
+        );
+    }
+
+    #[test]
+    fn a_template_reaching_the_graph_raw_would_record_no_references_at_all() {
+        // Why the blanking is the feature rather than an optimisation. The same template under
+        // an extension nothing recognises is read as Ruby, gives up in the first tag, and the
+        // call sites simply are not there, which is the whole of what indexing a template
+        // buys.
+        let mut harness = Harness::new();
+        let model = harness.write("app/models/story.rb", STORY);
+        harness.write("app/views/stories/index.html.rhubarb", VIEW);
+        harness.index();
+
+        assert_eq!(
+            harness.reference_list(&model, STORY, "title", true),
+            ["story.rb:3:6"]
+        );
+    }
+
+    #[test]
+    fn a_template_changed_on_disk_is_re_read_through_the_same_blanking() {
+        // The watcher's route into the graph. `index_buffer` is the hook `didOpen`, `didChange`
+        // and `didChangeWatchedFiles` all share, so a template that reached the graph raw
+        // through any one of them would replace its own call sites with parse errors — the same
+        // rule `.rbs` interfaces are held to, and for the same reason.
+        let mut harness = Harness::new();
+        let model = harness.write("app/models/story.rb", STORY);
+        let view = harness.write("app/views/stories/index.html.erb", "<h1>none</h1>\n");
+        harness.index();
+        assert_eq!(
+            harness.reference_list(&model, STORY, "title", true),
+            ["story.rb:3:6"]
+        );
+
+        harness.write("app/views/stories/index.html.erb", VIEW);
+        harness.watch(&[&view]);
+        harness.analysis.settle();
+
+        assert_eq!(
+            harness.reference_list(&model, STORY, "title", true),
+            ["story.rb:3:6", "index.html.erb:2:15"]
+        );
+    }
+
+    #[test]
+    fn a_template_publishes_no_diagnostics_and_a_ruby_file_beside_it_still_does() {
+        // What survives a correct scan is not about anything the user wrote: `<%= yield %>` in
+        // a layout, which is legal in the method a template compiles to and refused by a parser
+        // reading a file. Two of them over lobsters' 121 templates. A rule that fires on correct
+        // input does not earn a squiggle.
+        let mut harness = Harness::new();
+        let broken = harness.write("app/models/story.rb", "class Story\n  def title\nend\n");
+        let view = harness.write(
+            "app/views/stories/index.html.erb",
+            "<h1>Stories</h1>\n<% end %>\n<%= yield :head %>\n",
+        );
+        harness.index();
+
+        // One drain, because reading the stream empties it: two `latest` calls would make the
+        // second one answer `None` for a document that did publish.
+        let published = harness.published();
+        let for_uri = |uri: &DocUri| {
+            published
+                .iter()
+                .filter(|(sent, _)| sent == uri.as_str())
+                .count()
+        };
+        assert_eq!(for_uri(&view), 0, "{published:?}");
+        assert_eq!(for_uri(&broken), 1, "{published:?}");
+    }
+
+    #[test]
+    fn folding_is_declined_in_a_template_so_the_editor_keeps_its_own_guess() {
+        // The walk sees the Ruby and nothing else, so what it offers is folds for the `<% %>`
+        // blocks and none for the markup around them. `ranges.md` wrote the mechanism down
+        // before ERB was on the table: a client that has a folding provider stops guessing from
+        // indentation, so an empty array takes the fallback away *and* puts nothing in its
+        // place, while a `null` can only hand it back.
+        let mut harness = Harness::new();
+        let view = harness.write("app/views/stories/index.html.erb", VIEW);
+        let ruby = harness.write("app/models/story.rb", STORY);
+        harness.index();
+
+        let folds = |harness: &mut Harness, uri: &DocUri| {
+            harness.ask(
+                "textDocument/foldingRange",
+                serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+            )
+        };
+        assert!(folds(&mut harness, &view).is_null());
+        // The control, and it is not decoration: the same template's Ruby *does* fold, so this
+        // is a decision rather than an absence of anything to offer.
+        assert!(!folds(&mut harness, &ruby).is_null());
     }
 }

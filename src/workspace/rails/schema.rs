@@ -15,10 +15,11 @@ use ruby_prism::{CallNode, DefNode, Node};
 
 use super::inflect::underscore;
 use super::syntax::{
-    candidates, constant_spelling, first_string, first_symbol_or_string, header, keyword,
-    string_literal, symbol_or_string,
+    constant_spelling, first_string, first_symbol_or_string, header, keyword, string_literal,
+    symbol_or_string,
 };
 use super::{COLUMN_TYPES, NOT_COLUMNS, PRIMARY_KEY};
+use crate::generated::candidates;
 use crate::generated::{Declared, Facts, Owner, Source};
 
 /// One `db/schema.rb`, read.
@@ -512,6 +513,7 @@ pub(super) fn is_column_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
     use crate::generated::declaring;
 
     /// Every shape the dumper writes that this reader has an opinion about, in one file.
@@ -1145,5 +1147,82 @@ end
             "{rbs}"
         );
         assert!(!rbs.contains("db/schema.rb"), "{rbs}");
+    }
+
+    #[test]
+    fn a_column_is_a_method_that_types_its_chain_and_jumps_to_the_schema() {
+        // The schema's whole point in one expression. `Story` is found, `title` is a column,
+        // and no `def title` exists anywhere in the repository. What has to happen is three things at once: the member is found, the chain
+        // off it is typed, and the jump lands on the line of `db/schema.rb` that said so.
+        let source = "Story.new.title.upcase\n";
+        let (mut harness, schema, uri) = rails_project(source);
+
+        assert!(harness.has("Story#title()"), "the column is not a member");
+
+        let card = card(&mut harness, &uri, source, "upcase");
+        assert!(card.contains("String#upcase"), "{card}");
+
+        let definition = harness.definition_at(&uri, source, "title");
+        assert_eq!(
+            definition[0]["targetUri"],
+            serde_json::json!(schema.as_str()),
+            "{definition}"
+        );
+        // `    t.string "title", null: false` on line 2, revealed whole, with the name selected.
+        assert_eq!(
+            (
+                &definition[0]["targetRange"]["start"]["line"],
+                &definition[0]["targetRange"]["start"]["character"],
+                &definition[0]["targetSelectionRange"]["start"]["character"],
+            ),
+            (
+                &serde_json::json!(2),
+                &serde_json::json!(4),
+                &serde_json::json!(14),
+            ),
+            "{definition}"
+        );
+    }
+
+    #[test]
+    fn a_hover_on_a_column_says_which_file_and_which_table_it_came_from() {
+        // What keeps this tier honest. A schema-derived answer looks exactly like
+        // a resolved one on the fence line, so the card has to say where it came from — and it
+        // says it as the declaration's *documentation*, which is how the RBS carries it. That
+        // is why no module outside `workspace::rails` has to learn the word "table".
+        let source = "Story.new.title\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+
+        let card = card(&mut harness, &uri, source, "title");
+        assert!(card.contains("Story#title"), "{card}");
+        assert!(card.contains("db/schema.rb"), "{card}");
+        assert!(card.contains("table"), "{card}");
+        assert!(card.contains("stories"), "{card}");
+        assert!(card.contains("string"), "{card}");
+    }
+
+    #[test]
+    fn a_nullable_column_says_so_and_a_null_false_one_does_not() {
+        // Roughly a third of a real application's columns can be `nil`, and RBS is the one
+        // output format in reach that can say which. So the two columns are declared
+        // differently — and because a hover card shows a name rather than a return type, the
+        // provenance line is where a person sees it.
+        let source = "Story.new.description.upcase\n";
+        let (mut harness, _schema, uri) = rails_project(source);
+
+        let nullable = card(&mut harness, &uri, source, "description");
+        assert!(nullable.contains("may be `nil`"), "{nullable}");
+
+        let stated = "Story.new.title\n";
+        let other = harness.write("app/other.rb", stated);
+        harness.watch(&[&other]);
+        let stated = card(&mut harness, &other, stated, "title");
+        assert!(stated.contains("`null: false`"), "{stated}");
+        assert!(!stated.contains("may be `nil`"), "{stated}");
+
+        // And the chain is typed either way: an optional return is still a `String` to whoever
+        // asks what comes next, which is the same answer Ruby's own signatures give.
+        let chained = card(&mut harness, &uri, source, "upcase");
+        assert!(chained.contains("String#upcase"), "{chained}");
     }
 }

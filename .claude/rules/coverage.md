@@ -15,7 +15,7 @@ All in the `Makefile`, all enforced by `scripts/coverage.sh`.
 | --- | --- | --- |
 | `MIN_LINES` / `MIN_BRANCHES` | 95 | project-wide; catches aggregate regression |
 | `MIN_FILE_LINES` | 90 | every file on its own, so one bad file cannot hide in a good average |
-| `COVERAGE_FLOORS` | 100 | 31 named modules that must be complete |
+| `COVERAGE_FLOORS` | 100 | 39 named modules that must be complete |
 
 Regions and functions print off the same profile and are not gated. The project sits comfortably
 above both project bars; `make coverage` prints where.
@@ -25,6 +25,14 @@ file arriving at 100 raises the aggregate without closing any gap, and a refacto
 file into six turns aggregate gaps into named ones that then get closed. One gap was closed by
 **dropping a check rather than writing a test**: a `def`'s rest parameter cannot be Prism's
 `ImplicitRestNode`, so asking which kind it was put an arm in the file no Ruby reaches.
+
+- **Test code is not measured, and every `mod tests` has to say so.** The attribute is
+  `#[cfg_attr(coverage_nightly, coverage(off))]` above `#[cfg(test)]`. A test module without it is
+  counted like any other code: it is covered by construction, so it lifts the file's number without
+  testing anything, and a 100 floor over a file whose tests outweigh it stops being a statement
+  about the file. Three modules were missing the attribute — `code_actions.rs`, `indexer.rs` and
+  `synthesize.rs` — and adding it moved the project line figure down 0.06 points with the miss count
+  unchanged, which is what an honest denominator costs.
 
 - **The per-file bar is deliberately below the project bar, because the denominators are small.**
   the smallest files are a few dozen lines, so one uncovered line is several points and the

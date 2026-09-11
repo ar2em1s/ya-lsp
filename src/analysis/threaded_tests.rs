@@ -15,6 +15,7 @@
 //! are about positions in that list. A test whose only claim is the *shape* of an answer belongs
 //! in `mod tests` instead, which is faster to run and easier to read.
 
+use lsp_server::ErrorCode;
 use serde_json::json;
 
 use super::*;
@@ -77,6 +78,36 @@ const TOKEN_FILE_METHODS: usize = 2_000;
 /// times the debug number, because that is the build the suite runs in.
 const TOKEN_CEILING: Duration = Duration::from_millis(500);
 
+/// The ceiling on a `documentLink` answer over the same file [`TOKEN_FILE_METHODS`] builds.
+///
+/// Its own constant because it is its own measurement, even though the argument behind it is
+/// [`TOKEN_CEILING`]'s: this is a second whole-file request on the same serialized loop, and an
+/// editor asks for it unprompted — on open, and again after every edit settles. The cost is the
+/// Prism parse of the whole buffer, because a file's requires are a handful however long it is,
+/// so what this catches is a walk that became a function of the body rather than of the count.
+///
+/// Over ~10,000 lines the answer takes about 7 ms in a debug build, and the `selectionRange`
+/// queued behind it about 5 ms of its own — which is what that request costs over a file this
+/// size whatever ran before it. The ceiling is twenty times the debug number, the same multiple
+/// and for the same reason: it is a canary for a change in *kind*, on a shared runner whose cold
+/// page cache moves the number by a small multiple.
+const LINK_CEILING: Duration = Duration::from_millis(150);
+
+/// The ceiling on a `textDocument/inlayHint` answer over the whole of the same file.
+///
+/// [`TOKEN_CEILING`]'s argument again, for a request that is normally asked about a window and
+/// can still be asked about a document. The number is the largest of the three because the work
+/// is: 2,000 labels is 2,000 receivers classified out of the buffer and then looked up in the
+/// graph, against one parse for the other two. Over ~10,000 lines the answer takes about 67 ms
+/// in a debug build. The ceiling is twenty times that, the same multiple the two above it use
+/// and for the same reason: a canary for a change in kind.
+///
+/// What a *window* costs is not bounded here and has no constant. It is about 13 ms, of which
+/// ~12 is the parse of the whole buffer every request over it pays — so the two numbers sit close
+/// enough together that the clock cannot tell a bounded walk from a filtered one once a runner is
+/// busy, which is precisely what it was asked to tell and got wrong. `hints.rs` counts instead.
+const HINT_CEILING: Duration = Duration::from_millis(1_500);
+
 /// A workspace with gems and Ruby's own signatures off, as `Harness` builds one and for the
 /// same reason: ~800 files of signature work nothing here is asking about.
 fn project() -> tempfile::TempDir {
@@ -129,7 +160,11 @@ impl Threaded {
         env: gems::Env,
     ) -> Self {
         let (sender, outgoing) = crossbeam_channel::unbounded();
-        let (workspace, problems) = Workspace::load_with_env(root.path().to_path_buf(), None, env);
+        // See `testing::Harness`: the fixture is a Rails project and says so through the
+        // client's layer rather than by writing a marker file into the index.
+        let options = serde_json::json!({ "rails": { "enabled": true } });
+        let (workspace, problems) =
+            Workspace::load_with_env(root.path().to_path_buf(), Some(options), env);
         assert!(problems.is_empty(), "{problems:?}");
 
         let cancellations = Cancellations::default();
@@ -143,9 +178,14 @@ impl Threaded {
                 // background work has started and when it finished.
                 work_done_progress: true,
                 versioned_edits: true,
+                // On, so the refresh the gem index sends at the end lands in `outgoing` where a
+                // test can see it.
+                hint_refresh: true,
             },
+            super::testing::document_registrar(),
             sender,
             cancellations.clone(),
+            crate::logging::Reload::default(),
         );
 
         Self {
@@ -372,6 +412,208 @@ fn semantic_tokens_for_a_large_file_and_what_it_costs_the_request_behind_it() {
         queued - answered < TOKEN_CEILING,
         "the request behind it then took {:.2?} of its own",
         queued - answered
+    );
+    server.join();
+}
+
+#[test]
+fn document_links_for_a_large_file_and_what_it_costs_the_request_behind_it() {
+    // The second whole-file request on the loop, asked the way the first one was. An editor
+    // sends `documentLink` unprompted — on open, and again each time an edit settles — so the
+    // number that matters is the same one: not this request's latency but what the request
+    // queued behind it waits for.
+    //
+    // The file is the token measurement's, with two requires put in front of it. That is the
+    // shape being measured: a real file's requires are a handful no matter how long it is, so
+    // the cost is the parse of everything after them, and a walk that started scaling with the
+    // body rather than with the require count would show up here and nowhere else.
+    let root = project();
+    let library = write(root.path(), "lib/person.rb", "class Person\nend\n");
+    let source = format!("require \"person\"\nrequire \"nope\"\n{}", a_large_file());
+    let uri = write(root.path(), "app/big.rb", &source);
+    let mut server = Threaded::start(root);
+    server.open(&uri, &source);
+
+    let document = json!({ "textDocument": { "uri": uri.as_str() } });
+    // One round trip first, so what is measured is the request rather than the thread reaching
+    // the buffer for the first time.
+    server.ask("textDocument/foldingRange", document.clone());
+
+    let started = Instant::now();
+    let links = server.request("textDocument/documentLink", document);
+    let behind = server.request(
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": { "uri": uri.as_str() },
+            "positions": [{ "line": 3, "character": 3 }],
+        }),
+    );
+
+    let answer = server
+        .response(&links)
+        .response_result
+        .expect("handlers never error");
+    let answered = started.elapsed();
+    server.response(&behind);
+    let queued = started.elapsed();
+
+    // One link, not two: `person` is a file this workspace has and `nope` is not, and a path
+    // the graph cannot place is left un-underlined rather than underlined and dead.
+    assert_eq!(
+        answer,
+        json!([{
+            "range": {
+                "start": { "line": 0, "character": 9 },
+                "end": { "line": 0, "character": 15 },
+            },
+            "target": library.as_str(),
+        }])
+    );
+    // The head-of-line bound: this is what every request queued behind it waits.
+    assert!(
+        answered < LINK_CEILING,
+        "{TOKEN_FILE_METHODS} methods took {answered:.2?} to link"
+    );
+    // And the request behind it then runs at its own speed rather than at a degraded one.
+    assert!(
+        queued - answered < LINK_CEILING,
+        "the request behind it then took {:.2?} of its own",
+        queued - answered
+    );
+    server.join();
+}
+
+/// A workspace like [`project`] but with enough RBS to type something.
+///
+/// The hint measurement needs answers rather than an empty list — a walk that finds nothing
+/// measures the walk and not the work — and one class of two methods is the whole of what the
+/// file below asks about.
+fn project_with_a_signature() -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("tempdir");
+    let signatures = root.path().join("sig");
+    std::fs::create_dir_all(signatures.join("core")).unwrap();
+    std::fs::write(
+        signatures.join("core/core.rbs"),
+        "class String\n  def upcase: () -> String\n  def length: () -> Integer\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("ya-lsp.toml"),
+        format!(
+            "[gems]\ndefault_gems = false\n\n[rbs]\npath = {:?}\n",
+            signatures.display().to_string()
+        ),
+    )
+    .unwrap();
+    root
+}
+
+/// The same file, written so that every method carries exactly one hint.
+fn a_large_hinted_file() -> String {
+    (0..TOKEN_FILE_METHODS)
+        .map(|n| format!("def method_{n}(scale)\n  size = \"x\".upcase\n  size.length\nend\n\n"))
+        .collect()
+}
+
+#[test]
+fn inlay_hints_for_a_large_file_and_what_it_costs_the_request_behind_it() {
+    // The third whole-file request on the loop, asked the way the first two were. An editor
+    // normally asks about the window it is showing — `textDocument/inlayHint` carries a range —
+    // but the whole document is reachable all the same: a client may ask for it, and a short
+    // file *is* the whole document. So the number that matters is the one the two above measure:
+    // not this request's latency but what the request queued behind it waits for.
+    //
+    // Every method here carries exactly one hint, which is the worst shape rather than a
+    // typical one: 2,000 labels is more than any file has, and each one is a receiver classified
+    // out of the buffer and then looked up in the graph.
+    //
+    // **What the range buys is not measured here, and deliberately not.** That it bounds the
+    // *work* — a binding outside the window is never classified rather than classified and
+    // dropped — is a claim about work and not about order, and the only thing this harness can
+    // see work as is the clock. Over one screen the clock is mostly the whole-buffer parse every
+    // request pays, so under load the window inflates faster than the file does and a ratio
+    // between them collapses for a reason that has nothing to do with hints. It is counted
+    // instead, beside the module that makes the claim:
+    // `hints::tests::hints_answer_for_the_range_they_were_asked_about`.
+    let root = project_with_a_signature();
+    let source = a_large_hinted_file();
+    let uri = write(root.path(), "app/big.rb", &source);
+    let mut server = Threaded::start(root);
+    server.open(&uri, &source);
+
+    let whole = json!({
+        "textDocument": { "uri": uri.as_str() },
+        "range": {
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": TOKEN_FILE_METHODS * 5, "character": 0 },
+        },
+    });
+    // One round trip first, so what is measured is the request rather than the thread getting
+    // to the buffer for the first time.
+    server.ask(
+        "textDocument/foldingRange",
+        json!({ "textDocument": { "uri": uri.as_str() } }),
+    );
+
+    let started = Instant::now();
+    let hints = server.request("textDocument/inlayHint", whole);
+    let behind = server.request(
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": { "uri": uri.as_str() },
+            "positions": [{ "line": 1, "character": 3 }],
+        }),
+    );
+
+    let answer = server
+        .response(&hints)
+        .response_result
+        .expect("handlers never error");
+    let answered = started.elapsed();
+    server.response(&behind);
+    let queued = started.elapsed();
+
+    assert_eq!(answer.as_array().expect("hints").len(), TOKEN_FILE_METHODS);
+    // The head-of-line bound: this is what every request queued behind it waits.
+    assert!(
+        answered < HINT_CEILING,
+        "{TOKEN_FILE_METHODS} hints took {answered:.2?}"
+    );
+    // And the request behind it then runs at its own speed rather than at a degraded one.
+    assert!(
+        queued - answered < HINT_CEILING,
+        "the request behind it then took {:.2?} of its own",
+        queued - answered
+    );
+    server.join();
+}
+
+#[test]
+fn the_margin_is_redrawn_when_the_background_index_finishes() {
+    // The one answer in the crate that goes stale without the document changing. An editor
+    // re-asks for inlay hints when the buffer changes and when the window scrolls, and neither
+    // happens while somebody waits for a cold index — so a file opened before the signatures
+    // were in would keep its empty margin for as long as they left it alone.
+    //
+    // `workspace/inlayHint/refresh` is the protocol's answer and it is a *request*, so it goes
+    // out the same way `client/registerCapability` does and the main loop reads its reply and
+    // drops it. Gated on the client saying it supports one: where it does not, the hints are
+    // right from the next keystroke, exactly as they were before this existed.
+    let (root, gem_home, env) = project_with_a_gem();
+    let uri = write(root.path(), "app/main.rb", "class Person\nend\n");
+    let mut server = Threaded::start_with_env(root, Some(gem_home), env);
+
+    server.progress_at("begin");
+    server.open(&uri, "class Person\nend\n");
+
+    let finished = server.progress_at("end");
+    let refreshed = server.wait_for("an inlay hint refresh", |message| {
+        matches!(message, Message::Request(request) if request.method == "workspace/inlayHint/refresh")
+    });
+    assert!(
+        finished < refreshed,
+        "the margin was redrawn before the index finished: {}",
+        server.summary()
     );
     server.join();
 }

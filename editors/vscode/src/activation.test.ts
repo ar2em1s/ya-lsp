@@ -262,6 +262,77 @@ test('a template opens a server on its folder, the way a Ruby file does', async 
   assert.equal(errors.length, 0, 'a Markdown file is not this extension`s business');
 });
 
+/**
+ * Every folder's client is narrowed to that folder, and the shape survives the real conversion.
+ *
+ * Moved here from `selector.test.ts` when the wide single-folder form went away. There is one
+ * selector shape now — the folder, always — and what it has to get right is containment: its own
+ * files claimed, a sibling's refused, and nothing outside either, because what lies outside is the
+ * server's to ask for and two clients claiming one gem file is two servers answering one hover.
+ *
+ * Run through the *real* converter rather than asserted as a string, because the conversion is the
+ * step that can silently drop the pattern — and a dropped pattern does not narrow, it widens to
+ * language and scheme alone.
+ */
+test('a folder`s client claims its own folder and refuses a sibling`s', () => {
+  const { LANGUAGES, documentSelector } = require(bundle) as {
+    LANGUAGES: string[];
+    documentSelector(folderUri: string): { scheme: string; language: string }[];
+  };
+  const { createConverter } = require('vscode-languageclient/$test/common/protocolConverter') as {
+    createConverter(...args: unknown[]): {
+      asDocumentSelector(selector: unknown[]): {
+        language?: string;
+        scheme?: string;
+        pattern?: { baseUri?: { toString(): string }; pattern?: string };
+      }[];
+    };
+  };
+
+  const folder = 'file:///work/app';
+  const selector = documentSelector(folder);
+  assert.deepEqual(
+    selector.map((filter) => filter.language).sort(),
+    [...LANGUAGES].sort(),
+    'both languages this extension serves, or one of them is dead in every file'
+  );
+
+  const converted = createConverter(undefined, true, true).asDocumentSelector(selector);
+  assert.equal(converted.length, LANGUAGES.length, 'every filter must survive the conversion');
+
+  /**
+   * A `vscode.RelativePattern` matches a path only when it is under its base, modelled here because
+   * the stub above is not minimatch. The guard below is what stops this from passing vacuously.
+   */
+  const underBase = (
+    filter: { pattern?: { baseUri?: { toString(): string } } },
+    fsPath: string
+  ): boolean => {
+    const base = filter.pattern?.baseUri?.toString();
+    assert.ok(base, 'a dropped pattern claims every Ruby file the editor has open anywhere');
+    const prefix = base.replace(/^file:\/\//, '');
+    return fsPath === prefix || fsPath.startsWith(`${prefix}/`);
+  };
+
+  for (const filter of converted) {
+    assert.equal(filter.scheme, 'file');
+    assert.equal(filter.pattern?.pattern, '**/*');
+  }
+  const ruby = converted.find((filter) => filter.language === 'ruby');
+  assert.ok(ruby, 'Ruby must be claimed at all');
+  assert.ok(underBase(ruby, '/work/app/app/models/story.rb'), 'its own folder is claimed');
+  assert.equal(
+    underBase(ruby, '/work/api/app/models/story.rb'),
+    false,
+    'a sibling folder`s file is what the pattern exists to refuse'
+  );
+  assert.equal(
+    underBase(ruby, '/gems/activerecord-8.1.3.1/lib/active_record.rb'),
+    false,
+    'a gem is claimed by the registration the server sends, never by a guess made here'
+  );
+});
+
 test('the language client turns a protocol relative pattern into an editor one', () => {
   // The one link in the multi-root chain that cannot be reasoned about from the types. Client 10
   // runs every selector through `asDocumentSelector`, which recognises only the protocol's

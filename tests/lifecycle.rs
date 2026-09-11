@@ -252,6 +252,19 @@ fn full_lifecycle_over_stdio() {
     assert_eq!(result["capabilities"]["documentHighlightProvider"], true);
     assert_eq!(result["capabilities"]["selectionRangeProvider"], true);
     assert_eq!(result["capabilities"]["foldingRangeProvider"], true);
+    // Announced with its one option, which is the answer to a question the client would
+    // otherwise ask once per link: there is nothing to resolve.
+    assert_eq!(
+        result["capabilities"]["documentLinkProvider"]["resolveProvider"],
+        false
+    );
+    // Both hierarchies, against a real binary: they are announced through two different
+    // mechanisms and a client needs each of them to offer its own command.
+    assert_eq!(result["capabilities"]["callHierarchyProvider"], true);
+    assert_eq!(
+        result["capabilities"]["inlayHintProvider"]["resolveProvider"],
+        true
+    );
     assert_eq!(result["capabilities"]["workspaceSymbolProvider"], true);
     // The one capability `lsp-types` has no field for, so it is added on the way to JSON.
     // Asserted here as well as in `capabilities::tests` because the flatten that carries it also
@@ -465,6 +478,66 @@ fn a_broken_config_warns_instead_of_taking_the_server_down() {
     server.response(&id).response_result.expect("shutdown");
     server.notify("exit", serde_json::Value::Null);
     assert!(wait_for_exit(&mut server.child).success());
+}
+
+#[test]
+fn the_log_file_holds_the_requests_the_output_channel_would_have_shown() {
+    // The whole of item 36 in one assertion, over a real process: a `[log] file` turns a second
+    // sink on at a level of its own, the requests that arrive are written to it, and the file is
+    // where the setting says rather than where the binary happens to be.
+    //
+    // This is also the only test that runs `logging::install` — the one line that installs a
+    // global subscriber, which cannot be exercised in-process without taking the capture
+    // `testing.rs` installs away from every other test in the binary.
+    let root = fixture();
+    std::fs::write(
+        root.path().join("ya-lsp.toml"),
+        "[rbs]\nenabled = false\n\n[log]\nlevel = \"warn\"\nfile = true\nfile_level = \"debug\"\n",
+    )
+    .unwrap();
+
+    let mut server = started(root.path(), initialize_params(root.path()));
+    let uri = uri_of(root.path(), "lib/person.rb");
+    let id = server.request(
+        "textDocument/documentSymbol",
+        serde_json::json!({ "textDocument": { "uri": uri } }),
+    );
+    server.response(&id).response_result.expect("an outline");
+    shut_down(server);
+
+    let written = std::fs::read_to_string(root.path().join("tmp/ya-lsp.log"))
+        .expect("[log] file = true writes tmp/ya-lsp.log under the workspace root");
+
+    // The pair, at a level stderr was explicitly told not to carry — which is the reason the two
+    // sinks have two filters rather than one writer tee'd into both.
+    assert!(
+        written.contains("request method=\"textDocument/documentSymbol\""),
+        "{written}"
+    );
+    assert!(
+        written.contains("answered method=\"textDocument/documentSymbol\""),
+        "{written}"
+    );
+    // Every line says which process wrote it, because two windows on one project are two
+    // servers with one file between them.
+    let pid = format!("[{}] ", server_pid(&written));
+    assert!(
+        written.lines().all(|line| line.starts_with(&pid)),
+        "{written}"
+    );
+    // And nothing in it is the user's source.
+    assert!(!written.contains("class Person"), "{written}");
+}
+
+/// The pid every line of a log file is prefixed with, read back out of the first line.
+fn server_pid(written: &str) -> u32 {
+    written
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix('['))
+        .and_then(|rest| rest.split(']').next())
+        .and_then(|pid| pid.parse().ok())
+        .expect("every line starts with the pid that wrote it")
 }
 
 #[test]
@@ -1353,6 +1426,157 @@ fn gems_are_indexed_in_the_background_and_become_navigable() {
         target.ends_with("gems/shouty-1.2.3/lib/shouty.rb"),
         "{result}"
     );
+
+    shut_down(server);
+}
+
+/// The shipped binary asks the client to claim the gem it found, and names the real directory.
+///
+/// **The gap this closes.** The negotiation is unit-tested and the arbitration between several
+/// clients is tested in TypeScript, but nothing joined the two against the actual executable —
+/// `initialize_params` declares `synchronization.dynamicRegistration: false`, so every other test
+/// in this file is a client that would never be sent a registration. That left the whole mechanism
+/// resting on one manual check in an extension host.
+///
+/// Four things are asserted here that no in-process test can reach: the registration crosses the
+/// wire at all, it carries the gem home this process was pointed at by `GEM_HOME` rather than a
+/// path computed in a test, the watcher's registration is distinguishable from it by id — which is
+/// what an extension driving several servers needs — and a request inside the gem file the
+/// registration just named is answered over stdio.
+///
+/// The client takes three of the sixteen requests on purpose. A real client need not take all of
+/// them, and the batch coming back with exactly three plus synchronisation is what pins the
+/// per-capability filter: `doRegisterCapability` rejects the *whole* array on the first method it
+/// has no feature for, so sending one the client declined would cost every method after it.
+#[test]
+fn the_binary_asks_the_client_to_claim_the_gem_it_found() {
+    let (root, gem_home) = bundled_fixture();
+    let mut server = Server::start_with_env(root.path(), &[("GEM_HOME", gem_home.path())]);
+
+    let dynamic = serde_json::json!({ "dynamicRegistration": true });
+    let mut params = modern_client(root.path());
+    params["capabilities"]["textDocument"]["synchronization"] = dynamic.clone();
+    params["capabilities"]["textDocument"]["hover"] = dynamic.clone();
+    params["capabilities"]["textDocument"]["definition"] =
+        serde_json::json!({ "dynamicRegistration": true, "linkSupport": true });
+    params["capabilities"]["textDocument"]["documentSymbol"] = serde_json::json!({
+        "dynamicRegistration": true,
+        "hierarchicalDocumentSymbolSupport": true,
+    });
+    // The watcher registers on this same channel, and at `initialized` rather than when the bundle
+    // is known, so both are in flight here.
+    params["capabilities"]["workspace"]["didChangeWatchedFiles"] = dynamic;
+
+    let id = server.request("initialize", params);
+    server.response(&id).response_result.expect("initialize");
+    server.notify("initialized", serde_json::json!({}));
+
+    // Read until the document registration has arrived *and* the gem index has finished, in
+    // whichever order they come: the registration is sent when the roots are discovered, which is
+    // before the first gem file is indexed, and the outline below needs the second.
+    let mut watcher: Option<serde_json::Value> = None;
+    let mut documents: Option<serde_json::Value> = None;
+    let mut indexed = false;
+    while !indexed || documents.is_none() {
+        match server.read() {
+            Message::Request(request) => {
+                if request.method == "client/registerCapability" {
+                    let registrations = request.params["registrations"].clone();
+                    let first = registrations[0]["id"].as_str().unwrap_or_default();
+                    if first.starts_with(ya_lsp::server::capabilities::DOCUMENTS_ID_PREFIX) {
+                        documents = Some(registrations);
+                    } else {
+                        watcher = Some(registrations);
+                    }
+                }
+                // Answered whatever it was — this one and `window/workDoneProgress/create` are
+                // both server-initiated, and a server that wedged on the reply would hang here.
+                server.send(Message::Response(Response {
+                    id: request.id,
+                    response_result: Ok(serde_json::Value::Null),
+                }));
+            }
+            Message::Notification(notification)
+                if notification.method == "$/progress"
+                    && notification.params["value"]["kind"] == "end" =>
+            {
+                indexed = true;
+            }
+            _ => {}
+        }
+    }
+
+    let watcher = watcher.expect("the watcher registers too, and is not one of these");
+    assert_eq!(watcher[0]["method"], "workspace/didChangeWatchedFiles");
+    assert!(
+        watcher[0]["registerOptions"]
+            .get("documentSelector")
+            .is_none(),
+        "it narrows no documents, which is why an extension forwards it untouched: {watcher}"
+    );
+
+    let documents = documents.expect("the gem the bundle resolved to has to be claimed");
+    let methods: Vec<&str> = documents
+        .as_array()
+        .expect("a list of registrations")
+        .iter()
+        .map(|registration| registration["method"].as_str().expect("a method"))
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            "textDocument/hover",
+            "textDocument/definition",
+            "textDocument/documentSymbol",
+            "textDocument/didChange",
+            "textDocument/didClose",
+            "textDocument/didSave",
+            // Last, because registering it is what walks the documents already open and sends a
+            // `didOpen` for each one the new selector newly matches.
+            "textDocument/didOpen",
+        ],
+        "only the three this client said it takes, and synchronisation after them"
+    );
+
+    let bases: Vec<&str> = documents[0]["registerOptions"]["documentSelector"]
+        .as_array()
+        .expect("every registration carries its own selector")
+        .iter()
+        .map(|filter| filter["pattern"]["baseUri"].as_str().expect("a URI string"))
+        .collect();
+    let workspace = url::Url::from_file_path(root.path()).unwrap().to_string();
+    assert!(
+        bases.iter().any(|base| base.ends_with("gems/shouty-1.2.3")),
+        "the directory `GEM_HOME` pointed this process at, not one a test computed: {bases:?}"
+    );
+    assert!(
+        bases.iter().all(|base| !base.starts_with(&workspace)),
+        "the client already claimed the workspace, and twice means two providers: {bases:?}"
+    );
+
+    // The payoff, and the one step no in-process test reaches: a request inside the file the
+    // registration just named, over stdio, answered by the shipped binary.
+    const GEM_SOURCE: &str = "module Shouty\n  class Megaphone\n  end\nend\n";
+    let gem_file =
+        url::Url::from_file_path(gem_home.path().join("gems/shouty-1.2.3/lib/shouty.rb"))
+            .unwrap()
+            .to_string();
+    server.notify(
+        "textDocument/didOpen",
+        serde_json::json!({ "textDocument": {
+            "uri": gem_file, "languageId": "ruby", "version": 1, "text": GEM_SOURCE,
+        }}),
+    );
+    let id = server.request(
+        "textDocument/documentSymbol",
+        serde_json::json!({ "textDocument": { "uri": gem_file } }),
+    );
+    let outline = server
+        .response(&id)
+        .response_result
+        .expect("documentSymbol");
+    assert_eq!(outline[0]["name"], "Shouty", "{outline}");
+    assert_eq!(outline[0]["children"][0]["name"], "Megaphone", "{outline}");
 
     shut_down(server);
 }

@@ -91,7 +91,7 @@ test('and every setting the manifest declares reaches somebody', () => {
     Object.keys(properties)
       .filter((setting) => !READ_BY_CONFIG.includes(setting))
       .sort(),
-    ['ya-lsp.logLevel', 'ya-lsp.rubocop.hint', 'ya-lsp.serverPath', 'ya-lsp.trace.server']
+    ['ya-lsp.rubocop.hint', 'ya-lsp.serverPath', 'ya-lsp.trace.server']
   );
 });
 
@@ -99,19 +99,22 @@ test('every setting the server reads is honoured inside a workspace folder', () 
   // A property with no `scope` at all is `window`-scoped, and VS Code does not read a
   // `window`-scoped setting from a folder's `.vscode/settings.json`. The per-folder read in
   // `extension.ts` is real; without this the value it reads could not vary.
+  // `machine-overridable` is honoured in a folder too and additionally lets a container carry
+  // its own; `logLevel` keeps it now that the server reads the setting, because a remote with
+  // its own log level is exactly the case it was given that scope for.
   for (const setting of READ_BY_CONFIG) {
-    assert.equal(
-      properties[setting].scope,
-      'resource',
+    assert.ok(
+      ['resource', 'machine-overridable'].includes(properties[setting].scope ?? ''),
       `${setting} cannot be set per workspace folder`
     );
   }
+  assert.equal(properties['ya-lsp.logLevel'].scope, 'machine-overridable');
 });
 
 test('and the two that decide which process is spawned can also be set per machine', () => {
   // `machine-overridable` is honoured in a folder too, and additionally lets a remote or a
   // container carry its own path to the binary and its own log level.
-  assert.deepEqual(RESTART_REQUIRED, ['ya-lsp.serverPath', 'ya-lsp.logLevel']);
+  assert.deepEqual(RESTART_REQUIRED, ['ya-lsp.serverPath']);
   for (const setting of RESTART_REQUIRED) {
     assert.equal(properties[setting].scope, 'machine-overridable', `${setting} scope`);
   }

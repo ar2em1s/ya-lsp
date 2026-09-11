@@ -1,0 +1,88 @@
+# The benchmark corpora, pinned.
+#
+# Six public Ruby applications. Nothing here is vendored: every one is *cloned* into `tmp/`,
+# which is gitignored, and no artifact this project ships contains a byte of any of them. That
+# is what keeps the licence column free — `licensing.md`'s rule is per artifact, not per
+# repository — and it is a property of how they are used, not of the licences themselves.
+#
+# **Two obligations follow from the licence column and both are live.**
+#
+# 1. **No corpus source text is ever committed into this repository.** Four of the six are
+#    copyleft (AGPL-3.0, GPL-2.0) and one has a proprietary subdirectory, so a verbatim line
+#    committed here would be a fragment of an AGPL work inside an MIT one. The audit ledger
+#    therefore keys on a *hash* of the line, never the line — `audit.md`.
+# 2. **chatwoot's `enterprise/` tree is not MIT.** Its own LICENSE permits copying and modifying
+#    "for development and testing purposes, without requiring a subscription", which is exactly
+#    what an audit run does, and forbids copy, publish and distribution, which is exactly what
+#    committing a line would be. Reading it is fine; quoting it is not.
+#
+# The SHA is pinned for the reason `canary.md` gives for the canary's: an unpinned target makes
+# every number meaningless across runs, and a diff between two runs cannot separate "ya-lsp
+# changed" from "the corpus changed" unless both sides are the same commit.
+#
+# `ruby` is what the *corpus* declares — its `.ruby-version`, its `.tool-versions`, or its
+# Gemfile's `ruby` directive, in that order. It is not a preference. `corpora.py` resolves it
+# against what asdf has installed (exact first, then the highest installed patch of the same
+# MAJOR.MINOR) and refuses to guess further: installing a Ruby is out of scope and the script
+# prints the `asdf install` line instead. lobsters is the one that admits no substitute — its
+# Gemfile pins `ruby "4.0.0"` exactly, so bundler rejects 4.0.1.
+
+[lobsters]
+dir      = "tmp/corpora/lobsters"
+repo     = "https://github.com/lobsters/lobsters.git"
+sha      = "6d15d8f118e305b1de5190662a9651bf90132784"
+ruby     = "4.0.0"
+license  = "BSD-3-Clause"
+holder   = "2012-2019 Joshua Stein"
+role     = "canary"
+notes    = "The canary workspace. `make canary` asserts exact counts against this commit."
+
+[solidus]
+dir      = "tmp/corpora/solidus"
+repo     = "https://github.com/solidusio/solidus.git"
+sha      = "a8218a0855b38a30e7336ab41fbf5036c89f43d0"
+ruby     = "4.0.1"
+license  = "BSD-3-Clause"
+holder   = "2007-2014 Spree Commerce Inc.; 2015-2026 Solidus contributors"
+role     = "audit"
+notes    = "Declares no Ruby anywhere; 4.0 is the newest entry in its own CI matrix and 4.0.1 is the patch this pin fixes on. Needs `rubocop-rails` in a Gemfile-custom before ruby-lsp will index — see corpora.py's SOLIDUS_GEMFILE_CUSTOM."
+
+[mastodon]
+dir      = "tmp/corpora/mastodon"
+repo     = "https://github.com/mastodon/mastodon.git"
+sha      = "0a32b4a831838ef1f363a915c2e71e2a1b52cf0d"
+ruby     = "4.0.6"
+license  = "AGPL-3.0-or-later"
+holder   = "Eugen Rochko and other Mastodon contributors"
+role     = "audit"
+notes    = "Copyleft: no line of it may be committed here."
+
+[chatwoot]
+dir      = "tmp/corpora/chatwoot"
+repo     = "https://github.com/chatwoot/chatwoot.git"
+sha      = "8314676d1bece93d24293e87e80c94e7f5494d67"
+ruby     = "3.4.4"
+license  = "MIT AND LicenseRef-Chatwoot-Enterprise"
+holder   = "2017-2026 Chatwoot Inc."
+role     = "audit"
+notes    = "`enterprise/` and `spec/enterprise/` are under a proprietary licence that permits development and testing and forbids copying. Readable, never quotable."
+
+[forem]
+dir      = "tmp/corpora/forem"
+repo     = "https://github.com/forem/forem.git"
+sha      = "e8a07294e29d387b5057c9632f182a2077c9844d"
+ruby     = "3.3.0"
+license  = "AGPL-3.0-or-later"
+holder   = "Forem contributors"
+role     = "audit"
+notes    = "Copyleft. Ships its own tracked `.solargraph.yml`, so the setup step edits a tracked file here and only here."
+
+[discourse]
+dir      = "tmp/corpora/discourse"
+repo     = "https://github.com/discourse/discourse.git"
+sha      = "b8ff9a4a7729a22fd7f5ff9df2a784a2aa2c96bd"
+ruby     = "3.4.10"
+license  = "GPL-2.0-or-later"
+holder   = "Civilized Discourse Construction Kit, Inc."
+role     = "audit"
+notes    = "Swept since 2026-09-12. The old exclusion was about exhaustive bench sweeps, where it cost a large multiple of the others; the audit draws a stratified 896 positions here and settles in 5.5s, in line with the rest. It is the only corpus with plugins and engines, and the only one that makes check 5 fire."

@@ -245,9 +245,12 @@ pub fn index_source(graph: &mut Graph, uri: &str, source: &str, language: &Langu
 #[cfg(test)]
 pub(super) const CRASHES: &str = "# ya-lsp test: crash the indexer\n";
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::indexer;
+    use crate::analysis::testing::*;
     use rubydex::model::ids::UriId;
 
     fn holds(graph: &Graph, path: &Path) -> bool {
@@ -399,5 +402,53 @@ mod tests {
         assert!(!index_source(&mut graph, uri, CRASHES, &LanguageId::Ruby));
         assert_eq!(graph.documents().len(), before);
         assert!(graph.documents().contains_key(&UriId::from(uri)));
+    }
+
+    /// The workspace walk, which is a *worker-thread* panic.
+    ///
+    /// Driven through `index_workspace` rather than by calling the indexer inline, because the
+    /// two propagate differently: uncaught, this one reaches the analysis thread through
+    /// rubydex's `handle.join().expect("Worker thread panicked")` and an inline call would
+    /// never show that.
+    #[test]
+    fn a_file_that_crashes_the_indexer_costs_that_file_and_not_the_session() {
+        let mut harness = Harness::new();
+        harness.write("app/person.rb", "class Person\n  def shout\n  end\nend\n");
+        let bad = harness.write("app/rice.rb", indexer::CRASHES);
+        harness.index();
+
+        assert!(
+            harness.has("Person#shout()"),
+            "one bad file costs its own answers and nobody else's"
+        );
+        assert!(!harness.analysis.indexed(&bad));
+        assert!(harness.analysis.skipped.contains(&bad));
+
+        let said = harness.messages();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].starts_with("something went wrong while reading")
+                && said[0].contains("rice.rb"),
+            "a gap somebody can see is a gap somebody can report: {said:?}"
+        );
+    }
+
+    /// The other one: `extend self` inside a `Module.new` block.
+    ///
+    /// `ruby_indexer.rs:985` unwraps a lexical scope its own guard does not test for, which on
+    /// 0.2.5 ends the analysis thread. What is asserted is not merely that it survives: the panic
+    /// is the top-level face of a *wrong answer*, so the `def` inside the block has to be found
+    /// where it really is.
+    #[test]
+    fn extend_self_in_an_anonymous_module_indexes_like_any_other_file() {
+        let mut harness = Harness::new();
+        let source = "Foo = Module.new do\n  extend self\n  def hello = \"hi\"\nend\n";
+        let uri = harness.write("app/rice.rb", source);
+        harness.index();
+
+        assert!(harness.analysis.skipped.is_empty(), "nothing was skipped");
+        assert!(harness.analysis.indexed(&uri));
+        assert!(harness.has("Foo"), "the constant the block is assigned to");
+        assert!(harness.messages().is_empty(), "and nobody had to be told");
     }
 }

@@ -415,51 +415,142 @@ impl Rebase {
     /// declaration has moved off. `None` where the span overlaps what was just typed: it has no
     /// honest position in the new text, and the request settles and asks again rather than
     /// guessing at one.
+    ///
+    /// **A span and not two offsets, because the span is what resolves the ambiguity.** Text
+    /// inserted at offset *p* leaves the graph's position *p* naming two places in the buffer —
+    /// before what was typed and after it — and [`map`](Self::map) refuses it for that reason,
+    /// which is right for a caret and wrong for the ends of a span. A span's start is the byte
+    /// it covers first and its end the byte it covers last, so each leans on the side the span
+    /// is on and the pair comes back in order. Ask this about a declaration that begins its file
+    /// while a line is being typed above it and the answer is the line it is on now; ask `map`
+    /// and the place is dropped, which cost the corpora 36 of them.
     #[must_use]
-    pub fn to_buffer(self, offset: u32) -> Option<u32> {
-        self.map(offset, self.graph_len, self.buffer_len)
+    pub fn span_to_buffer(self, span: ByteSpan) -> Option<ByteSpan> {
+        // **Backwards is a caller's mistake, not a fact about the text**, and refusing is the one
+        // answer to it that cannot be wrong — a refused span settles and asks again, so the cost
+        // is a slow answer rather than a range pointing at text nobody asked about.
+        if span.start > span.end {
+            return None;
+        }
+        // An empty span covers no byte, so there is no side for it to lean on and nothing here
+        // can say which of the two places it means. That is `map`'s question exactly.
+        if span.start == span.end {
+            let at = self.map(span.start, self.graph_len, self.buffer_len)?;
+            return Some(ByteSpan { start: at, end: at });
+        }
+        Some(ByteSpan {
+            start: self.one_sided(span.start, self.graph_len, self.buffer_len, Side::Right)?,
+            end: self.one_sided(span.end, self.graph_len, self.buffer_len, Side::Left)?,
+        })
+    }
+
+    /// Where a position goes when it is defined by the byte on **one** side of it.
+    ///
+    /// The map is a common prefix and a common suffix, so a byte survives the edit exactly while
+    /// it is inside one of them: inside the prefix it has not moved, inside the suffix it has
+    /// moved by the difference in length. A position is a gap between two bytes and it is
+    /// *named* by the byte it leans on — [`Side::Right`] the one at `offset`, which is what a
+    /// span's start covers, [`Side::Left`] the one at `offset - 1`, which is what its end
+    /// covers. The two tests are the same pair of comparisons one index apart.
+    fn one_sided(&self, offset: u32, from_len: u32, to_len: u32, side: Side) -> Option<u32> {
+        if self.is_identity() {
+            return (offset <= from_len).then_some(offset);
+        }
+        let changed_from = from_len.saturating_sub(self.suffix);
+        let shifted = || {
+            let shifted = i64::from(offset) + i64::from(to_len) - i64::from(from_len);
+            u32::try_from(shifted).ok()
+        };
+        match side {
+            Side::Right if offset < self.prefix => Some(offset),
+            Side::Right if offset >= changed_from => shifted(),
+            Side::Left if offset <= self.prefix => Some(offset),
+            Side::Left if offset > changed_from => shifted(),
+            _ => None,
+        }
     }
 
     /// The body both directions share, which is why they take their lengths as arguments.
     ///
     /// **One copy on purpose.** The rule below is subtle enough that it has already been wrong
     /// once — the bounds were `<=` and had to become strict — and a second copy is a second
-    /// place for the next correction to miss.
+    /// place for the next correction to miss. It is written as the *agreement* of the two
+    /// one-sided maps rather than as its own pair of comparisons, so the strictness cannot drift
+    /// from them.
+    ///
+    /// **Strictly** inside the common prefix or the common suffix, and the strictness is a
+    /// defect this module's own test found rather than caution. A position names the same place
+    /// in both texts only when *both* of the bytes around it are unchanged — which is what a
+    /// caret means, and a caret is what every offset this translates is.
+    ///
+    /// With `<=` a pure deletion slips through: `Alpha.` becoming `Alph.` leaves the buffer side
+    /// of the changed region **empty**, so a boundary offset refused nothing, and the end of the
+    /// constant the user is halfway through typing landed inside the span of the longer one the
+    /// graph still holds — a precise answer about `Alpha` for a receiver spelled `Alph`, which
+    /// is exactly the class of wrong answer this map exists to stop.
+    ///
+    /// It also makes the map injective, which `<=` was not: an insertion had two buffer
+    /// positions straddling it naming one graph position.
     fn map(&self, offset: u32, from_len: u32, to_len: u32) -> Option<u32> {
-        if self.is_identity() {
-            return (offset <= from_len).then_some(offset);
-        }
-        // **Strictly** inside the common prefix or the common suffix, and the strictness is a
-        // defect this module's own test found rather than caution. A position is a gap between two
-        // bytes, and it names the same place in both texts only when *both* of those bytes are
-        // unchanged — `offset < prefix` says the byte after it is, and `offset > from_len -
-        // suffix` says the byte before it is.
-        //
-        // With `<=` a pure deletion slips through: `Alpha.` becoming `Alph.` leaves the buffer
-        // side of the changed region **empty**, so a boundary offset refused nothing, and the
-        // end of the constant the user is halfway through typing landed inside the span of the
-        // longer one the graph still holds — a precise answer about `Alpha` for a receiver
-        // spelled `Alph`, which is exactly the class of wrong answer this map exists to stop.
-        //
-        // It also makes the map injective, which `<=` was not: an insertion had two buffer
-        // positions straddling it naming one graph position.
-        if offset < self.prefix {
-            return Some(offset);
-        }
-        if offset > from_len.saturating_sub(self.suffix) {
-            let shifted = i64::from(offset) + i64::from(to_len) - i64::from(from_len);
-            return u32::try_from(shifted).ok();
-        }
-        None
+        let at = self.one_sided(offset, from_len, to_len, Side::Right)?;
+        (self.one_sided(offset, from_len, to_len, Side::Left) == Some(at)).then_some(at)
     }
+}
+
+/// A byte range of one document, `end` exclusive.
+///
+/// **Named fields and no positional constructor, because the two ends are not
+/// interchangeable.** [`Rebase::span_to_buffer`] leans them opposite ways — a start on the byte
+/// it covers first, an end on the byte it covers last — so a pair written the wrong way round
+/// comes back shifted by the length of whatever was typed, and looks like an ordinary range. A
+/// caller has to name both fields to build one, and one whose `start` is past its `end` is
+/// refused rather than translated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteSpan {
+    /// The first byte the span covers.
+    pub start: u32,
+    /// One past the last byte it covers, which is the position that byte's *right* edge is.
+    pub end: u32,
+}
+
+/// Which of the two bytes around a position names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// The byte at `offset`: what a span's start covers, and what an insertion pushes down.
+    Right,
+    /// The byte at `offset - 1`: what a span's end covers, and what stays where it was.
+    Left,
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use crate::analysis::indexer;
+    use crate::analysis::testing::*;
     use proptest::prelude::*;
 
     use super::*;
+
+    /// A span for the assertions here, and **only** here.
+    ///
+    /// `ByteSpan`'s fields are named so that production code cannot write one backwards by
+    /// accident; a test writing twenty of them longhand would bury what it is asserting, and a
+    /// swap inside an assertion is visible in the assertion. `a_span_handed_over_backwards_is_
+    /// refused_rather_than_translated` is what holds the guarantee itself.
+    fn span(start: u32, end: u32) -> ByteSpan {
+        ByteSpan { start, end }
+    }
+
+    #[test]
+    fn a_span_handed_over_backwards_is_refused_rather_than_translated() {
+        // The one mistake the type cannot prevent, and the reason it fails closed: a start and
+        // an end lean opposite ways, so a swapped pair comes back shifted by the length of what
+        // was typed — an ordinary-looking range over text nobody asked about. A refusal settles
+        // and asks again instead.
+        let rebase = Rebase::between("\nmodule Foo\nend\n", "module Foo\nend\n");
+        assert_eq!(rebase.span_to_buffer(span(0, 15)), Some(span(1, 16)));
+        assert_eq!(rebase.span_to_buffer(span(15, 0)), None);
+    }
 
     #[test]
     fn an_unedited_document_maps_every_offset_to_itself() {
@@ -468,7 +559,10 @@ mod tests {
         assert!(rebase.is_identity());
         for offset in 0..=text.len() as u32 {
             assert_eq!(rebase.to_graph(offset), Some(offset));
-            assert_eq!(rebase.to_buffer(offset), Some(offset));
+            assert_eq!(
+                rebase.span_to_buffer(span(0, offset)),
+                Some(span(0, offset))
+            );
         }
     }
 
@@ -495,7 +589,13 @@ mod tests {
         assert_eq!(rebase.to_graph(11), None);
         for offset in 0..=buffer.len() as u32 {
             if let Some(graph) = rebase.to_graph(offset) {
-                assert_eq!(rebase.to_buffer(graph), Some(offset), "at {offset}");
+                // The empty span is the strict map, which is what `to_graph` answered with —
+                // so this is the round trip and not a weaker statement of it.
+                assert_eq!(
+                    rebase.span_to_buffer(span(graph, graph)),
+                    Some(span(offset, offset)),
+                    "at {offset}"
+                );
             }
         }
     }
@@ -552,7 +652,81 @@ mod tests {
         let rebase = Rebase::between("Gamma.\n", "Alpha.\n");
         let (lo, hi) = rebase.changed_in_graph();
         assert!(lo < hi, "the fixture has to leave a region to refuse");
-        assert_eq!(rebase.to_buffer(lo + 1), None);
+        assert_eq!(rebase.span_to_buffer(span(lo + 1, hi)), None);
+    }
+
+    #[test]
+    fn a_span_that_begins_the_document_survives_an_insertion_above_it() {
+        // **The defect a corpus sweep found, at its smallest.** A newline typed at the top of a
+        // file leaves every byte of the text the graph holds intact, and yet graph offset 0 —
+        // where `class` and `module` start in most Ruby files — used to refuse, so a file
+        // written the ordinary way lost the place of its own declaration on the first keystroke
+        // above it. Here offset 0 is both the document's first position and the seam, which is
+        // why it is the *smallest* case and not a separate one.
+        let indexed = "module Foo\nend\n";
+        let buffer = "\nmodule Foo\nend\n";
+        let rebase = Rebase::between(buffer, indexed);
+        assert_eq!(
+            rebase.span_to_buffer(span(0, indexed.len() as u32)),
+            Some(span(1, buffer.len() as u32)),
+            "`module` and everything it declares moved down by exactly one byte"
+        );
+        // The caret at the same place is a different question and is still refused: nothing here
+        // says what the user meant by a position with new text on one side of it.
+        assert_eq!(rebase.to_graph(0), None);
+    }
+
+    #[test]
+    fn a_span_that_starts_where_the_edit_did_follows_the_text_it_covers() {
+        // **The general case, of which the document's first position is only a corner.** A
+        // settle puts what has already been typed into the graph, so the next keystroke leaves a
+        // declaration starting not at offset 0 but *at the seam* — an unchanged byte on each
+        // side of it, one that did not move and one that did. `map` refuses it, correctly, for a
+        // caret: it names two places in the buffer, before what was typed and after it. A span
+        // is not two places, and the corpora lost 36 of them here.
+        let indexed = "\nmodule Foo\nend\n";
+        let buffer = "\n\nmodule Foo\nend\n";
+        let rebase = Rebase::between(buffer, indexed);
+        assert_eq!(
+            rebase.span_to_buffer(span(1, indexed.len() as u32)),
+            Some(span(2, buffer.len() as u32))
+        );
+        assert_eq!(
+            rebase.to_graph(1),
+            None,
+            "the caret is still two places at once"
+        );
+    }
+
+    #[test]
+    fn a_span_that_ends_the_document_survives_an_insertion_below_it() {
+        // The end of a span leans the other way, and this is where that shows: the last
+        // position of a document has no byte to its right at all, so only the byte before it can
+        // name it. A file with no trailing newline is the one whose last declaration really does
+        // end there.
+        let indexed = "module Foo\nend";
+        let buffer = "module Foo\nend\n\nx = 1\n";
+        let rebase = Rebase::between(buffer, indexed);
+        assert_eq!(
+            rebase.span_to_buffer(span(0, indexed.len() as u32)),
+            Some(span(0, indexed.len() as u32))
+        );
+        assert_eq!(rebase.to_graph(buffer.len() as u32), None);
+    }
+
+    #[test]
+    fn an_edge_the_edit_itself_reached_is_refused_in_both_directions() {
+        // **A lean is not a licence: the byte it leans on still has to have survived.** Read
+        // backwards, an insertion above the first line is a *deletion* of it, and then the span
+        // the graph recorded for `Alpha` covers text that is simply gone — no offset in the
+        // buffer is where it is now. The caret is refused for the same reason and a stronger
+        // one: answering would card the constant the user just deleted, which is the class of
+        // wrong answer the strictness exists to stop.
+        let indexed = "Alpha\nx = 1\n";
+        let buffer = "x = 1\n";
+        let rebase = Rebase::between(buffer, indexed);
+        assert_eq!(rebase.to_graph(0), None);
+        assert_eq!(rebase.span_to_buffer(span(0, "Alpha".len() as u32)), None);
     }
 
     #[test]
@@ -639,7 +813,39 @@ mod tests {
                 if let Some(graph) = rebase.to_graph(offset) {
                     prop_assert!(graph as usize <= indexed.len());
                     prop_assert!(indexed.is_char_boundary(graph as usize));
-                    prop_assert_eq!(rebase.to_buffer(graph), Some(offset));
+                    prop_assert_eq!(rebase.span_to_buffer(span(graph, graph)),
+                                    Some(span(offset, offset)));
+                }
+            }
+        }
+
+        /// Each side of a span has a domain the round trip above cannot reach — every position
+        /// the strict map refuses and one lean accepts — so the three properties are stated of
+        /// the one-sided map directly. Injectivity is the one with teeth: two declarations the
+        /// graph found in different places must not come back at the same offset.
+        #[test]
+        fn every_span_endpoint_lands_in_range_on_a_boundary_and_alone(
+            buffer in "\\PC{0,40}", indexed in "\\PC{0,40}") {
+            let rebase = Rebase::between(&buffer, &indexed);
+            for side in [Side::Left, Side::Right] {
+                let mut seen: Vec<(u32, u32)> = Vec::new();
+                for offset in 0..=indexed.len() as u32 {
+                    if !indexed.is_char_boundary(offset as usize) {
+                        continue;
+                    }
+                    let Some(at) =
+                        rebase.one_sided(offset, rebase.graph_len, rebase.buffer_len, side)
+                    else {
+                        continue;
+                    };
+                    prop_assert!(at as usize <= buffer.len());
+                    prop_assert!(buffer.is_char_boundary(at as usize));
+                    prop_assert!(
+                        !seen.iter().any(|(already, _)| *already == at),
+                        "{side:?}: {offset} and {:?} both came back as {at}",
+                        seen.iter().find(|(already, _)| *already == at).map(|(_, was)| *was)
+                    );
+                    seen.push((at, offset));
                 }
             }
         }
@@ -1138,5 +1344,940 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The fixture the coordinate bug was found in, laid out so the collision is exact.
+    ///
+    /// `Alpha.` and `Gamma.` are on consecutive lines, so the two constant references are
+    /// **exactly `"Alpha.\n".len()` apart** — seven bytes. Insert seven bytes above them and a
+    /// buffer offset that names `Alpha` names `Gamma` in the graph: not "roughly wrong", the
+    /// other class's reference, byte for byte. That is what makes the two tests below a pair —
+    /// one asserts the right answer, the other asserts the wrong one is what you get without
+    /// the map.
+    const SHIFTED: &str = "class Alpha\n  def self.alpha_only\n  end\nend\n\n\
+                           class Gamma\n  def self.gamma_only\n  end\nend\n\n\
+                           Alpha.\nGamma.\n";
+
+    /// Seven bytes, which is the distance between the two references.
+    const PAD: &str = "# pad!\n";
+
+    /// A constant reference that really is one, and a declaration *below* where the pad goes.
+    ///
+    /// `SHIFTED` cannot serve the jump test: `Alpha.\nGamma.` is one chained call to Ruby, so
+    /// its `Gamma` is a method name and resolves to nothing even with no deferral at all.
+    const JUMPABLE: &str = "class Alpha\nend\n\nclass Gamma\nend\n\nGamma\n";
+
+    /// Open `SHIFTED`, index it, then defer and insert `PAD` at the top without indexing.
+    fn deferred_after_a_shift() -> (Harness, DocUri) {
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/main.rb", SHIFTED);
+        harness.index();
+        harness.open(&uri, SHIFTED);
+        // From here the graph is frozen: `didChange` records the edit and nothing indexes it,
+        // which is the whole of the deferred design.
+        harness.edit_without_indexing(
+            &uri,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(0, 0),
+                    end: lsp_types::Position::new(0, 0),
+                }),
+                text: PAD.to_owned(),
+            }],
+        );
+        (harness, uri)
+    }
+
+    /// The cursor just after the `.` of `Alpha.`, in the buffer's coordinates.
+    fn after_alpha_dot() -> serde_json::Value {
+        serde_json::json!({ "line": 11, "character": 6 })
+    }
+
+    /// That the request really was answered from the graph as it stood, and not by falling back.
+    ///
+    /// **The fallback property is what makes this necessary.** A refused map settles and asks again, so the
+    /// *answer* is correct either way and asserting on it proves nothing about the translation.
+    /// What only a genuinely deferred answer leaves behind is a graph that never saw the edit.
+    fn assert_deferred(harness: &Harness, uri: &DocUri, indexed: &str) {
+        assert_eq!(
+            harness.analysis.indexed_text.get(uri).map(String::as_str),
+            Some(indexed),
+            "the request fell back and indexed the buffer, so the map was never exercised"
+        );
+    }
+
+    #[test]
+    fn a_deferred_completion_is_answered_in_the_graph_s_coordinates_and_not_the_buffer_s() {
+        let (mut harness, uri) = deferred_after_a_shift();
+
+        let offered_answer = harness.ask(
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": after_alpha_dot(),
+            }),
+        );
+        let (labels, precise) = offered(&offered_answer);
+
+        // The receiver the *buffer* has is `Alpha`, and nothing was indexed after the edit.
+        assert!(
+            precise,
+            "the deferred answer fell through to the name-based list: {labels:?}"
+        );
+        assert_eq!(
+            labels,
+            vec!["alpha_only".to_owned()],
+            "the deferred answer is not the receiver the buffer has"
+        );
+    }
+
+    #[test]
+    fn without_the_map_the_same_deferred_completion_answers_the_wrong_class() {
+        // Delete the mechanism and watch it break. `rebase_for` falls back to the identity when
+        // it has no record of what the document was indexed as, so clearing the record is
+        // exactly "defer the index and keep using buffer offsets as graph keys" — which is the
+        // configuration this design exists to avoid, and it is `Alpha.new.` offering `Gamma`'s
+        // members. Reproduced here rather than described.
+        let (mut harness, uri) = deferred_after_a_shift();
+        harness.analysis.indexed_text.clear();
+
+        let answer = harness.ask(
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": after_alpha_dot(),
+            }),
+        );
+        let (labels, precise) = offered(&answer);
+
+        // What the buffer offset names in the older text is `Gamma`'s reference, and the call's
+        // own method reference is narrower than it — so `locate` keeps the call, `constant_at`
+        // finds no constant at all, and the receiver types as nothing. The degradation is
+        // therefore the **name-based list** rather than a confident answer about `Gamma`, and
+        // that list matches every method in the project: it contains `gamma_only`, which the
+        // correct answer above does not offer at all.
+        assert!(
+            !precise,
+            "without the map the receiver resolved, which this test cannot then tell apart"
+        );
+        assert!(
+            labels.iter().any(|label| label == "gamma_only"),
+            "the bug the map exists to remove did not reproduce: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_receiver_inside_what_was_just_typed_is_refused_rather_than_guessed_at() {
+        // The other half of the map's contract. Here the *receiver itself* is being typed, so
+        // no graph offset names it at all — the map refuses, the request falls back to a
+        // settle and asks again, and `Alph` is a constant nothing declares either way. What must not
+        // happen, on either side of that fallback, is `Alpha`'s members: they are what sits at
+        // this offset in the older text, and they are the wrong answer twice over.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/main.rb", SHIFTED);
+        harness.index();
+        harness.open(&uri, SHIFTED);
+        // Rewrite the `Alpha.` line into `Alph.` — the constant under the cursor is now text
+        // the graph has never held.
+        harness.edit_without_indexing(
+            &uri,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(10, 0),
+                    end: lsp_types::Position::new(10, 6),
+                }),
+                text: "Alph.".to_owned(),
+            }],
+        );
+
+        let answer = harness.ask(
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 10, "character": 5 },
+            }),
+        );
+        let (labels, precise) = offered(&answer);
+
+        assert!(
+            !precise,
+            "a receiver the graph has never held was typed anyway: {labels:?}"
+        );
+    }
+
+    /// Two methods with a scope boundary between them, and a `self.` that can tell the class
+    /// side from the instance side by which name comes back.
+    const TWO_SCOPES: &str = "class Alpha\n  def self.klass_only\n  end\n\n                                def inst_only\n  end\n\n  def first\n    x = 1\n  end\n\n                                def second\n    y = 2\n  end\nend\n";
+
+    #[test]
+    fn an_edit_that_swallows_a_scope_boundary_does_not_answer_from_the_wrong_scope() {
+        // **The case `changed_in_graph` cannot serve and the fallback cannot catch.** The edit
+        // runs from inside `first` to inside `second`, so the region the graph disagrees with
+        // spans an `end` and a `def`. The narrowest graph scope containing all of it is the
+        // *class body*, where `self` is the class object — so `self.` would offer the singleton
+        // while the caret is plainly inside an instance method. It is a wrong answer rather
+        // than an empty one, so retrying never happens.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/main.rb", TWO_SCOPES);
+        harness.index();
+        harness.open(&uri, TWO_SCOPES);
+        harness.edit_without_indexing(
+            &uri,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(8, 4),
+                    end: lsp_types::Position::new(12, 9),
+                }),
+                text: "self.".to_owned(),
+            }],
+        );
+
+        let answer = harness.ask(
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 8, "character": 9 },
+            }),
+        );
+        let (labels, _precise) = offered(&answer);
+
+        assert!(
+            labels.iter().any(|label| label == "inst_only"),
+            "the caret is inside an instance method and was offered {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "klass_only"),
+            "answered from the class body's scope: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_member_typed_after_a_settled_receiver_is_answered_without_indexing_it() {
+        // **The path the whole design is for**, and the one the other two tests do not reach.
+        // Here the *caret* is inside text the graph has never been given while the receiver is
+        // not, so `to_graph` refuses the cursor, the scope question is asked over the changed
+        // region instead, and `Receiver::Constant` still maps because it sits in the common
+        // prefix. This is what every keystroke of a member does.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/main.rb", SHIFTED);
+        harness.index();
+        harness.open(&uri, SHIFTED);
+        harness.edit_without_indexing(
+            &uri,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(10, 6),
+                    end: lsp_types::Position::new(10, 6),
+                }),
+                text: "al".to_owned(),
+            }],
+        );
+
+        let answer = harness.ask(
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 10, "character": 8 },
+            }),
+        );
+        let (labels, precise) = offered(&answer);
+
+        assert!(
+            precise && labels.iter().any(|label| label == "alpha_only"),
+            "a member typed on a settled receiver answered {labels:?}"
+        );
+        // And it was answered *deferred*: the fallback would have indexed the buffer, so the
+        // text the indexer was last handed still being the file on disk is what says the graph
+        // was never touched. Without this the assertion above passes either way.
+        assert_eq!(
+            harness.analysis.indexed_text.get(&uri).map(String::as_str),
+            Some(SHIFTED),
+            "the deferred path indexed the buffer after all"
+        );
+    }
+
+    #[test]
+    fn a_deferred_hover_cards_the_constant_under_the_caret_and_not_the_one_below_it() {
+        // `PAD` is the distance between the two references on purpose, so an offset handed to
+        // the graph unmapped lands exactly on the *other* class — a card that is precise,
+        // confident and about the wrong constant. The range has to come back through the map
+        // too, or the highlight sits a line above the word.
+        let (mut harness, uri) = deferred_after_a_shift();
+
+        let answer = harness.ask(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 11, "character": 2 },
+            }),
+        );
+
+        let card = answer["contents"]["value"].as_str().unwrap_or_default();
+        assert!(
+            card.contains("Alpha") && !card.contains("Gamma"),
+            "the caret is on Alpha and the card said: {card}"
+        );
+        assert_eq!(
+            answer["range"]["start"]["line"], 11,
+            "the span came back in the graph's coordinates rather than the buffer's"
+        );
+        assert_deferred(&harness, &uri, SHIFTED);
+    }
+
+    #[test]
+    fn a_deferred_jump_lands_where_the_declaration_is_now_and_not_where_it_was() {
+        // The inverse map's own test, and both halves of the map are in it: the caret is below
+        // the edit and so is the class it names. `class Gamma` is on line 3 of the text the
+        // graph holds and line 4 of the buffer, so a jump answered in the graph's coordinates
+        // lands a line above the class — the right file, the wrong line, and nothing about the
+        // answer says so.
+        //
+        // **The pad goes in the middle**, so the declaration is clear of the seam and both ends
+        // of its span shift whichever way they lean. A declaration starting *at* the seam is the
+        // other case and has its own test — it used to be refused here on the reasoning that
+        // such an offset is "honestly either 0 or 7", which is true of a caret and false of a
+        // span the graph already found. `assert_deferred` is what keeps either test honest: a
+        // refused map settles and re-asks, so the answer is right whether or not the translation
+        // ever ran.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/main.rb", JUMPABLE);
+        harness.index();
+        harness.open(&uri, JUMPABLE);
+        harness.edit_without_indexing(
+            &uri,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(2, 0),
+                    end: lsp_types::Position::new(2, 0),
+                }),
+                text: PAD.to_owned(),
+            }],
+        );
+
+        let answer = harness.ask(
+            "textDocument/definition",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 7, "character": 2 },
+            }),
+        );
+
+        assert_eq!(
+            answer[0]["targetSelectionRange"]["start"]["line"],
+            serde_json::json!(4),
+            "the jump answered {answer} instead of `class Gamma` on line 4"
+        );
+        assert_eq!(
+            answer[0]["originSelectionRange"]["start"]["line"],
+            serde_json::json!(7),
+            "the origin came back in the graph's coordinates rather than the buffer's"
+        );
+        assert_deferred(&harness, &uri, JUMPABLE);
+    }
+
+    /// One class opened in two files, which is the shape that kept the loss silent.
+    ///
+    /// A constant with several declarations is ordinary Ruby and routine Rails — the corpus this
+    /// was measured on has one with eighty-five. `link` maps four offsets per place and drops
+    /// the *place* when any of them refuses, so losing one leaves the response shorter rather
+    /// than empty; `answered_nothing` is false, the settle-and-retry never fires, and nothing
+    /// anywhere says a place is missing.
+    const REOPENED_ONE: &str = "class Alpha\n  def one\n  end\nend\n";
+    const REOPENED_TWO: &str = "class Alpha\n  def two\n  end\nend\n";
+
+    #[test]
+    fn a_deferred_jump_keeps_a_place_whose_declaration_begins_its_file() {
+        // The pad goes at the very top of `lib/one.rb`, so `class Alpha` there starts at graph
+        // offset 0 — the one offset in a document that has no byte to its left. Before
+        // `at_an_untouched_edge` that place was dropped and the jump came back with one
+        // location instead of two, silently and with no retry.
+        let mut harness = Harness::new();
+        let one = harness.write("lib/one.rb", REOPENED_ONE);
+        let two = harness.write("lib/two.rb", REOPENED_TWO);
+        let main = harness.write("lib/main.rb", "Alpha\n");
+        harness.index();
+        harness.open(&one, REOPENED_ONE);
+        harness.edit_without_indexing(
+            &one,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(0, 0),
+                    end: lsp_types::Position::new(0, 0),
+                }),
+                text: PAD.to_owned(),
+            }],
+        );
+
+        let answer = harness.ask(
+            "textDocument/definition",
+            serde_json::json!({
+                "textDocument": { "uri": main.as_str() },
+                "position": { "line": 0, "character": 2 },
+            }),
+        );
+        let places: Vec<(&str, i64)> = answer
+            .as_array()
+            .expect("definition answers an array of links")
+            .iter()
+            .map(|link| {
+                (
+                    link["targetUri"].as_str().unwrap_or_default(),
+                    link["targetSelectionRange"]["start"]["line"]
+                        .as_i64()
+                        .unwrap_or(-1),
+                )
+            })
+            .collect();
+
+        assert!(
+            places
+                .iter()
+                .any(|(uri, line)| *uri == one.as_str() && *line == 1),
+            "the place in the edited file was dropped or misplaced: {places:?}"
+        );
+        assert!(
+            places
+                .iter()
+                .any(|(uri, line)| *uri == two.as_str() && *line == 0),
+            "the untouched file's place is gone too: {places:?}"
+        );
+        assert_deferred(&harness, &one, REOPENED_ONE);
+    }
+
+    /// A typed instance variable and a call on it, which is the pair of paths the map reached
+    /// last.
+    ///
+    /// `@thing` is typed by an assignment written above the cursor, and what that assignment
+    /// yields is a `Receiver` holding the **offset of `Alpha`** — a graph key, parsed out of the
+    /// buffer. Both cards below go through `types::method_receiver` on it: one asks what the
+    /// variable is, the other what a member on it resolves to. Neither translated, so an
+    /// unindexed keystroke anywhere above them lost the assignment and the card fell to the
+    /// variable's own name.
+    const TYPED_IVAR: &str = "class Alpha\n  def only_alpha\n  end\nend\n\n\
+                              class Holder\n  def run\n    @thing = Alpha.new\n\
+                              \u{20}   @thing.only_alpha\n  end\nend\n";
+
+    /// Open `TYPED_IVAR`, index it, then defer and insert `PAD` at the top without indexing.
+    ///
+    /// The pad is above everything, so every offset the two cards need moves by exactly its
+    /// length and nothing the user pointed at changed — the edit a deferred answer is supposed
+    /// to survive completely, and the one the audit's fifth check makes at every position it
+    /// samples.
+    fn deferred_after_a_typed_ivar() -> (Harness, DocUri) {
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/main.rb", TYPED_IVAR);
+        harness.index();
+        harness.open(&uri, TYPED_IVAR);
+        harness.edit_without_indexing(
+            &uri,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(0, 0),
+                    end: lsp_types::Position::new(0, 0),
+                }),
+                text: PAD.to_owned(),
+            }],
+        );
+        (harness, uri)
+    }
+
+    #[test]
+    fn a_deferred_card_on_an_instance_variable_keeps_the_type_its_assignment_gives_it() {
+        // `locator::resolve_variable` reads the buffer and keys the graph, and the hinge is the
+        // constant inside the assignment: `Alpha` sits at one offset in the buffer and another
+        // in the text the graph holds. Untranslated it resolves to nothing, the whole chain
+        // collapses, and what is left is the variable's spelling — a *guessed* card where a
+        // derived one stood a keystroke earlier, which is the deferred path answering less than
+        // the eager one.
+        let (mut harness, uri) = deferred_after_a_typed_ivar();
+
+        let answer = harness.ask(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 9, "character": 6 },
+            }),
+        );
+        let card = answer["contents"]["value"].as_str().unwrap_or_default();
+
+        assert!(
+            card.contains("class Alpha"),
+            "the assignment stopped typing the variable: {card}"
+        );
+        // The provenance line is the buffer's and stays the buffer's — `Receiver::Assigned`'s
+        // offset is deliberately not translated, because this names a line for a reader in the
+        // text the reader is looking at. Line 9 is where the assignment is *now*.
+        assert!(
+            card.contains("Type taken from the assignment on line 9"),
+            "the card named the wrong line for the assignment: {card}"
+        );
+        assert!(
+            !card.contains("guessed from the name"),
+            "the deferred card fell to the variable's own name: {card}"
+        );
+        assert_deferred(&harness, &uri, TYPED_IVAR);
+    }
+
+    #[test]
+    fn a_deferred_call_on_an_instance_variable_is_typed_in_the_graph_s_coordinates() {
+        // The same receiver one token to the right, and a different function reaching it:
+        // `locator::typed`, which is what `hover` and `definition` share. The degradation here
+        // is quieter than the card above — `only_alpha` is declared once in the whole fixture,
+        // so the name-based list finds it anyway and *the answer looks right*. What says it is
+        // not is the footnote: a list matched on a name says so, and a receiver that was really
+        // typed says where the type came from.
+        let (mut harness, uri) = deferred_after_a_typed_ivar();
+
+        let answer = harness.ask(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 9, "character": 14 },
+            }),
+        );
+        let card = answer["contents"]["value"].as_str().unwrap_or_default();
+
+        assert!(
+            card.contains("Alpha#only_alpha"),
+            "the member did not resolve at all: {card}"
+        );
+        assert!(
+            !card.contains("Matched on the method name alone"),
+            "the receiver was not typed and the name list answered instead: {card}"
+        );
+        assert!(
+            card.contains("Type taken from the assignment on line 9"),
+            "the type stopped coming from the assignment: {card}"
+        );
+        assert_deferred(&harness, &uri, TYPED_IVAR);
+    }
+
+    #[test]
+    fn a_templates_variable_survives_an_unindexed_edit_in_the_controller_that_types_it() {
+        // **The cross-document half, and the cursor is not in the edited file at all.** The
+        // view↔renderer rung reads the controller's *buffer* on purpose — an unsaved
+        // controller should type the template it renders — and that is exactly the moment the
+        // controller's offsets stop naming the graph's text. So the map that has to be applied
+        // is the controller's, fetched with its text rather than derived from the request's
+        // document, which is the only map the template's own request knows about.
+        let mut harness = Harness::new();
+        harness.write("app/models/story.rb", STORY);
+        let controller = harness.write("app/controllers/stories_controller.rb", CONTROLLER);
+        let view = harness.write(
+            "app/views/stories/show.html.erb",
+            "<h1><%= @story.title %></h1>\n",
+        );
+        harness.index();
+        harness.open(&controller, CONTROLLER);
+        harness.edit_without_indexing(
+            &controller,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(0, 0),
+                    end: lsp_types::Position::new(0, 0),
+                }),
+                text: PAD.to_owned(),
+            }],
+        );
+
+        let answer = harness.ask(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": view.as_str() },
+                "position": { "line": 0, "character": 15 },
+            }),
+        );
+        let card = answer["contents"]["value"].as_str().unwrap_or_default();
+
+        assert!(
+            card.contains("Story#title"),
+            "an edit in another document lost the template's type: {card}"
+        );
+        // The whole rung, and this is the assertion that fires without the map: `Story#title`
+        // is *also* what the name guess answers, because the variable happens to be spelled
+        // after its class. The right answer and the lucky one differ only in the footnote.
+        assert!(
+            !card.contains("guessed from the name"),
+            "the convention gave way to the name guess: {card}"
+        );
+        // Line 4 and not line 3: the lookup follows the graph and the line a reader is sent to
+        // follows the buffer, and this is the one card that can tell the two apart.
+        assert!(
+            card.contains("Type taken from `StoriesController`, line 4"),
+            "the card named the line the assignment used to be on: {card}"
+        );
+        assert_deferred(&harness, &controller, CONTROLLER);
+    }
+
+    #[test]
+    fn an_assignment_being_typed_is_refused_rather_than_read_at_the_old_offsets() {
+        // The other half of the map's contract, on the rung above: here the edit is *inside*
+        // the constant the assignment names, so no graph offset stands for it at all. What must
+        // not happen is `Alpha` — it is what sits at that offset in the older text, and a card
+        // naming it would be confident, precise and about a class the buffer no longer mentions.
+        // Falling to the variable's own name is the degradation this is supposed to have.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/main.rb", TYPED_IVAR);
+        harness.index();
+        harness.open(&uri, TYPED_IVAR);
+        harness.edit_without_indexing(
+            &uri,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(7, 13),
+                    end: lsp_types::Position::new(7, 18),
+                }),
+                text: "Alph".to_owned(),
+            }],
+        );
+
+        let answer = harness.ask(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 8, "character": 6 },
+            }),
+        );
+        let card = answer["contents"]["value"].as_str().unwrap_or_default();
+
+        assert!(
+            !card.contains("class Alpha"),
+            "a receiver the graph has never held was typed anyway: {card}"
+        );
+    }
+
+    #[test]
+    fn a_controller_assignment_being_typed_leaves_the_template_the_rung_below() {
+        // The same refusal one document over, and the reason it is a `continue` rather than a
+        // decline: the request is about the *template*, which nobody has touched, so there is
+        // nothing here for a settle-and-retry to have been triggered by. The rung says it
+        // cannot answer, the name guess answers instead, and the card says which — the whole of
+        // what is owed while somebody is mid-word in another file.
+        let mut harness = Harness::new();
+        harness.write("app/models/story.rb", STORY);
+        let controller = harness.write("app/controllers/stories_controller.rb", CONTROLLER);
+        let view = harness.write(
+            "app/views/stories/show.html.erb",
+            "<h1><%= @story.title %></h1>\n",
+        );
+        harness.index();
+        harness.open(&controller, CONTROLLER);
+        harness.edit_without_indexing(
+            &controller,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(2, 13),
+                    end: lsp_types::Position::new(2, 18),
+                }),
+                text: "Stor".to_owned(),
+            }],
+        );
+
+        let answer = harness.ask(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": view.as_str() },
+                "position": { "line": 0, "character": 15 },
+            }),
+        );
+        let card = answer["contents"]["value"].as_str().unwrap_or_default();
+
+        assert!(
+            !card.contains("Type taken from `StoriesController`"),
+            "the convention answered from an assignment the graph no longer holds: {card}"
+        );
+        assert_deferred(&harness, &controller, CONTROLLER);
+    }
+
+    #[test]
+    fn an_index_that_crashed_does_not_leave_the_map_claiming_the_graph_caught_up() {
+        // **The bulkhead meeting the map, and the failure is silent in both directions.** A
+        // contained panic costs the document its update: the graph keeps the version it already had. If
+        // `indexed_text` recorded the text that *failed* to go in, the map would compare two
+        // equal strings, answer `identity`, and hand a buffer offset to a graph some unknown
+        // number of edits behind — with no refusal, so nothing falls back.
+        //
+        // What the caret then lands on is text seven bytes along, and on *this* fixture that is
+        // the `Gamma` of `Alpha.\nGamma.` — one chained call to Ruby, so a method name that
+        // resolves to nothing, and the symptom is silence rather than a wrong class. It is the
+        // same defect either way: the offset was handed to a graph that never received the
+        // edit. The assertion is on the answer being right, which covers both.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/main.rb", SHIFTED);
+        harness.index();
+        harness.open(&uri, SHIFTED);
+        harness.edit_without_indexing(
+            &uri,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(0, 0),
+                    end: lsp_types::Position::new(0, 0),
+                }),
+                text: PAD.to_owned(),
+            }],
+        );
+        // Armed rather than written into the text, because the sentinel is 33 bytes and this
+        // fixture's whole point is a *seven*-byte shift: a sentinel in the buffer destroys the
+        // common suffix, the map then refuses everything, and the test would pass on a
+        // refusal instead of on the map being right.
+        indexer::SOURCE_INDEXES_TO_CRASH.with(|counter| counter.set(1));
+        // Something that is not deferred forces the index, which panics and is contained.
+        harness.analysis.settle();
+
+        let answer = harness.ask(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 11, "character": 2 },
+            }),
+        );
+
+        let card = answer["contents"]["value"].as_str().unwrap_or_default();
+        assert!(
+            card.contains("Alpha") && !card.contains("Gamma"),
+            "the map trusted an index that never happened and said: {card}"
+        );
+        assert_deferred(&harness, &uri, SHIFTED);
+    }
+
+    #[test]
+    fn a_refused_receiver_is_answered_by_indexing_rather_than_by_answering_nothing() {
+        // **The map is an optimization and not a filter**, and this is the test that says so.
+        // Rewriting `Alpha.` into `Gamma.` puts a constant the graph knows perfectly well at an
+        // offset the graph has never seen — the refusal is about the *offset*, not the name —
+        // so the deferred attempt has nothing to say. Answering nothing there would trade a
+        // correct answer for a fast empty list, so the request settles and asks again.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/main.rb", SHIFTED);
+        harness.index();
+        harness.open(&uri, SHIFTED);
+        harness.edit_without_indexing(
+            &uri,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position::new(10, 0),
+                    end: lsp_types::Position::new(10, 6),
+                }),
+                text: "Gamma.".to_owned(),
+            }],
+        );
+
+        let answer = harness.ask(
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 10, "character": 6 },
+            }),
+        );
+        let (labels, precise) = offered(&answer);
+
+        assert!(
+            precise && labels.iter().any(|label| label == "gamma_only"),
+            "a refused deferral answered {labels:?} instead of indexing and answering Gamma's"
+        );
+    }
+
+    #[test]
+    fn navigation_sees_an_incremental_edit_immediately() {
+        // The buffer the editor is typing into shadows the file on disk, and every answer has
+        // to come from the buffer — including one assembled from range edits.
+        let mut harness = Harness::new();
+        let source = "class Person\n  def shout; end\nend\n";
+        let uri = harness.write("lib/person.rb", source);
+        harness.index();
+        harness.open(&uri, source);
+
+        harness.edit(
+            &uri,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 1,
+                        character: 6,
+                    },
+                    end: lsp_types::Position {
+                        line: 1,
+                        character: 11,
+                    },
+                }),
+                text: "whisper".to_owned(),
+            }],
+        );
+
+        let edited = "class Person\n  def whisper; end\nend\n";
+        let markdown = harness.hover_at(&uri, edited, "whisper")["contents"]["value"]
+            .as_str()
+            .expect("markdown")
+            .to_owned();
+        assert!(markdown.contains("Person#whisper"), "{markdown}");
+
+        // And the old name is gone from the index rather than merely shadowed by it.
+        let outline = harness.outline(&uri);
+        assert_eq!(outline[0]["children"][0]["name"], "whisper", "{outline}");
+        assert_eq!(
+            outline[0]["children"].as_array().unwrap().len(),
+            1,
+            "{outline}"
+        );
+    }
+
+    #[test]
+    fn navigation_ranges_are_in_the_negotiated_encoding() {
+        // The failure this guards against is invisible on ASCII and silent everywhere else: a
+        // range built from byte offsets sends the editor to the wrong column on every line
+        // that contains an emoji, an accent, or CJK text.
+        let source = "x = \"\u{1f600}\u{1f600}\"; class Person; end\n";
+        for (encoding, expected) in [
+            (PositionEncoding::Utf8, 22),  // two 4-byte emoji
+            (PositionEncoding::Utf16, 18), // two surrogate pairs
+            (PositionEncoding::Utf32, 16), // two characters
+        ] {
+            let mut harness = Harness::with_encoding(encoding);
+            let uri = harness.write("lib/person.rb", source);
+            harness.index();
+
+            let outline = harness.outline(&uri);
+            assert_eq!(
+                outline[0]["selectionRange"]["start"]["character"], expected,
+                "{encoding:?}: {outline}"
+            );
+
+            // And the request side agrees: a position expressed in the same units has to come
+            // back to the same byte offset, or hover would land one construct off.
+            let hover = harness.ask(
+                "textDocument/hover",
+                serde_json::json!({
+                    "textDocument": { "uri": uri.as_str() },
+                    "position": { "line": 0, "character": expected },
+                }),
+            );
+            assert!(
+                hover["contents"]["value"]
+                    .as_str()
+                    .is_some_and(|markdown| markdown.contains("class Person")),
+                "{encoding:?}: {hover}"
+            );
+        }
+    }
+
+    /// The same call under three prefixes, one of which is prose in English.
+    ///
+    /// A line of markup is a line of a *document*, and a client counts its columns in UTF-16
+    /// units of the text it has. Only the first and last lines here are ones where that agrees
+    /// with the bytes: the middle line's quotes, accent and emoji are seven units short of
+    /// their eighteen bytes.
+    const WIDE: &str = "\
+<p>plain <%= Story::TAGLINE %></p>
+<p>\u{201c}curly\u{201d} caf\u{e9} \u{1f680} <%= Story::TAGLINE %></p>
+<p><%= Story::TAGLINE %></p>
+";
+
+    /// The markup to the left of a cursor may not move it, whatever it is made of.
+    ///
+    /// A defect a corpus sweep finds rather than a test. An LSP position
+    /// is a count of UTF-16 units of the text the **client** has, and `with_text` converted it
+    /// against the blanked view — where a 3-byte `\u{201c}` in the markup has become three
+    /// spaces. So the cursor was displaced left by (bytes − units) of every non-ASCII character
+    /// in the markup before it on the line, and every range answered back was displaced right
+    /// by the same amount. It is a *wrong* answer and not only a missing one: on a dense enough
+    /// line the displaced cursor lands on a different identifier.
+    ///
+    /// Both directions are one bug and this asks about both at once. `definition` reads a
+    /// position the client sent, and its `originSelectionRange` is a position the client will
+    /// use — so the middle row is the assertion: the cursor arrives at column 30, and the span
+    /// comes back naming columns 30 to 37 rather than the bytes 37 to 44 it was found at.
+    ///
+    /// It is the reproduction rather than an illustration. With the conversion pointed back at
+    /// the view, the middle row answers **`story.rb:0`** — the seven-unit displacement puts the
+    /// cursor inside `Story::`, and the jump lands on `class Story` instead of on the constant
+    /// the user clicked. The other two rows are unmoved, which is what makes it a defect users
+    /// only hit when they do not write their markup in English.
+    #[test]
+    fn a_cursor_in_a_template_is_where_the_editor_put_it() {
+        /// The LSP position of `needle` on `line`, counted the way a client counts.
+        fn at(source: &str, line: usize, needle: &str) -> serde_json::Value {
+            let text = source.lines().nth(line).expect("the line");
+            let column = text.find(needle).expect("the needle");
+            serde_json::json!({
+                "line": line,
+                "character": text[..column].encode_utf16().count(),
+            })
+        }
+
+        let mut harness = Harness::new();
+        harness.write("app/models/story.rb", STORY);
+        let view = harness.write("app/views/stories/index.html.erb", WIDE);
+        harness.index();
+
+        let mut drawn = vec![format!(
+            "{:<8}{:>14}{:>16}",
+            "prefix", "asked at", "jumps to"
+        )];
+        for (line, prefix) in ["ascii", "wide", "none"].iter().enumerate() {
+            let asked = at(WIDE, line, "TAGLINE");
+            let defined = harness.ask(
+                "textDocument/definition",
+                serde_json::json!({
+                    "textDocument": { "uri": view.as_str() },
+                    "position": asked.clone(),
+                }),
+            );
+            let link = defined
+                .as_array()
+                .and_then(|links| links.first())
+                .cloned()
+                .unwrap_or_default();
+            let origin = &link["originSelectionRange"];
+            let span = match origin["start"]["character"].as_u64() {
+                Some(_) => format!(
+                    "{}-{}",
+                    origin["start"]["character"], origin["end"]["character"]
+                ),
+                None => "\u{2014}".to_owned(),
+            };
+            let target = link["targetUri"].as_str().map_or_else(String::new, |uri| {
+                uri.rsplit('/').next().unwrap_or_default().to_owned()
+            });
+            let jump = match link["targetSelectionRange"]["start"]["line"].as_u64() {
+                Some(at) => format!("{target}:{at}"),
+                None => "\u{2014}".to_owned(),
+            };
+            // The caret the editor placed, drawn beside the span it gets back: the two agree
+            // only if the same text was counted on both trips.
+            drawn.push(format!(
+                "{prefix:<8}{:>14}{jump:>16}",
+                format!("{}:{}", asked["character"], span)
+            ));
+        }
+
+        assert_eq!(
+            drawn.join("\n"),
+            "prefix        asked at        jumps to\n\
+             ascii         20:20-27      story.rb:1\n\
+             wide          30:30-37      story.rb:1\n\
+             none          14:14-21      story.rb:1"
+        );
+    }
+
+    #[test]
+    fn a_non_ascii_line_of_markup_above_the_cursor_does_not_move_the_answer() {
+        // Why the ERB scanner pads by byte and not by character: padding by character would let
+        // the emoji on the line above shorten the buffer by three bytes, and every offset below
+        // it would be wrong — silently, and only for people who do not write markup in English.
+        let wide = VIEW.replace(
+            "<h1>Stories</h1>",
+            "<h1>\u{413}\u{43e}\u{440}\u{44f}\u{447}\u{438}\u{435} \u{1f525}</h1>",
+        );
+        let mut harness = Harness::new();
+        let model = harness.write("app/models/story.rb", STORY);
+        harness.write("app/views/stories/index.html.erb", &wide);
+        harness.index();
+
+        // The same line and the same column as the ASCII fixture above: the markup grew by
+        // fourteen bytes and the Ruby did not move.
+        assert_eq!(
+            harness.reference_list(&model, STORY, "title", true),
+            ["story.rb:3:6", "index.html.erb:2:15"]
+        );
     }
 }

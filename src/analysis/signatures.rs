@@ -120,6 +120,7 @@ fn blank(source: &str, spans: &[(usize, usize)]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
 
     const NESTED: &str = "\
 class Array
@@ -209,5 +210,135 @@ end
         // the two tests above.
         let stripped = without_interfaces(NESTED).expect("two interfaces");
         assert!(ruby_rbs::node::parse(&stripped).is_ok(), "{stripped}");
+    }
+
+    #[test]
+    fn a_signature_file_that_cannot_be_read_is_skipped_rather_than_indexed_raw() {
+        // A signature root is walked and then read, and a file can go between the two. The
+        // fallback is to leave it to `index_files`, which is the same answer as for a file
+        // with no interfaces in it.
+        let mut harness = Harness::new();
+        let absent = harness.root.path().join("gone.rbs");
+        assert!(!harness.analysis.index_edited_signature(&absent));
+
+        // Not a signature file at all: nothing to edit, and the same answer.
+        let ruby = harness.write("app/person.rb", "class Person\nend\n");
+        assert!(
+            !harness
+                .analysis
+                .index_edited_signature(&ruby.to_path().expect("a path"))
+        );
+    }
+
+    #[test]
+    fn an_rbs_interface_never_reaches_the_graph() {
+        // The end of the path `analysis::signatures` starts: the unit tests there check the text
+        // that comes out, and this checks that rubydex agreed to read it and that nothing from
+        // inside the block survived indexing.
+        //
+        // A signature root of its own rather than the vendored one, so the fixture owns exactly
+        // what is in it: `_Reader` at the top level lands its member on `Object`, and `_Rand`
+        // inside `class Bag` lands its member on `Bag` — both shapes appear in one real file,
+        // `core/array.rbs`, and a rule that only looked at the top level would miss the second.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = dir.path().join("sig/core");
+        std::fs::create_dir_all(&core).unwrap();
+        std::fs::write(
+            core.join("bag.rbs"),
+            "\
+class Bag
+  %a{deprecated: Use Bag::_Rand, or make your own}
+  interface _Rand
+    def roll: (Integer max) -> Integer
+  end
+
+  def keep: () -> void
+end
+
+interface _Reader
+  def read: () -> String
+end
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            format!(
+                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
+                dir.path().join("sig").display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        let uri = harness.write("app/main.rb", "");
+        harness.index();
+        harness.index_gems();
+
+        // The signatures did get indexed — without this the rest of the test passes vacuously,
+        // and an edited file rbs refuses to parse is exactly how it would come to.
+        assert!(
+            harness.has("Bag#keep()"),
+            "the signature root was not indexed"
+        );
+        assert!(!harness.has("Bag#roll()"));
+        assert!(!harness.has("Object#read()"));
+
+        // And the shape a user sees: `Object` is every receiver's ancestor, so a member misfiled
+        // there is offered on everything in the language.
+        let found = harness.declarations_at(&uri, "Bag.new.~\n");
+        assert!(found.contains(&"keep".to_owned()), "{found:?}");
+        assert!(!found.contains(&"roll".to_owned()), "{found:?}");
+        assert!(!found.contains(&"read".to_owned()), "{found:?}");
+    }
+
+    #[test]
+    fn a_projects_own_signatures_are_edited_the_same_way() {
+        // The second of the two routes an `.rbs` file takes into the graph, and the one that was
+        // missed the first time. These files arrive through `index_workspace` rather than through
+        // the background signature index; filtered one way and not the other, `Object#slurp` came
+        // back and was offered on every receiver in the project.
+        //
+        // **No `index.include` here, and that is half of what this test pins.** With a
+        // `**/*.rb` default a project's own `sig/` reaches nothing at all unless the project
+        // widens the glob itself — the feature exists and is invisible.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("sig")).unwrap();
+        std::fs::write(
+            dir.path().join("sig/widget.rbs"),
+            "\
+class Widget
+  interface _Spinnable
+    def spin: () -> void
+  end
+
+  def render: () -> String
+end
+
+interface _Readerish
+  def slurp: () -> String
+end
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ya-lsp.toml"),
+            "[gems]\nenabled = false\ndefault_gems = false\n\n[rbs]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        let uri = harness.write("lib/app.rb", "class Widget\nend\n");
+        harness.index();
+
+        assert!(
+            harness.has("Widget#render()"),
+            "the sig/ directory was not indexed"
+        );
+        assert!(!harness.has("Widget#spin()"));
+        assert!(!harness.has("Object#slurp()"));
+
+        let found = harness.declarations_at(&uri, "Widget.new.~\n");
+        assert_eq!(found, vec!["render".to_owned()], "{found:?}");
     }
 }

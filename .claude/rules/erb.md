@@ -43,9 +43,10 @@ paths:
   watcher share, exactly as the `.rbs` interface rule does. A template reaching the graph raw records
   **no references at all**, so the blanking is the feature, not an optimisation.
 - **`Analysis::with_text` hands out the blanked view too, and forgetting that half is the easiest bug
-  to miss.** Ten of the eighteen requests parse the document themselves rather than reading the graph
+  to miss.** Nineteen of the twenty-four requests reach it rather than the graph's copy of the file
   — the outline, the folds, the scope walk under highlight and rename, the semantic tokens, the
-  cursor under a typed receiver — and every one would otherwise be handed markup to parse as Ruby.
+  labels drawn in the margin, the cursor under a typed receiver — and every one would otherwise be
+  handed markup to parse as Ruby.
   The graph half looked completely correct while `semanticTokens` returned one token for a template
   with four identifiers. The *buffer* stays exactly what the editor sent, because that is what
   incremental edits apply to; `with_source` is the one accessor reaching it, and only `completion`

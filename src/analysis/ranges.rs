@@ -699,6 +699,7 @@ fn marker(comment: &str) -> Option<Marker> {
 mod tests {
     use super::*;
     use crate::analysis::position::PositionEncoding;
+    use crate::analysis::testing::*;
 
     /// Every fold drawn down the left of the file it was computed from: `┌` where one opens, `│`
     /// through each line it hides, and `┘` on the last line it hides. A comment run opens with a
@@ -1262,5 +1263,127 @@ mod tests {
         ] {
             assert!(!chain(marked).is_empty(), "no chain for {marked:?}");
         }
+    }
+
+    #[test]
+    fn a_selection_chain_arrives_as_a_nest_of_parents() {
+        // The half `ranges` own tests cannot see: LSP spells a chain as one range carrying its
+        // parent rather than as a list, the innermost is the one at the top, and the outermost
+        // carries no `parent` key at all.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/a.rb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.selection(&uri, "puts \"he~llo\"\n"),
+            serde_json::json!([{
+                "range": { "start": { "line": 0, "character": 6 },
+                           "end": { "line": 0, "character": 11 } },
+                "parent": {
+                    "range": { "start": { "line": 0, "character": 5 },
+                               "end": { "line": 0, "character": 12 } },
+                    "parent": {
+                        "range": { "start": { "line": 0, "character": 0 },
+                                   "end": { "line": 0, "character": 12 } },
+                        "parent": {
+                            "range": { "start": { "line": 0, "character": 0 },
+                                       "end": { "line": 1, "character": 0 } }
+                        }
+                    }
+                }
+            }])
+        );
+    }
+
+    #[test]
+    fn one_chain_comes_back_per_position_asked_about_in_the_order_asked() {
+        // The protocol pairs the two arrays by index and has no spelling for "not this one", so
+        // a position that resolved to nothing still has to answer — with the buffer, which is
+        // what the second of these is.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/a.rb", "");
+        harness.index();
+        harness.open(&uri, "call(1)\n\n");
+
+        let found = harness.ask(
+            "textDocument/selectionRange",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "positions": [
+                    { "line": 0, "character": 5 },
+                    { "line": 1, "character": 0 },
+                ],
+            }),
+        );
+
+        let chains = found.as_array().expect("one chain per position");
+        assert_eq!(chains.len(), 2);
+        assert_eq!(chains[0]["range"]["end"]["character"], 6);
+        assert_eq!(
+            chains[1]["range"]["end"],
+            serde_json::json!({ "line": 2, "character": 0 })
+        );
+        assert_eq!(chains[1]["parent"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn folding_ranges_are_whole_lines_and_carry_no_characters() {
+        // `lineFoldingOnly` is what every client that matters sends, and a character offset it
+        // has been told to ignore is a field that can only ever be wrong. The `kind` is absent
+        // for the same reason: syntax folds have none, and `null` is not one of LSP's three.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/a.rb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.folding(&uri, "# note\n# more\ndef foo\n  1\nend\n"),
+            serde_json::json!([
+                { "startLine": 0, "endLine": 1, "kind": "comment" },
+                { "startLine": 2, "endLine": 3 },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_file_with_nothing_to_fold_answers_null_rather_than_an_empty_list() {
+        // The one place `null`-versus-`[]` costs the user something they had: a client with a
+        // folding provider stops guessing folds from indentation, so an empty array would take
+        // the guess away *and* put nothing in its place. A `null` hands it back.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/a.rb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.folding(&uri, "x = 1\ny = 2\n"),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_file_the_editor_never_opened_still_folds_and_still_expands() {
+        // Both read through `with_text`, so both answer from disk for a file no `didOpen` ever
+        // named — which is what an editor does when it asks about a file it is only previewing.
+        let mut harness = Harness::new();
+        let uri = harness.write("lib/b.rb", "def foo\n  1\nend\n");
+        harness.index();
+
+        assert_eq!(
+            harness.ask(
+                "textDocument/foldingRange",
+                serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+            ),
+            serde_json::json!([{ "startLine": 0, "endLine": 1 }])
+        );
+        let found = harness.ask(
+            "textDocument/selectionRange",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "positions": [{ "line": 1, "character": 2 }],
+            }),
+        );
+        assert_eq!(
+            found[0]["range"]["start"],
+            serde_json::json!({ "line": 1, "character": 2 })
+        );
     }
 }

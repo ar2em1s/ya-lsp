@@ -1,11 +1,13 @@
 ---
 paths:
   - "src/messages.rs"
+  - "src/logging.rs"
   - "src/workspace/config.rs"
   - "src/workspace/mod.rs"
   - "src/workspace/gems.rs"
   - "src/workspace/rbs.rs"
   - "src/analysis/mod.rs"
+  - "src/analysis/requests.rs"
 ---
 
 # What the server says

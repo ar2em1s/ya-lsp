@@ -2,6 +2,8 @@
 
 use std::process::ExitCode;
 
+use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+
 const USAGE: &str = "\
 ya-lsp — a standalone Ruby language server
 
@@ -15,8 +17,9 @@ OPTIONS:
     -h, --help     Print this message.
 
 ENVIRONMENT:
-    YA_LSP_LOG     Log filter, e.g. `info`, `debug`, `ya_lsp=trace`. Logs go to stderr, never
-                   to stdout, which carries the LSP transport.
+    YA_LSP_LOG     Log filter, e.g. `info`, `debug`, `ya_lsp=trace`. Outranks [log] level in
+                   ya-lsp.toml. Logs go to stderr, never to stdout, which carries the LSP
+                   transport; [log] file adds a second copy on disk.
 ";
 
 fn main() -> ExitCode {
@@ -52,9 +55,13 @@ fn main() -> ExitCode {
     // transport, so treat its absence as the default rather than an error.
     let _ = stdio;
 
-    init_logging();
+    // The decisions are all in `ya_lsp::logging`; the two lines here are the edge — reading the
+    // environment, and the one call that cannot be undone. Anything more in `main` is a line no
+    // test reaches.
+    let (sinks, reload) = ya_lsp::logging::install(std::env::var("YA_LSP_LOG").ok());
+    tracing_subscriber::registry().with(sinks).init();
 
-    match ya_lsp::server::run_stdio() {
+    match ya_lsp::server::run_stdio(reload) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!("{error:#}");
@@ -62,20 +69,4 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Logging goes to stderr only. Anything written to stdout corrupts the LSP stream, and the
-/// failure mode — the editor silently disconnecting — is miserable to debug.
-fn init_logging() {
-    use tracing_subscriber::{EnvFilter, fmt};
-
-    let filter = EnvFilter::try_from_env("YA_LSP_LOG")
-        .unwrap_or_else(|_| EnvFilter::new(ya_lsp::DEFAULT_LOG_FILTER));
-
-    fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .with_target(false)
-        .init();
 }

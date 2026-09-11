@@ -1061,9 +1061,11 @@ fn span(at: &Location<'_>) -> (u32, u32) {
     (at.start_offset() as u32, at.end_offset() as u32)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::testing::*;
 
     /// The selection a fixture marks: `~` twice for a range, once for a bare cursor.
     fn marked(source: &str) -> (String, u32, u32) {
@@ -1370,7 +1372,7 @@ mod tests {
 
     #[test]
     fn the_selection_stays_where_it_would_run_the_same_number_of_times() {
-        // Placement is the whole item. Each of these has a statement the expression could be
+        // Placement is the whole point. Each of these has a statement the expression could be
         // hoisted in front of, and in each the hoist would change the program: it would be
         // evaluated when the guard says it should not be, on every turn of a loop rather than
         // once, at a different time, or where Ruby cannot parse a line at all.
@@ -1810,5 +1812,90 @@ mod tests {
     #[test]
     fn a_selection_of_nothing_but_whitespace_is_not_a_selection() {
         assert!(at("def f\n  puts 1\nend\n", 6, 8).is_empty());
+    }
+
+    #[test]
+    fn a_code_action_arrives_as_an_edit_the_editor_can_apply_without_asking_again() {
+        // No `command` and no `data`: everything the action does is in the `edit`, so there is
+        // nothing to resolve and nothing for the server to be asked a second time. The `kind`
+        // is what the client filters on before it asks at all.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/story.rb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.actions(&uri, "def title\n  puts ~story.name~\nend\n"),
+            "--- Extract into local variable `extracted` [refactor.extract] ---\n\
+             def title\n  extracted = story.name\n  puts extracted\nend\n"
+        );
+        let answer = harness.ask(
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "range": marked_range("def title\n  puts ~story.name~\nend\n"),
+                "context": { "diagnostics": [] },
+            }),
+        );
+        assert_eq!(answer[0]["command"], serde_json::Value::Null);
+        assert_eq!(answer[0]["data"], serde_json::Value::Null);
+        assert_eq!(answer[0]["kind"], "refactor.extract");
+        // The same `WorkspaceEdit` a rename produces, from the same builder, so the version the
+        // client negotiated for arrives here too.
+        assert_eq!(
+            answer[0]["edit"]["documentChanges"][0]["textDocument"]["version"],
+            1
+        );
+    }
+
+    #[test]
+    fn a_position_with_nothing_to_offer_answers_null_rather_than_an_empty_list() {
+        // `[]` tells the client ya-lsp answered and had nothing; `null` tells it nothing was
+        // known. Neither costs a fallback here — no editor invents Ruby refactorings — but the
+        // two are different words and this one is the true one.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/story.rb", "");
+        harness.index();
+
+        assert_eq!(harness.actions(&uri, "~x = 1\n"), "null");
+    }
+
+    #[test]
+    fn a_template_is_offered_no_code_actions() {
+        // Declined for a reason no other request has. Every action here writes a **line**, and
+        // in a template a line belongs to the markup: `erb::ruby_view` keeps the offsets so that
+        // everything which reads answers unchanged, and there is nothing it can do about a line
+        // that starts with `<td>`.
+        let mut harness = Harness::new();
+        let uri = harness.write("app/views/stories/show.html.erb", "");
+        harness.index();
+
+        assert_eq!(
+            harness.actions(&uri, "<td><%= puts ~story.name~ %></td>\n"),
+            "null"
+        );
+    }
+
+    #[test]
+    fn nothing_inside_a_gem_is_offered_a_code_action() {
+        // The same rule as a rename's, silently for the same reason: ya-lsp never proposes an
+        // edit to a file that is not the user's own, and a gem is opened to be read.
+        let (dir, gem_home, env) = project_with_gem(
+            "module Shouty\n  def self.blast(volume)\n    volume * 2\n  end\nend\n",
+        );
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/main.rb", "Shouty.blast(1)\n");
+        harness.index();
+        harness.index_gems();
+
+        let inside = DocUri::from_path(&gem_home.path().join("gems/shouty-1.2.3/lib/shouty.rb"))
+            .expect("a gem file");
+        assert_eq!(
+            harness.actions(
+                &inside,
+                "module Shouty\n  def self.blast(volume)\n    ~volume * 2~\n  end\nend\n"
+            ),
+            "null"
+        );
+        assert!(harness.messages().is_empty(), "nothing said, deliberately");
     }
 }

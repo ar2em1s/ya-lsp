@@ -11,6 +11,24 @@ paths:
   published release; when its API churns the blast radius must be one directory. The return-type
   table is inside that directory and *beside* the graph rather than in it, which keeps the pin cheap
   to reverse — `types.md`.
+- **`analysis/mod.rs` is the thread; `analysis/requests.rs` is the LSP request layer.** Privacy in
+  Rust is by module *descendant*, so a sibling file's `impl Analysis` sees every private field and
+  every private method — which is why that split cost no signature, no accessor and no trait. What
+  is `pub(super)` there is `Analysis::serve`, the one item the run loop calls, plus `own_documents`
+  and `file_name`, which the tests beside `search.rs` and `rename.rs` name.
+  `analysis/synthesize.rs` did this first.
+- **A test lives beside the code whose invariant it would break, and the harness lives in
+  `analysis/`.** `analysis/testing.rs` holds the `Harness` every end-to-end test drives the server
+  through; it is inside `analysis/` because a `Harness` holds an `Analysis`, which is private there
+  and holds the graph. What it hands the rest of the crate is `serde_json::Value`, `String`, `usize`
+  and `bool` — `has`, `declarations_of`, `generated_for`, `document_count` are the graph questions a
+  test beside a *reader* is allowed to ask. `every_generated_document` names a rubydex type and is
+  `pub(super)` for exactly that reason. **A test that wants more than that surface is a test of the
+  analysis thread**, whatever Ruby feature it exercises, and stays under `analysis/`.
+- **Every `mod tests` carries `#[cfg_attr(coverage_nightly, coverage(off))]`.** Without it the file's
+  coverage counts its own test code, which is covered by construction — the number then measures how
+  much test there is rather than how much of the module is tested, and a per-file floor stops
+  meaning anything. Three modules were missing it and their real figures were lower than reported.
 - **Nothing may write to stdout** except the LSP transport. Logging goes to stderr via `tracing`
   (`YA_LSP_LOG` sets the filter). A stray `println!` disconnects the editor with no error.
 - **`Graph::set_encoding` is inert** — offsets from rubydex are always UTF-8 bytes. Convert with
@@ -34,7 +52,7 @@ paths:
   indexing nothing.
 - **Diagnostic defaults are measured, not chosen.** Most rubydex rules fire on correct Ruby
   (`dynamic-ancestor` fires hundreds of times on a real project) and ship `Off`. Before changing a
-  default in `analysis::diagnostics`, run it over a corpus in `tmp/` and count — `benchmarking.md`.
+  default in `analysis::diagnostics`, run it over a corpus in `tmp/` and count.
 - **`publishDiagnostics` is stateful per URI.** Clearing means sending an explicit empty array;
   sending nothing leaves the old squiggles on screen forever.
 - **Client capabilities gate response shapes.** `analysis::ClientSupport` reads
@@ -44,6 +62,25 @@ paths:
 - **A gem's file URIs are inside the workspace when the bundle is vendored.** Any new "is this the
   user's code?" test must exclude `Analysis::foreign_prefixes`, not just the workspace prefix — go
   through `is_own_code`. That list holds the gem roots, the RBS root, and Ruby's own library.
+- **The client is told where the answers are, and the list comes from `capabilities::advertised`.**
+  A document selector is the only gate on what a client ever sends, and a gem's source, Ruby's stdlib
+  and the RBS beside them are outside every workspace folder — so `Analysis::register_documents` asks
+  for them over `client/registerCapability` once the bundle is discovered, which is the earliest the
+  roots exist. **Every request method must appear in `capabilities::DYNAMIC`**: text synchronisation
+  registers on its own, so a method missing from that table leaves a gem file claimed for `didOpen`
+  and silent for that one request, which looks like it is working. A capability that is not a
+  document request is ruled out in `NOT_A_DOCUMENT` rather than left out. **The selector names one
+  directory per gem the lockfile resolved, never `Gems::roots`** — that field is every gem path that
+  exists on the machine, because the first question when no gems are found is which directories were
+  searched, and `foreign_prefixes` is built from it for `is_own_code`, where a wider answer is still
+  a correct one. As a selector it asks the editor to claim every Ruby file under every bundle on the
+  machine; it is also what makes the arbitration between several servers mean anything, since two
+  folders on one Ruby with different bundles must claim different gems. **And the workspace's own
+  prefix is never in the selector** — the client already claimed it, and a second provider over one
+  document is one server answering the same hover twice, which is what the vendored-bundle filter in
+  `register_documents` is for. Ids are fixed strings because re-registering one replaces the client's
+  *record* of a registration without disposing the provider behind it, so a reload has to unregister
+  first. A client that declines keeps exactly what it had, and is told once per process.
 - **rubydex's resolver panics after a deletion, and `analysis::resolve` contains it.**
   `Graph::delete_document` invalidates before it untracks the deleted document's strings, so the work
   the invalidation queued can name a string that has gone, and `resolution.rs:748` unwraps it.
@@ -116,8 +153,8 @@ paths:
   that eleven hand-written strings had never reached, because none ended in a bare `\r`.
 - **A template is blanked on every route into the server, and there are four.** `.erb` reaches rubydex
   through `index_templates` on the cold walk and through `index_buffer` from `didOpen`, `didChange`
-  and the watcher; it reaches the *parsers* through `with_text`, which ten of the eighteen requests
-  use instead of the graph. Every one gets `erb::ruby_view`, which is length- and line-preserving, so
+  and the watcher; it reaches the *parsers* through `with_text`, which nineteen of the twenty-four
+  requests reach. Every one gets `erb::ruby_view`, which is length- and line-preserving, so
   there is no second coordinate system anywhere. The one accessor handing back the real markup is
   `with_source`, and only `completion` calls it (`erb.md`). `codeAction` is declined in a template
   outright: it is the one that writes *lines* (`code-actions.md`).

@@ -91,14 +91,68 @@ pub fn find(
         ));
     }
 
-    // References arrive per declaration and per document, in hash order. Sorting makes the list
-    // read down the file, and adjacent duplicates — the same span reached through two
-    // declarations of one reopened class — collapse.
-    //
-    // `write` is sorted on but deliberately not compared by the dedup: one span reached both as
-    // a declaration and as a reference is one place, not two, and the place it is declared is
-    // what it is. Leaving it in the comparison would have emitted the same location twice for
-    // every caller, `textDocument/references` included.
+    ordered(found)
+}
+
+/// Every place a **member** is named, for a cursor the graph holds no target for.
+///
+/// [`find`] starts from a [`Located`], which is the graph saying what the cursor is on. A macro's
+/// `:symbol` has no such target — rubydex records the call and not its arguments — so the name
+/// arrives from the buffer instead and the mechanism after that is the same one a method under
+/// the cursor gets: matched by name, declaration included.
+///
+/// `name` is the bare word, and both spellings are searched for [`method_names`]'s reason. That
+/// function derives them from a declaration's own name and is not used here on purpose: it
+/// splits on `#`, and a `scope :recent` declares `Story.recent()`.
+#[must_use]
+pub fn to_member(
+    graph: &Graph,
+    synthesized: &Synthesized,
+    name: &str,
+    declarations: &[DeclarationId],
+    scope: &HashSet<UriId>,
+) -> Vec<Reference> {
+    let spellings = [StringId::from(name), StringId::from(&*format!("{name}()"))];
+    let mut found = by_name(graph, &spellings, scope);
+    found.extend(declaration_sites(graph, synthesized, declarations, scope));
+    ordered(found)
+}
+
+/// Every call of one method, matched by name, in the user's own code.
+///
+/// The mechanism [`find`] gives a method under the cursor, addressed by declaration instead:
+/// `callHierarchy/incomingCalls` arrives holding the method it wants the callers of and there is
+/// no position to locate. Both spellings are searched for [`method_names`]' reason, and the
+/// declaration itself is deliberately not in the result — a `def` is not a call of itself, which
+/// is the one way this differs from `includeDeclaration`.
+///
+/// **Found by name is found by name.** Every caller of `call` or `name` here is a caller of
+/// *something* spelled that way, exactly as `textDocument/references` is, and a tree makes that
+/// look more precise than a flat list does. Saying so is the caller's job and it is not optional.
+#[must_use]
+pub fn calls_to(
+    graph: &Graph,
+    declaration: DeclarationId,
+    scope: &HashSet<UriId>,
+) -> Vec<Reference> {
+    let names = method_names(graph, &[declaration]);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    ordered(by_name(graph, &names, scope))
+}
+
+/// One list, read down the file, with each place in it once.
+///
+/// References arrive per declaration and per document, in hash order. Sorting makes the list read
+/// down the file, and adjacent duplicates — the same span reached through two declarations of one
+/// reopened class — collapse.
+///
+/// `write` is sorted on but deliberately not compared by the dedup: one span reached both as a
+/// declaration and as a reference is one place, not two, and the place it is declared is what it
+/// is. Leaving it in the comparison would have emitted the same location twice for every caller,
+/// `textDocument/references` included.
+fn ordered(mut found: Vec<Reference>) -> Vec<Reference> {
     found.sort_unstable_by(|left, right| {
         (&left.uri, left.start, left.end, Reverse(left.write)).cmp(&(
             &right.uri,
@@ -248,6 +302,8 @@ fn at(graph: &Graph, uri_id: UriId, offset: &rubydex::offset::Offset) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::MAX_REFERENCES;
+    use crate::analysis::testing::*;
     use rubydex::{indexing::LanguageId, resolution::Resolver};
 
     use super::super::indexer;
@@ -260,6 +316,35 @@ mod tests {
             .filter(|(_, declaration)| declaration.name().ends_with(suffix))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    #[test]
+    fn a_declaration_that_names_no_method_has_no_call_sites() {
+        // `calls_to` is reached from a call-hierarchy item whose `data` is whatever the client
+        // sent back, and a class is the shape that takes when an item is stale or invented. With
+        // no method among the declarations there is no name to match on, and the guard is not
+        // decoration: `by_name` with an empty list walks every reference in the workspace to
+        // compare each against nothing.
+        let mut graph = Graph::new();
+        assert!(indexer::index_source(
+            &mut graph,
+            "file:///fixture/hr.rb",
+            "class Person\n  def shout\n  end\nend\n\nPerson.new.shout\n",
+            &LanguageId::Ruby
+        ));
+        Resolver::new(&mut graph).resolve();
+        let scope: HashSet<UriId> = graph.documents().keys().copied().collect();
+
+        let [person] = declarations_named(&graph, "Person")[..] else {
+            panic!("one declaration named Person");
+        };
+        assert!(calls_to(&graph, person, &scope).is_empty());
+
+        // The method beside it, so the empty answer above is the class rather than the fixture.
+        let [shout] = declarations_named(&graph, "#shout()")[..] else {
+            panic!("one declaration named shout");
+        };
+        assert_eq!(calls_to(&graph, shout, &scope).len(), 1);
     }
 
     #[test]
@@ -286,6 +371,265 @@ mod tests {
         assert_eq!(
             names,
             vec![StringId::from("shout"), StringId::from("shout()")]
+        );
+    }
+
+    #[test]
+    fn find_all_references_on_new_lists_call_sites_and_not_the_constructor() {
+        // The redirect is a navigation affordance, and `references` is the one caller that must
+        // not take it: `def initialize` is not a declaration of `new`, and a work list of
+        // `.new` call sites with the constructor in it is noise. Before the flag it appeared
+        // for every class whose constructor is in the user's own code.
+        let mut harness = Harness::new();
+        harness.write("lib/shop.rb", CONSTRUCTORS);
+        let source = "Money.new(1)\nMoney.new(2)\n";
+        let caller = harness.write("lib/main.rb", source);
+        harness.index();
+
+        assert_eq!(
+            harness.reference_list(&caller, source, "new(1)", true),
+            vec!["main.rb:0:6", "main.rb:1:6"]
+        );
+    }
+
+    #[test]
+    fn a_use_in_a_spec_is_a_use_and_this_list_is_never_fenced() {
+        // Stated here because two other surfaces do the opposite: a completion list drops a
+        // name only the suite can call, and so does the name rung of goto-definition. This
+        // request must not, and neither must `rename`, which is built on it — a work list of
+        // places to edit that quietly omitted the suite is a refactor that breaks the suite,
+        // and the user never sees what was left out. `environment` holds the table of which
+        // surface does which; this is the half of it with teeth.
+        let mut harness = Harness::new();
+        let declaration = "class Store\n  def ship\n  end\nend\n";
+        let store = harness.write("app/models/store.rb", declaration);
+        harness.write(
+            "spec/models/store_spec.rb",
+            "describe Store do\n  it \"ships\" do\n    Store.new.ship\n  end\nend\n",
+        );
+        harness.write("app/jobs/ship_job.rb", "Store.new.ship\n");
+        harness.index();
+
+        assert_eq!(
+            harness.reference_list(&store, declaration, "ship", false),
+            vec!["ship_job.rb:0:10", "store_spec.rb:2:14"]
+        );
+    }
+
+    #[test]
+    fn a_use_in_a_migration_is_a_use_too() {
+        // The same rule as the spec above, for the tree added after it. A migration is real
+        // Ruby somebody edits and `rename` is built on this list: a work list that quietly
+        // omitted `db/migrate` is a rename that leaves a migration calling a method that no
+        // longer exists, and the failure surfaces years later on somebody else's machine.
+        let mut harness = Harness::new();
+        let declaration = "class Store\n  def ship\n  end\nend\n";
+        let store = harness.write("app/models/store.rb", declaration);
+        harness.write(
+            "db/migrate/20180101000000_ship_everything.rb",
+            "class ShipEverything\n  def change\n    Store.new.ship\n  end\nend\n",
+        );
+        harness.write("app/jobs/ship_job.rb", "Store.new.ship\n");
+        harness.index();
+
+        assert_eq!(
+            harness.reference_list(&store, declaration, "ship", false),
+            vec!["ship_job.rb:0:10", "20180101000000_ship_everything.rb:2:14"]
+        );
+    }
+
+    #[test]
+    fn references_from_a_method_definition_find_its_call_sites() {
+        // The other half of `method_references_are_name_based`: the cursor on `def shout`
+        // rather than on a call. What was defined decides the mechanism — a method is matched
+        // by name, and a constant through the resolution.
+        let mut harness = Harness::new();
+        let declaration = "class Person\n  def shout\n  end\n  attr_reader :volume\nend\n";
+        let person = harness.write("app/person.rb", declaration);
+        let main = harness.write(
+            "app/main.rb",
+            "Person.new.shout\nPerson.new.volume\nother.shout\n",
+        );
+        harness.index();
+        // Open, so the ranges come from the buffer rather than from a re-read of disk: an open
+        // file is the one a find-references result is most likely to name.
+        harness.open(&main, "Person.new.shout\nPerson.new.volume\nother.shout\n");
+
+        // Name-based, so `other.shout` is in the answer too — stated rather than hidden.
+        assert_eq!(
+            harness.reference_list(&person, declaration, "shout", false),
+            vec!["main.rb:0:11", "main.rb:2:6"]
+        );
+        // `attr_reader :volume` defines a method as much as `def` does.
+        assert_eq!(
+            harness.reference_list(&person, declaration, "volume", false),
+            vec!["main.rb:1:11"]
+        );
+    }
+
+    #[test]
+    fn constant_references_are_resolved_rather_than_matched_by_name() {
+        // The whole point of doing this against a resolved graph. `Person` inside `module HR`
+        // and `HR::Person` at the top level are the same constant written two ways, and the
+        // top-level `Person` is a different class that merely shares a name. Any grep gets all
+        // three wrong.
+        let mut harness = Harness::new();
+        harness.write(
+            "app/hr.rb",
+            "module HR\n  class Person\n  end\n\n  class Team\n    def lead\n      Person.new\n    end\n  end\nend\n",
+        );
+        harness.write("app/person.rb", "class Person\nend\n");
+        let source = "HR::Person.new\nPerson.new\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        // The cursor is on the `Person` half of `HR::Person`, which is what the user points at.
+        let found = harness.reference_list(&uri, source, "Person.new", false);
+        assert_eq!(found, vec!["hr.rb:6:6", "main.rb:0:4"], "{found:?}");
+        // Line 1's bare `Person` is a different class and is not in the list. Nothing that
+        // matches on text could tell the two apart in either direction.
+        assert!(!found.contains(&"main.rb:1:0".to_owned()), "{found:?}");
+    }
+
+    #[test]
+    fn a_reference_is_the_name_the_user_wrote_not_the_call_around_it() {
+        // rubydex fabricates a constant reference for every call with a constant receiver so
+        // that `Person.new` can resolve against `Person`'s singleton class. Listing those bytes
+        // would show a second, wider hit over text the user never wrote.
+        let mut harness = Harness::new();
+        harness.write("app/person.rb", "class Person\nend\n");
+        let source = "Person.new\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        let found = harness.references_at(&uri, source, "Person", false);
+        assert_eq!(found.as_array().map(Vec::len), Some(1), "{found}");
+        assert_eq!(
+            found[0]["range"],
+            serde_json::json!({
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 6 },
+            }),
+            "{found}"
+        );
+    }
+
+    #[test]
+    fn references_can_be_asked_for_from_the_definition() {
+        // The common gesture: the cursor is on `class Person`, not on a use of it.
+        let mut harness = Harness::new();
+        let declaration = "class Person\nend\n";
+        let person = harness.write("app/person.rb", declaration);
+        let source = "Person.new\n";
+        harness.write("app/main.rb", source);
+        harness.index();
+
+        assert_eq!(
+            harness.reference_list(&person, declaration, "Person", false),
+            vec!["main.rb:0:0"]
+        );
+        // With the declaration included, its own name span joins the list.
+        assert_eq!(
+            harness.reference_list(&person, declaration, "Person", true),
+            vec!["main.rb:0:0", "person.rb:0:6"]
+        );
+    }
+
+    #[test]
+    fn method_references_are_name_based_and_will_over_report() {
+        // Stated rather than hidden: with no type inference, `shout` is `shout` whoever the
+        // receiver is. `Megaphone#shout` is a different method and it is in the answer anyway.
+        let mut harness = Harness::new();
+        harness.write(
+            "app/person.rb",
+            "class Person\n  def shout\n  end\nend\n\nclass Megaphone\n  def shout\n  end\nend\n",
+        );
+        let source = "Person.new.shout\nMegaphone.new.shout\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        let found = harness.reference_list(&uri, source, "shout", false);
+        assert_eq!(found, vec!["main.rb:0:11", "main.rb:1:14"], "{found:?}");
+    }
+
+    #[test]
+    fn a_call_to_a_method_that_was_never_defined_still_finds_its_call_sites() {
+        // `define_method` and friends mean a name can have call sites and no declaration at
+        // all. Routing through the resolution would answer `null` for exactly the code where
+        // the editor's own word search is least able to help.
+        let mut harness = Harness::new();
+        let source = "widget.summon\nother.summon\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        assert!(!harness.has("#summon()"));
+
+        assert_eq!(
+            harness.reference_list(&uri, source, "summon", true),
+            vec!["main.rb:0:7", "main.rb:1:6"]
+        );
+    }
+
+    #[test]
+    fn references_never_leave_the_users_own_code() {
+        // A gem that uses the same constant is not an answer: nobody is going to edit it, and
+        // for the name-based half of this feature a Rails bundle would drown the real hits.
+        let (dir, _gem_home, env) = project_with_gem("Shouty = 1\nShouty\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+
+        let source = "Shouty\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        let found = harness.reference_list(&uri, source, "Shouty", true);
+        assert!(
+            found.iter().all(|hit| hit.starts_with("main.rb")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn too_many_references_are_truncated_and_the_user_is_told() {
+        // The cap is a safety property, not a preference: without it a name-based match in a
+        // large workspace hands the editor a multi-megabyte response. Measured, `.new` across a
+        // 17,557-file tree finds 35,733. Truncating silently would be a wrong answer that looks
+        // exactly like a right one, so it is said out loud.
+        let mut harness = Harness::new();
+        let source = "widget.ping\n".repeat(MAX_REFERENCES + 1);
+        let uri = harness.write("app/main.rb", &source);
+        harness.index();
+
+        let found = harness.references_at(&uri, &source, "ping", false);
+        assert_eq!(found.as_array().map(Vec::len), Some(MAX_REFERENCES));
+
+        assert_eq!(
+            harness.messages(),
+            vec![messages::references_truncated(
+                MAX_REFERENCES + 1,
+                MAX_REFERENCES
+            )],
+            "a truncated answer has to say so, and say by how much"
+        );
+    }
+
+    #[test]
+    fn the_bytes_rubydex_invented_are_never_listed_as_references() {
+        // rubydex fabricates a constant reference to `<Person>` for every call with a `Person`
+        // receiver, so that the singleton class can be resolved. Those references are attached
+        // to the singleton class — which is exactly what a cursor on `class << self` resolves
+        // to. Verified by removing the filter: this returns `Person.new` in main.rb, a span the
+        // user never wrote and cannot rename.
+        let mut harness = Harness::new();
+        let declaration = "class Person\n  class << self\n    def build\n    end\n  end\nend\n";
+        let person = harness.write("app/person.rb", declaration);
+        harness.write("app/main.rb", "Person.new\n");
+        harness.index();
+
+        assert!(
+            harness
+                .references_at(&person, declaration, "self\n", false)
+                .is_null(),
+            "a call is not a reference to the callee's singleton class"
         );
     }
 }

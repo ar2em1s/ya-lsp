@@ -5,9 +5,11 @@ paths:
 
 # VS Code extension
 
-- **`config.ts` and `server.ts` must never import `vscode`.** That is the only reason they are
-  testable — there is no extension host here, and they hold the platform-specific mistakes.
-  Anything needing the editor goes in `extension.ts`, tested through the bundle-loading smoke test.
+- **`config.ts`, `server.ts` and `claims.ts` must never import `vscode`.** That is the only reason
+  they are testable — there is no extension host here, and they hold the mistakes that are invisible
+  from inside one: the platform-specific paths, the settings translation, and which of several
+  servers answers about a file no folder holds. Anything needing the editor goes in `extension.ts`, tested through the
+  bundle-loading smoke test.
 - **Settings are read with `inspect`, never `get`.** `get` returns package.json's default when
   nobody set anything, which would make package.json a second source of truth for every default in
   `workspace::config` and would quietly outrank the server's. Only explicitly-set values are sent,
@@ -50,17 +52,43 @@ paths:
   `deprecationMessage`, a migration, and a window in which both keys are read and can disagree.
   Every clarity win worth having comes from a category title, a rewritten first sentence, or an
   `enumDescriptions` entry — none of which can break a settings file.
-- **The document selector's pattern is the protocol's relative-pattern shape, never
-  `vscode.RelativePattern`.** It is the only thing stopping one folder's client from claiming a
-  sibling folder's files. `vscode-languageclient` 10 runs every selector through
-  `asDocumentSelector`, whose `asGlobPattern` recognises exactly two things: a plain string, and LSP
-  3.18's `{ baseUri, pattern }` where `baseUri` is a **URI string**. Everything else becomes
-  `undefined`, including a `vscode.RelativePattern`, whose `baseUri` is a `Uri` object and fails
-  `URI.is`. An undefined pattern does not narrow, it *widens*: `languages.match` then scores on
-  language and scheme alone, so every folder's client claims every folder's Ruby files. Given the
-  protocol shape, the client constructs the `vscode.RelativePattern` itself, which makes the
-  separator right on Windows by construction. `activation.test.ts` pins both halves, the second as
-  an explicit guard.
+- **The document selector is the only gate, and every client's is its own folder.**
+  `LanguageClientOptions.workspaceFolder` sets the `rootUri` and nothing else — it does not filter
+  documents — so the selector alone decides which files are ever `didOpen`ed and asked about.
+  Everything else scores 0 in `languages.match` and the server is never told the document exists.
+  A gem's source, Ruby's stdlib and the RBS beside them live outside *every* workspace folder, and
+  the server indexes and answers about all three; it shipped claiming only the folder and presented
+  in the worst form available: `definition` worked, jumped into
+  `activerecord-8.1.3.1/lib/active_record.rb`, and every request in the file it had just opened was
+  dead — nothing logged, because no request was ever sent. **The extension does not fix that by
+  guessing where the gems are.** Doing so means a second copy of `workspace/gems.rs` in TypeScript —
+  the bundle parse, `require_paths`, the vendored-versus-installed RBS choice, an engine's `app/` —
+  which would drift in the one direction nothing reports, since an unclaimed file produces silence
+  rather than an error. So the server names its own roots after the handshake, over
+  `client/registerCapability`, and the selector built here stays the folder and only the folder,
+  whatever the workspace looks like. Nothing varies with the number of folders, which is why no
+  folder count restarts anything.
+- **`claims.ts` decides which server answers about a root, because it is the only place that sees
+  them all.** Two folders on one Ruby resolve to the same gem roots, both servers register them, and
+  two providers over one document is one hover card printed twice with no way to tell which server
+  wrote either half. First asker wins, through `middleware.handleRegisterCapability`; a root only one
+  bundle resolved to is claimed by that bundle, and a registration whose selector empties is dropped
+  rather than forwarded empty — an empty array is not nullish, so the client would keep a provider
+  that can never match. A registration the server did not make under `ya-lsp-documents/` passes
+  through untouched, which is what the file watcher's
+  registration needs. When a client stops it gives its roots
+  up, and `onFoldersChanged` rebuilds exactly the clients that had asked for one nobody owns any
+  more — a selector cannot be changed after construction, so a client that lost a root the first
+  time cannot pick it up later.
+- **The pattern is the protocol's relative-pattern shape, never `vscode.RelativePattern`.**
+  `vscode-languageclient` 10 runs every selector through `asDocumentSelector`, whose
+  `asGlobPattern` recognises exactly two things: a plain string, and LSP 3.18's
+  `{ baseUri, pattern }` where `baseUri` is a **URI string**. Everything else becomes `undefined`,
+  including a `vscode.RelativePattern`, whose `baseUri` is a `Uri` object and fails `URI.is`. An
+  undefined pattern does not narrow, it *widens*: `languages.match` then scores on language and
+  scheme alone, so every folder's client would claim every folder's Ruby files — and so would every
+  registration the server sends. `activation.test.ts` pins the conversion and the containment that
+  follows from it, with an explicit guard so neither can pass vacuously.
 - **`engines.vscode` decides three other versions, and they are not independent.** `@types/vscode`
   is pinned *exactly* to it — a higher one compiles against APIs the oldest supported editor lacks
   and fails at a user's runtime rather than in CI. `vscode-languageclient` has its own floor (10.x
@@ -69,7 +97,9 @@ paths:
   `microsoft/vscode`'s `.npmrc` at the matching `release/*` branch rather than guessing.
 - **`yarn test` runs the bundle, not the sources.** `dist/extension.js` is what ships, and the
   failures worth catching — a dropped import, a command declared but never registered — only exist
-  there.
+  there. `compile` empties `out/` before `tsc` writes it, because `tsc` does not: a deleted test file
+  left a compiled copy behind and `node --test "out/**/*.test.js"` went on running it green, against
+  a module the repository no longer had.
 - **Anything the server reads once at startup needs a restart, not a notification.** `logLevel` is
   `EnvFilter::try_from_env`; `serverPath` decided which process was spawned. `RESTART_REQUIRED` is
   the list, and the extension performs the restart rather than leaving the setting inert.
