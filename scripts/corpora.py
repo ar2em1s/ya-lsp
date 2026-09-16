@@ -20,7 +20,7 @@ repository.
 
 Steps, each idempotent and each runnable alone:
 
-    clone        fetch the pinned commit into the corpus directory
+    clone        fetch the pinned commit into the corpus directory (git only, no Ruby)
     ruby         write `.tool-versions` with the resolved Ruby
     gems         `bundle install`, plus the one corpus that needs a Gemfile hook first
     lsps         install ruby-lsp, solargraph and solargraph-rails into that Ruby
@@ -483,14 +483,22 @@ def blame_gem(out):
     return match.group(1) if match else None
 
 
+# Each step, and whether it reaches for a Ruby. **The third column is what CI depends on.** The
+# canary job installs no Ruby at all — deliberately, for a project whose headline is that it
+# needs none — and it clones through this script, so `clone` has to run on a machine with no
+# asdf on PATH. `RUBYLESS` is derived from this column rather than written out again, so a step
+# added here cannot forget to say which kind it is.
 STEPS = [
-    ("clone", step_clone),
-    ("ruby", step_ruby),
-    ("gems", step_gems),
-    ("lsps", step_lsps),
-    ("solargraph", step_solargraph),
-    ("docs", step_docs),
+    ("clone", step_clone, False),           # git fetch and checkout; nothing else
+    ("ruby", step_ruby, True),
+    ("gems", step_gems, True),
+    ("lsps", step_lsps, True),
+    ("solargraph", step_solargraph, True),
+    ("docs", step_docs, True),
 ]
+# Which commands run without asdf. `setup` and `status` are in neither list and stay guarded:
+# `setup` runs every step, and `status` resolves each corpus' Ruby to report on it.
+RUBYLESS = frozenset(name for name, _, needs_ruby in STEPS if not needs_ruby)
 
 
 # --------------------------------------------------------------------------------- status
@@ -699,7 +707,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "command",
-        choices=[name for name, _ in STEPS] + ["status", "setup"],
+        choices=[name for name, _, _ in STEPS] + ["status", "setup"],
         help="which step to run; `setup` runs them all in order",
     )
     parser.add_argument("--only", action="append", metavar="NAME", help="one corpus; repeatable")
@@ -712,7 +720,10 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="echo the commands run")
     args = parser.parse_args()
 
-    if not shutil.which("asdf"):
+    # Only the commands that drive a Ruby need asdf. Guarding the rest fails `clone`, which is a
+    # git fetch — and `make canary-clone` is that command on a runner with no Ruby toolchain at
+    # all. It was written unconditionally once and took CI's canary job down with it.
+    if args.command not in RUBYLESS and not shutil.which("asdf"):
         print("corpora: asdf is not on PATH; this script drives Ruby through it", file=sys.stderr)
         return 2
 
@@ -735,7 +746,7 @@ def main():
     failures = 0
     for corpus in corpora:
         print(f"{corpus.name} ({corpus.license})")
-        for name, step in steps:
+        for name, step, _ in steps:
             try:
                 print(f"  {name:<11} {step(corpus, args)}", flush=True)
             except Fail as failure:

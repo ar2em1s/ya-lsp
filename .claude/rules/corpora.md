@@ -61,6 +61,12 @@ A corpus path is not a secret; a corpus *line* is the thing with an owner. Namin
   `--allow-nearest` takes another patch of the same MAJOR.MINOR, preferring one whose bundle
   already resolves over the highest one, and says which in the manifest. It is an escape hatch, not
   a default: a measurement taken under a substituted Ruby says so on its face.
+- **`clone` is the one command that needs no Ruby, and CI depends on that.** The canary job
+  installs no Ruby toolchain at all — deliberately, for a project whose headline is that it needs
+  none — and `make canary-clone` fetches through this script. So the asdf guard is **per command**,
+  derived from the `needs_ruby` column of `STEPS` rather than listed again beside it. A guard at
+  the top of `main` refuses a git fetch on a runner that was never going to have asdf; it was
+  written that way once and the only thing that could see it was CI.
 - **discourse is swept, and was not until 2026-09-12.** The exclusion was measured against the
   *exhaustive* bench sweeps, where it is four times the next corpus and over an hour a side; the
   audit draws a stratified sample and there it costs 77s. `audit.md` carries the numbers and what

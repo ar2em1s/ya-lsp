@@ -63,6 +63,13 @@ paths:
   ya-lsp's object store, and runs `checkout --detach` on the working tree being developed in. It
   was written that way once; what stopped it was an unrelated dirty tree, not the check.
   `[ -e "$dir/.git" ]` cannot walk up, and the toplevel comparison refuses the root itself.
+- **Nothing on the canary's path may need a Ruby.** The job installs none — that is the same
+  decision as *the gem half is not covered* above, not a second one — so the clone step it now
+  shares with the other five corpora has to stay a git fetch. `scripts/corpora.py` therefore
+  guards on `asdf` per command, off the `needs_ruby` column of its `STEPS` table, and `clone` is
+  the one that says no. A guard at the top of `main` covers the five commands that do drive Ruby
+  and takes this job down with them; that is exactly how it was written when the clone moved
+  there, and a laptop with asdf on PATH cannot reproduce it.
 - **`make canary` is deliberately not in `make ci`.** Everything in `ci` is hermetic; a target that
   fails on a plane teaches people to skip it. CI runs the canary as its own job, where the name in
   the checks list says what it covers.
