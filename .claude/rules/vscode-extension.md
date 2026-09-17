@@ -74,12 +74,36 @@ paths:
   wrote either half. First asker wins, through `middleware.handleRegisterCapability`; a root only one
   bundle resolved to is claimed by that bundle, and a registration whose selector empties is dropped
   rather than forwarded empty — an empty array is not nullish, so the client would keep a provider
-  that can never match. A registration the server did not make under `ya-lsp-documents/` passes
+  that can never match. **A root inside another workspace folder is refused outright**, before
+  first-asker-wins applies: that folder's client already claims it by selector, so granting it puts
+  two providers over one file from the registration side — the one direction `claimedByNestedFolder`
+  cannot see. Which folder "another" means is `innermostFolder`, shared with the request-side
+  narrowing so the two cannot disagree; a vendored bundle inside a *nested* folder belongs to that
+  folder and not to the one above it, and a first-match rule would have handed it to whichever folder
+  the `.code-workspace` listed first. A registration the server did not make under `ya-lsp-documents/` passes
   through untouched, which is what the file watcher's
   registration needs. When a client stops it gives its roots
   up, and `onFoldersChanged` rebuilds exactly the clients that had asked for one nobody owns any
   more — a selector cannot be changed after construction, so a client that lost a root the first
   time cannot pick it up later.
+- **A workspace folder may contain another one, and the selector cannot say so.** VS Code allows
+  it — a monorepo listing the repository for the code beside the apps and each app for its own
+  `Gemfile.lock` — and `getWorkspaceFolder` resolves a file in the inner folder to the *innermost*
+  one. An LSP glob has `*`, `**`, `?`, `{}` and `[]` and **no way to subtract a path**, so "under
+  the parent but not under the child" is unsayable: the outer folder's client claims the inner
+  folder's files along with its own, both clients match, and every request is answered twice — a
+  hover card printed twice, every completion item doubled, one set of squiggles over another.
+  Nesting cannot simply be refused, because each folder may hold the only `Gemfile.lock` for its
+  own code and a server resolves exactly one bundle. So the outer client is narrowed where it
+  sends, in `narrowing()`: `GeneralMiddleware.sendRequest` covers every request with one hook, and
+  the four text-sync hooks keep the outer server from being handed the buffer at all. The predicate
+  is `claimedByNestedFolder`, beside `Claims` because it is the same question from the other side —
+  that one arbitrates a file *no* folder holds, this one a file *two* folders hold. **`index.exclude`
+  does not reach this**: the server indexes an opened buffer whatever its walk collected, so an
+  excluded file still gets a hover. The wiring is pinned in `activation.test.ts` rather than only
+  the predicate, because what is left to get wrong is reading the document from the wrong place in
+  the parameters or passing the two strings in the wrong order — both silent, and failing in
+  opposite directions.
 - **The pattern is the protocol's relative-pattern shape, never `vscode.RelativePattern`.**
   `vscode-languageclient` 10 runs every selector through `asDocumentSelector`, whose
   `asGlobPattern` recognises exactly two things: a plain string, and LSP 3.18's

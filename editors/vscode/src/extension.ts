@@ -20,12 +20,13 @@ import {
   DidChangeConfigurationNotification,
   LanguageClient,
   LanguageClientOptions,
+  Middleware,
   RegistrationParams,
   ServerOptions,
   TransportKind,
 } from 'vscode-languageclient/node';
 
-import { Claims, DocumentFilter, Registration } from './claims';
+import { Claims, DocumentFilter, Registration, claimedByNestedFolder } from './claims';
 import { RESTART_REQUIRED, Settings, serverEnvironment, serverOptions } from './config';
 import { FolderFiles, RUBOCOP_EXTENSION, usesRubocop } from './rubocop';
 import { resolveServer } from './server';
@@ -173,12 +174,13 @@ async function start(folder: vscode.WorkspaceFolder): Promise<void> {
     outputChannel: channelFor(folder),
     initializationOptions: serverOptions(settings),
     middleware: {
+      ...narrowing(key),
       // The one place every client is visible at once, which is what this decision needs. The
       // server registers the roots it has answers about; `claims` drops the ones another folder's
       // server got to first, and forwards everything it does not recognise — the file watcher's
       // registration carries no selector and has to arrive exactly as sent.
       handleRegisterCapability: (params, next): Promise<void> => {
-        const narrowed = claims.narrow(key, params.registrations as Registration[]);
+        const narrowed = claims.narrow(key, params.registrations as Registration[], folderUris());
         // `next` is typed as the protocol's `RequestHandler`, which takes a cancellation token as
         // its second argument — but the client builds it as `nextParams =>
         // this.doRegisterCapability(nextParams)` and there is no token anywhere to pass. Narrowed
@@ -412,6 +414,77 @@ function isExecutable(candidate: string): boolean {
   }
 }
 
+
+/**
+ * Whether this client is the one to send about `document`.
+ *
+ * A request naming no document — `initialize`, `workspace/symbol`, `shutdown` — is always this
+ * client's to send: it is about the folder rather than about a file, and the folder is its own.
+ */
+/**
+ * The middleware that keeps one folder's client out of a nested folder's files.
+ *
+ * Exported because this is the half of the nesting fix that cannot be reasoned about from
+ * `claims.ts`: the predicate there is pure and tested directly, and everything that can still go
+ * wrong is *wiring* — reading the document from the wrong place in the parameters, or passing the
+ * folder and the document in the wrong order. Both fail silently and in opposite directions. One
+ * leaves every answer doubled, exactly as before; the other makes a client answer nothing at all,
+ * with no error anywhere. `activation.test.ts` drives this against the stubbed editor.
+ */
+export function narrowing(folder: string): Middleware {
+  return {
+    // Every request this client would send about a document a *nested* workspace folder holds,
+    // dropped before it goes. `getWorkspaceFolder` resolves such a file to the innermost folder
+    // and `documentSelector` cannot: an LSP glob has no way to subtract a path, so this folder's
+    // client claims a nested folder's files too and the user reads every answer twice. The
+    // folder list is read per call rather than captured, because `onDidChangeWorkspaceFolders`
+    // can add a nested folder under a client that is already running.
+    //
+    // `textDocument.uri` is the only shape read, and it is the only one that has to be: every
+    // request carrying a document somewhere else — `completionItem/resolve`, a hierarchy item, an
+    // inlay hint being resolved — follows one that carries it here, so blocking the entry point
+    // blocks the rest. `null` is the empty answer for all of them.
+    sendRequest: (type, param, token, next) => {
+      if (mine(folder, documentOf(param))) {
+        return next(type, param, token);
+      }
+      // `sendRequest`'s `R` is the response type of whichever request this is, and there is no
+      // way to name it from here. `null` is a legal response to every one of them — the
+      // protocol's own "no answer" — so the cast asserts what the protocol already guarantees.
+      return Promise.resolve(null) as never;
+    },
+    // The same decision for the text sync, so the server is never told the document exists. It
+    // saves the outer server indexing and publishing diagnostics about a buffer that is not its
+    // to answer about — `didOpen` indexes whatever it is handed, whatever `index.exclude` said —
+    // and the four must agree with each other or the server sees an edit to a file it never
+    // opened. They do, because the predicate is the same one and it reads the same list.
+    didOpen: (document, next) => (mine(folder, document.uri.toString()) ? next(document) : Promise.resolve()),
+    didChange: (event, next) =>
+      mine(folder, event.document.uri.toString()) ? next(event) : Promise.resolve(),
+    didSave: (document, next) => (mine(folder, document.uri.toString()) ? next(document) : Promise.resolve()),
+    didClose: (document, next) => (mine(folder, document.uri.toString()) ? next(document) : Promise.resolve()),
+  };
+}
+
+function mine(folder: string, document: string | undefined): boolean {
+  return document === undefined || !claimedByNestedFolder(folder, folderUris(), document);
+}
+
+/**
+ * Every workspace folder's URI, read at the call rather than captured at construction.
+ *
+ * A nested folder can be added under a client that is already running, and unlike the selector —
+ * which is fixed once the client is built — this decision can follow.
+ */
+function folderUris(): string[] {
+  return (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString());
+}
+
+/** The document a request names, in the one place every request that starts a chain names it. */
+function documentOf(param: unknown): string | undefined {
+  const uri = (param as { textDocument?: { uri?: unknown } } | undefined)?.textDocument?.uri;
+  return typeof uri === 'string' ? uri : undefined;
+}
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

@@ -57,7 +57,13 @@ pub struct IndexConfig {
     pub include: Vec<String>,
     /// Globs, relative to the workspace root, to skip.
     pub exclude: Vec<String>,
-    /// Extra roots to index and to resolve `require` against.
+    /// Extra roots to index and to resolve `require` against — the project's own `$LOAD_PATH`.
+    ///
+    /// Relative to the workspace root, or absolute. A path that leaves the root is how a monorepo
+    /// names a tree its applications share: it is walked for `.rb` and `.rbs`, it counts as the
+    /// user's own code, and the server asks the editor to claim it, because no client's selector
+    /// reaches outside its own folder. `..` and a symlink out of the tree both work, and both
+    /// used to fail silently — see `workspace::resolve_load_path`.
     pub load_paths: Vec<PathBuf>,
     /// Hard ceiling on indexed files. Refuse rather than thrash.
     pub max_files: usize,

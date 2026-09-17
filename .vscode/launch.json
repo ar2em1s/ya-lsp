@@ -14,20 +14,6 @@
       "env": {
         "YA_LSP_LOG": "ya_lsp=debug"
       }
-    },
-    {
-      "name": "Multi-root gem check",
-      "type": "extensionHost",
-      "request": "launch",
-      "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}/editors/vscode",
-        "${workspaceFolder}/tmp/multiroot/ya-lsp-multiroot.code-workspace"
-      ],
-      "outFiles": ["${workspaceFolder}/editors/vscode/dist/**/*.js"],
-      "preLaunchTask": "build the extension (release)",
-      "env": {
-        "YA_LSP_LOG": "ya_lsp=debug"
-      }
     }
   ]
 }

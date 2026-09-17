@@ -102,3 +102,24 @@ paths:
   project excluding `db/` gets no dump read. Deliberately narrow — one caller, one file type — rather
   than a general "read anything" door. `core-invariants.md` holds it to the same strictly-wider
   property the other two share.
+
+- **`[index] load_paths` indexes, and the path it names is resolved once.** It documented itself as
+  "extra roots to index" for four releases and indexed nothing — it reached `require` resolution and
+  the prefix order and stopped — so a monorepo that named its shared tree got a `require` resolving
+  to a document the graph did not hold. Two spellings failed on top of that, both silently, because
+  `is_dir` was the only check and `is_dir` follows everything: `../shared` kept its `..` into every
+  prefix comparison, and the graph writes no URI with a `..` in it; a `shared` that is a **symlink**
+  out of the tree was never walked, since `discover` sets `follow_links(false)`. `resolve_load_path`
+  canonicalizes both, and then spells the result back under the root's own prefix when it is inside
+  the root — `canonicalize` resolves the root's symlinks too, and a workspace routinely reaches disk
+  through one, so a canonicalized `lib` under a root spelled `/tmp/...` comes back `/private/tmp/...`
+  and stops being a prefix of any document the walk indexed.
+- **Inside the root and outside it are indexed by different things, and the split is the rule.**
+  `Workspace::external_load_paths` is the second list. A load path inside the root is already the
+  walk's — walking it again is every file twice, so every class declared twice. One outside is
+  reached by nothing else, so `Analysis::collect_external_load_paths` takes it as `.rb` and `.rbs`
+  (the globs are written relative to the root and cannot describe a tree outside it), inside
+  `index.max_files`, and `register_documents` asks the client to claim it, because no selector
+  reaches outside its own folder. **Known limit**: a file opened through a *different* spelling than
+  the one indexed — a symlinked tree browsed through the link rather than through its target — forks
+  a second document, since `DocUri` canonicalizes encoding and not symlinks.

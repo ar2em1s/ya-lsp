@@ -4,6 +4,29 @@ The server and the VS Code extension ship as one version. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-09-17
+
+### Fixed
+
+- **A workspace folder inside another workspace folder no longer answers everything twice.** VS
+  Code allows the nesting — a monorepo listing the repository for the code beside its applications,
+  and each application for its own `Gemfile.lock` — and the editor resolves a file in the inner
+  folder to the innermost one. A document selector cannot say that: an LSP glob has no way to
+  subtract a path, so the outer folder's client claimed the inner folder's files too, both servers
+  answered, and every hover card, completion item and diagnostic arrived twice. The nesting cannot
+  simply be refused, because each folder may hold the only lockfile for its own code and a server
+  resolves exactly one bundle. The outer client now stops at the boundary instead. A root that lies
+  inside another folder is likewise refused at registration, where the same duplicate used to arrive
+  from the opposite direction.
+- **`[index] load_paths` indexes the roots it names.** It documented itself as "extra roots to index"
+  and indexed nothing — it reached `require` resolution and stopped — so a project that named a tree
+  outside its root got a `require` that resolved to a document the graph did not hold. Both spellings
+  of such a path failed on top of that, and silently: `../shared` carried its `..` into comparisons
+  against URIs that never contain one, and a directory reached through a **symlink** was never walked
+  at all. Both resolve now, the tree is indexed, it counts as the user's own code — diagnostics,
+  rename and search all treat it as the project's rather than as somebody's gem — and the server asks
+  the editor to claim it, since no client's selector reaches outside its own folder.
+
 ## [0.5.0] — 2026-09-16
 
 ### Added

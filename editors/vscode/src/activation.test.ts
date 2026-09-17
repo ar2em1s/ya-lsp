@@ -378,3 +378,81 @@ test('the language client turns a protocol relative pattern into an editor one',
     'an editor RelativePattern is dropped, which is why the protocol shape is used'
   );
 });
+
+/**
+ * The wiring between `claims.ts`'s predicate and the requests this client actually sends.
+ *
+ * `claimedByNestedFolder` is pure and pinned in `claims.test.ts`; what is left here is the part
+ * that can only be wrong in `extension.ts` — reading the document from the wrong place in the
+ * parameters, or handing the predicate its two strings the wrong way round. Both are silent, and
+ * they fail in opposite directions: one leaves every answer in a nested folder doubled, exactly
+ * the bug this exists to fix, and the other makes a client answer nothing anywhere.
+ *
+ * Driven through the bundle rather than the sources, for the reason every other test here is.
+ */
+test('a parent folder`s client sends nothing about a nested folder`s files', async () => {
+  const { narrowing } = require(bundle) as {
+    narrowing(folder: string): {
+      sendRequest(
+        type: string,
+        param: unknown,
+        token: undefined,
+        next: (type: string, param: unknown, token: undefined) => Promise<unknown>
+      ): Promise<unknown>;
+      didOpen(document: unknown, next: (document: unknown) => Promise<void>): Promise<void>;
+    };
+  };
+
+  const folder = (uri: string): unknown => ({ name: uri, uri: { toString: () => uri } });
+  strict.workspace = {
+    ...(strict.workspace as Record<string, unknown>),
+    workspaceFolders: [folder('file:///repo'), folder('file:///repo/backend')],
+  };
+
+  const middleware = narrowing('file:///repo');
+  const forwarded: string[] = [];
+  const next = (_type: string, param: unknown): Promise<unknown> => {
+    forwarded.push(String((param as { textDocument: { uri: string } }).textDocument.uri));
+    return Promise.resolve('a card');
+  };
+  const hover = (uri: string): unknown => ({
+    textDocument: { uri },
+    position: { line: 0, character: 0 },
+  });
+
+  assert.equal(
+    await middleware.sendRequest('textDocument/hover', hover('file:///repo/backend/app.rb'), undefined, next),
+    null,
+    'the backend client is the one that answers here, and it is the only one that should'
+  );
+  // The guard, in the direction that would otherwise pass by refusing everything.
+  assert.equal(
+    await middleware.sendRequest('textDocument/hover', hover('file:///repo/shared/user.rb'), undefined, next),
+    'a card',
+    'the parent folder still answers about its own files, or nothing answers about them at all'
+  );
+  assert.deepEqual(forwarded, ['file:///repo/shared/user.rb'], 'and only that one was sent');
+
+  // A request naming no document is about the folder, not about a file, and must still go.
+  const symbols: string[] = [];
+  assert.deepEqual(
+    await middleware.sendRequest('workspace/symbol', { query: 'User' }, undefined, (type) => {
+      symbols.push(type);
+      return Promise.resolve(['a symbol']);
+    }),
+    ['a symbol'],
+    'workspace/symbol carries no textDocument and must not be mistaken for a blocked one'
+  );
+  assert.deepEqual(symbols, ['workspace/symbol']);
+
+  // And the text sync, so the outer server is never handed the buffer in the first place.
+  const opened: string[] = [];
+  const document = (uri: string): unknown => ({ uri: { toString: () => uri } });
+  const open = (document: unknown): Promise<void> => {
+    opened.push(String((document as { uri: { toString(): string } }).uri.toString()));
+    return Promise.resolve();
+  };
+  await middleware.didOpen(document('file:///repo/backend/app.rb'), open);
+  await middleware.didOpen(document('file:///repo/shared/user.rb'), open);
+  assert.deepEqual(opened, ['file:///repo/shared/user.rb']);
+});

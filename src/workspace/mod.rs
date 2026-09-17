@@ -162,18 +162,42 @@ impl Workspace {
     /// which is what `require "version"` inside an app means.
     #[must_use]
     pub fn load_paths(&self) -> Vec<PathBuf> {
-        let mut paths: Vec<PathBuf> = self
-            .config
-            .index
-            .load_paths
-            .iter()
-            .map(|relative| self.root.join(relative))
-            .filter(|path| path.is_dir())
-            .collect();
+        let mut paths: Vec<PathBuf> = self.project_load_paths();
         if let Some(gems) = self.gems.as_ref() {
             paths.extend(gems.load_paths());
         }
         paths
+    }
+
+    /// The project's own load paths, resolved — without the bundle's.
+    ///
+    /// Its own method because two callers want exactly this list and neither wants the gems:
+    /// [`Workspace::external_load_paths`] below, and the tests that pin the resolution.
+    #[must_use]
+    pub fn project_load_paths(&self) -> Vec<PathBuf> {
+        self.config
+            .index
+            .load_paths
+            .iter()
+            .filter_map(|relative| resolve_load_path(&self.root, relative))
+            .collect()
+    }
+
+    /// The project's load paths that lie **outside** the workspace root.
+    ///
+    /// The split is what decides who indexes them. A load path inside the root is already the
+    /// walk's business — `discover` collected it, under `index.include` and the root's own
+    /// spelling — and walking it a second time here would index every file twice, which is two
+    /// declarations of every class and a definition list with each place in it twice. One
+    /// outside the root is reached by nothing else: the walk starts at the root and
+    /// `follow_links` is off, so a sibling directory, or a symlink to one, is invisible until
+    /// something names it. That is what this list is for.
+    #[must_use]
+    pub fn external_load_paths(&self) -> Vec<PathBuf> {
+        self.project_load_paths()
+            .into_iter()
+            .filter(|path| !path.starts_with(&self.root))
+            .collect()
     }
 
     /// Walk the workspace and collect the files to index.
@@ -272,6 +296,39 @@ fn matches_any(patterns: &[Pattern], relative: &Path) -> bool {
     patterns
         .iter()
         .any(|pattern| pattern.matches_path_with(relative, MATCH_OPTIONS))
+}
+
+/// A configured load path as the filesystem really spells it, or `None` if it is not a directory.
+///
+/// `is_dir` on the bare join was the whole check, and it let two spellings through that then
+/// matched no document at all. Every path here is compared against the graph's own URIs, and the
+/// graph never writes a `..`: `load_paths = ["../shared"]` joined to `<root>/../shared`, passed
+/// `is_dir` — which follows `..` happily — and resolved nothing, with no warning anywhere. A
+/// `shared` that is a **symlink** out of the tree failed the same way and for the same reason.
+///
+/// So the path is canonicalized, and then, when it is inside the root, spelled back the way the
+/// root spells it. That second half is not tidiness. `canonicalize` resolves every symlink in the
+/// path, and a workspace root routinely reaches disk through one — every macOS temp directory,
+/// `/var` and `/tmp` on any mac — so a canonicalized `lib` under a root spelled `/tmp/...` comes
+/// back as `/private/tmp/.../lib` and stops being a prefix of any document the walk indexed.
+/// Keeping the root's spelling for what is inside it, and the canonical one for what is outside,
+/// is the only pairing where both comparisons hold.
+fn resolve_load_path(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let resolved = root.join(relative).canonicalize().ok()?;
+    if !resolved.is_dir() {
+        return None;
+    }
+    // `canonicalize` on the root too, because the question is whether the *real* directories
+    // nest — `<root>/../shared` can canonicalize back inside a root that is itself a symlink.
+    match root.canonicalize() {
+        Ok(canonical_root) => match resolved.strip_prefix(&canonical_root) {
+            Ok(inside) => Some(root.join(inside)),
+            Err(_) => Some(resolved),
+        },
+        // A root that cannot be canonicalized has been deleted under us. The resolved path is
+        // still the best answer available, and it is what the walk would have failed on too.
+        Err(_) => Some(resolved),
+    }
 }
 
 /// The ignore rules, spelled once. The other half of what both entry points share.
@@ -911,5 +968,104 @@ mod tests {
         assert!(problems.is_empty(), "{problems:?}");
         // `app` does not exist, so only `lib` survives.
         assert_eq!(workspace.load_paths(), vec![root.join("lib")]);
+        // And it is spelled the way the *root* is, not the way the filesystem is. A temp
+        // directory on macOS reaches disk through `/var -> /private/var`, so a canonicalized
+        // `lib` would come back under `/private/...` and stop being a prefix of any document the
+        // walk indexed — every one of which is spelled from this same root.
+        assert!(
+            workspace.load_paths()[0].starts_with(root),
+            "a load path inside the root keeps the root's spelling: {:?}",
+            workspace.load_paths()[0]
+        );
+        // Inside the root, so nothing here is the walk's to be told about a second time.
+        assert!(workspace.external_load_paths().is_empty());
+    }
+
+    #[test]
+    fn a_load_path_that_leaves_the_root_resolves_and_is_external() {
+        // `../shared` passed `is_dir` — which follows `..` happily — and then matched no
+        // document at all, because the graph spells no URI with a `..` in it. Silent: no
+        // warning, no error, `require` simply resolved nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("shared/models")).unwrap();
+        std::fs::write(base.join("shared/models/user.rb"), "class User; end\n").unwrap();
+        let root = base.join("app");
+        write(&root, "lib/thing.rb", "x");
+        std::fs::write(
+            root.join("ya-lsp.toml"),
+            "[index]\nload_paths = [\"../shared\"]\n",
+        )
+        .unwrap();
+
+        let (workspace, problems) = Workspace::load(root.clone(), None);
+        assert!(problems.is_empty(), "{problems:?}");
+        let resolved = workspace.project_load_paths();
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+        assert!(
+            !resolved[0].to_string_lossy().contains(".."),
+            "a `..` survives into every prefix comparison downstream: {:?}",
+            resolved[0]
+        );
+        assert!(resolved[0].ends_with("shared"), "{:?}", resolved[0]);
+        // Outside the root, so the walk never reaches it and something else has to.
+        assert_eq!(workspace.external_load_paths(), resolved);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_load_path_that_is_a_symlink_out_of_the_tree_resolves_to_where_the_files_are() {
+        // The other spelling of the same monorepo. `follow_links` is off in the walk, so a
+        // symlinked directory is not indexed by it and never was; naming it here is the only
+        // route, and it only works if the link is resolved to its target.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("shared/models")).unwrap();
+        std::fs::write(base.join("shared/models/user.rb"), "class User; end\n").unwrap();
+        let root = base.join("app");
+        write(&root, "lib/thing.rb", "x");
+        std::os::unix::fs::symlink(base.join("shared"), root.join("shared")).unwrap();
+        std::fs::write(
+            root.join("ya-lsp.toml"),
+            "[index]\nload_paths = [\"shared\"]\n",
+        )
+        .unwrap();
+
+        let (workspace, _) = Workspace::load(root.clone(), None);
+        let external = workspace.external_load_paths();
+        assert_eq!(external.len(), 1, "{external:?}");
+        assert!(
+            external[0].join("models/user.rb").is_file(),
+            "the link has to resolve to the directory that really holds the files: {:?}",
+            external[0]
+        );
+        // The guard, and it is the whole point of calling it *external*: the link sits inside
+        // the root, so a resolution that stopped at the link would put it on the wrong side of
+        // the split and the walk would be expected to have indexed it. It did not.
+        assert!(
+            !external[0].starts_with(&root),
+            "resolved past the link, not to it: {:?}",
+            external[0]
+        );
+    }
+
+    #[test]
+    fn a_load_path_that_is_not_a_directory_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "lib/thing.rb", "x");
+        std::fs::write(root.join("notes.txt"), "not a directory").unwrap();
+        std::fs::write(
+            root.join("ya-lsp.toml"),
+            "[index]\nload_paths = [\"notes.txt\", \"nowhere\", \"lib\"]\n",
+        )
+        .unwrap();
+
+        let (workspace, _) = Workspace::load(root.to_path_buf(), None);
+        assert_eq!(
+            workspace.project_load_paths(),
+            vec![root.join("lib")],
+            "a file and a missing directory are both dropped, and the real one survives"
+        );
     }
 }

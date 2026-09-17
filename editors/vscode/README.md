@@ -1,77 +1,162 @@
 # ya-lsp for VS Code
 
-Ruby language support that does not need Ruby.
+**Ruby language support that never runs Ruby.** It parses your code, reads `Gemfile.lock` and the
+gems on disk, and answers from a graph it builds itself — so go-to-definition, hover and completion
+work on a machine where the project's Ruby is not installed, the bundle is not installed, and
+nothing has to boot. The extension ships the binary: there is nothing to add to your `Gemfile` and
+nothing to `bundle exec`.
 
-The extension bundles a `ya-lsp` binary for your platform. There is nothing to install and nothing
-to add to your `Gemfile`: ya-lsp never executes Ruby, `bundle` or `gem`, so it works on a machine
-where the project's Ruby is not installed at all.
+**What makes it different from every other Ruby server: each answer tells you how far to trust it.**
+A Ruby tool that cannot run your code has to guess sometimes, and the usual arrangement is that you
+find out which answers were guesses by being wrong.
 
-It does *read* `.ruby-version` and `.tool-versions` — in the project or any directory above it, the
-way rbenv, chruby, RVM, asdf and mise all resolve them — falling back to `RUBY VERSION` in
-`Gemfile.lock`. That is how it knows which Ruby's own library to index. When none of them answer it
-says so rather than guessing, and `json`, `uri` and the other ~40 gems inside Ruby stay out of the
-index; `ya-lsp.gems.rubyVersion` settles it, and `ya-lsp.gems.defaultGems` silences it.
+- **No Ruby, at all.** Never executes `ruby`, `bundle` or `gem`, and never shells out. A legacy app
+  on a Ruby you may not install, a locked bundle you may not add a gem to, an air-gapped box, a
+  container: install the extension and that is the whole setup.
+- **Fast from cold.** A pinned commit of a real Rails application — **606 files** — indexes in
+  **under 50 ms**, re-measured on every CI run against a 500 ms ceiling the build fails at.
+- **Nothing to keep warm.** **No cache on disk**, so there is nothing to invalidate or prune, and
+  no first-run penalty after a branch switch.
+- **Every answer is labelled.** Hover cards and completion rows say *Resolved*, *Derived* or
+  *Guessed*, and the guessing can be switched off entirely.
+- **Your gems too.** Definitions, hover and completion follow into the bundle, Ruby's own library
+  and the RBS signatures beside them — read from `Gemfile.lock` and the gem directories on disk.
+
+```ruby
+"x".upcase          # String  — Resolved: the code names the type
+@title.upcase       # String  — Derived: from the assignment, and the card says so
+@user               # User    — Guessed: the receiver's name alone, and nothing else
+```
+
+*Guessed* is the only tier allowed to be wrong, it never displaces the other two, and it is never
+painted into a margin as an inlay hint. `ya-lsp.types.guessFromNames` turns it off and keeps only
+the answers that are checkable.
+
+---
+
+## Getting started
+
+1. **Install the extension.** In VS Code, `Ctrl+P` / `Cmd+P`, then:
+
+   ```
+   ext install ar2em1s.yalsp
+   ```
+
+   Or find **ya-lsp** in the Extensions view, or open it
+   [on the Marketplace](https://marketplace.visualstudio.com/items?itemName=ar2em1s.yalsp).
+
+2. **Open a Ruby project.** That is the whole setup. The server starts on the first `.rb` or
+   `.erb` file you open, indexes the workspace, then indexes the bundle with progress in the status
+   bar. Nothing is added to your `Gemfile` and no Ruby is invoked.
+
+3. **Check it is working.** Hover any constant — the card names the declaration and carries a tier.
+   If nothing happens, run **ya-lsp: Show Output** from the command palette.
+
+4. *(Optional)* **Commit a `ya-lsp.toml`** in the workspace root so the whole team gets the same
+   setup in every editor:
+
+   ```toml
+   [gems]
+   enabled = true
+
+   [types]
+   guess_from_names = false   # keep only answers that are checkable
+   ```
+
+   It **overrides every editor setting below**, and changes take effect without a restart.
+
+**Requirements:** VS Code 1.108 or newer. The extension bundles a binary for **macOS (Apple
+silicon), Linux (x64, arm64) and Windows (x64, arm64)**. On any other platform — Intel macOS
+included — build the server from [the repository](https://github.com/ar2em1s/ya-lsp) and point
+`ya-lsp.serverPath` at it.
+
+---
+
+## Contents
+
+- [What you get](#what-you-get)
+- [How precise are the answers?](#how-precise-are-the-answers)
+- [Which Ruby it indexes](#which-ruby-it-indexes)
+- [Settings](#settings)
+- [Running RuboCop alongside](#running-rubocop-alongside)
+- [Commands](#commands)
+- [Multi-root workspaces](#multi-root-workspaces)
+
+---
 
 ## What you get
 
 Diagnostics, go-to-definition, hover, document symbols, workspace symbol search, find-references,
 completion, signature help, occurrence highlighting, folding, expand-selection, rename, four
 refactorings, document links, inlay hints and the type and call hierarchies — across your project
-**and its gems**, which are read straight from `Gemfile.lock` and the gem directories on disk.
+**and its gems**.
 
-Folding follows the syntax rather than the indentation VS Code otherwise guesses from: `if`,
+**Folding follows the syntax** rather than the indentation VS Code otherwise guesses from: `if`,
 `elsif` and `else` fold as three regions, a heredoc's body folds, comment blocks and `#region`
 markers fold as themselves, and every `end` stays on screen.
 
-**Show Type Hierarchy** works in both directions, on a class or a module, from the right-click menu
-or the command palette. Upwards it lists Ruby's own ancestors — so included and `prepend`ed modules
-are in it, the way `Module#ancestors` reports them; downwards it lists every class below, not only
-the ones written `< Base`, so a subclass three levels down is in the list too.
+**Show Type Hierarchy** works in both directions, on a class or a module. Upwards it lists Ruby's
+own ancestors — so included and `prepend`ed modules are in it, the way `Module#ancestors` reports
+them; downwards it lists every class below, not only the ones written `< Base`, so a subclass three
+levels down is in the list too.
 
-**Inlay hints** label three things the line does not say: what a block parameter holds, what a
-local assigned from a call holds, and what a method returns where a signature declares it. A type
-ya-lsp matched on a name alone is **never drawn** — a margin has no room for a footnote and is read
-as fact — so every hint you see is derived from a signature, an assignment or a convention, and
-points at which one in its tooltip. Each family has its own switch.
+**Inlay hints** label three things the line does not say: what a block parameter holds, what a local
+assigned from a call holds, and what a method returns where a signature declares it. A type matched
+on a name alone is **never drawn** — a margin has no room for a footnote and is read as fact — so
+every hint you see is derived from a signature, an assignment or a convention, and points at which
+one in its tooltip. Each family has its own switch.
 
-**Call hierarchy** works in both directions. *Show Call Hierarchy* upwards is a work list: nothing
-links a call to a declaration, so every caller is a name match and each row says `by name` beside
-the file it is in. Downwards it lists only the calls that resolve precisely, because an edge in a
-tree claims more than a row in a list does.
+**Call hierarchy** works in both directions. Upwards is a work list: nothing links a call to a
+declaration, so every caller is a name match and each row says `by name` beside the file it is in.
+Downwards it lists only the calls that resolve precisely, because an edge in a tree claims more than
+a row in a list does.
 
 **F2 renames** local variables, parameters and constants. A constant changes in every file it is
-written in, and only where it really is that constant — `Person` inside `module HR` and
-`HR::Person` at the top level are one name, a `Person` in another namespace is not. Nothing is
-edited until every place it would be edited has been read back and confirmed to hold only that
-name; if one of them cannot be, the whole rename is declined and a notification says which file to
-look at. Methods, instance variables, anything defined in a gem, and a name that is also written
-as a keyword or a hash key are declined the same way, each with its own reason — rename is the one
-feature here that would rather say no than be approximately right.
+written in, and only where it really is that constant — `Person` inside `module HR` and `HR::Person`
+at the top level are one name, a `Person` in another namespace is not. Nothing is edited until every
+place it would be edited has been read back and confirmed to hold only that name; if one of them
+cannot be, the whole rename is declined and a notification says which file to look at. Methods,
+instance variables, anything defined in a gem, and a name that is also written as a keyword or a
+hash key are declined the same way, each with its own reason — **rename would rather say no than be
+approximately right.**
 
 **The lightbulb** offers four refactorings: extract the selection into a local variable or into a
 method, toggle a block between `{ }` and `do … end`, and declare an `attr_reader`, `attr_writer` or
-`attr_accessor` for the instance variable at the cursor. They are the four families that are
-rewrites over a syntax tree; the fifth, autocorrecting a style offence, is RuboCop's own and
-arrives if you run its server alongside.
+`attr_accessor` for the instance variable at the cursor. Like rename, these decline rather than
+approximate — an extraction whose result would have to hand a value back to the code after it, a
+block whose two spellings would bind to different calls, an `attr_reader` that would read the
+class's `@count` rather than an instance's. Every action is applied to a copy of the file and
+re-parsed before it is offered, so nothing in the menu can leave your buffer unparseable.
 
-Like rename, these decline rather than approximate — an extraction whose result would have to hand
-a value back to the code after it, a block whose two spellings would bind to different calls, an
-`attr_reader` that would read the class's `@count` rather than an instance's. And every action is
-applied to a copy of the file and re-parsed before it is offered, so nothing in the menu can leave
-your buffer unparseable.
+---
 
 ## How precise are the answers?
 
 ya-lsp resolves constants and does not infer types, and that line runs through every feature.
-Constants are exact. Methods are matched by name once the receiver is a local variable, which
-means find-references on `name` returns every call spelled that way. `Foo.`, `self.` and a bare
-call in a class body all resolve properly. The repository README has the tier table and the
-order a receiver is tried in.
+Constants are exact. Methods are matched by name once the receiver is a local variable, which means
+find-references on `name` returns every call spelled that way. `Foo.`, `self.` and a bare call in a
+class body all resolve properly. [The repository
+README](https://github.com/ar2em1s/ya-lsp#readme) has the full tier table and the order a receiver
+is tried in.
+
+---
+
+## Which Ruby it indexes
+
+ya-lsp *reads* `.ruby-version` and `.tool-versions` — in the project or any directory above it, the
+way rbenv, chruby, RVM, asdf and mise all resolve them — falling back to `RUBY VERSION` in
+`Gemfile.lock`. That is how it knows which Ruby's own library to index.
+
+When none of them answer **it says so rather than guessing**, and `json`, `uri` and the other ~40
+gems inside Ruby stay out of the index. `ya-lsp.gems.rubyVersion` settles it, and
+`ya-lsp.gems.defaultGems` silences it.
+
+---
 
 ## Settings
 
-The settings UI groups these the way the table does. A committed `ya-lsp.toml` in the workspace
-root **overrides every one of them**, so a team can agree on one setup that works in every editor;
+The settings UI groups these the way the table does. A committed `ya-lsp.toml` in the workspace root
+**overrides every one of them**, so a team can agree on one setup that works in every editor;
 changing it takes effect without a restart. The two spellings differ by convention rather than by
 meaning, so the TOML key is named beside each setting.
 
@@ -110,7 +195,7 @@ meaning, so the TOML key is named beside each setting.
 | `ya-lsp.trees.migration` | `[trees] migration` | Where migrations live, as `parent/mark` pairs. A migration is loaded by path, alone, so what is written in one is reachable from nothing. |
 | `ya-lsp.index.include` | `[index] include` | Globs, relative to the folder, of the files to index. |
 | `ya-lsp.index.exclude` | `[index] exclude` | Globs to skip. Where vendored or generated Ruby goes when git does not ignore it. |
-| `ya-lsp.index.loadPaths` | `[index] load_paths` | Extra roots to index, also used to resolve `require "..."`. |
+| `ya-lsp.index.loadPaths` | `[index] load_paths` | Extra roots to index, also used to resolve `require "..."`. A path outside the folder is how a monorepo names a tree its apps share. |
 | `ya-lsp.index.respectGitignore` | `[index] respect_gitignore` | Skip what git ignores. Turn it off for a project whose Ruby is generated into an ignored directory. |
 | `ya-lsp.index.maxFiles` | `[index] max_files` | Refuse to index a workspace larger than this. |
 
@@ -119,41 +204,61 @@ gem files nobody has needed to tune, and `index.max_files` is the one that actua
 
 ### When something else is already linting the file
 
-Switch the rule off rather than the category. `ya-lsp.diagnostics.rules` set to
+**Switch the rule off rather than the category.** `ya-lsp.diagnostics.rules` set to
 `{ "parse-warning": "off" }` silences the "assigned but unused variable" class of warnings — the
 ground RuboCop's and Standard's `Lint/UselessAssignment` covers — while a file that does not parse
 still gets its squiggle. Every rule can be set that way, all ten complete by name, and each says on
 hover what it fires on.
 
-### Running RuboCop alongside
+---
+
+## Running RuboCop alongside
 
 ya-lsp never runs Ruby, so no cop offence and no autocorrect ever comes from it. Install
 [RuboCop](https://marketplace.visualstudio.com/items?itemName=rubocop.vscode-rubocop), published by
-the RuboCop team, and run both — LSP allows a language to be served by more than one server, and
-these two divide the work rather than competing for it. There is nothing to configure: ya-lsp
-advertises no formatting capability, so there is no default formatter to pick between; each
-extension owns its own diagnostic collection rather than overwriting the other's; and the two
-lightbulbs merge, because ya-lsp advertises only `refactor.extract` and `refactor.rewrite` while
-RuboCop advertises only `quickfix`. Turn `parse-warning` off, as above, so
+the RuboCop team, and run both — **LSP allows a language to be served by more than one server, and
+these two divide the work rather than competing for it.**
+
+There is nothing to configure: ya-lsp advertises no formatting capability, so there is no default
+formatter to pick between; each extension owns its own diagnostic collection rather than overwriting
+the other's; and the two lightbulbs merge, because ya-lsp advertises only `refactor.extract` and
+`refactor.rewrite` while RuboCop advertises only `quickfix`. Turn `parse-warning` off, as above, so
 that the one class of warning they both report arrives once.
 
 You get offences, formatting, and — **on RuboCop 1.89 or newer** — a lightbulb on each offence
-offering *Autocorrect* and *Disable for this line*. 1.89 is where RuboCop's server started
-answering `textDocument/codeAction`; on an older one the quick fixes are absent and only the
-whole-document **RuboCop: Format with Autocorrects** command applies them.
+offering *Autocorrect* and *Disable for this line*. 1.89 is where RuboCop's server started answering
+`textDocument/codeAction`; on an older one the quick fixes are absent and only the whole-document
+**RuboCop: Format with Autocorrects** command applies them.
 
-ya-lsp offers this once per project, when it finds a `.rubocop.yml` or `rubocop` in
-`Gemfile.lock` and the extension is not installed. `ya-lsp.rubocop.hint` turns the offer off, and
-so does choosing **Don't show again**.
+ya-lsp offers this once per project, when it finds a `.rubocop.yml` or `rubocop` in `Gemfile.lock`
+and the extension is not installed. `ya-lsp.rubocop.hint` turns the offer off, and so does choosing
+**Don't show again**.
+
+---
 
 ## Commands
 
 - **ya-lsp: Restart Server**
 - **ya-lsp: Show Output**
 
+---
+
 ## Multi-root workspaces
 
-One server per folder, because everything a server does — the index, gem discovery, `ya-lsp.toml`
-— is scoped to a single root. A workspace with a single folder starts its server with the window.
-In a multi-root workspace each folder starts when you open a Ruby file inside it, so a folder with
-no Ruby in it — infrastructure, docs, a service in another language — never gets one.
+One server per folder, because everything a server does — the index, gem discovery, `ya-lsp.toml` —
+is scoped to a single root. A workspace with a single folder starts its server with the window. In a
+multi-root workspace each folder starts when you open a Ruby file inside it, so a folder with no
+Ruby in it — infrastructure, docs, a service in another language — never gets one.
+
+**A folder may contain another folder**, which is how a monorepo with a `Gemfile.lock` per
+application is usually opened. Each keeps its own bundle, and a file in the inner folder is answered
+by the inner folder's server only — so nothing arrives twice. Where those applications share a tree
+beside them, name it with `ya-lsp.index.loadPaths` and it is indexed, counts as your own code, and
+is reachable from every folder that names it.
+
+---
+
+## License
+
+MIT. Ruby's RBS signatures are vendored under their own licence — run **ya-lsp --licenses** or see
+[`NOTICE.txt`](https://github.com/ar2em1s/ya-lsp/blob/master/NOTICE.txt).

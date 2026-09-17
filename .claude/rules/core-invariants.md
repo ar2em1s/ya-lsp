@@ -62,6 +62,16 @@ paths:
 - **A gem's file URIs are inside the workspace when the bundle is vendored.** Any new "is this the
   user's code?" test must exclude `Analysis::foreign_prefixes`, not just the workspace prefix — go
   through `is_own_code`. That list holds the gem roots, the RBS root, and Ruby's own library.
+- **The user's own code is not only what is under the root.** `Analysis::own_prefixes` is the second
+  way to say yes, and it holds exactly the `[index] load_paths` entries that resolve *outside* the
+  root — a monorepo's shared tree, named by hand. Without it that tree is indexed and then treated
+  as somebody's gem: no diagnostics, no rename, ranked below the bundle in search, in a directory
+  the project wrote down itself. It is a separate list rather than a wider `workspace_prefix`
+  because the gems must stay out, which is `is_generator_source`'s argument applied to a different
+  question — and the guard against widening it too far is a test that a gem root still answers no.
+  Both halves are a function of one resolution: `workspace::resolve_load_path` canonicalizes, and
+  the walk, this list and the registration all read that same answer, so they cannot disagree about
+  how a path is spelled.
 - **The client is told where the answers are, and the list comes from `capabilities::advertised`.**
   A document selector is the only gate on what a client ever sends, and a gem's source, Ruby's stdlib
   and the RBS beside them are outside every workspace folder — so `Analysis::register_documents` asks

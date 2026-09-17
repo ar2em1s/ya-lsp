@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { Claims, DOCUMENTS_ID_PREFIX, Registration } from './claims';
+import { Claims, DOCUMENTS_ID_PREFIX, Registration, claimedByNestedFolder } from './claims';
 
 const APP = 'file:///work/app';
 const API = 'file:///work/api';
@@ -132,4 +132,106 @@ test('releasing a server nobody was waiting on rebuilds nothing', () => {
   claims.narrow(API, [documents('textDocument/hover', ['file:///gems/other-1.0.0'])]);
 
   assert.deepEqual(claims.release(APP), [], 'API never asked for what APP was holding');
+});
+
+/**
+ * A folder inside another folder, which is the one containment case the selector cannot express.
+ *
+ * `/repo` holds the code beside the apps; `/repo/backend` and `/repo/frontend` are applications
+ * with their own `Gemfile.lock`, so all three want a server and the nesting cannot be flattened
+ * away. Without this, `/repo`'s client claims every file in both apps as well as its own and the
+ * user reads every hover, every completion item and every squiggle twice.
+ */
+const REPO = 'file:///repo';
+const BACKEND = 'file:///repo/backend';
+const FRONTEND = 'file:///repo/frontend';
+const NESTED = [REPO, BACKEND, FRONTEND];
+
+test('an outer folder gives up the files a nested folder holds', () => {
+  assert.equal(
+    claimedByNestedFolder(REPO, NESTED, 'file:///repo/backend/app/models/story.rb'),
+    true,
+    'the backend client answers about its own files, and it is the only one that should'
+  );
+  assert.equal(
+    claimedByNestedFolder(REPO, NESTED, 'file:///repo/frontend/app/helpers/tag.rb'),
+    true
+  );
+});
+
+test('an outer folder keeps everything no nested folder holds', () => {
+  // The guard that stops the test above from passing by refusing everything: `/repo` still has
+  // files of its own, at any depth, and giving those up would leave them answered by nobody.
+  assert.equal(claimedByNestedFolder(REPO, NESTED, 'file:///repo/shared/models/user.rb'), false);
+  assert.equal(claimedByNestedFolder(REPO, NESTED, 'file:///repo/Rakefile'), false);
+  assert.equal(
+    claimedByNestedFolder(REPO, NESTED, 'file:///repo/lib/tasks/deep/down/here.rb'),
+    false,
+    'depth is not what decides it — which folder holds the file is'
+  );
+});
+
+test('a nested folder gives up nothing to the folder above it', () => {
+  // The direction matters, and getting it backwards silently swaps which server answers: the
+  // inner folder is the one `getWorkspaceFolder` resolves to, so it keeps its own files.
+  assert.equal(claimedByNestedFolder(BACKEND, NESTED, 'file:///repo/backend/app/models/story.rb'), false);
+  // And it never had a claim on its parent's files or its sibling's — the selector refused those.
+  assert.equal(claimedByNestedFolder(BACKEND, NESTED, 'file:///repo/shared/models/user.rb'), false);
+  assert.equal(claimedByNestedFolder(BACKEND, NESTED, 'file:///repo/frontend/app/helpers/tag.rb'), false);
+});
+
+test('a sibling folder is left to the selector, and a gem to `Claims`', () => {
+  assert.equal(claimedByNestedFolder(APP, [APP, API], 'file:///work/api/app/models/story.rb'), false);
+  assert.equal(
+    claimedByNestedFolder(APP, [APP, API], `${ACTIVERECORD}/lib/active_record.rb`),
+    false,
+    'a root outside every folder is claimed by registration, and must not be dropped here'
+  );
+});
+
+test('a folder whose name merely prefixes another keeps its files', () => {
+  // `/repo` against `/repository`: a prefix test without the separator hands one folder's files
+  // to a server that was never told about them, and nothing anywhere reports it.
+  assert.equal(
+    claimedByNestedFolder('file:///repo', ['file:///repo', 'file:///repository'], 'file:///repository/app.rb'),
+    false
+  );
+  assert.equal(
+    claimedByNestedFolder('file:///repo/', ['file:///repo/', BACKEND], 'file:///repo/backend/app.rb'),
+    true,
+    'a folder URI carrying a trailing slash decides the same way'
+  );
+});
+
+test('a root inside another folder is that folder`s, whoever registered it', () => {
+  // The registration side of the nesting problem. `repo/backend`'s server resolves the shared
+  // tree its `[index] load_paths` names and asks for it — but that tree is inside `repo`, whose
+  // client already claims it by selector. Granting it would put two providers over the file
+  // again, from the one direction `claimedByNestedFolder` cannot see.
+  const claims = new Claims();
+  const shared = 'file:///repo/shared';
+  assert.deepEqual(
+    claims.narrow(BACKEND, [documents('textDocument/hover', [shared])], NESTED),
+    [],
+    'the repository folder holds it, and its selector already claims every file in it'
+  );
+  // The guard: a root inside *no* folder is exactly what this class exists to hand out, and
+  // passing the folder list must not have broken that.
+  assert.deepEqual(
+    claimed(claims.narrow(BACKEND, [documents('textDocument/hover', [ACTIVERECORD])], NESTED)),
+    [ACTIVERECORD]
+  );
+});
+
+test('a server may still claim a root inside its own folder', () => {
+  // A vendored bundle at `vendor/bundle` is inside the folder that locked it. The server filters
+  // those out before sending — they are already claimed by its own selector — but the rule here
+  // is "another folder's", not "any folder's", and getting that backwards would drop a root the
+  // server does send: `.gem_rbs_collection/` in a folder that is itself nested.
+  const claims = new Claims();
+  const vendored = `${BACKEND}/vendor/bundle/ruby/4.0.0/gems/nokogiri-1.19.0`;
+  assert.deepEqual(
+    claimed(claims.narrow(BACKEND, [documents('textDocument/hover', [vendored])], NESTED)),
+    [vendored]
+  );
 });

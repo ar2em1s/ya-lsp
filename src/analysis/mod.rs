@@ -766,6 +766,16 @@ struct Analysis {
     /// Every workspace document URI starts with this. Used to keep gem diagnostics off the
     /// screen without parsing a URL per diagnostic.
     workspace_prefix: String,
+    /// The project's own code that is **not** under the root: `[index] load_paths` entries
+    /// pointing outside it, as directory URI prefixes.
+    ///
+    /// A second way to be the user's own code, and the only one there is. A monorepo whose
+    /// applications share a tree beside them names it here, and every surface that asks "may I
+    /// act on this file?" has to say yes: without it a shared model gets no diagnostics, is not
+    /// offered for rename, and ranks as somebody else's code in search — in a directory the
+    /// project wrote down by hand. The gem roots stay out of it, which is the whole reason this
+    /// is a separate list rather than a wider `workspace_prefix`.
+    own_prefixes: Vec<String>,
     /// URI prefixes of everything indexed that is not the user's code: the gem roots, and the
     /// RBS root Ruby's own signatures came from.
     ///
@@ -902,9 +912,53 @@ impl Analysis {
             recovering: false,
             index_full_reported: false,
             workspace_prefix,
+            // Filled by `index_workspace` rather than here, so that a `ya-lsp.toml` reload —
+            // which re-runs that walk and can change `[index] load_paths` — cannot leave it
+            // describing the previous configuration. Every other prefix list works this way.
+            own_prefixes: Vec::new(),
             published: HashMap::new(),
             logging,
         }
+    }
+
+    /// Add the project's load paths that lie outside the workspace root to the walk's result.
+    ///
+    /// **`[index] load_paths` said "extra roots to index" for four releases and indexed nothing.**
+    /// It reached `require` resolution and the prefix list that says which code is the project's
+    /// own, and no walk ever visited it — so a monorepo that put its shared tree on the list got
+    /// a `require` that resolved to a document the graph did not hold. The list is small, it is
+    /// written by hand, and it is the only way to name project code the root does not contain:
+    /// `discover` starts at the root and `follow_links` is off, so a sibling directory, or a
+    /// symlink to one, is reached by nothing else.
+    ///
+    /// Taken as `.rb` and `.rbs`, the way every other load path in the crate is walked, rather
+    /// than through `index.include`: those globs are written relative to the root and cannot
+    /// describe a tree outside it. Inside `index.max_files` all the same — it is a budget over
+    /// the project's own code, and this is the project's own code.
+    fn collect_external_load_paths(&mut self, discovery: &mut crate::workspace::Discovery) {
+        let external = self.workspace.external_load_paths();
+        if external.is_empty() {
+            return;
+        }
+        let budget = self.workspace.config().index.max_files;
+        let already: std::collections::HashSet<&PathBuf> = discovery.files.iter().collect();
+        let mut found: Vec<PathBuf> = gems::source_files(&external)
+            .into_iter()
+            .filter(|path| !already.contains(path))
+            .collect();
+        drop(already);
+
+        let room = budget.saturating_sub(discovery.files.len());
+        if found.len() > room {
+            found.truncate(room);
+            discovery.truncated = true;
+        }
+        tracing::info!(
+            "{} file(s) from {} load path(s) outside the workspace root",
+            found.len(),
+            external.len()
+        );
+        discovery.files.extend(found);
     }
 
     /// Index everything in the workspace, once, at startup.
@@ -912,7 +966,18 @@ impl Analysis {
         let started = Instant::now();
         self.warn_about_unknown_rules();
         self.say_what_the_fences_replaced();
-        let discovery = self.workspace.discover();
+        // Before the walk that reads them, and re-read on every rebuild: `[index] load_paths` is
+        // configuration, and a reload arrives here. A directory URI so the prefix test cannot
+        // match a sibling whose name merely starts the same way.
+        self.own_prefixes = self
+            .workspace
+            .external_load_paths()
+            .iter()
+            .filter_map(|path| DocUri::from_path(path))
+            .map(|uri| format!("{}/", uri.as_str().trim_end_matches('/')))
+            .collect();
+        let mut discovery = self.workspace.discover();
+        self.collect_external_load_paths(&mut discovery);
 
         for problem in &discovery.problems {
             tracing::warn!("{problem}");
@@ -1248,9 +1313,16 @@ impl Analysis {
         // Here rather than after the walk below, and deliberately not behind the gem budget: this
         // is a function of which roots were *discovered*, and a bundle large enough to be
         // truncated is the one whose gems a user is most likely to be reading in.
+        // The project's own trees outside the root go on the same list as the gems, and for the
+        // same reason: a client's selector is its folder, so a file outside every folder is one
+        // nobody would ever send a request about. They are not *foreign* — `own_prefixes` keeps
+        // them the user's own code — they are merely elsewhere, and being elsewhere is the whole
+        // of what `register_documents` is for.
+        let external = self.workspace.external_load_paths();
         self.register_documents(
             &held
                 .iter()
+                .chain(external.iter())
                 .chain(signatures.origin.is_some().then_some(&signatures.root))
                 .collect::<Vec<_>>(),
         );
@@ -2127,7 +2199,12 @@ impl Analysis {
     /// Compared as a URI prefix rather than a path: both sides come from `Url::from_file_path`,
     /// so they are already canonical, and this runs once per diagnostic.
     fn is_own_code(&self, uri: &str) -> bool {
-        uri.starts_with(&self.workspace_prefix)
+        let named = uri.starts_with(&self.workspace_prefix)
+            || self
+                .own_prefixes
+                .iter()
+                .any(|prefix| uri.starts_with(prefix));
+        named
             && !self
                 .foreign_prefixes
                 .iter()
@@ -4137,5 +4214,103 @@ end
 
         let found = harness.declarations_at(&uri, "Blanket.new.~\n");
         assert_eq!(found, vec!["tuck".to_owned()], "{found:?}");
+    }
+    /// A reload that changes `[index] load_paths` changes what counts as the user's own code.
+    ///
+    /// `own_prefixes` is the one prefix list that is not derived from the bundle, so it has no
+    /// other reason to be rebuilt — and it was first written where `workspace_prefix` is, which is
+    /// read once at construction. `rebuild` re-runs the walk and clears every neighbouring list;
+    /// a stale one here would keep answering about the *previous* configuration's directories for
+    /// the rest of the session, which is the shape every bug in this family has.
+    #[test]
+    fn a_reload_that_changes_the_load_paths_changes_what_is_owned() {
+        let shared = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(shared.path().join("models")).unwrap();
+        std::fs::write(shared.path().join("models/user.rb"), "class User; end\n").unwrap();
+        let real = shared.path().canonicalize().unwrap();
+        let user = DocUri::from_path(&real.join("models/user.rb")).unwrap();
+
+        let base = "[gems]\ndefault_gems = false\n\n[rbs]\nenabled = false\n";
+        let mut harness = Harness::configured(base);
+        harness.index();
+        assert!(
+            !harness.analysis.is_own_code(user.as_str()),
+            "nothing names this tree yet"
+        );
+
+        // The project names it, and reloads.
+        std::fs::write(
+            harness.root.path().join("ya-lsp.toml"),
+            format!(
+                "{base}\n[index]\nload_paths = [{}]\n",
+                serde_json::to_string(&shared.path().to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+        harness.run(Task::ReloadConfig);
+        harness.analysis.settle();
+        assert!(
+            harness.analysis.is_own_code(user.as_str()),
+            "a reload has to re-read the list, or it describes the configuration before it"
+        );
+    }
+
+    /// A tree outside the workspace root, named by `[index] load_paths`, is indexed, is the
+    /// user's own code, and is a root the client is asked to claim.
+    ///
+    /// The monorepo case, and every one of the three had its own way of failing quietly. The
+    /// setting documented itself as "extra roots to index" and indexed nothing — it reached
+    /// `require` resolution and stopped — so a shared model was a name the graph did not hold.
+    /// Once indexed it would have been *foreign*, because `is_own_code` is a prefix test against
+    /// the root: no diagnostics, no rename, ranked below the bundle in search, in a directory
+    /// the project wrote down by hand. And a file outside every workspace folder is one no
+    /// client's selector claims, so nothing would ever have asked about it.
+    #[test]
+    fn a_load_path_outside_the_root_is_indexed_owned_and_claimed() {
+        let shared = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(shared.path().join("models")).unwrap();
+        std::fs::write(
+            shared.path().join("models/user.rb"),
+            "class User\n  def display_name = 'x'\nend\n",
+        )
+        .unwrap();
+
+        let mut harness = Harness::configured(&format!(
+            "[gems]\ndefault_gems = false\n\n[rbs]\nenabled = false\n\n[index]\nload_paths = [{}]\n",
+            serde_json::to_string(&shared.path().to_string_lossy()).unwrap()
+        ));
+        let source = "class Story\n  def who = User.new\nend\n";
+        let story = harness.write("app/models/story.rb", source);
+        harness.index();
+
+        // Indexed: the declaration is in the graph, reachable from a file in the root.
+        let answer = harness.definition_at(&story, source, "User");
+        let landed = serde_json::to_string(&answer).unwrap();
+        assert!(
+            landed.contains("models/user.rb"),
+            "a load path outside the root has to be walked, or `require` resolves to nothing: {landed}"
+        );
+
+        // The user's own code: the prefix test has a second way to say yes now.
+        //
+        // Canonicalized, because that is the spelling the index holds: `resolve_load_path`
+        // resolves the path once and everything downstream — the walk, `own_prefixes`, the
+        // registration — is a function of that one answer. A temp directory on macOS reaches
+        // disk through `/var -> /private/var`, so the two spellings genuinely differ here and
+        // asserting the wrong one is how this test first failed.
+        let real = shared.path().canonicalize().unwrap();
+        let user_uri = DocUri::from_path(&real.join("models/user.rb")).unwrap();
+        assert!(
+            harness.analysis.is_own_code(user_uri.as_str()),
+            "a tree the project named by hand is not somebody else's gem"
+        );
+        // The guard, in the direction that widening a prefix test always threatens: a real gem
+        // root must still be foreign, or diagnostics start appearing inside the bundle.
+        assert!(
+            !harness
+                .analysis
+                .is_own_code("file:///gems/activerecord-8.1.3.1/lib/active_record.rb"),
+            "widening `is_own_code` must not have swallowed the gems it exists to exclude"
+        );
     }
 }
