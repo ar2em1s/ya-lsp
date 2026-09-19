@@ -1,27 +1,27 @@
-//! Rails' inflector, minus everything this corpus did not need.
+//! Rails' inflector, minus everything real applications here do not need.
 //!
-//! Four functions and the two tables in [`super`] that make them irregular. What is missing
-//! costs a **miss**, never a wrong answer, and that is the whole design: a class whose plural
-//! names no table declares nothing, and a table no class claims declares nothing. Both
-//! directions are here because both are needed — [`table_of`] goes class to table, which is the
-//! safe direction the schema reader takes, and [`singularize`] goes the other way because a
-//! `has_many :comments` says its element type in the plural and nowhere else.
+//! Six functions, plus the two tables in [`super`] that make them irregular. What is missing costs
+//! a **miss**, never a wrong answer, and that is the whole design: a class whose plural names no
+//! table declares nothing, and a table no class claims declares nothing.
 //!
-//! No acronym table, deliberately: `Api` where an application configured `API` is a name the
-//! graph will not hold, which answers nothing — the same outcome as declining, reached without
-//! a table of somebody else's configuration.
+//! Both directions are here because both are needed:
+//! - [`table_of`] goes class to table: the safe direction the schema reader takes;
+//! - [`singularize`] goes the other way, because a `has_many :comments` states its element type in
+//!   the plural and nowhere else.
+//!
+//! No acronym table, deliberately (see [`camelize`]).
 
 use super::{IRREGULAR, UNCOUNTABLE};
 
-/// `user_sessions` -> `UserSessions`, the way Rails' inflector does it minus the acronym table.
+/// `user_sessions` -> `UserSessions`, as Rails' inflector does it, minus the acronym table.
 ///
-/// `None` for anything that cannot be a constant. Acronyms are deliberately absent: `Api` where
-/// an application configured `API` is a name the graph will not hold, which answers nothing —
+/// `None` for anything that cannot be a constant. Acronyms are deliberately absent: `Api` where an
+/// application configured `API` is a name the graph will not hold, which answers nothing. That is
 /// the same outcome as declining, reached without a table of somebody else's configuration.
 ///
-/// Public because the name guess spells a class the same way — `@user_session` is a
-/// `UserSession` by the same rule that makes `user_sessions/` a `UserSessionsController`, and
-/// two copies of an inflector are two inflectors that disagree.
+/// Public because the name guess spells a class the same way: `@user_session` is a `UserSession` by
+/// the rule that makes `user_sessions/` a `UserSessionsController`, and two copies of an inflector
+/// are two inflectors that disagree.
 #[must_use]
 pub fn camelize(segment: &str) -> Option<String> {
     let mut name = String::with_capacity(segment.len());
@@ -39,11 +39,11 @@ pub fn camelize(segment: &str) -> Option<String> {
 /// The module a `helper :accounts` names, by Rails' own rule.
 ///
 /// `AbstractController::Helpers::ClassMethods#modules_for_helpers` does
-/// `"#{arg.to_s.camelize}Helper".constantize`, and ActiveSupport's `camelize` turns a `/` into a
-/// `::` — so `helper "spree/admin/orders"` is `Spree::Admin::OrdersHelper`. No corpus writes the
-/// slash form and it is read anyway, for `table_name_suffix`'s reason: it is the same walk, and
-/// the only way this could name a module that exists and is not the one Rails meant is by
-/// declining to read a separator Rails reads.
+/// `"#{arg.to_s.camelize}Helper".constantize`, and ActiveSupport's `camelize` turns a `/` into
+/// `::`, so `helper "spree/admin/orders"` is `Spree::Admin::OrdersHelper`. The slash form is rare
+/// and read anyway, for `table_name_suffix`'s reason: it is the same walk, and declining to read a
+/// separator Rails reads is the only way this could name an existing module that is not the one
+/// Rails meant.
 ///
 /// `None` for a segment that cannot spell a constant, which [`camelize`] already decides.
 #[must_use]
@@ -55,18 +55,18 @@ pub fn helper_module(name: &str) -> Option<String> {
         }
         spelled.push_str(&camelize(segment)?);
     }
-    // `split` always yields at least one segment, and a segment that cannot spell a constant has
-    // already declined the whole name through `?` — so there is nothing left to test here, and
-    // `helper ""` is `camelize("")` answering `None`.
+    // `split` always yields at least one segment, and a segment that cannot spell a constant
+    // already declined the whole name through `?`. So nothing is left to test here: `helper ""` is
+    // `camelize("")` answering `None`.
     Some(spelled + "Helper")
 }
 
 /// The table a top-level class reads, by Rails' own rule: underscore it, then pluralize it.
 ///
-/// `None` for anything that cannot be a class name. The caller must have established that the
-/// class is **top level** — `Admin::Setting`'s table depends on `table_name_prefix`, which is
-/// Ruby that only runs, so a namespaced model is declined here and left to
-/// `schema::read_table_names`, which is the escape that works for it.
+/// `None` for anything that cannot be a class name. The caller must have established that the class
+/// is **top level**: `Admin::Setting`'s table depends on `table_name_prefix`, which only running
+/// Ruby knows, so a namespaced model is declined here and left to `schema::read_table_names`, the
+/// escape that works for it.
 #[must_use]
 pub fn table_of(class: &str) -> Option<String> {
     Some(pluralize(&underscore(class)?))
@@ -74,11 +74,10 @@ pub fn table_of(class: &str) -> Option<String> {
 
 /// `comments` -> `comment`, by the inverse of the rules [`pluralize`] applies.
 ///
-/// The direction the schema reader refuses, and it is admitted here because there is no other: a
-/// `has_many :comments` says its element type in the plural and nowhere else. What makes it
-/// safe is the same clause that makes the rest of this file safe — a name this gets wrong is a
-/// class the application does not define, and a class the application does not define declares
-/// nothing.
+/// The direction the schema reader refuses, admitted here because there is no other: a
+/// `has_many :comments` states its element type in the plural and nowhere else. It is safe for the
+/// reason the rest of this file is: a name this gets wrong is a class the application does not
+/// define, and such a class declares nothing.
 pub(super) fn singularize(word: &str) -> String {
     let (prefix, last) = word.split_at(word.rfind('_').map_or(0, |at| at + 1));
     if UNCOUNTABLE.contains(&last) {
@@ -93,8 +92,8 @@ pub(super) fn singularize(word: &str) -> String {
         return format!("{stem}y");
     }
     if let Some(stem) = word.strip_suffix("ves") {
-        // The two arms `pluralize` wrote, read back: `shelves` came from a `f` and `knives`
-        // from a `fe`.
+        // The two arms `pluralize` wrote, read back: `shelves` came from an `f`, and `knives` from
+        // an `fe`.
         return if stem.ends_with('l') || stem.ends_with('r') {
             format!("{stem}f")
         } else {
@@ -111,12 +110,12 @@ pub(super) fn singularize(word: &str) -> String {
     word.strip_suffix('s').unwrap_or(word).to_owned()
 }
 
-/// `UserSession` -> `user_session`, the inverse of [`camelize`] and Rails' `underscore` minus
-/// its acronym table, for the same reason [`camelize`] is missing one.
+/// `UserSession` -> `user_session`: the inverse of [`camelize`], and Rails' `underscore` minus its
+/// acronym table, for the same reason.
 ///
 /// `pub(super)` for a second caller: `isolate_namespace Spree` installs the prefix
-/// `generate_railtie_name` spells, which is `underscore(mod.name).tr("/", "_")` — one segment at
-/// a time here, because this deliberately knows nothing about `::`.
+/// `generate_railtie_name` spells, `underscore(mod.name).tr("/", "_")`. One segment at a time here,
+/// because this deliberately knows nothing about `::`.
 pub(super) fn underscore(class: &str) -> Option<String> {
     if !class.starts_with(|first: char| first.is_ascii_uppercase()) {
         return None;
@@ -125,8 +124,8 @@ pub(super) fn underscore(class: &str) -> Option<String> {
     let mut name = String::with_capacity(class.len() + 4);
     for (index, character) in characters.iter().enumerate() {
         // Rails' two rules in one: a capital after a lower-case letter or a digit starts a word,
-        // and so does the last capital of a run that is followed by a lower-case one — which is
-        // what makes `APIKey` into `api_key` rather than `a_p_i_key`.
+        // and so does the last capital of a run followed by a lower-case one. That makes `APIKey`
+        // into `api_key`, not `a_p_i_key`.
         if index > 0
             && character.is_ascii_uppercase()
             && (!characters[index - 1].is_ascii_uppercase()
@@ -141,20 +140,20 @@ pub(super) fn underscore(class: &str) -> Option<String> {
     Some(name)
 }
 
-/// `user_session` -> `user_sessions`, by the subset of Rails' inflector this corpus needed.
+/// `user_session` -> `user_sessions`, by the subset of Rails' inflector real applications need.
 ///
-/// The rules are Rails' own, in Rails' own order — the later a rule is defined there the
-/// earlier it is tried — minus the ones no application in the corpus exercises. What is missing
-/// costs a *miss*, never a wrong answer: an unpluralizable class names a table that does not
-/// exist, and a table nobody claims declares nothing.
+/// The rules are Rails' own, in Rails' own order (the later a rule is defined there, the earlier it
+/// is tried), minus the ones real applications do not exercise. What is missing costs a *miss*,
+/// never a wrong answer: an unpluralizable class names a table that does not exist, and a table
+/// nobody claims declares nothing.
 ///
-/// [`super::enums`] is the second caller and it inflects an *attribute* rather than a class:
+/// [`super::enums`] is the second caller, and it inflects an *attribute*, not a class:
 /// `enum :status` installs `self.statuses`, which is `name.pluralize` in Rails' own words. The
-/// failure direction is the same one — a word this does not know installs a class method under
-/// a name nobody calls, which is a member that is never looked up rather than a wrong answer.
+/// failure direction is the same: a word this does not know installs a class method under a name
+/// nobody calls, a member never looked up rather than a wrong answer.
 pub(super) fn pluralize(word: &str) -> String {
-    // The inflection is on the last word only: `user_session` is a session, and `admin_person`
-    // is `admin_people`.
+    // Only the last word is inflected: `user_session` is a session, and `admin_person` becomes
+    // `admin_people`.
     let (prefix, last) = word.split_at(word.rfind('_').map_or(0, |at| at + 1));
     if UNCOUNTABLE.contains(&last) {
         return word.to_owned();
@@ -195,8 +194,8 @@ pub(super) fn pluralize(word: &str) -> String {
 
 /// Rails' `[^aeiouy]`, narrowed to the letters it can only have meant.
 ///
-/// Spelled out rather than derived, because "not a vowel" is true of a digit and of every
-/// letter with an accent, and `A1y` pluralizing to `a1ies` is a rule nobody wrote down.
+/// Spelled out, not derived, because "not a vowel" is true of a digit and of every accented letter,
+/// and `A1y` pluralizing to `a1ies` is a rule nobody wrote down.
 fn is_consonant(character: char) -> bool {
     "bcdfghjklmnpqrstvwxz".contains(character)
 }
@@ -206,11 +205,11 @@ fn is_consonant(character: char) -> bool {
 mod tests {
     use super::*;
 
-    /// What `helper :accounts` names, and the separator Rails reads that no corpus writes.
+    /// What `helper :accounts` names, and the separator Rails reads that applications rarely write.
     ///
-    /// A table rather than a test each, because the row that matters is the slash: ActiveSupport's
-    /// `camelize` turns it into a `::`, and declining to read it is the only way this could name a
-    /// module that exists and is not the one Rails meant.
+    /// A table, not a test each, because the row that matters is the slash: ActiveSupport's
+    /// `camelize` turns it into `::`, and declining to read it is the only way this could name an
+    /// existing module that is not the one Rails meant.
     #[test]
     fn the_module_a_helper_call_names() {
         let rows = [
@@ -235,9 +234,8 @@ mod tests {
 
     /// The class→table direction, and what it declines.
     ///
-    /// A table rather than a test each, because the rows that matter are the ones that answer
-    /// `None` or answer something unexpected — and every miss here costs an answer that is not
-    /// given, never one that is wrong.
+    /// A table, not a test each, because the rows that matter are the ones answering `None` or
+    /// something unexpected, and every miss here costs an answer not given, never a wrong one.
     #[test]
     fn the_table_a_class_reads() {
         let rows: Vec<(&str, Option<String>)> = [
@@ -327,9 +325,9 @@ mod tests {
             ("user_sessions", "user_session"),
             ("admin_people", "admin_person"),
             ("gas", "ga"),
-            // Rails' own rule is `([^aeiouy]|qu)ies$`, so a vowel before the `ies` is not one:
-            // the word falls through to stripping the `s`, which is a miss and not a wrong
-            // answer — and a miss is a table nobody claims.
+            // Rails' own rule is `([^aeiouy]|qu)ies$`, so a vowel before the `ies` does not match:
+            // the word falls through to stripping the `s`. That is a miss, not a wrong answer, and
+            // a miss is a table nobody claims.
             ("aies", "aie"),
         ] {
             assert_eq!(singularize(plural), singular, "{plural}");

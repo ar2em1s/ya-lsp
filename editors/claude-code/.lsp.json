@@ -1,0 +1,16 @@
+{
+  "ya-lsp": {
+    "command": "ya-lsp",
+    "args": ["--stdio"],
+    "extensionToLanguage": {
+      ".rb": "ruby",
+      ".rake": "ruby",
+      ".gemspec": "ruby",
+      ".ru": "ruby",
+      ".jbuilder": "ruby",
+      ".builder": "ruby",
+      ".ruby": "ruby",
+      ".erb": "erb"
+    }
+  }
+}

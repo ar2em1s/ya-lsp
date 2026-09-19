@@ -1,8 +1,8 @@
-//! End-to-end: spawn the real binary and speak LSP to it over stdio.
+//! End to end: spawn the real binary and speak LSP to it over stdio.
 //!
-//! The in-process tests in `analysis` cover graph behaviour. This covers what they cannot —
-//! that the shipped executable frames messages correctly, negotiates capabilities, and exits
-//! cleanly — which is exactly the layer where a language server tends to fail silently.
+//! The in-process tests in `analysis` cover graph behaviour. This covers what they cannot: that the
+//! shipped executable frames messages correctly, negotiates capabilities and exits cleanly, which
+//! is exactly where a language server tends to fail silently.
 
 use std::{
     io::{BufReader, Write},
@@ -13,10 +13,18 @@ use std::{
 
 use lsp_server::{Message, Notification, Request, RequestId, Response};
 
-/// How long any single message may take to arrive. Generous — this only has to beat the
-/// 150 ms analysis debounce — but finite, so a server that stops talking fails the test
-/// instead of hanging the suite.
+/// How long any single message may take to arrive. Generous (it only has to beat the 150 ms
+/// analysis debounce) but finite, so a server that stops talking fails the test instead of hanging
+/// the suite.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a test may wait for ya-lsp's own watcher to notice a change on disk.
+///
+/// A timeout, never a sleep: the loop it bounds stops as soon as the answer changes, which through
+/// the shipped binary is a request or two. It is a minute because it must cover *arming*
+/// (`server::watcher::watch` records what that costs and where it is pathological), not the
+/// hundred-millisecond debounce behind it.
+const WATCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct Server {
     child: Child,
@@ -31,7 +39,7 @@ impl Server {
         Self::start_with_env(root, &[])
     }
 
-    /// `start`, with extra environment variables — the only way to point the real binary at a
+    /// `start`, with extra environment variables: the only way to point the real binary at a
     /// synthetic gem home, since gem discovery reads the process environment.
     fn start_with_env(root: &std::path::Path, env: &[(&str, &std::path::Path)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ya-lsp"));
@@ -158,10 +166,10 @@ fn fixture() -> tempfile::TempDir {
         "require \"person\"\n\nPerson.new\n",
     )
     .unwrap();
-    // Ruby's own signatures are off for every fixture that is not about them. They come from
-    // whatever rbs the machine has, or from the vendored copy, and neither belongs in a test of
-    // something else: 250 files of background work is noise these assertions would have to
-    // wait out. `built_in_classes_*` turns them back on and is where they are tested.
+    // Ruby's own signatures are off for every fixture not about them. They come from whatever rbs
+    // the machine has, or the vendored copy, and neither belongs in a test of something else:
+    // hundreds of files of background work is noise the assertions would have to wait out.
+    // `built_in_classes_*` turns them back on and tests them.
     std::fs::write(dir.path().join("ya-lsp.toml"), "[rbs]\nenabled = false\n").unwrap();
     dir
 }
@@ -185,8 +193,21 @@ fn modern_client(root: &std::path::Path) -> serde_json::Value {
     params
 }
 
-/// A project with one bundled gem installed in a directory of its own, laid out the way
-/// RubyGems lays one out. Returns the project and the gem home, which has to stay alive.
+/// The same client, plus the two capabilities a generated document needs to be readable.
+///
+/// A separate builder, not a field on `modern_client`, because the pair decides whether a code
+/// action is offered at all: a fixture with them on by accident could not show that a client
+/// without them is offered nothing.
+fn reading_client(root: &std::path::Path) -> serde_json::Value {
+    let mut params = modern_client(root);
+    params["capabilities"]["window"]["showDocument"] = serde_json::json!({ "support": true });
+    params["capabilities"]["workspace"]["textDocumentContent"] =
+        serde_json::json!({ "dynamicRegistration": true });
+    params
+}
+
+/// A project with one bundled gem installed in its own directory, laid out as RubyGems lays one
+/// out. Returns the project and the gem home, which must stay alive.
 fn bundled_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
     let project = fixture();
     std::fs::write(
@@ -240,8 +261,8 @@ fn full_lifecycle_over_stdio() {
         .response_result
         .expect("initialize should succeed");
 
-    // The client offered utf-8, so the server must take it: rubydex speaks byte offsets, and
-    // choosing utf-8 makes every column conversion the identity.
+    // The client offered utf-8, so the server must take it: rubydex speaks byte offsets, and utf-8
+    // makes every column conversion the identity.
     assert_eq!(result["capabilities"]["positionEncoding"], "utf-8");
     assert_eq!(result["capabilities"]["textDocumentSync"]["change"], 2); // INCREMENTAL
     assert_eq!(
@@ -252,27 +273,27 @@ fn full_lifecycle_over_stdio() {
     assert_eq!(result["capabilities"]["documentHighlightProvider"], true);
     assert_eq!(result["capabilities"]["selectionRangeProvider"], true);
     assert_eq!(result["capabilities"]["foldingRangeProvider"], true);
-    // Announced with its one option, which is the answer to a question the client would
-    // otherwise ask once per link: there is nothing to resolve.
+    // Announced with its one option, answering a question the client would otherwise ask once per
+    // link: there is nothing to resolve.
     assert_eq!(
         result["capabilities"]["documentLinkProvider"]["resolveProvider"],
         false
     );
-    // Both hierarchies, against a real binary: they are announced through two different
-    // mechanisms and a client needs each of them to offer its own command.
+    // Both hierarchies, against the real binary: they are announced by two different mechanisms,
+    // and a client needs each to offer its own command.
     assert_eq!(result["capabilities"]["callHierarchyProvider"], true);
     assert_eq!(
         result["capabilities"]["inlayHintProvider"]["resolveProvider"],
         true
     );
     assert_eq!(result["capabilities"]["workspaceSymbolProvider"], true);
-    // The one capability `lsp-types` has no field for, so it is added on the way to JSON.
-    // Asserted here as well as in `capabilities::tests` because the flatten that carries it also
-    // carries every provider above, and a flatten that stopped flattening would look like this
-    // line passing and the rest of them failing.
+    // The one capability `lsp-types` has no field for, added on the way to JSON. Asserted here as
+    // well as in `capabilities::tests` because the flatten carrying it also carries every provider
+    // above, and a flatten that stopped flattening would show as this line passing and the rest
+    // failing.
     assert_eq!(result["capabilities"]["typeHierarchyProvider"], true);
-    // `prepareProvider` is the load-bearing half: it is what lets the server decline a position
-    // before the editor has asked the user to type a new name for it.
+    // `prepareProvider` is the half that matters: it lets the server decline a position before the
+    // editor asks the user to type a new name.
     assert_eq!(
         result["capabilities"]["renameProvider"]["prepareProvider"],
         true
@@ -285,12 +306,46 @@ fn full_lifecycle_over_stdio() {
         result["capabilities"]["signatureHelpProvider"]["triggerCharacters"],
         serde_json::json!(["(", ","])
     );
-    // The kinds are the load-bearing half of this one: a client filters on them before it asks,
-    // so a `codeActionProvider` that lists none is never asked for a refactoring at all.
+    // The kinds are what matter here: a client filters on them before asking, so a
+    // `codeActionProvider` listing none is never asked for a refactoring. The empty string is the
+    // third kind, on purpose: the protocol's name for a kindless action, which is what the
+    // read-only jump into a generated document is.
     assert_eq!(
         result["capabilities"]["codeActionProvider"]["codeActionKinds"],
-        serde_json::json!(["refactor.extract", "refactor.rewrite"])
+        serde_json::json!(["refactor.extract", "refactor.rewrite", ""])
     );
+    // The two halves of `workspace/textDocumentContent`: the scheme the server serves documents
+    // under, and the command that opens one. Both are announced in the handshake and neither has an
+    // `lsp-types` field (hence `capabilities::Advertised`), so this assertion is all that stands
+    // between a typo and an unreachable feature.
+    assert_eq!(
+        result["capabilities"]["workspace"]["textDocumentContent"]["schemes"],
+        serde_json::json!(["ya-lsp-generated"])
+    );
+    assert_eq!(
+        result["capabilities"]["workspace"]["workspaceFolders"]["supported"],
+        true
+    );
+    // The filter is everything a client asks about: without it, the server is asked before every
+    // file operation in the project, and with a misspelled glob it is asked about none. Files only,
+    // because a folder rename arrives as the folder, never as the Ruby inside it.
+    assert_eq!(
+        result["capabilities"]["workspace"]["fileOperations"]["willRename"]["filters"],
+        serde_json::json!([{
+            "scheme": "file",
+            "pattern": { "glob": "**/*.rb", "matches": "file" }
+        }])
+    );
+    // One command, whose name carries the workspace root: `vscode-languageclient` calls
+    // `registerCommand` for every name here, which throws on a name already taken, and the
+    // extension starts one client per workspace folder.
+    let commands = result["capabilities"]["executeCommandProvider"]["commands"]
+        .as_array()
+        .expect("one command");
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    let command = commands[0].as_str().expect("a name");
+    assert!(command.starts_with("ya-lsp.showGenerated."), "{command}");
+    assert_ne!(command, "ya-lsp.showGenerated");
     assert_eq!(result["serverInfo"]["name"], "ya-lsp");
 
     server.notify("initialized", serde_json::json!({}));
@@ -324,8 +379,8 @@ fn full_lifecycle_over_stdio() {
         }),
     );
 
-    // The server has to have applied that edit to its own copy of the buffer, and the only way
-    // to see its copy from out here is to ask for the outline.
+    // The server must have applied that edit to its own copy of the buffer, and from out here the
+    // only way to see that copy is to ask for the outline.
     let id = server.request(
         "textDocument/documentSymbol",
         serde_json::json!({ "textDocument": { "uri": uri } }),
@@ -334,9 +389,9 @@ fn full_lifecycle_over_stdio() {
         .response(&id)
         .response_result
         .expect("documentSymbol");
-    // This client never advertised `hierarchicalDocumentSymbolSupport`, so the answer must be
-    // the flat pre-3.10 shape: `SymbolInformation`, carrying a `location` and a
-    // `containerName` rather than nested `children`.
+    // This client never advertised `hierarchicalDocumentSymbolSupport`, so the answer must be the
+    // flat pre-3.10 shape: `SymbolInformation`, with a `location` and a `containerName` instead of
+    // nested `children`.
     assert!(
         symbols[0]["location"].is_object(),
         "a client without hierarchical support must get the flat shape: {symbols}"
@@ -344,10 +399,10 @@ fn full_lifecycle_over_stdio() {
     assert_eq!(symbols[1]["name"], "murmur", "{symbols}");
     assert_eq!(symbols[1]["containerName"], "Person", "{symbols}");
 
-    // A code action over the buffer the server is holding, asked of the real process: the two
-    // extractions and the accessors are pure functions over one string and are covered as such,
-    // but this is the only place the request reaches the shipped binary at all — and it is the
-    // one request whose answer is an edit to the user's file.
+    // A code action over the buffer the server holds, asked of the real process: the extractions
+    // and accessors are pure functions over one string and are tested as such, but this is the only
+    // place the request reaches the shipped binary, and it is the one request whose answer edits
+    // the user's file.
     let id = server.request(
         "textDocument/codeAction",
         serde_json::json!({
@@ -360,8 +415,8 @@ fn full_lifecycle_over_stdio() {
         }),
     );
     let actions = server.response(&id).response_result.expect("codeAction");
-    // `def murmur` is a method with an empty body inside `class Person`: nothing to extract and
-    // no instance variable to declare an accessor for, so the honest answer is `null`.
+    // `def murmur` is a method with an empty body inside `class Person`: nothing to extract and no
+    // instance variable to give an accessor, so the honest answer is `null`.
     assert_eq!(actions, serde_json::Value::Null, "{actions}");
 
     server.notify(
@@ -395,8 +450,8 @@ fn full_lifecycle_over_stdio() {
         "{actions}"
     );
 
-    // An unimplemented method must still be answered rather than dropped: an unanswered
-    // request wedges the client forever.
+    // An unimplemented method must still be answered, not dropped: an unanswered request wedges the
+    // client forever.
     let id = server.request(
         "textDocument/formatting",
         serde_json::json!({
@@ -444,8 +499,8 @@ fn defaults_to_utf16_when_the_client_advertises_nothing() {
     );
     let result = server.response(&id).response_result.expect("initialize");
 
-    // A client that omits `general.positionEncodings` predates the capability and must be
-    // served UTF-16, which is what the spec mandates.
+    // A client that omits `general.positionEncodings` predates the capability and must be served
+    // UTF-16, as the spec mandates.
     assert_eq!(result["capabilities"]["positionEncoding"], "utf-16");
 
     server.notify("initialized", serde_json::json!({}));
@@ -482,13 +537,13 @@ fn a_broken_config_warns_instead_of_taking_the_server_down() {
 
 #[test]
 fn the_log_file_holds_the_requests_the_output_channel_would_have_shown() {
-    // The whole of item 36 in one assertion, over a real process: a `[log] file` turns a second
-    // sink on at a level of its own, the requests that arrive are written to it, and the file is
-    // where the setting says rather than where the binary happens to be.
+    // Logging to a file, over a real process, in one assertion: a `[log] file` turns on a second
+    // sink at its own level, incoming requests are written to it, and the file is where the setting
+    // says, not where the binary happens to be.
     //
-    // This is also the only test that runs `logging::install` — the one line that installs a
-    // global subscriber, which cannot be exercised in-process without taking the capture
-    // `testing.rs` installs away from every other test in the binary.
+    // This is also the only test that runs `logging::install`, the one line installing a global
+    // subscriber, which cannot run in-process without taking `testing.rs`'s capture away from every
+    // other test in the binary.
     let root = fixture();
     std::fs::write(
         root.path().join("ya-lsp.toml"),
@@ -508,8 +563,8 @@ fn the_log_file_holds_the_requests_the_output_channel_would_have_shown() {
     let written = std::fs::read_to_string(root.path().join("tmp/ya-lsp.log"))
         .expect("[log] file = true writes tmp/ya-lsp.log under the workspace root");
 
-    // The pair, at a level stderr was explicitly told not to carry — which is the reason the two
-    // sinks have two filters rather than one writer tee'd into both.
+    // The pair, at a level stderr was explicitly told not to carry, which is why the two sinks have
+    // two filters instead of one writer tee'd into both.
     assert!(
         written.contains("request method=\"textDocument/documentSymbol\""),
         "{written}"
@@ -518,8 +573,8 @@ fn the_log_file_holds_the_requests_the_output_channel_would_have_shown() {
         written.contains("answered method=\"textDocument/documentSymbol\""),
         "{written}"
     );
-    // Every line says which process wrote it, because two windows on one project are two
-    // servers with one file between them.
+    // Every line says which process wrote it, because two windows on one project are two servers
+    // sharing one file.
     let pid = format!("[{}] ", server_pid(&written));
     assert!(
         written.lines().all(|line| line.starts_with(&pid)),
@@ -561,7 +616,7 @@ fn a_syntax_error_reaches_the_client_as_a_diagnostic() {
         .to_string();
     let params = loop {
         let params = server.notification("textDocument/publishDiagnostics");
-        // The clean file in the fixture never publishes, but do not depend on that.
+        // The clean file in the fixture never publishes, but do not rely on that.
         if params["uri"] == serde_json::Value::String(broken.clone()) {
             break params;
         }
@@ -574,11 +629,11 @@ fn a_syntax_error_reaches_the_client_as_a_diagnostic() {
         .unwrap_or_else(|| panic!("{items:?}"));
     assert_eq!(error["severity"], 1); // DiagnosticSeverity::ERROR
     assert_eq!(error["source"], "ya-lsp");
-    // Prism's own words, forwarded verbatim: ya-lsp owns the severity and the code and not one
-    // word of the text. `parse_errors_read_the_way_prism_wrote_them` pins the whole set; here
-    // it is the wire that is being checked, so one sentence is enough — but a sentence, not a
-    // length. "Non-empty" as the whole contract is the same gap as an unranked completion
-    // list: the mechanism tested, the content not.
+    // Prism's own words, forwarded verbatim: ya-lsp owns the severity and the code and not one word
+    // of the text. `parse_errors_read_the_way_prism_wrote_them` pins the whole set; here the wire
+    // is being checked, so one sentence is enough, but a sentence, not a length. "Non-empty" as the
+    // whole contract would test the mechanism and not the content, like an unranked completion
+    // list.
     assert_eq!(
         error["message"],
         "expected an `end` to close the `class` statement"
@@ -624,7 +679,7 @@ fn a_syntax_error_reaches_the_client_as_a_diagnostic() {
 #[test]
 fn navigation_over_stdio() {
     // The end-to-end navigation claim: an editor that opens a file can ask what a name is, where it
-    // came from, and what the file contains — and get answers in the shapes it advertised.
+    // came from and what the file contains, and gets answers in the shapes it advertised.
     let root = fixture();
     let mut server = started(root.path(), modern_client(root.path()));
 
@@ -656,8 +711,8 @@ fn navigation_over_stdio() {
         serde_json::json!(person),
         "{targets}"
     );
-    // `linkSupport` was advertised, so the answer carries the origin span and points at the
-    // class name rather than at the whole body.
+    // `linkSupport` was advertised, so the answer carries the origin span and points at the class
+    // name, not the whole body.
     assert_eq!(targets[0]["originSelectionRange"]["start"]["character"], 0);
     assert_eq!(targets[0]["originSelectionRange"]["end"]["character"], 6);
     assert_eq!(targets[0]["targetSelectionRange"]["start"]["line"], 1);
@@ -708,8 +763,8 @@ fn navigation_over_stdio() {
     assert_eq!(symbols[0]["kind"], 5, "SymbolKind::CLASS: {symbols}");
     assert_eq!(symbols[0]["children"][0]["name"], "shout", "{symbols}");
 
-    // A position with nothing under it must answer `null`, not an error: an error is something
-    // the editor shows the user.
+    // A position with nothing under it must answer `null`, not an error: the editor shows errors to
+    // the user.
     let id = server.request(
         "textDocument/hover",
         serde_json::json!({
@@ -740,8 +795,8 @@ fn project_wide_search_over_stdio() {
     let team = uri_of(root.path(), "lib/team.rb");
     let main = uri_of(root.path(), "lib/main.rb");
 
-    // Every use of `Person`, asked for from the class definition, with the definition itself
-    // included the way VS Code asks for it.
+    // Every use of `Person`, asked from the class definition, including the definition itself as VS
+    // Code asks.
     let id = server.request(
         "textDocument/references",
         serde_json::json!({
@@ -765,7 +820,7 @@ fn project_wide_search_over_stdio() {
         "{found}"
     );
 
-    // A method, which is name-based — `shout` is called once and defined once.
+    // A method, which is name-based: `shout` is called once and defined once.
     let id = server.request(
         "textDocument/references",
         serde_json::json!({
@@ -815,7 +870,7 @@ fn project_wide_search_over_stdio() {
 #[test]
 fn completion_over_stdio() {
     // The end-to-end completion claim: an editor asking what can be typed at a position gets an
-    // answer that came from the project, not from the words in the open buffer.
+    // answer from the project, not from words in the open buffer.
     let root = fixture();
     std::fs::write(
         root.path().join("lib/office.rb"),
@@ -825,8 +880,8 @@ fn completion_over_stdio() {
     .unwrap();
     let mut server = started(root.path(), modern_client(root.path()));
 
-    // A buffer the editor holds and the disk has never seen, which is the situation completion
-    // always runs in.
+    // A buffer the editor holds and the disk has never seen: the situation completion always runs
+    // in.
     let scratch = uri_of(root.path(), "lib/scratch.rb");
     let typed = "HR::Person.bui\n";
     server.notify(
@@ -850,9 +905,9 @@ fn completion_over_stdio() {
         }),
     );
     let found = server.response(&id).response_result.expect("completion");
-    // One row, so the cap dropped nothing and the client is told it may narrow this itself
-    // rather than ask again for every further character. Over the wire, because that flag is
-    // the one thing here an editor acts on without being asked anything else.
+    // One row, so the cap dropped nothing, and the client is told it may narrow this list itself
+    // instead of asking again for every character. Tested over the wire, because that flag is the
+    // one thing here an editor acts on without asking anything else.
     assert_eq!(found["isIncomplete"], false, "{found}");
     let labels: Vec<&str> = found["items"]
         .as_array()
@@ -905,8 +960,8 @@ fn completion_over_stdio() {
     let found = server.response(&id).response_result.expect("completion");
     assert_eq!(found["items"][0]["label"], "name:", "{found}");
 
-    // A comment is not a place Ruby can be written, and saying so lets the editor fall back to
-    // its own word list instead of showing an empty popup.
+    // A comment is not a place Ruby can be written, and saying so lets the editor fall back to its
+    // own word list instead of showing an empty popup.
     server.notify(
         "textDocument/didChange",
         serde_json::json!({
@@ -931,10 +986,9 @@ fn completion_over_stdio() {
 
 #[test]
 fn signature_help_over_stdio() {
-    // The end-to-end signature-help claim: an editor asking what a half-written call
-    // takes gets the method's real parameters, with the one being typed marked — over the wire,
-    // from a buffer the disk has never seen, and with the offsets in the encoding the client
-    // negotiated rather than in bytes.
+    // The end-to-end signature-help claim: an editor asking what a half-written call takes gets the
+    // method's real parameters, with the one being typed marked, over the wire, from a buffer the
+    // disk has never seen, with offsets in the encoding the client negotiated, not bytes.
     let root = fixture();
     std::fs::write(
         root.path().join("lib/office.rb"),
@@ -991,7 +1045,7 @@ fn signature_help_over_stdio() {
         "{help}"
     );
 
-    // Two arguments in, and the answer follows the cursor rather than the request.
+    // Two arguments in, and the answer follows the cursor, not the request.
     server.notify(
         "textDocument/didChange",
         serde_json::json!({
@@ -1012,7 +1066,7 @@ fn signature_help_over_stdio() {
     );
     assert_eq!(ask(&mut server, 32)["activeParameter"], 3, "`remote:`");
 
-    // And outside a call there is nothing to say, which is what closes the popup.
+    // And outside a call there is nothing to say, which closes the popup.
     server.notify(
         "textDocument/didChange",
         serde_json::json!({
@@ -1027,10 +1081,10 @@ fn signature_help_over_stdio() {
 
 #[test]
 fn document_highlight_over_stdio() {
-    // The end-to-end highlight claim, and the one that needs a real server to
-    // make: the two halves of the answer come from different places — a Prism walk of the
-    // buffer for the local, the graph for the method — and an editor cannot tell, because both
-    // arrive as ranges in the encoding it negotiated over a buffer the disk has never seen.
+    // The end-to-end highlight claim, which needs a real server: the answer's two halves come from
+    // different places (a Prism walk of the buffer for the local, the graph for the method), and an
+    // editor cannot tell, because both arrive as ranges in its negotiated encoding over a buffer
+    // the disk has never seen.
     let root = fixture();
     let mut server = started(root.path(), modern_client(root.path()));
 
@@ -1042,8 +1096,8 @@ fn document_highlight_over_stdio() {
                 "uri": scratch,
                 "languageId": "ruby",
                 "version": 1,
-                // `total` is a local in one method and a different local in the other; `sum` is
-                // a method with a call. The comment is the word match this replaces.
+                // `total` is a local in one method and a different local in the other; `sum` is a
+                // method with a call. The comment is the word match this replaces.
                 "text": "class Till\n  # total is a word here\n  def sum(total)\n    total + 1\n  end\n\n  def other\n    total = 2\n    sum(total)\n  end\nend\n"
             }
         }),
@@ -1060,8 +1114,8 @@ fn document_highlight_over_stdio() {
         server.response(&id).response_result.expect("a response")
     };
 
-    // The parameter on line 2 and its use on line 3, and nothing on lines 7 and 8 where the
-    // other method spells the same six letters.
+    // The parameter on line 2 and its use on line 3, and nothing on lines 7 and 8, where the other
+    // method spells the same letters.
     let found = ask(&mut server, 2, 12);
     assert_eq!(found.as_array().map(Vec::len), Some(2), "{found}");
     assert_eq!(
@@ -1100,8 +1154,8 @@ fn document_highlight_over_stdio() {
         serde_json::json!({ "line": 8, "character": 4 })
     );
 
-    // And `null` in the comment, which is what hands the word matching back to the client for
-    // the positions ya-lsp cannot speak for.
+    // And `null` in the comment, which hands word matching back to the client where ya-lsp cannot
+    // speak.
     assert_eq!(ask(&mut server, 1, 6), serde_json::Value::Null);
 
     shut_down(server);
@@ -1109,10 +1163,10 @@ fn document_highlight_over_stdio() {
 
 #[test]
 fn type_hierarchy_over_stdio() {
-    // Three requests and one round trip, which is why this needs a real server: the item the
-    // client expands is the item the server sent, `data` and all, and nothing in-process can
-    // check that the field survives serialisation both ways. The capability is here too, because
-    // it is the one `lsp-types` has no field for and is added on the way to JSON.
+    // Three requests and one round trip, which is why this needs a real server: the item the client
+    // expands is the item the server sent, `data` and all, and nothing in-process can check that
+    // the field survives serialisation both ways. The capability is checked too, because
+    // `lsp-types` has no field for it and it is added on the way to JSON.
     let root = fixture();
     let mut server = started(root.path(), modern_client(root.path()));
 
@@ -1148,7 +1202,7 @@ fn type_hierarchy_over_stdio() {
     assert_eq!(prepared[0]["kind"], 5, "SymbolKind::Class: {prepared}");
     assert!(prepared[0]["data"].is_string(), "{prepared}");
 
-    // Expanded upwards with the item exactly as it arrived, which is what an editor sends.
+    // Expanded upwards with the item exactly as it arrived, as an editor sends it.
     let supertypes = ask(
         &mut server,
         "typeHierarchy/supertypes",
@@ -1190,7 +1244,7 @@ fn type_hierarchy_over_stdio() {
         "{subtypes}"
     );
 
-    // A method is not a type, and the editor is told so with a `null` rather than an empty tree.
+    // A method is not a type, and the editor is told so with `null`, not an empty tree.
     assert_eq!(
         ask(
             &mut server,
@@ -1208,9 +1262,9 @@ fn type_hierarchy_over_stdio() {
 
 #[test]
 fn rename_over_stdio() {
-    // Through the shipped binary because this is the one request that *writes*: the edit has to
-    // survive serialisation and arrive as something an editor can apply, and the version it
-    // carries comes from the `didOpen` rather than from anything in-process.
+    // Through the shipped binary because this is the one request that *writes*: the edit must
+    // survive serialisation and arrive as something an editor can apply, and its version comes from
+    // the `didOpen`, not from anything in-process.
     let root = fixture();
     let mut server = started(root.path(), modern_client(root.path()));
 
@@ -1262,8 +1316,8 @@ Ledger.new
     let edit = ask(&mut server, "textDocument/rename", params);
     let changes = &edit["documentChanges"][0];
     assert_eq!(changes["textDocument"]["uri"], scratch);
-    // The version the buffer was opened at, which is what lets the client refuse an edit the
-    // user has typed past.
+    // The version the buffer was opened at, which lets the client refuse an edit the user has typed
+    // past.
     assert_eq!(changes["textDocument"]["version"], 7);
     assert_eq!(
         changes["edits"],
@@ -1286,9 +1340,9 @@ Ledger.new
         "{edit}"
     );
 
-    // A method is refused, and the refusal reaches the user as a message rather than only as a
-    // `null` the editor turns into its own generic sentence. The message goes out ahead of the
-    // response, so it is read first — `response` steps over notifications and would drop it.
+    // A method is refused, and the refusal reaches the user as a message, not only as a `null` the
+    // editor turns into its own generic sentence. The message goes out before the response, so it
+    // is read first: `response` steps over notifications and would drop it.
     let id = server.request(
         "textDocument/prepareRename",
         serde_json::json!({
@@ -1298,8 +1352,8 @@ Ledger.new
     );
     let mut said = String::new();
     while !said.contains("renaming a method") {
-        // Stepping over whatever startup said: this client takes no dynamic registrations, so
-        // it has already been told that files cannot be watched.
+        // Stepping over whatever startup said: this client takes no dynamic registrations, so it
+        // was already told files cannot be watched.
         said = server.notification("window/showMessage")["message"]
             .as_str()
             .unwrap_or_default()
@@ -1316,8 +1370,8 @@ Ledger.new
 #[test]
 fn a_client_without_link_support_gets_plain_locations() {
     // LSP lets a server answer `definition` with `LocationLink`s only if the client said it
-    // understands them. Sending the richer shape unasked is not a graceful degradation — some
-    // clients fail to parse it outright.
+    // understands them. Sending the richer shape unasked is not graceful degradation: some clients
+    // fail to parse it outright.
     let root = fixture();
     let mut server = started(root.path(), initialize_params(root.path()));
 
@@ -1333,6 +1387,430 @@ fn a_client_without_link_support_gets_plain_locations() {
     assert!(targets[0]["uri"].is_string(), "{targets}");
     assert!(targets[0]["targetUri"].is_null(), "{targets}");
     assert!(targets[0]["range"].is_object(), "{targets}");
+
+    shut_down(server);
+}
+
+#[test]
+fn implementations_are_advertised_and_answered_as_plain_locations() {
+    // The asymmetry comes from a real client: Claude Code sends `definition.linkSupport: true` and
+    // no `textDocument.implementation` capability, so the negotiated shape is `LocationLink[]` for
+    // one goto and `Location[]` for the other. A server reading one flag for both sends an agent a
+    // shape it never asked for, and `modern_client` is exactly that pair of capabilities.
+    //
+    // Over a real process because the capability is the other half: an answer nothing advertised is
+    // one no client ever requests.
+    let root = fixture();
+    std::fs::write(
+        root.path().join("lib/loud.rb"),
+        "class Loud < Person\n  def shout\n  end\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("lib/caller.rb"),
+        "person = Person.new\nperson.shout\n",
+    )
+    .unwrap();
+
+    let mut server = Server::start(root.path());
+    let id = server.request("initialize", modern_client(root.path()));
+    let advertised = server.response(&id).response_result.expect("initialize");
+    assert_eq!(
+        advertised["capabilities"]["implementationProvider"],
+        serde_json::json!(true),
+        "{advertised}"
+    );
+    server.notify("initialized", serde_json::json!({}));
+
+    let caller = uri_of(root.path(), "lib/caller.rb");
+    let id = server.request(
+        "textDocument/implementation",
+        serde_json::json!({
+            "textDocument": { "uri": caller },
+            "position": { "line": 1, "character": 8 }
+        }),
+    );
+    let found = server
+        .response(&id)
+        .response_result
+        .expect("implementation");
+
+    // `Location[]`, not `LocationLink[]`, while `definition` at the same cursor is the other way
+    // round: the whole point of the pair.
+    assert!(found[0]["uri"].is_string(), "{found}");
+    assert!(found[0]["targetUri"].is_null(), "{found}");
+    let files: Vec<String> = found
+        .as_array()
+        .expect("locations")
+        .iter()
+        .map(|location| {
+            location["uri"]
+                .as_str()
+                .unwrap_or_default()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(files, ["person.rb", "loud.rb"], "{found}");
+
+    let id = server.request(
+        "textDocument/definition",
+        serde_json::json!({
+            "textDocument": { "uri": caller },
+            "position": { "line": 1, "character": 8 }
+        }),
+    );
+    let defined = server.response(&id).response_result.expect("definition");
+    assert!(defined[0]["targetUri"].is_string(), "{defined}");
+
+    shut_down(server);
+}
+
+#[test]
+fn a_type_definition_is_advertised_and_answers_where_a_definition_does_not() {
+    // The pair that shows what this request is for. At `person`, the *definition* jump answers
+    // nothing (a local is a line the reader can already see), and the type jump answers
+    // `class Person`, the one thing about that local the line does not say.
+    //
+    // Over a real process because the capability is the other half of the feature: an answer
+    // nothing advertised is one no client requests. `modern_client` declares `linkSupport` for
+    // `definition` only, so the shape here is `Location[]`: the third goto reading its own flag,
+    // not a neighbour's.
+    let root = fixture();
+    std::fs::write(
+        root.path().join("lib/caller.rb"),
+        "person = Person.new\nperson.shout\n",
+    )
+    .unwrap();
+
+    let mut server = Server::start(root.path());
+    let id = server.request("initialize", modern_client(root.path()));
+    let advertised = server.response(&id).response_result.expect("initialize");
+    assert_eq!(
+        advertised["capabilities"]["typeDefinitionProvider"],
+        serde_json::json!(true),
+        "{advertised}"
+    );
+    server.notify("initialized", serde_json::json!({}));
+
+    let caller = uri_of(root.path(), "lib/caller.rb");
+    let at = serde_json::json!({
+        "textDocument": { "uri": caller },
+        "position": { "line": 1, "character": 2 }
+    });
+    let id = server.request("textDocument/typeDefinition", at.clone());
+    let found = server
+        .response(&id)
+        .response_result
+        .expect("typeDefinition");
+
+    assert!(found[0]["uri"].is_string(), "{found}");
+    assert!(found[0]["targetUri"].is_null(), "{found}");
+    assert!(
+        found[0]["uri"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("person.rb"),
+        "{found}"
+    );
+
+    let id = server.request("textDocument/definition", at);
+    let defined = server.response(&id).response_result.expect("definition");
+    assert!(defined.is_null(), "{defined}");
+
+    shut_down(server);
+}
+
+#[test]
+fn a_declaration_no_file_declares_is_read_by_asking_this_server_for_the_document_it_wrote() {
+    // Showing a generated document, over a real process. `Point = Struct.new(:x, :y)` declares `x`
+    // and `y` without writing either down, so the only statement of what they are is RBS this
+    // server generated, indexed under a scheme with no file behind it. That stops it becoming a
+    // `Location`, and also stops anyone reading it. The three steps here are the door: a code
+    // action names the document, the command asks the client to show it, and the client asks this
+    // server for its content.
+    let root = fixture();
+    std::fs::write(
+        root.path().join("lib/point.rb"),
+        "Point = Struct.new(:x, :y)\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("lib/uses.rb"), "Point.new(1, 2).x\n").unwrap();
+
+    let mut server = Server::start(root.path());
+    let id = server.request("initialize", reading_client(root.path()));
+    let advertised = server.response(&id).response_result.expect("initialize");
+    let command = advertised["capabilities"]["executeCommandProvider"]["commands"][0]
+        .as_str()
+        .expect("one command")
+        .to_owned();
+    server.notify("initialized", serde_json::json!({}));
+
+    let uses = uri_of(root.path(), "lib/uses.rb");
+    let at = serde_json::json!({ "line": 0, "character": 16 });
+    let id = server.request(
+        "textDocument/codeAction",
+        serde_json::json!({
+            "textDocument": { "uri": uses },
+            "range": { "start": at, "end": at },
+            "context": { "diagnostics": [] },
+        }),
+    );
+    let actions = server.response(&id).response_result.expect("code actions");
+    assert_eq!(
+        actions[0]["title"], "Show the RBS ya-lsp generated for Point, from point.rb",
+        "{actions}"
+    );
+    // No kind and no edit: the one action in the menu that changes nothing on disk.
+    assert!(actions[0]["kind"].is_null(), "{actions}");
+    assert!(actions[0]["edit"].is_null(), "{actions}");
+    // The same name that was advertised, which the client registered with the editor.
+    assert_eq!(actions[0]["command"]["command"], serde_json::json!(command));
+    let named = actions[0]["command"]["arguments"][0]
+        .as_str()
+        .expect("the document")
+        .to_owned();
+    assert!(named.starts_with("ya-lsp-generated:"), "{named}");
+
+    // Running it asks the client to open that document, the command's only job; the response
+    // carries nothing, because the work travels the other way.
+    let id = server.request(
+        "workspace/executeCommand",
+        serde_json::json!({ "command": command, "arguments": [named] }),
+    );
+    let shown = server.server_request("window/showDocument");
+    assert_eq!(shown.params["uri"], serde_json::json!(named), "{shown:?}");
+    assert_eq!(shown.params["takeFocus"], true);
+    assert_eq!(
+        server.response(&id).response_result.expect("the command"),
+        serde_json::Value::Null
+    );
+
+    // And what the client puts in the window, spelled as VS Code would spell it back (every
+    // component decoded on the way in and re-escaped on the way out), so both colons arrive as
+    // `%3A` and it is still the same document.
+    let spelled = named
+        .replacen("ya-lsp-generated:", "\u{0}", 1)
+        .replace(':', "%3A");
+    let spelled = spelled.replacen('\u{0}', "ya-lsp-generated:", 1);
+    assert_ne!(spelled, named);
+    let id = server.request(
+        "workspace/textDocumentContent",
+        serde_json::json!({ "uri": spelled }),
+    );
+    let content = server.response(&id).response_result.expect("the content");
+    let rbs = content["text"].as_str().expect("text");
+    assert!(rbs.contains("class Point"), "{rbs}");
+    assert!(rbs.contains("def x:"), "{rbs}");
+
+    shut_down(server);
+}
+
+#[test]
+fn moving_a_model_in_the_file_tree_renames_the_class_before_the_move_happens() {
+    // Renaming a class with its file, over a real process. The editor asks *before* moving the file
+    // and applies the answer alongside the move, so `app/models/purchase.rb` arrives already
+    // declaring `Purchase`. A file that kept `Order` would raise `NameError` on the next boot, at a
+    // point nothing connects back to the drag in the file tree.
+    let root = fixture();
+    // `rails.enabled` is `auto`, and this is what it detects: an engine has no
+    // `config/application.rb` and a fresh clone has no `Gemfile.lock`, so detection reads both, and
+    // one is enough.
+    std::fs::create_dir_all(root.path().join("config")).unwrap();
+    std::fs::create_dir_all(root.path().join("app/models")).unwrap();
+    std::fs::write(
+        root.path().join("config/application.rb"),
+        "module Shop\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("app/models/order.rb"),
+        "class Order\n  def total\n  end\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("app/models/basket.rb"),
+        "class Basket\n  def item\n    Order.new\n  end\nend\n",
+    )
+    .unwrap();
+
+    let mut server = Server::start(root.path());
+    let id = server.request("initialize", modern_client(root.path()));
+    let advertised = server.response(&id).response_result.expect("initialize");
+    assert_eq!(
+        advertised["capabilities"]["workspace"]["fileOperations"]["willRename"]["filters"][0]["pattern"]
+            ["glob"],
+        "**/*.rb"
+    );
+    server.notify("initialized", serde_json::json!({}));
+
+    let id = server.request(
+        "workspace/willRenameFiles",
+        serde_json::json!({
+            "files": [{
+                "oldUri": uri_of(root.path(), "app/models/order.rb"),
+                "newUri": uri_of(root.path(), "app/models/purchase.rb"),
+            }],
+        }),
+    );
+    let edit = server.response(&id).response_result.expect("an edit");
+    // Both files: the class itself and the one call of it. An edit changing only the declaring file
+    // would break the project just as surely as no edit.
+    let changes = edit["documentChanges"].as_array().expect("changes");
+    let mut renamed: Vec<String> = changes
+        .iter()
+        .map(|change| {
+            let uri = change["textDocument"]["uri"].as_str().unwrap_or_default();
+            let name = uri.rsplit('/').next().unwrap_or(uri);
+            let edits = change["edits"].as_array().expect("edits");
+            format!("{name} {} -> {}", edits.len(), edits[0]["newText"])
+        })
+        .collect();
+    renamed.sort();
+    assert_eq!(
+        renamed,
+        ["basket.rb 1 -> \"Purchase\"", "order.rb 1 -> \"Purchase\""],
+        "{edit}"
+    );
+
+    // And a move that changes no class is answered `null`, not an empty edit: a client that gets
+    // one still puts a pointless undo step in front of the user.
+    let id = server.request(
+        "workspace/willRenameFiles",
+        serde_json::json!({
+            "files": [{
+                "oldUri": uri_of(root.path(), "lib/main.rb"),
+                "newUri": uri_of(root.path(), "lib/start.rb"),
+            }],
+        }),
+    );
+    assert_eq!(
+        server.response(&id).response_result.expect("no edit"),
+        serde_json::Value::Null
+    );
+
+    shut_down(server);
+}
+
+#[test]
+fn two_servers_in_one_window_do_not_register_one_command_name() {
+    // The failure this guards against is not subtle, and not this feature's:
+    // `vscode-languageclient` turns `executeCommandProvider` into
+    // `vscode.commands.registerCommand`, which throws on a name already taken, and the extension
+    // starts one client per workspace folder. A shared name would cost a multi-root workspace every
+    // feature in its second folder.
+    let first = fixture();
+    let second = fixture();
+    let mut names = Vec::new();
+    for root in [&first, &second] {
+        let mut server = Server::start(root.path());
+        let id = server.request("initialize", reading_client(root.path()));
+        let advertised = server.response(&id).response_result.expect("initialize");
+        names.push(
+            advertised["capabilities"]["executeCommandProvider"]["commands"][0]
+                .as_str()
+                .expect("one command")
+                .to_owned(),
+        );
+        server.notify("initialized", serde_json::json!({}));
+        shut_down(server);
+    }
+    assert_ne!(names[0], names[1], "{names:?}");
+}
+
+#[test]
+fn a_client_that_cannot_read_a_generated_document_is_never_shown_the_door_to_one() {
+    // Neovim's shape: it answers `window/showDocument`, but its LSP client implements nothing that
+    // would fill the buffer that opens, so it would get an empty window named after a URI. The
+    // action is withheld instead, and it appears, with no change on this side, once the client can
+    // read one.
+    let root = fixture();
+    std::fs::write(
+        root.path().join("lib/point.rb"),
+        "Point = Struct.new(:x, :y)\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("lib/uses.rb"), "Point.new(1, 2).x\n").unwrap();
+
+    let mut client = modern_client(root.path());
+    client["capabilities"]["window"]["showDocument"] = serde_json::json!({ "support": true });
+    let mut server = started(root.path(), client);
+    let uses = uri_of(root.path(), "lib/uses.rb");
+    let at = serde_json::json!({ "line": 0, "character": 16 });
+    let id = server.request(
+        "textDocument/codeAction",
+        serde_json::json!({
+            "textDocument": { "uri": uses },
+            "range": { "start": at, "end": at },
+            "context": { "diagnostics": [] },
+        }),
+    );
+    let actions = server.response(&id).response_result.expect("code actions");
+    assert_eq!(actions, serde_json::Value::Null, "{actions}");
+
+    shut_down(server);
+}
+
+#[test]
+fn a_declaration_is_advertised_and_answers_the_signature_where_the_definition_answers_the_source() {
+    // The pair again, the other way round from the type jump: here both requests answer, with
+    // **different files**. `definition` opens the `def` somebody wrote and `declaration` opens the
+    // `.rbs` saying what it takes: the only question this server answers with a file the reader
+    // would not otherwise open.
+    //
+    // Over a real process for the capability, as above. `modern_client` declares `linkSupport` for
+    // `definition` alone, so the shape here is `Location[]`: the fourth goto reading the fourth
+    // flag.
+    let root = fixture();
+    std::fs::create_dir_all(root.path().join("sig")).unwrap();
+    std::fs::write(
+        root.path().join("sig/person.rbs"),
+        "class Person\n  def shout: () -> void\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("lib/caller.rb"),
+        "person = Person.new\nperson.shout\n",
+    )
+    .unwrap();
+
+    let mut server = Server::start(root.path());
+    let id = server.request("initialize", modern_client(root.path()));
+    let advertised = server.response(&id).response_result.expect("initialize");
+    assert_eq!(
+        advertised["capabilities"]["declarationProvider"],
+        serde_json::json!(true),
+        "{advertised}"
+    );
+    server.notify("initialized", serde_json::json!({}));
+
+    let caller = uri_of(root.path(), "lib/caller.rb");
+    let at = serde_json::json!({
+        "textDocument": { "uri": caller },
+        "position": { "line": 1, "character": 9 }
+    });
+    let id = server.request("textDocument/declaration", at.clone());
+    let declared = server.response(&id).response_result.expect("declaration");
+    assert!(
+        declared[0]["uri"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("person.rbs"),
+        "{declared}"
+    );
+    assert!(declared[0]["targetUri"].is_null(), "{declared}");
+
+    let id = server.request("textDocument/definition", at);
+    let defined = server.response(&id).response_result.expect("definition");
+    assert!(
+        defined[0]["targetUri"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("person.rb"),
+        "{defined}"
+    );
 
     shut_down(server);
 }
@@ -1354,9 +1832,9 @@ fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
 
 /// A gem the project depends on becomes navigable, and the editor is told it is happening.
 ///
-/// The acceptance criterion reduced to something CI can run: no Ruby is
-/// executed anywhere, the gem is found from `Gemfile.lock` plus a `GEM_HOME`, and
-/// goto-definition crosses from the project into it.
+/// The acceptance criterion reduced to something CI can run: no Ruby runs anywhere, the gem is
+/// found from `Gemfile.lock` plus a `GEM_HOME`, and goto-definition crosses from the project into
+/// it.
 #[test]
 fn gems_are_indexed_in_the_background_and_become_navigable() {
     let (root, gem_home) = bundled_fixture();
@@ -1366,9 +1844,9 @@ fn gems_are_indexed_in_the_background_and_become_navigable() {
     server.response(&id).response_result.expect("initialize");
     server.notify("initialized", serde_json::json!({}));
 
-    // The server opens the progress stream with a request of its own. Answering it is the
-    // client's job, and a server that cannot cope with the answer arriving at any moment would
-    // wedge here.
+    // The server opens the progress stream with a request of its own. Answering it is the client's
+    // job, and a server that could not cope with the answer arriving at any moment would wedge
+    // here.
     let mut created: Option<RequestId> = None;
     let mut token = serde_json::Value::Null;
     let mut begun = false;
@@ -1432,22 +1910,24 @@ fn gems_are_indexed_in_the_background_and_become_navigable() {
 
 /// The shipped binary asks the client to claim the gem it found, and names the real directory.
 ///
-/// **The gap this closes.** The negotiation is unit-tested and the arbitration between several
-/// clients is tested in TypeScript, but nothing joined the two against the actual executable —
-/// `initialize_params` declares `synchronization.dynamicRegistration: false`, so every other test
-/// in this file is a client that would never be sent a registration. That left the whole mechanism
-/// resting on one manual check in an extension host.
+/// **What only this covers.** The negotiation is unit-tested and the arbitration between clients is
+/// tested in TypeScript, but only this joins them against the real executable: `initialize_params`
+/// declares `synchronization.dynamicRegistration: false`, so every other test here is a client that
+/// would never get a registration.
 ///
-/// Four things are asserted here that no in-process test can reach: the registration crosses the
-/// wire at all, it carries the gem home this process was pointed at by `GEM_HOME` rather than a
-/// path computed in a test, the watcher's registration is distinguishable from it by id — which is
-/// what an extension driving several servers needs — and a request inside the gem file the
-/// registration just named is answered over stdio.
+/// Four things are asserted that no in-process test can reach:
 ///
-/// The client takes three of the sixteen requests on purpose. A real client need not take all of
-/// them, and the batch coming back with exactly three plus synchronisation is what pins the
-/// per-capability filter: `doRegisterCapability` rejects the *whole* array on the first method it
-/// has no feature for, so sending one the client declined would cost every method after it.
+/// 1. The registration crosses the wire at all.
+/// 2. It carries the gem home this process was pointed at by `GEM_HOME`, not a path computed in a
+///    test.
+/// 3. The watcher's registration is distinguishable from it by id, which an extension driving
+///    several servers needs.
+/// 4. A request inside the gem file the registration just named is answered over stdio.
+///
+/// The client takes only three of the requests on purpose. A real client need not take all of them,
+/// and getting back exactly three plus synchronisation pins the per-capability filter:
+/// `doRegisterCapability` rejects the *whole* array at the first method it has no feature for, so
+/// sending one the client declined would cost every method after it.
 #[test]
 fn the_binary_asks_the_client_to_claim_the_gem_it_found() {
     let (root, gem_home) = bundled_fixture();
@@ -1463,17 +1943,17 @@ fn the_binary_asks_the_client_to_claim_the_gem_it_found() {
         "dynamicRegistration": true,
         "hierarchicalDocumentSymbolSupport": true,
     });
-    // The watcher registers on this same channel, and at `initialized` rather than when the bundle
-    // is known, so both are in flight here.
+    // The watcher registers on this same channel, at `initialized` rather than once the bundle is
+    // known, so both are in flight here.
     params["capabilities"]["workspace"]["didChangeWatchedFiles"] = dynamic;
 
     let id = server.request("initialize", params);
     server.response(&id).response_result.expect("initialize");
     server.notify("initialized", serde_json::json!({}));
 
-    // Read until the document registration has arrived *and* the gem index has finished, in
-    // whichever order they come: the registration is sent when the roots are discovered, which is
-    // before the first gem file is indexed, and the outline below needs the second.
+    // Read until the document registration has arrived *and* the gem index has finished, in either
+    // order: the registration is sent when the roots are discovered, before the first gem file is
+    // indexed, and the outline below needs the index.
     let mut watcher: Option<serde_json::Value> = None;
     let mut documents: Option<serde_json::Value> = None;
     let mut indexed = false;
@@ -1489,8 +1969,8 @@ fn the_binary_asks_the_client_to_claim_the_gem_it_found() {
                         watcher = Some(registrations);
                     }
                 }
-                // Answered whatever it was — this one and `window/workDoneProgress/create` are
-                // both server-initiated, and a server that wedged on the reply would hang here.
+                // Answered whatever it was: this one and `window/workDoneProgress/create` are both
+                // server-initiated, and a server that wedged on the reply would hang here.
                 server.send(Message::Response(Response {
                     id: request.id,
                     response_result: Ok(serde_json::Value::Null),
@@ -1531,8 +2011,8 @@ fn the_binary_asks_the_client_to_claim_the_gem_it_found() {
             "textDocument/didChange",
             "textDocument/didClose",
             "textDocument/didSave",
-            // Last, because registering it is what walks the documents already open and sends a
-            // `didOpen` for each one the new selector newly matches.
+            // Last, because registering it walks the already-open documents and sends a `didOpen`
+            // for each one the new selector newly matches.
             "textDocument/didOpen",
         ],
         "only the three this client said it takes, and synchronisation after them"
@@ -1581,12 +2061,119 @@ fn the_binary_asks_the_client_to_claim_the_gem_it_found() {
     shut_down(server);
 }
 
+/// Ask `workspace/symbol` until the answer is the wanted one, or until [`WATCH_TIMEOUT`].
+///
+/// A poll, not a wait on a message, because the change produces no notification of its own:
+/// `publishDiagnostics` fires only for a file with something to say, and a class appearing is not
+/// that. The interval is small enough to be invisible where arming is instant and large enough not
+/// to busy-loop where it is not.
+fn symbol_settles(server: &mut Server, query: &str, found: bool) -> bool {
+    symbol_settles_within(server, query, found, WATCH_TIMEOUT)
+}
+
+/// The same, on the caller's own deadline, for the one caller that means to give up early.
+fn symbol_settles_within(
+    server: &mut Server,
+    query: &str,
+    found: bool,
+    patience: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + patience;
+    while std::time::Instant::now() < deadline {
+        let id = server.request("workspace/symbol", serde_json::json!({ "query": query }));
+        let answer = server
+            .response(&id)
+            .response_result
+            .expect("workspace/symbol");
+        if answer.is_null() != found {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Write a probe until the server's own watcher reports one, then remove it again.
+///
+/// **An indexed workspace does not mean an armed watcher, and in between, a file written on disk is
+/// lost for the life of the process.** `watcher::watch` returns as soon as its thread exists, and
+/// arming happens on that thread, on purpose, so no client waits for a walk a network mount can
+/// make arbitrarily slow (`concurrency.md` has the argument). So a test that writes once inside
+/// that window then waits [`WATCH_TIMEOUT`] for an event that will never come, and whether it lands
+/// inside depends on how fast the *index* finished, a property of the build, not of the server. A
+/// single write made this test flaky under a faster dependency profile.
+///
+/// So: rewrite the probe instead of waiting on one, as `watcher::tests::armed` does one layer down.
+/// The removal is waited on too, so nothing after this sees a class the fixture never had.
+fn watcher_armed(server: &mut Server, root: &std::path::Path) {
+    let probe = root.join("lib/probe_for_the_watcher.rb");
+    let deadline = std::time::Instant::now() + WATCH_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        std::fs::write(&probe, "class ProbeForTheWatcher\nend\n").expect("the probe file");
+        if symbol_settles_within(
+            server,
+            "ProbeForTheWatcher",
+            true,
+            Duration::from_millis(500),
+        ) {
+            std::fs::remove_file(&probe).expect("the probe file");
+            assert!(
+                symbol_settles(server, "ProbeForTheWatcher", false),
+                "the probe was watched on the way in and not on the way out"
+            );
+            return;
+        }
+    }
+    panic!("the server's own watcher never armed");
+}
+
+#[test]
+fn a_client_with_no_watcher_of_its_own_still_follows_the_files_on_disk() {
+    // **File watching, through the shipped binary.** `initialize_params` advertises no
+    // `workspace.didChangeWatchedFiles`, so `capabilities::watched_files` answers `None`, nothing
+    // is registered, and ya-lsp watches the project itself. That is the setup for Claude Code,
+    // Helix, eglot and Neovim on Linux. Without it, the three changes below would be invisible for
+    // the life of the process, and every symptom would look like the server being wrong rather than
+    // never being told.
+    //
+    // No `didOpen` anywhere, on purpose: an agent edits through a shell, and a file it never opened
+    // is the case a client's own watcher would have covered.
+    let root = fixture();
+    let mut server = started(root.path(), initialize_params(root.path()));
+    assert!(
+        symbol_settles(&mut server, "Person", true),
+        "the workspace was not indexed at all"
+    );
+    watcher_armed(&mut server, root.path());
+
+    let created = root.path().join("lib/comment.rb");
+    std::fs::write(&created, "class Comment\nend\n").unwrap();
+    assert!(
+        symbol_settles(&mut server, "Comment", true),
+        "a file created on disk never reached the index"
+    );
+
+    std::fs::write(&created, "class Comment\n  def body\n  end\nend\n").unwrap();
+    assert!(
+        symbol_settles(&mut server, "body", true),
+        "a method added on disk never reached the index"
+    );
+
+    std::fs::remove_file(&created).unwrap();
+    assert!(
+        symbol_settles(&mut server, "Comment", false),
+        "a file deleted on disk was still being answered about"
+    );
+
+    shut_down(server);
+}
+
 /// `--licenses` prints what the binary is obliged to carry, and exits cleanly.
 ///
-/// This is the one test that runs the binary as a *command* rather than as a server. It exists
-/// because the obligation belongs to the artifact: a bare `ya-lsp` attached to a release or
-/// installed with `cargo install` has no licence file beside it, and the BSD-2-Clause material
-/// embedded in it has to reach the person holding it somehow.
+/// The one test that runs the binary as a *command* rather than a server. It exists because the
+/// obligation belongs to the artifact: a bare `ya-lsp` attached to a release or installed with
+/// `cargo install` has no licence file beside it, and the BSD-2-Clause material embedded in it
+/// must reach whoever holds it somehow.
 #[test]
 fn licenses_are_carried_by_the_binary_itself() {
     let output = Command::new(env!("CARGO_BIN_EXE_ya-lsp"))
@@ -1621,10 +2208,9 @@ fn licenses_are_carried_by_the_binary_itself() {
 
 /// The command line, which no editor uses and every packager does.
 ///
-/// `--version` is what a Homebrew formula or a CI step calls to check what it installed;
-/// `--help` is what someone types after the binary did nothing they expected. Both write to
-/// stdout, which is the LSP transport in every other mode — hence the assertion that the
-/// *other* stream stays empty.
+/// `--version` is what a Homebrew formula or a CI step calls to check what it installed; `--help`
+/// is what someone types after the binary did nothing they expected. Both write to stdout, the LSP
+/// transport in every other mode, hence the assertion that the *other* stream stays empty.
 #[test]
 fn the_command_line_answers_version_and_help() {
     for flags in [["-V", "--version"], ["-h", "--help"]] {
@@ -1655,10 +2241,10 @@ fn the_command_line_answers_version_and_help() {
     }
 }
 
-/// An argument nobody recognises fails loudly, on stderr, with the usage attached.
+/// An unrecognised argument fails loudly, on stderr, with the usage attached.
 ///
-/// Exiting 0 here would let a typo in an editor's configuration look like a server that starts
-/// and then says nothing — the single most confusing way for this binary to fail.
+/// Exiting 0 would let a typo in an editor's configuration look like a server that starts and then
+/// says nothing: the most confusing way for this binary to fail.
 #[test]
 fn an_unrecognised_argument_fails_with_the_usage() {
     let output = Command::new(env!("CARGO_BIN_EXE_ya-lsp"))
@@ -1682,8 +2268,8 @@ fn an_unrecognised_argument_fails_with_the_usage() {
 
 /// A transport that breaks before the handshake is a failure, not a quiet success.
 ///
-/// Closing stdin immediately is what an editor that crashed on startup looks like from here.
-/// The exit code is the only thing a supervisor can see, so it has to be non-zero.
+/// Closing stdin immediately is what an editor that crashed on startup looks like from here. The
+/// exit code is all a supervisor can see, so it must be non-zero.
 #[test]
 fn a_transport_that_never_speaks_exits_non_zero() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ya-lsp"))
@@ -1707,13 +2293,12 @@ fn a_transport_that_never_speaks_exits_non_zero() {
     );
 }
 
-/// The first log line names the version, and it does not wait for the handshake.
+/// The first log line names the version, and does not wait for the handshake.
 ///
-/// A pasted log is the only thing a bug report reliably carries, and every line in one is
-/// worthless without knowing which build wrote it. Asserted on the path where `initialize` never
-/// arrives, because that is the case the placement exists for: put this after the handshake and
-/// the logs from a client that cannot complete one — the reports hardest to reproduce — carry no
-/// version at all.
+/// A pasted log is the only thing a bug report reliably carries, and every line in it is worthless
+/// without knowing which build wrote it. Asserted on the path where `initialize` never arrives,
+/// because that is the case the placement is for: logged after the handshake, logs from a client
+/// that cannot complete one (the hardest reports to reproduce) would carry no version at all.
 #[test]
 fn startup_logs_the_version_before_the_handshake() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ya-lsp"))
@@ -1738,9 +2323,9 @@ fn startup_logs_the_version_before_the_handshake() {
 
 /// Ruby's own core classes: indexed, navigable, and reachable from a literal.
 ///
-/// The whole of Ruby's own signatures through the wire. The workspace has no gems and asks for core only —
-/// which rung of the ladder answered is `workspace::rbs`'s business, and pinning it here would
-/// make the test assert something about the machine rather than about the server.
+/// All of Ruby's own signatures through the wire. The workspace has no gems and asks for core only;
+/// which rung of the ladder answered is `workspace::rbs`'s business, and pinning it here would test
+/// the machine, not the server.
 #[test]
 fn built_in_classes_are_indexed_and_complete() {
     let root = fixture();
@@ -1756,7 +2341,7 @@ fn built_in_classes_are_indexed_and_complete() {
     server.notify("initialized", serde_json::json!({}));
     drain_progress(&mut server);
 
-    // A buffer the disk has never seen, which is the situation completion always runs in.
+    // A buffer the disk has never seen: the situation completion always runs in.
     let uri = uri_of(root.path(), "lib/scratch.rb");
     let source = "greeting = \"hello\"\ngreeting.upc\nString.new\ngreeting.pu\n\
                   Person.new.sho\nOptionPars\n";
@@ -1774,10 +2359,10 @@ fn built_in_classes_are_indexed_and_complete() {
         "expected String#upcase after a string local, got {labels:?}"
     );
 
-    // And this is what makes the line above mean anything. With core in the graph, the
-    // name-based fallback would offer `upcase` too — it offers every method name there is. Only
-    // a receiver the server actually typed can *refuse* `push`, which is an `Array` method and
-    // no `String` has ever had one.
+    // This is what makes the line above mean anything. With core in the graph, the name-based
+    // fallback would offer `upcase` too, since it offers every method name there is. Only a
+    // receiver the server actually typed can *refuse* `push`, an `Array` method no `String` has
+    // ever had.
     let labels = completion_labels(&mut server, &uri, 3, 11);
     assert!(
         !labels.iter().any(|label| label == "push"),
@@ -1832,11 +2417,10 @@ fn built_in_classes_are_indexed_and_complete() {
     let markdown = result["contents"]["value"].as_str().expect("markdown");
     assert!(markdown.contains("String"), "{markdown}");
 
-    // Core only. `OptionParser` is a stdlib signature and this workspace asked for neither the
-    // stdlib nor its gems. Which classes are "core" is rbs's call and it moves — `Set` and
-    // `Pathname` are both in `core/` as of rbs 4.x, so neither can be used to test this — which
-    // is exactly why `the_stdlib_signatures_are_indexed_when_asked_for` asserts the positive
-    // side separately.
+    // Core only. `OptionParser` is a stdlib signature, and this workspace asked for neither the
+    // stdlib nor gems. Which classes count as "core" is rbs's call and it moves (`Set` and
+    // `Pathname` are in `core/` in current rbs, so neither can test this), which is why
+    // `the_stdlib_signatures_are_indexed_when_asked_for` asserts the positive side separately.
     let labels = completion_labels(&mut server, &uri, 5, 10);
     assert!(
         !labels.iter().any(|label| label == "OptionParser"),
@@ -1893,8 +2477,8 @@ fn built_ins_can_be_turned_off_and_completion_still_answers() {
     );
 
     // No `String` in the graph, so the literal receiver has nothing to resolve against. It must
-    // degrade to the name-based list — the project's own `Person#shout` — rather than to
-    // silence, which is what a bare `None` from `receiver_for` would produce.
+    // degrade to the name-based list (the project's own `Person#shout`), not to the silence a bare
+    // `None` from `receiver_for` would produce.
     let labels = completion_labels(&mut server, &uri, 0, 11);
     assert!(
         labels.iter().any(|label| label == "shout"),
@@ -1957,9 +2541,9 @@ fn a_client_without_progress_support_is_sent_no_progress() {
     server.response(&id).response_result.expect("initialize");
     server.notify("initialized", serde_json::json!({}));
 
-    // Indexing still has to happen — the gem is navigable either way, the client just does not
-    // get told when. Which means the only honest way to wait is to keep asking, exactly as a
-    // progress-less editor would as the user works.
+    // Indexing still happens (the gem is navigable either way; the client just is not told when).
+    // So the only honest way to wait is to keep asking, as a progress-less editor would as the user
+    // works.
     let uri = uri_of(root.path(), "lib/main.rb");
     server.notify(
         "textDocument/didOpen",
@@ -2012,11 +2596,11 @@ fn a_client_without_progress_support_is_sent_no_progress() {
 
 #[test]
 fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
-    // The file watcher through the shipped binary. With it covering `ya-lsp.toml` and nothing
-    // else, a `git checkout`, a `git pull`, a rebase or a `rails g model` changes Ruby under a
-    // running server and nothing re-indexes it — a deleted file keeps its declarations until
-    // someone restarts. Every step here happens with
-    // no `didOpen` anywhere, because that is the situation: the editor never touched the file.
+    // The file watcher through the shipped binary. If it covered only `ya-lsp.toml`, a
+    // `git checkout`, `git pull`, rebase or `rails g model` would change Ruby under a running
+    // server with nothing re-indexing it, and a deleted file would keep its declarations until a
+    // restart. Every step here happens with no `didOpen`, because that is the situation: the editor
+    // never touched the file.
     let root = fixture();
     let mut server = Server::start(root.path());
     let mut params = initialize_params(root.path());
@@ -2026,7 +2610,7 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
     server.response(&id).response_result.expect("initialize");
     server.notify("initialized", serde_json::json!({}));
 
-    // The registration covers the project's Ruby now, not only its configuration.
+    // The registration covers the project's Ruby, not only its configuration.
     let registration = server.server_request("client/registerCapability");
     let watchers = registration.params["registrations"][0]["registerOptions"]["watchers"]
         .as_array()
@@ -2049,18 +2633,24 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
         watchers,
         vec![
             spelled("ya-lsp.toml"),
-            // The second constant, and the only non-Ruby file this server reads: watched so
-            // that an editor's own save of a `db/structure.sql` re-settles, never indexed, and
-            // spelled here because this is the wire.
+            // The second constant, and the only non-Ruby file this server reads: watched so an
+            // editor's save of `db/structure.sql` re-settles, never indexed, and spelled here
+            // because this is the wire.
             spelled("db/*structure.sql"),
             spelled("**/*.rb"),
             spelled("**/*.erb"),
+            // Rails' three other template handlers, plain Ruby and never blanked. On the wire
+            // because each glob is a watcher the client registers: a handler the walk indexes but
+            // nobody watches goes stale on the first `git checkout` that touches it.
+            spelled("**/*.jbuilder"),
+            spelled("**/*.builder"),
+            spelled("**/*.ruby"),
             spelled("**/*.rbs"),
             spelled("**/*.rake"),
             spelled("**/*.gemspec"),
+            spelled("**/*.ru"),
             spelled("**/Rakefile"),
             spelled("**/Gemfile"),
-            spelled("**/config.ru"),
         ],
         "the config, and index.include verbatim — spelled out here rather than derived because \
          this is the wire, and a widened default that reaches an editor by accident is exactly \
@@ -2087,7 +2677,7 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
         server.response(&id).response_result.expect("definition")
     };
 
-    // A file appears, and the file that uses it is rewritten — one `git pull` in miniature.
+    // A file appears, and the file using it is rewritten: one `git pull` in miniature.
     std::fs::write(&place_path, "class Place\n  def name\n  end\nend\n").unwrap();
     std::fs::write(
         root.path().join("lib/main.rb"),
@@ -2120,7 +2710,7 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
     assert_eq!(symbols[0]["name"], "Place", "{symbols}");
     assert_eq!(symbols[1]["name"], "name", "{symbols}");
 
-    // And references, which is the half that reads the *other* file the change touched.
+    // And references, the half that reads the *other* file the change touched.
     let id = server.request(
         "textDocument/references",
         serde_json::json!({
@@ -2133,7 +2723,7 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
     assert_eq!(found.as_array().map(Vec::len), Some(1), "{found}");
     assert_eq!(found[0]["uri"], serde_json::json!(main), "{found}");
 
-    // The same file, rewritten: the declarations it used to hold have to go with it.
+    // The same file, rewritten: the declarations it used to hold must go with it.
     std::fs::write(&place_path, "class Place\n  def label\n  end\nend\n").unwrap();
     server.notify(
         "workspace/didChangeWatchedFiles",
@@ -2157,8 +2747,8 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
         "the method the rewrite removed is still in the index: {rewritten}"
     );
 
-    // And gone: the one change nothing else in the protocol can stand in for. Without it a
-    // deleted file keeps every declaration it had for the life of the process.
+    // And gone: the one change nothing else in the protocol can stand in for. Without it, a deleted
+    // file keeps every declaration it had for the life of the process.
     std::fs::remove_file(&place_path).unwrap();
     server.notify(
         "workspace/didChangeWatchedFiles",
@@ -2175,11 +2765,10 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
 
 #[test]
 fn the_config_file_reloads_without_a_restart() {
-    // Config reload through the shipped binary rather than an in-process connection: an editor
-    // that takes a dynamic registration is asked to watch `ya-lsp.toml`, and the change it
-    // reports back actually changes an answer. Without the server sending
-    // `client/registerCapability` this works in exactly one editor — the one whose extension
-    // brings a watcher of its own.
+    // Config reload through the shipped binary, not an in-process connection: an editor that takes
+    // a dynamic registration is asked to watch `ya-lsp.toml`, and the change it reports really
+    // changes an answer. Without the server sending `client/registerCapability`, this works in only
+    // one editor: the one whose extension brings its own watcher.
     let root = fixture();
     std::fs::write(
         root.path().join("lib/broken.rb"),
@@ -2224,8 +2813,8 @@ fn the_config_file_reloads_without_a_restart() {
             break params;
         }
     };
-    // `parse-error` only: Prism also reports the indentation as a `parse-warning`, and this
-    // test is about the one rule the file being edited turns on and off.
+    // `parse-error` only: Prism also reports the indentation as a `parse-warning`, and this test is
+    // about the one rule the edited file turns on and off.
     assert!(
         !has_parse_error(&silent),
         "the rule was off, so nothing should have reported it: {silent:?}"
@@ -2262,13 +2851,12 @@ fn the_config_file_reloads_without_a_restart() {
 
 #[test]
 fn the_editor_can_switch_one_rule_off_and_leave_the_others_loud() {
-    // Per-rule severity through the shipped binary and through the layer the *editor* sends —
-    // `ya-lsp.toml` is what `the_config_file_reloads_without_a_restart` drives, and this is the
-    // editor's view of the same setting. The rule is `parse-warning` because that is the one
-    // a project may already be linting for itself: the public Rails app measured for it
-    // switches off exactly its ground (`Lint/UselessAssignment`) in `.standard.yml` while a file
-    // that does not parse is still worth a squiggle. One file carries both, so the assertion is
-    // that the warning goes and the errors beside it stay.
+    // Per-rule severity through the shipped binary, via the layer the *editor* sends: `ya-lsp.toml`
+    // is what `the_config_file_reloads_without_a_restart` drives, and this is the editor's view of
+    // the same setting. The rule is `parse-warning` because a project may already lint for that
+    // itself (a public Rails app turns off exactly that ground, `Lint/UselessAssignment`, in
+    // `.standard.yml`) while a file that does not parse still deserves a squiggle. One file carries
+    // both, so the assertion is that the warning goes and the errors beside it stay.
     let root = fixture();
     std::fs::write(
         root.path().join("lib/unused.rb"),
@@ -2289,9 +2877,9 @@ fn the_editor_can_switch_one_rule_off_and_leave_the_others_loud() {
     assert_eq!(reported[1], ["parse-error", "parse-error", "parse-warning"]);
     shut_down(server);
 
-    // The same workspace, started with the one thing the extension sends for
-    // `ya-lsp.diagnostics.rules`. `lib/unused.rb` now has nothing left to report and so is never
-    // published at all, which is why the assertion is made on the file that still has errors.
+    // The same workspace, started with what the extension sends for `ya-lsp.diagnostics.rules`.
+    // `lib/unused.rb` now has nothing to report and is never published, which is why the assertion
+    // is on the file that still has errors.
     let mut params = initialize_params(root.path());
     params["initializationOptions"] =
         serde_json::json!({ "diagnostics": { "rules": { "parse-warning": "off" } } });
@@ -2306,8 +2894,8 @@ fn the_editor_can_switch_one_rule_off_and_leave_the_others_loud() {
 
 /// The rule names published for each of `uris`, sorted, waiting until every one has been seen.
 ///
-/// Sorted rather than pinned in order: which end of a broken file rubydex reports first is not
-/// something this test is entitled to an opinion about.
+/// Sorted, not pinned in order: which end of a broken file rubydex reports first is not something
+/// this test may have an opinion about.
 fn published_codes(server: &mut Server, uris: &[&str]) -> Vec<Vec<String>> {
     let mut found: Vec<Option<Vec<String>>> = vec![None; uris.len()];
     while found.iter().any(Option::is_none) {
@@ -2337,10 +2925,9 @@ fn published_codes(server: &mut Server, uris: &[&str]) -> Vec<Vec<String>> {
 
 #[test]
 fn selection_and_folding_ranges_over_stdio() {
-    // The end-to-end ranges claim. Both are pure functions of one buffer, so what
-    // a real server adds over the unit tests is the wire: a chain arrives as a nest of `parent`
-    // objects rather than a list, a fold arrives as two line numbers with no characters on it,
-    // and both are measured against a buffer the disk has never seen.
+    // The end-to-end ranges claim. Both are pure functions of one buffer, so a real server adds the
+    // wire: a chain arrives as nested `parent` objects instead of a list, a fold as two line
+    // numbers with no characters, and both are measured against a buffer the disk has never seen.
     let root = fixture();
     let mut server = started(root.path(), modern_client(root.path()));
 
@@ -2395,7 +2982,7 @@ fn selection_and_folding_ranges_over_stdio() {
         serde_json::json!({ "line": 4, "character": 14 }),
         "{found}"
     );
-    // And the last link is the whole buffer, which is what makes every position answerable.
+    // And the last link is the whole buffer, which makes every position answerable.
     let mut outermost = &found[0];
     while outermost["parent"].is_object() {
         outermost = &outermost["parent"];

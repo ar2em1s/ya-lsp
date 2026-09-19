@@ -1,32 +1,35 @@
 //! `enum`, both of its spellings, and the 3 + 4N names one call installs.
 //!
-//! What Rails installs is read out of `activerecord/lib/active_record/enum.rb` rather than
-//! remembered: `_enum` writes the attribute, its writer and `self.<name.pluralize>`, and
-//! `define_enum_methods` writes `<label>?`, `<label>!`, `self.<label>` and `self.not_<label>` for
-//! every value. The class-side pair really is `klass.scope`, so an `enum` feeds
-//! [`super::models::Model::collections`] exactly as a `scope` does and reuses the relation class
-//! and the model class side unchanged.
+//! What Rails installs is read out of `activerecord/lib/active_record/enum.rb`, not remembered:
+//! - `_enum` writes the attribute, its writer and `self.<name.pluralize>`;
+//! - `define_enum_methods` writes `<label>?`, `<label>!`, `self.<label>` and `self.not_<label>` for
+//!   every value.
+//!
+//! The class-side pair really is `klass.scope`, so an `enum` feeds
+//! [`super::models::Model::collections`] exactly as a `scope` does, reusing the relation class and
+//! the model's class side unchanged.
 //!
 //! # The two spellings, and the one Rails removed
 //!
-//! `enum(name, values = nil, **options)`, and `values, options = options, {} unless values`. So
-//! `enum :status, { draft: 0 }` and `enum :status, draft: 0` are the same call written twice — in
-//! the second there is no options hash at all, because the options hash *is* the values. The
-//! older `enum status: { draft: 0 }` wore its options with a leading underscore (`_prefix`,
-//! `_suffix`, `_scopes`, `_instance_methods`) and could define several enums in one call; Rails
-//! 8.1 deleted it, and applications still carry it.
+//! `enum(name, values = nil, **options)`, then `values, options = options, {} unless values`. So
+//! `enum :status, { draft: 0 }` and `enum :status, draft: 0` are the same call: in the second, the
+//! options hash *is* the values.
+//!
+//! The older `enum status: { draft: 0 }` spelled its options with a leading underscore (`_prefix`,
+//! `_suffix`, `_scopes`, `_instance_methods`) and could define several enums per call. Rails 8.1
+//! deleted it; applications still carry it.
 //!
 //! # What is declined, and why each fails to nothing
 //!
-//! - **A values list that is not a literal** — `enum :locale, LANGUAGES_CONFIG.map { ... }.to_h`
-//!   — declares the attribute and none of its values. Declining the whole call would be worse
-//!   rather than safer: the three attribute names do not depend on the values, and the column
-//!   underneath is an `Integer` that would otherwise be believed.
-//! - **A label that is not a valid method name.** Rails installs `'ml-dsa-44': 2` under that
-//!   exact name *and* under a transliterated alias; this declines both.
+//! - **A values list that is not a literal** (`enum :locale, LANGUAGES_CONFIG.map { ... }.to_h`)
+//!   declares the attribute and none of its values. Declining the whole call would be worse: the
+//!   three attribute names do not depend on the values, and the `Integer` column underneath would
+//!   otherwise be believed.
+//! - **A label that is not a valid method name.** Rails installs `'ml-dsa-44': 2` under that exact
+//!   name *and* a transliterated alias; this declines both.
 //! - **A `prefix:` or `suffix:` this cannot read** takes every value method with it, because the
-//!   names would be wrong rather than missing. A `scopes:` or `instance_methods:` it cannot read
-//!   is read as `false` for the same reason.
+//!   names would be wrong, not missing. An unreadable `scopes:` or `instance_methods:` is read as
+//!   `false` for the same reason.
 
 use ruby_prism::{AssocNode, CallNode, Node};
 
@@ -66,11 +69,11 @@ struct Label {
 
 /// The four options that change *what* an `enum` declares.
 ///
-/// `default:` and `validate:` are the other two Rails takes and neither names a member, so
-/// neither is here — which is the same rule that keeps `validates` out of [`super::MACROS`].
+/// `default:` and `validate:` are the other two Rails takes. Neither names a member, so neither is
+/// here: the rule that keeps `validates` out of [`super::MACROS`].
 struct Options {
-    /// The prefix and the suffix every label is wrapped in, or `None` when one of them is
-    /// written and is not something this can read.
+    /// The prefix and suffix every label is wrapped in, or `None` when one is written in a form
+    /// this cannot read.
     affix: Option<(String, String)>,
     scopes: bool,
     instance_methods: bool,
@@ -86,12 +89,12 @@ impl Options {
         }
     }
 
-    /// The options a call wrote, under whichever spelling wears them.
+    /// The options a call wrote, under whichever spelling it uses.
     ///
-    /// `under` is the underscore the older keyword form puts in front of every option name, so
-    /// that `prefix: true` and `_prefix: true` are one reader and not two. Rails is strict about
-    /// it in both directions — the modern form *raises* on `_prefix` — and so is this: a name
-    /// spelled the other form's way is not an option here, it is a value or an unknown keyword.
+    /// `under` is the underscore the older keyword form puts before every option name, so
+    /// `prefix: true` and `_prefix: true` share one reader. Rails is strict both ways (the modern
+    /// form *raises* on `_prefix`), and so is this: a name spelled the other form's way is not an
+    /// option here but a value or an unknown keyword.
     fn read(source: &str, name: &str, pairs: &[AssocNode<'_>], under: &str) -> Self {
         let written = |option: &str| {
             let want = format!("{under}{option}");
@@ -117,8 +120,8 @@ impl Options {
 
 /// Rails' `prefix = prefix == true ? "#{name}_" : "#{prefix}_"`, and its suffix twin.
 ///
-/// `None` is "written, and not readable" — which the caller turns into an enum with no values
-/// rather than into values under the wrong names.
+/// `None` means "written, and not readable". The caller turns it into an enum with no values, not
+/// values under the wrong names.
 fn affix(source: &str, value: Option<Node<'_>>, name: &str, trailing: bool) -> Option<String> {
     let Some(node) = value else {
         return Some(String::new());
@@ -138,7 +141,7 @@ fn affix(source: &str, value: Option<Node<'_>>, name: &str, trailing: bool) -> O
     })
 }
 
-/// An option that is on unless the call says otherwise — and off unless it says so in a literal.
+/// An option that is on unless the call says otherwise, and off only when it says so in a literal.
 fn flag(value: Option<Node<'_>>) -> bool {
     value.is_none_or(|node| node.as_true_node().is_some())
 }
@@ -163,9 +166,8 @@ type Written = (String, (u32, u32), (u32, u32));
 
 /// Every label a values list names.
 ///
-/// `None` is a values list that is not a literal at all; an element inside a literal one that
-/// cannot be read is dropped on its own, because the values beside it are still exactly what
-/// Rails will install.
+/// `None` is a values list that is not a literal at all. An unreadable element inside a literal
+/// list is dropped alone, because the values beside it are still exactly what Rails installs.
 fn values(source: &str, node: &Node<'_>) -> Option<Vec<Written>> {
     let span = |node: &Node<'_>| {
         let location = node.location();
@@ -194,12 +196,12 @@ fn values(source: &str, node: &Node<'_>) -> Option<Vec<Written>> {
     )
 }
 
-/// Whether a name can be written as a `def` rather than only reached through `send`.
+/// Whether a name can be written as a `def`, not only reached through `send`.
 ///
-/// Rails does not require it — `define_method` takes anything — so this is the one place the
-/// reader is deliberately narrower than the framework. The alternative is a generated `def` RBS
-/// cannot parse, which `Synthesized::record` refuses *as a whole document*: one strange label
-/// would cost every declaration in the file.
+/// Rails does not require it (`define_method` takes anything), so this is the one place the reader
+/// is deliberately narrower than the framework. The alternative is a generated `def` RBS cannot
+/// parse, and `Synthesized::record` refuses such a document *whole*: one strange label would cost
+/// every declaration in the file.
 fn is_method_name(name: &str) -> bool {
     let mut characters = name.chars();
     characters
@@ -218,8 +220,8 @@ fn attributes(source: &str, node: &CallNode<'_>) -> Option<Vec<Enum>> {
     let arguments: Vec<Node<'_>> = node.arguments()?.arguments().iter().collect();
     let first = arguments.first()?;
 
-    // The older keyword form. Every pair that is not an option defines an enum of its own —
-    // `enum status: { ... }, kind: { ... }` is two — and the options apply to all of them.
+    // The older keyword form. Every pair that is not an option defines its own enum
+    // (`enum status: { ... }, kind: { ... }` is two), and the options apply to all of them.
     if first.as_keyword_hash_node().is_some() {
         let (defined, options): (Vec<_>, Vec<_>) = pairs(first)?.into_iter().partition(|pair| {
             symbol_or_string(source, &pair.key()).is_none_or(|(key, _)| !key.starts_with('_'))
@@ -238,9 +240,8 @@ fn attributes(source: &str, node: &CallNode<'_>) -> Option<Vec<Enum>> {
 
     let (name, name_at) = symbol_or_string(source, first)?;
     let list = arguments.get(1)?;
-    // `enum :status, draft: 0` — Rails swaps the options hash into `values` when nothing was
-    // passed positionally, so a call written this way has no options at all and every pair in it
-    // is a value.
+    // `enum :status, draft: 0`: Rails swaps the options hash into `values` when nothing was passed
+    // positionally, so this call has no options and every pair is a value.
     let options = match list.as_keyword_hash_node() {
         Some(_) => Options::plain(),
         None => Options::read(
@@ -302,10 +303,10 @@ impl Enum {
 
     /// Say the 3 + 4N names this call installs.
     ///
-    /// `relation` is whether the class it is written on has a generated relation class — the
-    /// same condition a `has_many` carries, and for the same reason: `Story.draft`
-    /// returns a `Story::Relation`, and a project that wrote its own `Story::Relation` meant
-    /// something by it. Without one the class-side pair is declined and the rest stands.
+    /// `relation` is whether the class has a generated relation class: the same condition as for
+    /// `has_many`, for the same reason. `Story.draft` returns a `Story::Relation`, and a project
+    /// that wrote its own `Story::Relation` meant something by it. Without one, the class-side pair
+    /// is declined and the rest stands.
     pub(super) fn declare(
         &self,
         facts: &mut Facts,
@@ -317,10 +318,9 @@ impl Enum {
         let instance = Owner::Instance(class.to_owned());
         let singleton = Owner::Singleton(class.to_owned());
         let whole = Some((self.at, self.name_at));
-        // The label and not the value it is stored as: `EnumType#deserialize` answers with the
-        // key of the mapping, and the keys of a `HashWithIndifferentAccess` are strings. The `?`
-        // is the column's — an enum call cannot see whether the column is `null: false`, and
-        // over-admitting `nil` is the direction that is never wrong.
+        // The label, not the stored value: `EnumType#deserialize` returns the mapping's key, and a
+        // `HashWithIndifferentAccess` has string keys. The `?` is the column's: an enum call cannot
+        // see whether the column is `null: false`, and over-admitting `nil` is never wrong.
         facts.declare(Declared {
             owner: instance.clone(),
             name: self.name.clone(),
@@ -347,10 +347,10 @@ impl Enum {
             from: Source::Enum,
             overloads: Vec::new(),
         });
-        // `singleton_class.define_method(name.pluralize) { enum_values }`. The real class is an
-        // `ActiveSupport::HashWithIndifferentAccess`, which no project without Rails in its
-        // bundle has indexed; `Hash` is the class it subclasses, so every member it answers is
-        // one this declares and none of them is invented.
+        // `singleton_class.define_method(name.pluralize) { enum_values }`. The real class is
+        // `ActiveSupport::HashWithIndifferentAccess`, which a project without Rails in its bundle
+        // has not indexed. `Hash` is its superclass, so every member this declares is real and none
+        // is invented.
         facts.declare(Declared {
             owner: singleton.clone(),
             name: pluralize(&self.name),
@@ -399,15 +399,15 @@ impl Enum {
                 continue;
             }
             // `klass.scope value_method_name, -> { where(name => value) }`, and its `not_` twin.
-            // The lambda takes nothing, so the parameter list is exact rather than the
-            // `(*untyped)` a hand-written `scope` has to settle for.
+            // The lambda takes nothing, so the parameter list is exact, not the `(*untyped)` a
+            // hand-written `scope` has to settle for.
             for (name, sense) in [
                 (label.method.clone(), "is"),
                 (format!("not_{}", label.method), "is not"),
             ] {
-                // On the relation as well as the class object, because this pair really is a
-                // `scope` and Rails delegates every scope to the relation:
-                // `Article.published.draft` is the spelling an `enum` exists to make short.
+                // On the relation as well as the class object: this pair really is a `scope`, and
+                // Rails delegates every scope to the relation. `Article.published.draft` is the
+                // spelling an `enum` exists to make short.
                 chained.declare(
                     facts,
                     class,
@@ -465,7 +465,7 @@ mod tests {
             .render(&declaring(&[]))
     }
 
-    /// Every `def` in a rendering, in order, so a test can name what changed rather than pin it.
+    /// Every `def` in a rendering, in order, so a test can name what changed instead of pinning it.
     fn names(source: &str) -> Vec<String> {
         rbs(source)
             .lines()
@@ -476,13 +476,13 @@ mod tests {
 
     /// The whole of what one ordinary `enum` declares, pinned.
     ///
-    /// Pinned as a document for the reason the schema's and the model's are: 3 + 4N is a claim
-    /// about Rails, and asserting it one predicate at a time is how a change to the shape passes
-    /// ten green tests. Every name here was read out of `_enum` and `define_enum_methods`.
+    /// Pinned as a document, like the schema's and the model's: 3 + 4N is a claim about Rails, and
+    /// asserting one predicate at a time lets a change of shape pass ten green tests. Every name
+    /// here was read out of `_enum` and `define_enum_methods`.
     ///
-    /// 4N names and 6N declarations: the class-side pair really is a `scope`, so it is on the
-    /// relation class too — see [`Chained`]. `Story.draft.published` is what the second copy
-    /// buys, and the whole of the second body is why it is written in one run.
+    /// 4N names and 6N declarations: the class-side pair is a `scope`, so it is on the relation
+    /// class too (see [`Chained`]). `Story.draft.published` is what the second copy buys, and why
+    /// the second body is written in one run.
     #[test]
     fn the_rbs_an_enum_declares() {
         assert_eq!(
@@ -526,7 +526,7 @@ end
         );
     }
 
-    /// The spelling Rails 8.1 deleted, which one application in six carries all of.
+    /// The spelling Rails 8.1 deleted, which real applications still carry.
     #[test]
     fn the_older_keyword_spelling_declares_the_same_names() {
         assert_eq!(
@@ -548,8 +548,8 @@ end
         assert!(declared.contains(&"self.kinds".to_owned()), "{declared:?}");
     }
 
-    /// `values, options = options, {} unless values` — so a call written without braces has no
-    /// options at all, and a pair that looks like one is a value.
+    /// `values, options = options, {} unless values`: a call written without braces has no options,
+    /// and a pair that looks like one is a value.
     #[test]
     fn a_braceless_hash_is_the_values_and_never_the_options() {
         let declared = names(&model("  enum :status, draft: 0, prefix: true\n"));
@@ -590,7 +590,7 @@ end
                 declared.contains(&format!("self.not_{want}")),
                 "{call}{declared:?}"
             );
-            // The attribute itself is never renamed — Rails wraps the *label*.
+            // The attribute itself is never renamed: Rails wraps the *label*.
             assert!(
                 declared.contains(&"status".to_owned()),
                 "{call}{declared:?}"
@@ -601,8 +601,8 @@ end
     /// An option is spelled one way per form, and Rails raises on the other. So does this.
     #[test]
     fn an_option_written_for_the_other_spelling_is_not_an_option() {
-        // `_prefix` in the modern form is a keyword Rails rejects; here it is simply not read,
-        // and the value methods keep their plain names.
+        // `_prefix` in the modern form is a keyword Rails rejects. Here it is simply not read, and
+        // the value methods keep their plain names.
         let declared = names(&model("  enum :status, { draft: 0 }, _prefix: true\n"));
         assert!(declared.contains(&"draft?".to_owned()), "{declared:?}");
         // `prefix` in the older form is another enum, exactly as Rails reads it.
@@ -611,8 +611,8 @@ end
         assert!(declared.contains(&"on?".to_owned()), "{declared:?}");
     }
 
-    /// `scopes: false` drops the class side, `instance_methods: false` drops the instance side,
-    /// and both leave the three names the attribute itself owns.
+    /// `scopes: false` drops the class side, `instance_methods: false` the instance side, and both
+    /// keep the three names the attribute owns.
     #[test]
     fn the_two_options_that_take_names_away() {
         let declared = names(&model("  enum :status, { draft: 0 }, scopes: false\n"));
@@ -631,9 +631,9 @@ end
         assert!(declared.contains(&"status".to_owned()), "{declared:?}");
     }
 
-    /// An option this cannot read is refused rather than approximated, and the two halves refuse
-    /// differently on purpose: a prefix it cannot read would name every value method *wrongly*,
-    /// where a `scopes:` it cannot read might only mean there are none.
+    /// An option this cannot read is refused, not approximated, and the two halves refuse
+    /// differently on purpose: an unreadable prefix would name every value method *wrongly*, while
+    /// an unreadable `scopes:` might only mean there are none.
     #[test]
     fn an_option_that_is_not_a_literal_is_declined() {
         let declared = names(&model("  enum :status, { draft: 0 }, prefix: SETTING\n"));
@@ -644,7 +644,7 @@ end
         assert!(!declared.contains(&"self.draft".to_owned()), "{declared:?}");
     }
 
-    /// Rails' `if prefix` — `false` and `nil` are no prefix, not the string "false".
+    /// Rails' `if prefix`: `false` and `nil` mean no prefix, not the string "false".
     #[test]
     fn a_prefix_that_is_false_is_no_prefix() {
         for call in [
@@ -655,8 +655,8 @@ end
         }
     }
 
-    /// `values.respond_to?(:each_pair) ? values.each_pair : values.each_with_index` — an array
-    /// is a values list too, and its labels are its elements.
+    /// `values.respond_to?(:each_pair) ? values.each_pair : values.each_with_index`: an array is a
+    /// values list too, and its labels are its elements.
     #[test]
     fn an_array_of_values_is_read_like_a_hash_of_them() {
         assert_eq!(
@@ -667,9 +667,9 @@ end
 
     /// A non-literal values list declares the attribute, not nothing.
     ///
-    /// The three names an attribute owns do not depend on its values at all, and the column
-    /// underneath is the integer the labels are stored as — so declaring nothing here does not
-    /// leave the answer absent, it leaves it wrong. `synthesized.md` has the argument.
+    /// The three names an attribute owns do not depend on its values, and the column underneath is
+    /// the integer the labels are stored as. Declaring nothing would not leave the answer absent;
+    /// it would leave it wrong. `synthesized.md` has the argument.
     #[test]
     fn a_values_list_that_is_not_a_literal_still_declares_its_attribute() {
         for call in [
@@ -687,9 +687,9 @@ end
 
     /// A label Rails installs through `define_method` and this cannot write as a `def`.
     ///
-    /// One label in the six corpora — mastodon's `'ml-dsa-44': 2` — and Rails also installs a
-    /// transliterated alias for it, which this deliberately does not: see `synthesized.md`. The
-    /// values beside a declined one are still declared, because Rails still installs them.
+    /// Rails also installs a transliterated alias for it, which this deliberately does not (see
+    /// `synthesized.md`). The values beside a declined one are still declared, because Rails still
+    /// installs them.
     #[test]
     fn a_label_that_cannot_be_written_as_a_def_is_declined() {
         let declared = names(&model(
@@ -709,8 +709,8 @@ end
                 "_x!",
                 "self._x",
                 "self.not__x",
-                // The class-side pair again, on the relation class: a declined label is declined
-                // on both sides, which is the property a second home could have lost.
+                // The class-side pair again, on the relation class: a declined label is declined on
+                // both sides, which a second home could have broken.
                 "rsa",
                 "not_rsa",
                 "_x",
@@ -719,8 +719,7 @@ end
         );
     }
 
-    /// A prefix can make a legal label illegal, which is the case that says the check belongs
-    /// after the affixes rather than before them.
+    /// A prefix can make a legal label illegal, so the check belongs after the affixes, not before.
     #[test]
     fn a_prefix_is_part_of_the_name_that_has_to_be_spellable() {
         assert_eq!(
@@ -764,8 +763,7 @@ end
         assert!(!has("  enum :status, STATUSES\n"));
     }
 
-    /// The columns the schema has to decline, which is the whole of what this tells another
-    /// generator.
+    /// The columns the schema must decline: the whole of what this tells another generator.
     #[test]
     fn the_attributes_an_enum_re_types() {
         let model = read_model(&model(
@@ -777,8 +775,7 @@ end
         );
     }
 
-    /// Where each jump lands: the attribute's three names on the call, and a value's four on the
-    /// value.
+    /// Where each jump lands: the attribute's three names on the call, a value's four on the value.
     #[test]
     fn where_a_generated_name_says_it_was_declared() {
         let source = model("  enum :status, { draft: 0, published: 1 }\n");
@@ -803,9 +800,8 @@ end
                 ("published: 1", "published"),
                 ("published: 1", "published"),
                 ("published: 1", "published"),
-                // The relation class' copy of the two class-side names, each landing on the
-                // same label as its twin: `Story.draft.published` jumps where `Story.published`
-                // does.
+                // The relation class's copy of the two class-side names, each landing on the same
+                // label as its twin: `Story.draft.published` jumps where `Story.published` does.
                 ("draft: 0", "draft"),
                 ("draft: 0", "draft"),
                 ("published: 1", "published"),
@@ -824,8 +820,8 @@ end
         assert_eq!((at(last.declared), at(last.selection)), (":draft", "draft"));
     }
 
-    /// `singleton_class.define_method(name.pluralize)`, including the words Rails' inflector has
-    /// a rule for and the ones it refuses.
+    /// `singleton_class.define_method(name.pluralize)`, including words Rails' inflector has a rule
+    /// for and words it refuses.
     #[test]
     fn the_class_method_is_the_attribute_pluralized() {
         for (attribute, plural) in [
@@ -838,8 +834,8 @@ end
         }
     }
 
-    /// An `enum` written where a macro is not a statement of a class body declares nothing —
-    /// the bounding rule the rest of this directory follows, applied to the new reader.
+    /// An `enum` written where a macro is not a statement of a class body declares nothing: the
+    /// bounding rule the rest of this directory follows.
     #[test]
     fn only_a_statement_of_a_class_body_is_a_macro() {
         for body in [
@@ -852,13 +848,13 @@ end
         }
     }
 
-    /// An `enum` in one expression: the four names a value installs, and where each of them says
-    /// it was declared.
+    /// An `enum` in one expression: the four names a value installs, and where each says it was
+    /// declared.
     ///
-    /// `story.published?` is a member, it hovers as `bool`, and the jump lands on the
-    /// `published: 1` *inside* the call with the label selected, which is the side table's
-    /// mapping at its best case. `Story.published` is the same fact on the class side, and it is a `scope`
-    /// because Rails installs it by calling `klass.scope`.
+    /// `story.published?` is a member, hovers as `bool`, and jumps to `published: 1` *inside* the
+    /// call with the label selected: the side table's mapping at its best. `Story.published` is the
+    /// same fact on the class side, and it is a `scope` because Rails installs it with
+    /// `klass.scope`.
     #[test]
     fn an_enum_declares_its_values_and_jumps_to_the_one_that_named_them() {
         let source = "Story.published.first.published?\n";
@@ -888,10 +884,9 @@ end
         );
         assert!(!value.contains("guessed from the name"), "{value}");
 
-        // And it answers `bool`, which cannot be read off a hover card: no card in this crate
-        // prints a return type, and `bool` is `true | false` — a union, which
-        // `class_of` deliberately declines — so it is read off the document the pass wrote,
-        // which is the text `Types::harvest` then reads.
+        // It answers `bool`, which a hover card cannot show: no card prints a return type, and
+        // `bool` is `true | false`, a union `class_of` declines. So it is read off the document the
+        // pass wrote, the text `Types::harvest` reads next.
         assert!(
             harness
                 .generated_for(&article)
@@ -906,8 +901,8 @@ end
             serde_json::json!(article.as_str()),
             "{definition}"
         );
-        // Line 1 is the `enum` call; the target is `published: 1` and the selection is the label
-        // — the whole of the call is *not* what a value method was declared by.
+        // Line 1 is the `enum` call. The target is `published: 1` and the selection is the label:
+        // the whole call is *not* what declared a value method.
         assert_eq!(
             (
                 &definition[0]["targetRange"]["start"]["line"],
@@ -925,13 +920,13 @@ end
         );
     }
 
-    /// An `enum` re-types the column it is stored in, and does it by the column standing down.
+    /// An `enum` re-types the column it is stored in, by the column standing down.
     ///
     /// The one place in this pass where a generator's output depends on another generator's
-    /// *input*. `story.status` is the label — a `String` — and the column holds the integer it
-    /// is stored as; the two declarations are in two different generated documents, so `Facts`'
-    /// precedence can never see the pair and the schema has to decline. What that has to
-    /// produce is **one** `Story#status` and a chain that reaches `String`.
+    /// *input*. `story.status` is the label (a `String`), and the column holds the integer it is
+    /// stored as. The two declarations are in different generated documents, so `Facts`' precedence
+    /// never sees the pair, and the schema must decline. The result must be **one** `Story#status`
+    /// and a chain that reaches `String`.
     #[test]
     fn an_enum_re_types_the_column_it_is_stored_in() {
         let source = "Story.new.status.upcase\n";

@@ -24,8 +24,8 @@ test('a .rubocop.yml is enough on its own', () => {
 });
 
 test('an empty config file still counts', () => {
-  // `read` returning `''` is a file that exists; only `undefined` is absence, and `''` is
-  // falsy in a way that would silently reverse this answer if the check were on truthiness.
+  // `read` returning `''` means the file exists; only `undefined` is absence. `''` is falsy, so a
+  // truthiness check would silently reverse this answer.
   assert.equal(usesRubocop(folder({ '.rubocop.yml': '' })), true);
 });
 
@@ -37,8 +37,8 @@ test('rubocop in the bundle is enough on its own', () => {
 });
 
 test('and a transitive rubocop counts, because it still lints', () => {
-  // Nobody wrote `gem "rubocop"`; `rubocop-rails` pulled it in. It is in the bundle, `bundle
-  // exec rubocop` runs, and the official extension will find it.
+  // Nobody wrote `gem "rubocop"`; `rubocop-rails` pulled it in. It is in the bundle,
+  // `bundle exec rubocop` runs, and the official extension will find it.
   assert.equal(
     usesRubocop(
       folder({
@@ -52,9 +52,9 @@ test('and a transitive rubocop counts, because it still lints', () => {
 });
 
 test('a lockfile that only mentions rubocop as a dependency of something absent does not count', () => {
-  // The guard the four-space anchor exists for: `rubocop-ast` is a spec, and the word `rubocop`
-  // appears inside its name and inside dependency lines at six spaces. None of that is RuboCop
-  // being installed, and a bare substring search would say it was.
+  // The guard the four-space anchor exists for: `rubocop-ast` is a spec, and `rubocop` appears
+  // inside its name and in dependency lines at six spaces. None of that means RuboCop is installed,
+  // and a bare substring search would say it was.
   assert.equal(
     usesRubocop(
       folder({
@@ -68,7 +68,7 @@ test('a lockfile that only mentions rubocop as a dependency of something absent 
 });
 
 test('the name of the extension is the one the RuboCop team publishes', () => {
-  // Spelled wrong, `getExtension` never matches and the hint shows to someone who already has
-  // it — every session, forever.
+  // Misspelled, `getExtension` never matches, and the hint shows to someone who already has the
+  // extension, every session, forever.
   assert.equal(RUBOCOP_EXTENSION, 'rubocop.vscode-rubocop');
 });

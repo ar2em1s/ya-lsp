@@ -1,39 +1,38 @@
 //! The two conventions with no macro at all: a mailer's actions and a job's `perform`.
 //!
-//! Every other generator in this directory starts from a call; this one starts from a `def` and a
-//! superclass. What it writes is entirely **class-side**: Rails answers a mailer's every public
-//! action on the class itself, ActiveJob installs `perform_later` and `perform_now` beside a
-//! `perform`, and Sidekiq installs `perform_async`, `perform_in` and `perform_at`.
+//! Every other generator here starts from a call; this one starts from a `def` and a superclass.
+//! Everything it writes is **class-side**:
+//! - Rails answers a mailer's every public action on the class itself.
+//! - ActiveJob installs `perform_later` and `perform_now` beside a `perform`.
+//! - Sidekiq installs `perform_async`, `perform_in` and `perform_at`.
 //!
 //! # Why the superclass is the gate, and `def perform` is not
 //!
-//! `perform` is an ordinary method name and applications are full of it — service objects define
-//! a public `def perform` with no superclass at all, by the hundred. Declaring `self.perform_later`
-//! on those would put a class method on classes that raise it. So the convention is recognised by
-//! what a class *inherits* or *includes*, and the `def` is only what it then reads. That is what
-//! makes the convention exact rather than a guess.
+//! `perform` is an ordinary method name. Service objects define a public `def perform` with no
+//! superclass, by the hundred, and declaring `self.perform_later` on them would add a class method
+//! that raises. So the convention is recognised by what a class *inherits* or *includes*, and the
+//! `def` is only what it then reads. That makes it exact, not a guess.
 //!
 //! # Sidekiq is not a gap; it is the majority of this half
 //!
 //! `include Sidekiq::Worker` or `Sidekiq::Job` outnumbers ActiveJob in real applications, so
-//! declining it would decline most of the feature. Both spellings are read: `Sidekiq::Job` is
-//! what 7.0 renamed `Sidekiq::Worker` to, and both are still written.
+//! declining it would decline most of the feature. Both spellings are read: Sidekiq 7.0 renamed
+//! `Sidekiq::Worker` to `Sidekiq::Job`, and both are still written.
 //!
 //! # What is declined, and why each fails to nothing
 //!
 //! - **A module.** `include Sidekiq::Worker` in a concern installs the class methods on whoever
-//!   includes it, which this pass cannot know — the same wall a concern's `scope` hits, and the
-//!   same answer.
-//! - **A `def` that is not a statement of the class body**, one inside `private`/`protected`, and
-//!   `def self.` — none is an action Rails routes to.
-//! - **A method name RBS cannot spell.** `def <=>` in a mailer would render RBS that does not
-//!   parse, and [`Synthesized::record`](crate::analysis::synthesized::Synthesized::record) refuses
-//!   a document it cannot parse *whole* — so one odd name would silence every declaration the file
-//!   makes. The guard is load-bearing rather than tidy.
+//!   includes it, which this pass cannot know. Same wall, and same answer, as a concern's `scope`.
+//! - **A `def` that is not a statement of the class body**, one under `private`/`protected`, and
+//!   `def self.`: none is an action Rails routes to.
+//! - **A method name RBS cannot spell.** `def <=>` in a mailer would render unparseable RBS, and
+//!   [`Synthesized::record`](crate::analysis::synthesized::Synthesized::record) refuses a document
+//!   it cannot parse *whole*. One odd name would silence every declaration in the file, so the
+//!   guard is load-bearing.
 
 use ruby_prism::{ClassNode, DefNode, Node, StatementsNode};
 
-use super::syntax::{constant_spelling, def_header, parameters_of, spellable, symbol_or_string};
+use super::syntax::{constant_spelling, def_span, parameters_of, spellable, symbol_or_string};
 use super::{BASES, INHERITS, WORKERS};
 use crate::generated::{Declared, Facts, Owner, Source};
 
@@ -48,20 +47,19 @@ pub enum Convention {
     Worker,
 }
 
-/// The class a mailer action hands back, spelled the way ActionMailer spells it.
+/// The class a mailer action returns, spelled as ActionMailer spells it.
 ///
-/// Real framework text rather than a name this crate invented, which is the difference between
-/// it and `Comment::Relation`: when actionmailer is in the bundle and indexed, the gem's own
-/// class is what a chain reaches and the stub below adds members to it rather than shadowing
-/// it — a declaration with no span is never a place, so the gem keeps every place there is.
+/// Real framework text, not an invented name like `Comment::Relation`. When actionmailer is in the
+/// bundle and indexed, a chain reaches the gem's own class, and the stub below adds members to it
+/// without shadowing it. A declaration with no span is never a place, so the gem keeps every place
+/// there is.
 pub const MESSAGE_DELIVERY: &str = "ActionMailer::MessageDelivery";
 
-/// What `MessageDelivery` answers, and it is deliberately the four names and nothing else.
+/// What `MessageDelivery` answers: deliberately these four names and nothing else.
 ///
-/// `deliver_now` and `deliver_later` are 183 call sites across the six corpora and the `!`
-/// forms are mastodon's 16. Each returns `untyped`: `deliver_now` hands back the `Mail::Message`
-/// and `deliver_later` the enqueued job, and both are classes in gems that this crate would be
-/// naming rather than reading.
+/// `deliver_now` and `deliver_later` are the common calls, and the `!` forms are rarer. Each
+/// returns `untyped`: `deliver_now` returns the `Mail::Message` and `deliver_later` the enqueued
+/// job, both classes in gems this crate would be naming, not reading.
 const DELIVERIES: [(&str, &str); 4] = [
     ("deliver_now", "()"),
     ("deliver_now!", "()"),
@@ -69,16 +67,16 @@ const DELIVERIES: [(&str, &str); 4] = [
     ("deliver_later!", "(*untyped)"),
 ];
 
-/// The class methods each convention installs, and what each of them returns.
+/// The class methods each convention installs, and what each returns.
 ///
-/// One table read by one loop, so a name and its type cannot drift apart. The parameter column
-/// is `None` for "the `def`'s own" — `perform_later` takes exactly what `perform` takes — and
-/// `Some` for the two that prepend one of their own.
+/// One table, one loop, so a name and its type cannot drift apart. The parameter column is `None`
+/// for "the `def`'s own" (`perform_later` takes exactly what `perform` takes) and `Some` for the
+/// two that prepend a parameter of their own.
 const INSTALLS: [(Convention, &str, Option<&str>, &str); 6] = [
     (Convention::Job, "perform_later", None, "untyped"),
     (Convention::Job, "perform_now", None, "untyped"),
-    // Sidekiq's client answers with the job id it pushed, or `nil` when a client middleware
-    // stopped the push. One class, in Ruby's own signatures, and true of all three.
+    // Sidekiq's client returns the job id it pushed, or `nil` when a client middleware stopped the
+    // push. One class, in Ruby's own signatures, and true of all three.
     (Convention::Worker, "perform_async", None, "String?"),
     (
         Convention::Worker,
@@ -98,14 +96,15 @@ const INSTALLS: [(Convention, &str, Option<&str>, &str); 6] = [
 
 /// Which convention a class body is, or none.
 ///
-/// The one place the decision is made, and both callers reach it: this file's own reader asks
-/// it of what Prism read, and [`analysis::synthesize`](crate::analysis) asks it of what the
-/// graph recorded, so which documents are worth opening and which classes are worth reading
-/// cannot disagree.
+/// The one place the decision is made, and both callers use it. This file's reader asks it of what
+/// Prism read; [`analysis::synthesize`](crate::analysis) asks it of what the graph recorded. So
+/// "which documents are worth opening" and "which classes are worth reading" cannot disagree.
 ///
-/// The order is the whole of the rule. A mixin is asked first, because a class that includes
-/// `Sidekiq::Job` and inherits something ending `Job` is a worker and not an ActiveJob. Then
-/// the two framework bases, which end in neither suffix. Then the suffixes.
+/// The order is the rule:
+/// 1. A mixin, because a class that includes `Sidekiq::Job` and inherits something ending in `Job`
+///    is a worker, not an ActiveJob.
+/// 2. The two framework bases, which end in neither suffix.
+/// 3. The suffixes.
 #[must_use]
 pub fn convention_of(superclass: Option<&str>, mixins: &[String]) -> Option<Convention> {
     if mixins.iter().any(|name| WORKERS.contains(&name.as_str())) {
@@ -125,12 +124,11 @@ pub fn convention_of(superclass: Option<&str>, mixins: &[String]) -> Option<Conv
 
 /// Whether a class writing this superclass is a **mailer**, with no mixin to consider.
 ///
-/// [`convention_of`]'s mailer half asked of the one input a projection of the graph always has:
-/// `analysis::views` needs it for `app/views/user_mailer/`, where the question is which of the
-/// application's classes a *view directory* may name, and a `Sidekiq::Worker` mixin cannot make
-/// a class into a mailer. So the mixins are empty rather than unavailable, and both framework
-/// spellings — `< ApplicationMailer` and `< ActionMailer::Base` — still answer, because they
-/// are `INHERITS` and `BASES` and not a second table.
+/// [`convention_of`]'s mailer half, asked of the one input a projection of the graph always has.
+/// `analysis::views` needs it for `app/views/user_mailer/`: which classes may a *view directory*
+/// name? A `Sidekiq::Worker` mixin cannot make a class a mailer, so the mixins are empty, not
+/// unavailable. Both framework spellings (`< ApplicationMailer`, `< ActionMailer::Base`) still
+/// answer, because they come from `INHERITS` and `BASES`, not a second table.
 #[must_use]
 pub fn is_mailer(superclass: &str) -> bool {
     convention_of(Some(superclass), &[]) == Some(Convention::Mailer)
@@ -156,11 +154,10 @@ struct Entry {
     actions: Vec<Action>,
     /// The class methods the body already writes, in both spellings Ruby has for one.
     ///
-    /// A convention installs a method the class does not have; a class that wrote the same one
-    /// itself meant something by it, and its own `def` has a signature, a body and the docs
-    /// above it. Declaring over the top would add a second place to jump to and nothing else —
-    /// which is not hypothetical: a worker that writes its own `perform_async` inside a
-    /// `class << self` to debounce the real one is exactly the position this rule protects.
+    /// A convention installs a method the class does not have. A class that wrote the same one
+    /// itself meant something by it, and its `def` has a signature, a body and docs. Declaring over
+    /// it would only add a second place to jump to. Real case: a worker that writes its own
+    /// `perform_async` inside `class << self` to debounce the real one.
     singletons: Vec<String>,
 }
 
@@ -192,8 +189,8 @@ pub fn read_entrypoints(source: &str) -> Entrypoints {
 
 impl Entrypoints {
     /// Whether any class here is a mailer, so the caller can pick the one file that writes the
-    /// [`MESSAGE_DELIVERY`] stub. Exactly one may, for the reason exactly one file writes a
-    /// relation class: it is one type however many files reach it.
+    /// [`MESSAGE_DELIVERY`] stub. Exactly one may, as with a relation class: it is one type however
+    /// many files reach it.
     #[must_use]
     pub fn delivers(&self) -> bool {
         self.classes
@@ -203,9 +200,9 @@ impl Entrypoints {
 
     /// The RBS these conventions declare.
     ///
-    /// `delivery` is whether this file is the one to write the [`MESSAGE_DELIVERY`] stub. It is
-    /// the caller's decision and not this file's, because the answer depends on every other
-    /// file and on whether the application declared that class itself.
+    /// `delivery` says whether this file writes the [`MESSAGE_DELIVERY`] stub. The caller decides,
+    /// because the answer depends on every other file and on whether the application declared that
+    /// class itself.
     #[must_use]
     pub fn signatures(&self, file: &str, delivery: bool) -> Facts {
         let mut facts = Facts::default();
@@ -229,8 +226,8 @@ impl Entry {
             if convention != self.convention {
                 continue;
             }
-            // The mailer's row is the one whose name comes from the file rather than from the
-            // table, because its class method *is* the action.
+            // The mailer's row takes its name from the file, not the table, because its class
+            // method *is* the action.
             let name = if installed.is_empty() {
                 action.name.clone()
             } else {
@@ -264,10 +261,10 @@ impl Entry {
 
 /// The class a mailer action returns, written once for the whole workspace.
 ///
-/// **Nothing here is mapped**, for the reason nothing in a relation class is: no line of
-/// anybody's code declares `MessageDelivery#deliver_later`. When actionmailer is indexed the
-/// gem's own `def deliver_later` is there too and *it* is the place; this adds the members to
-/// the same declaration and adds no place at all, so the two can only agree.
+/// **Nothing here is mapped**, as with a relation class: no line of anybody's code declares
+/// `MessageDelivery#deliver_later`. When actionmailer is indexed, the gem's own `def deliver_later`
+/// is the place; this adds members to the same declaration and no place at all, so the two can only
+/// agree.
 fn message_delivery(facts: &mut Facts) {
     let owner = Owner::Instance(MESSAGE_DELIVERY.to_owned());
     facts.note(
@@ -299,19 +296,18 @@ struct Reader<'src> {
 impl Reader<'_> {
     /// One body, and then the class and module bodies written as statements of it.
     ///
-    /// **Statements, not a walk of the whole tree**, for the reason
-    /// [`super::models`] recurses this way: a generic visit descends into every method body in
-    /// the file and overflows a 2 MiB stack on a large one. It also says what the bounding rule
-    /// says — a `class` inside an `if` is not a statement of the body.
+    /// **Statements, not a walk of the whole tree**, for the reason [`super::models`] recurses this
+    /// way: a generic visit descends into every method body and overflows a 2 MiB stack on a large
+    /// file. It also matches the bounding rule: a `class` inside an `if` is not a statement of the
+    /// body.
     fn walk(&mut self, body: Option<Node<'_>>) {
         let Some(statements) = body.and_then(|body| body.as_statements_node()) else {
             return;
         };
         for statement in statements.body().iter() {
-            // A `module` is walked through and never read. `include Sidekiq::Worker` in a
-            // concern installs the class methods on whoever includes it, which is the wall a
-            // concern's `scope` hits and gets the same answer: declare nothing rather than
-            // declare it somewhere no call reaches.
+            // A `module` is walked through, never read. `include Sidekiq::Worker` in a concern
+            // installs the class methods on whoever includes it: the wall a concern's `scope` hits,
+            // with the same answer. Declare nothing rather than declare it where no call reaches.
             let (path, inner) = if let Some(class) = statement.as_class_node() {
                 if let Some(entry) = self.entry(&class) {
                     self.classes.push(entry);
@@ -328,7 +324,7 @@ impl Reader<'_> {
         }
     }
 
-    /// One `class` body: what it inherits, what it includes, and the `def`s that follow from it.
+    /// One `class` body: what it inherits, what it includes, and the `def`s that follow.
     fn entry(&self, node: &ClassNode<'_>) -> Option<Entry> {
         let name = {
             let path = node.constant_path();
@@ -352,9 +348,9 @@ impl Reader<'_> {
 
     /// Every class method the body writes itself, in both spellings.
     ///
-    /// `def self.perform_async` and `class << self; def perform_async; end; end` are one thing
-    /// to Ruby and two shapes to Prism, and the corpus writes the second — so reading only the
-    /// first would leave the rule true and the one case it exists for uncovered.
+    /// `def self.perform_async` and `class << self; def perform_async; end; end` are one thing to
+    /// Ruby and two shapes to Prism. Real code writes the second, so reading only the first would
+    /// leave the rule's one real case uncovered.
     fn singletons(&self, body: Option<&StatementsNode<'_>>) -> Vec<String> {
         let mut written = Vec::new();
         let Some(body) = body else {
@@ -385,8 +381,8 @@ impl Reader<'_> {
 
     /// Every constant the body `include`s, spelled as written.
     ///
-    /// `include` and not `extend` or `prepend`: `Sidekiq::Worker` is documented as an include
-    /// and `extend`ing it puts its `included` hook nowhere.
+    /// `include`, not `extend` or `prepend`: `Sidekiq::Worker` is documented as an include, and
+    /// `extend`ing it puts its `included` hook nowhere.
     fn mixins(&self, body: Option<&StatementsNode<'_>>) -> Vec<String> {
         let mut mixins = Vec::new();
         let Some(body) = body else {
@@ -410,9 +406,9 @@ impl Reader<'_> {
 
     /// The public `def`s of a class body that this convention reads.
     ///
-    /// Visibility is the file's own: a bare `private` or `protected` closes the public section,
-    /// and `private :welcome` names methods already written. `private def welcome` needs
-    /// neither — the `def` is an argument rather than a statement, so it was never collected.
+    /// Visibility is the file's own. A bare `private` or `protected` closes the public section, and
+    /// `private :welcome` names methods already written. `private def welcome` needs neither: the
+    /// `def` is an argument, not a statement, so it was never collected.
     fn actions(&self, body: Option<&StatementsNode<'_>>, convention: Convention) -> Vec<Action> {
         let mut actions: Vec<Action> = Vec::new();
         let mut visible = true;
@@ -464,7 +460,7 @@ impl Reader<'_> {
         Some(Action {
             parameters: parameters_of(self.source, node.parameters().as_ref()),
             name,
-            at: def_header(node),
+            at: def_span(node),
             name_at: (at.start_offset() as u32, at.end_offset() as u32),
         })
     }
@@ -528,8 +524,8 @@ end
             .rbs
     }
 
-    /// Pinned whole, for the reason the model's is: every rule shows up in the text, and asserting
-    /// them one predicate at a time is how a change to the shape passes ten green tests.
+    /// Pinned whole, as the model's is: every rule shows in the text, and asserting one predicate
+    /// at a time lets a change of shape pass ten green tests.
     #[test]
     fn the_rbs_a_mailer_declares() {
         assert_eq!(
@@ -547,8 +543,8 @@ end
         );
     }
 
-    /// `initialize` is the one public `def` a mailer has that Rails does not route to;
-    /// `def self.` is not an action; and a `def` under a bare `private` is not one either.
+    /// Not actions: `initialize` (the one public `def` Rails does not route to), `def self.`, and a
+    /// `def` under a bare `private`.
     #[test]
     fn what_a_mailer_body_declares_nothing_for() {
         let rbs = rbs(MAILER, false);
@@ -595,10 +591,9 @@ end
         let declarations = read_entrypoints(MAILER)
             .signatures("app/mailers/user_mailer.rb", true)
             .render(&declaring(&[]));
-        // Joined: `ActionMailer` is a name no file in the *application* writes `module` for,
-        // so this crate cannot know its kind and the spelling does not change. An explicit
-        // wrapper would declare one, which is measured at 234 chatwoot positions on `Api`,
-        // `ActiveStorage` and the rest.
+        // Joined: no file in the *application* writes `module` for `ActionMailer`, so this crate
+        // cannot know its kind and keeps the spelling. An explicit wrapper would declare one, and
+        // wrongly declared wrappers on names like `Api` and `ActiveStorage` cost real answers.
         assert!(
             declarations.rbs.ends_with(
                 "\
@@ -615,28 +610,27 @@ end
             "{}",
             declarations.rbs
         );
-        // Two mapped actions and six `def`s: the four deliveries are text this crate invented
-        // and no line of anybody's code declares them.
+        // Two mapped actions and six `def`s: the four deliveries are text this crate invented,
+        // declared by no line of anybody's code.
         assert_eq!(declarations.methods, 6);
         assert_eq!(declarations.spans.len(), 2);
         assert!(!read_entrypoints(JOB).delivers());
         assert!(read_entrypoints(MAILER).delivers());
     }
 
-    /// The gate, and the corpus that argues for it: 161 of chatwoot's classes define a public
-    /// `def perform` and are service objects, so the superclass is what says a job is a job.
+    /// The gate. Service objects routinely define a public `def perform`, so the superclass is what
+    /// says a job is a job.
     #[test]
     fn a_class_no_convention_recognises_declares_nothing() {
         for source in [
             "class FilterService\n  def perform(scope)\n  end\nend\n",
             "class Cleanup < ApplicationService\n  def perform\n  end\nend\n",
-            // A migration Rails generated for a job — chatwoot has three, and a rule keyed on
-            // the class's own name rather than its superclass would have declared on all of
-            // them.
+            // A migration Rails generated for a job. A rule keyed on the class's own name instead
+            // of its superclass would declare on it.
             "class EnqueueValidateHooksJob < ActiveRecord::Migration[7.1]\n  def perform\n  \
              end\nend\n",
-            // A class inside an `if` is not a statement of the body, and neither is a `def`
-            // inside a `def`.
+            // A class inside an `if` is not a statement of the body, and neither is a `def` inside
+            // a `def`.
             "if x\n  class LateMailer < ApplicationMailer\n    def welcome\n    end\n  \
              end\nend\n",
             "class OuterJob < ApplicationJob\n  def wrapper\n    def perform\n    end\n  \
@@ -657,8 +651,8 @@ end
         let job = ["Sidekiq::Job".to_owned()];
         assert_eq!(convention_of(None, &sidekiq), Some(Convention::Worker));
         assert_eq!(convention_of(None, &job), Some(Convention::Worker));
-        // A mixin outranks a suffix: a class that includes `Sidekiq::Job` and inherits
-        // something ending `Job` is a worker, and `perform_later` would raise on it.
+        // A mixin outranks a suffix: a class that includes `Sidekiq::Job` and inherits something
+        // ending in `Job` is a worker, and `perform_later` would raise on it.
         assert_eq!(
             convention_of(Some("ApplicationJob"), &job),
             Some(Convention::Worker)
@@ -689,19 +683,18 @@ end
             convention_of(Some("ActiveRecord::Migration[7.1]"), &[]),
             None
         );
-        // `extend` and `prepend` are not the shape, so a mixin list that holds neither name
-        // says nothing.
+        // `extend` and `prepend` are not the shape, so a mixin list holding neither name says
+        // nothing.
         assert_eq!(
             convention_of(None, &["ActiveSupport::Concern".to_owned()]),
             None
         );
     }
 
-    /// Every parameter shape Ruby has, rendered as the shape and not as a type.
+    /// Every parameter shape Ruby has, rendered as the shape, not as a type.
     ///
-    /// Arity is what `types.rs` matches a call against, so a `perform_later` that claims the
-    /// wrong one answers nothing rather than answering wrongly — which makes this the half that
-    /// has to be exact.
+    /// `types.rs` matches a call against the arity, so a `perform_later` claiming the wrong one
+    /// answers nothing. This is the half that must be exact.
     #[test]
     fn every_parameter_shape_a_def_can_have() {
         let shapes = [
@@ -716,8 +709,7 @@ end
             ("def perform(to:)\nend", "(to: untyped)"),
             ("def perform(to: nil)\nend", "(?to: untyped)"),
             ("def perform(**options)\nend", "(**untyped)"),
-            // `**nil` says the method takes no keywords at all, so it is the one that adds
-            // nothing.
+            // `**nil` says the method takes no keywords at all, so it adds nothing.
             ("def perform(a, **nil)\nend", "(untyped)"),
             ("def perform(...)\nend", "(*untyped, **untyped)"),
             ("def perform(&block)\nend", "()"),
@@ -734,12 +726,12 @@ end
         }
     }
 
-    /// A name RBS cannot spell takes nothing else with it, which is the point of the guard:
+    /// A name RBS cannot spell takes nothing else with it: the point of the guard, since
     /// `Synthesized::record` refuses a generated document it cannot parse *whole*.
     ///
     /// **A writer is spellable and is routed.** `ActionMailer::Base` answers every public instance
-    /// method on the class, `value=` included, and RBS writes `def self.value=: (untyped) -> …`
-    /// without complaint. `<=>` is the shape the guard exists for.
+    /// method on the class, `value=` included, and RBS accepts `def self.value=: (untyped) -> …`.
+    /// `<=>` is the shape the guard exists for.
     #[test]
     fn a_method_name_rbs_cannot_spell_is_the_only_one_declined() {
         let rbs = rbs(
@@ -770,8 +762,8 @@ end
         assert!(!rbs.contains("<=>"), "{rbs}");
     }
 
-    /// A class that wrote the class method itself keeps its own, in both spellings — and the
-    /// case is forem's, which debounces the real `perform_async` behind one of its own.
+    /// A class that wrote the class method itself keeps its own, in both spellings. Real apps
+    /// debounce the real `perform_async` behind one of their own.
     #[test]
     fn a_class_method_the_body_already_writes_is_not_installed_over() {
         let bare = rbs(
@@ -811,13 +803,13 @@ end
         assert!(!opened.contains("perform_async"), "{opened}");
         assert!(opened.contains("def self.perform_in:"), "{opened}");
 
-        // A `class << other` is not the class's own singleton, and a `def self.perform` is not
-        // one of the names a convention installs — so neither takes anything away.
-        // Four things a body can hold that this reads past: a `class << other`, which is not
-        // the class's own singleton; an empty `class << self`; a call with a receiver, which is
-        // not a statement the class is making about itself; a bare `include`, which is what a
-        // half-typed line looks like to a parser that is asked on every keystroke; and a
-        // `def self.perform`, which is not one of the names a convention installs.
+        // Five things a body can hold that this reads past:
+        // - a `class << other`, which is not the class's own singleton;
+        // - an empty `class << self`;
+        // - a call with a receiver, which is not the class stating something about itself;
+        // - a bare `include`, which is what a half-typed line looks like to a parser asked on every
+        //   keystroke;
+        // - a `def self.perform`, which is not a name a convention installs.
         let unrelated = rbs(
             "\
 class OtherWorker
@@ -919,22 +911,22 @@ end
         assert!(!rbs.contains("EmptyMailer"), "{rbs}");
     }
 
-    /// The whole `def` line is the target and the name is the selection, in all three spellings
-    /// a `def` header has.
+    /// The whole `def` is the target and the name is the selection, whatever the header looks like:
+    /// the pair every hand-written `def` already answers with.
     #[test]
     fn a_class_method_points_at_the_def_that_implied_it() {
         for (source, header) in [
             (
                 "class M < ApplicationMailer\n  def welcome(user)\n  end\nend\n",
-                "def welcome(user)",
+                "def welcome(user)\n  end",
             ),
             (
                 "class M < ApplicationMailer\n  def welcome user\n  end\nend\n",
-                "def welcome user",
+                "def welcome user\n  end",
             ),
             (
                 "class M < ApplicationMailer\n  def welcome\n  end\nend\n",
-                "def welcome",
+                "def welcome\n  end",
             ),
         ] {
             let declarations = read_entrypoints(source)
@@ -952,10 +944,11 @@ end
 
     #[test]
     fn a_mailer_action_is_a_class_method_that_jumps_to_its_def_and_chains() {
-        // A mailer in one expression. Three things have to happen at once: the
-        // action is a *class* method, the jump lands on the `def` that implied it, and the
-        // chain runs on through `MessageDelivery` — which nothing in this workspace declares,
-        // so the stub is what carries it.
+        // A mailer in one expression. Three things must happen at once:
+        // 1. the action is a *class* method;
+        // 2. the jump lands on the `def` that implied it;
+        // 3. the chain continues through `MessageDelivery`, which nothing in this workspace
+        //    declares, so the stub carries it.
         let source = "UserMailer.welcome(current_user).deliver_later\n";
         let (mut harness, _story, uri) = models_project(source);
         let mailer = harness.write("app/mailers/user_mailer.rb", MAILERS);
@@ -976,7 +969,7 @@ end
             serde_json::json!(mailer.as_str()),
             "{definition}"
         );
-        // `  def welcome(user)` on line 1, revealed whole, with the name selected past `def `.
+        // `  def welcome(user)` on line 1, revealed whole, with the name selected after `def `.
         assert_eq!(
             (
                 &definition[0]["targetRange"]["start"]["line"],
@@ -1001,9 +994,9 @@ end
 
     #[test]
     fn a_hover_on_a_mailer_action_says_which_def_it_came_from() {
-        // The provenance rule again, and it is the same rule: the card names the file and the
-        // `def`, because the *generated RBS* carries a comment above the declaration. Nothing
-        // in `hover.rs` knows the word "mailer".
+        // The provenance rule again: the card names the file and the `def` because the *generated
+        // RBS* carries a comment above the declaration. Nothing in `hover.rs` knows the word
+        // "mailer".
         let source = "UserMailer.welcome(current_user)\n";
         let (mut harness, _story, uri) = models_project(source);
         let mailer = harness.write("app/mailers/user_mailer.rb", MAILERS);
@@ -1016,9 +1009,9 @@ end
 
     #[test]
     fn a_jobs_perform_installs_both_entry_points_with_its_own_arity() {
-        // The job half, and the arity is the part that has to be exact: an answer is
-        // partitioned by how many positional arguments the *call* wrote, so a
-        // `perform_later` claiming `()` would answer nothing for every call anybody makes.
+        // The job half. Arity must be exact: an answer is partitioned by the *call's* positional
+        // argument count, so a `perform_later` claiming `()` would answer nothing for any real
+        // call.
         let source = "DigestJob.perform_later(1)\n";
         let (mut harness, _story, uri) = models_project(source);
         let job = harness.write(
@@ -1045,7 +1038,7 @@ end
             "a job's only entry point is `perform`: {rbs}"
         );
 
-        // Both map to the one `def perform`, which is the whole convention.
+        // Both map to the one `def perform`: that is the convention.
         let definition = harness.definition_at(&uri, source, "perform_later");
         assert_eq!(
             definition[0]["targetUri"],
@@ -1061,10 +1054,9 @@ end
 
     #[test]
     fn a_sidekiq_worker_is_read_and_a_service_object_named_perform_is_not() {
-        // Sidekiq is not a footnote: 241 of the corpus' 401 job classes are `include
-        // Sidekiq::Worker` or `Sidekiq::Job`. And the gate is the superclass or the mixin and
-        // never the `def` — 161 of chatwoot's classes define a public `def perform` with
-        // nothing above them, and every one of them is a service object.
+        // Sidekiq is not a footnote: in real apps most job classes are `include Sidekiq::Worker` or
+        // `Sidekiq::Job`. The gate is the superclass or the mixin, never the `def`: service objects
+        // define a public `def perform` with nothing above them.
         let (mut harness, _story, _uri) = models_project("");
         let worker = harness.write(
             "app/workers/bust_cache_worker.rb",
@@ -1099,9 +1091,9 @@ end
 
     #[test]
     fn the_message_delivery_stub_is_written_once_and_is_never_a_place() {
-        // The relation class's bargain, on a name that is real: one type however many mailers
-        // reach it, so exactly one file writes it — and nothing in it is mapped, so when
-        // actionmailer *is* indexed the gem keeps every place there is.
+        // The relation class's bargain, on a real name: one type however many mailers reach it, so
+        // exactly one file writes it. Nothing in it is mapped, so when actionmailer *is* indexed
+        // the gem keeps every place there is.
         let (mut harness, _story, _uri) = models_project("");
         let first = harness.write("app/mailers/user_mailer.rb", MAILERS);
         let second = harness.write(
@@ -1129,8 +1121,8 @@ end
             "{user}"
         );
 
-        // Every declaration in the stub is text this crate invented, so none of them is a
-        // definition anything will offer as a place to jump to.
+        // Every declaration in the stub is text this crate invented, so none is offered as a place
+        // to jump to.
         let source = "AdminMailer.alert.deliver_now\n";
         let uri = harness.write("app/deliver.rb", source);
         harness.watch(&[&uri]);

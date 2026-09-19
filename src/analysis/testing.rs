@@ -1,26 +1,25 @@
 //! The harness every end-to-end test in the crate drives the server through.
 //!
-//! It is here rather than in [`crate::testing`] for the reason `analysis/` exists at all: a
-//! [`Harness`] holds an [`Analysis`], which is private to `analysis`, and the crate's first
-//! invariant is that nothing outside `analysis/` may name a rubydex type. A child module of
-//! `analysis` sees every private field; the rest of the crate sees a `Harness` that answers in
-//! `serde_json::Value`, `String`, `usize` and `bool` and nothing else. The one method that does
-//! name a rubydex type — [`Harness::every_generated_document`] — is `pub(super)` for that
-//! reason, so the boundary is the compiler's rather than a habit's.
+//! It lives here, not in [`crate::testing`], for the same reason `analysis/` exists: a [`Harness`]
+//! holds an [`Analysis`], which is private to `analysis`, and the crate's first invariant is that
+//! nothing outside `analysis/` names a rubydex type. A child module of `analysis` sees every
+//! private field; the rest of the crate sees a `Harness` that answers only in `serde_json::Value`,
+//! `String`, `usize` and `bool`. The one method that names a rubydex type,
+//! [`Harness::every_generated_document`], is `pub(super)` for that reason, so the compiler enforces
+//! the boundary.
 //!
-//! That is also why [`Harness::has`], [`Harness::declarations_of`], [`Harness::generated_for`]
-//! and [`Harness::document_count`] exist: they are the graph questions a test beside a *reader*
-//! needs to ask, phrased in types that reader is allowed to hold. A test that wants more than
-//! they offer is asking about the analysis thread rather than about the reader, whatever Ruby
-//! feature it happens to exercise, and belongs inside `analysis/`.
+//! That is also why [`Harness::has`], [`Harness::declarations_of`], [`Harness::generated_for`] and
+//! [`Harness::document_count`] exist: they are the graph questions a test beside a *reader* needs,
+//! in types that reader may hold. A test that needs more is asking about the analysis thread, not
+//! the reader, and belongs inside `analysis/`.
 
 use super::locator::Site;
 use super::requests::file_name;
 use super::*;
 
 // The names a moved test reaches for, re-exported so a test module beside the code it pins needs
-// one `use` line rather than fifteen. Everything here is already `pub` somewhere; nothing private
-// to `analysis` is widened by being named again.
+// one `use` line instead of fifteen. Everything here is already `pub` somewhere; nothing private to
+// `analysis` is widened.
 pub(crate) use crate::analysis::position::PositionEncoding;
 pub(crate) use crate::analysis::{ClientSupport, Task, TextChange, synthesized};
 pub(crate) use crate::messages;
@@ -28,8 +27,8 @@ pub(crate) use crate::workspace::{DocUri, Workspace, gems};
 
 /// The LSP position of the first occurrence of `needle`.
 ///
-/// Every fixture here is ASCII, so counting characters is counting bytes; `position.rs`
-/// owns the cases where that is not true.
+/// Every fixture here is ASCII, so counting characters is counting bytes; `position.rs` covers the
+/// cases where it is not.
 pub(crate) fn position_of(source: &str, needle: &str) -> serde_json::Value {
     let offset = source
         .find(needle)
@@ -47,8 +46,8 @@ pub(crate) fn marked_position(marked: &str) -> serde_json::Value {
     serde_json::json!({ "line": line, "character": character })
 }
 
-/// The selection a fixture marks with two `~`, as the protocol spells one — or an empty
-/// range at a single `~`, which is what an editor sends when nothing is selected.
+/// The selection a fixture marks with two `~`, as the protocol spells one, or an empty range at a
+/// single `~`, which is what an editor sends when nothing is selected.
 pub(crate) fn marked_range(marked: &str) -> serde_json::Value {
     let start = marked.find('~').expect("a ~ marking the selection");
     let rest = marked.replacen('~', "", 1);
@@ -64,15 +63,13 @@ pub(crate) fn marked_range(marked: &str) -> serde_json::Value {
     serde_json::json!({ "start": at(start), "end": at(end) })
 }
 
-/// A `textDocument/signatureHelp` response drawn the way an editor draws it: every
-/// signature on its own line, the active parameter of the active one underlined beneath it,
-/// and the documentation last.
+/// A `textDocument/signatureHelp` response drawn the way an editor draws it: each signature on its
+/// own line, the active parameter of the active one underlined, and the documentation last.
 ///
-/// Rendering the offsets rather than asserting on them is the point. A span that is off by
-/// one draws under the wrong text, which is visible at a glance and reads as the bug it is;
-/// a pair of numbers in an `assert_eq!` shows nobody anything. The underline counts
-/// characters where the protocol counts UTF-16 code units, which every fixture here is
-/// ASCII enough for — `render`'s own tests are where the two are made to differ.
+/// Drawing the offsets instead of asserting on them is the point. A span off by one draws under the
+/// wrong text, which is visible at a glance; a pair of numbers in an `assert_eq!` shows nobody
+/// anything. The underline counts characters where the protocol counts UTF-16 units, which is fine
+/// for these ASCII fixtures; `render`'s own tests make the two differ.
 pub(crate) fn drawn(help: &serde_json::Value) -> String {
     let Some(signatures) = help["signatures"].as_array() else {
         return "null".to_owned();
@@ -117,8 +114,8 @@ pub(crate) fn drawn_hierarchy(answer: &serde_json::Value) -> String {
     items
         .iter()
         .map(|item| {
-            // LSP numbers `Module` 2 and `Class` 5. Anything else is printed rather than
-            // panicked over, so a wrong kind reads as a wrong row instead of a lost test.
+            // LSP numbers `Module` 2 and `Class` 5. Anything else is printed, not panicked over, so
+            // a wrong kind reads as a wrong row instead of a lost test.
             let keyword = match item["kind"].as_u64() {
                 Some(2) => "module".to_owned(),
                 Some(5) => "class".to_owned(),
@@ -134,16 +131,15 @@ pub(crate) fn drawn_hierarchy(answer: &serde_json::Value) -> String {
         .join("\n")
 }
 
-/// Each hint spliced into the line it is drawn on, which is the line the user sees.
+/// Each hint spliced into the line it is drawn on: the line the user sees.
 ///
-/// The position is half of every hint and the half a list of labels cannot show — a return
-/// label drawn at the method's name rather than past its parameter list lands *inside* the
-/// parameter list, where it reads as an annotation on the last parameter — and a column
-/// number is the hardest possible way to notice that. So the label goes into the text, and
-/// the assertion is a picture of the margin.
+/// The position is half of every hint, and the half a list of labels cannot show. A return label
+/// drawn at the method's name instead of after its parameter list lands *inside* the list, where it
+/// reads as an annotation on the last parameter, and a column number is the hardest way to notice
+/// that. So the label goes into the text, and the assertion is a picture of the margin.
 ///
-/// The fixture is ASCII, so a character offset and a byte offset are the same number here.
-/// `position.rs` is what holds that apart everywhere it is not.
+/// The fixture is ASCII, so character and byte offsets are the same number here; `position.rs`
+/// handles everywhere they are not.
 pub(crate) fn drawn_hints(source: &str, answer: &serde_json::Value) -> String {
     let Some(rows) = answer.as_array() else {
         return "null".to_owned();
@@ -162,10 +158,10 @@ pub(crate) fn drawn_hints(source: &str, answer: &serde_json::Value) -> String {
 
 /// The rows of a call hierarchy answer, drawn with the call sites that put them there.
 ///
-/// `fromRanges` is the half a list of names cannot show, and the half an editor draws: a row
-/// naming the right method with its ranges against the wrong file highlights whatever text
-/// happens to be at those offsets. Incoming and outgoing rows differ only in which key holds
-/// the item, so one function draws both and a test never has to say which it asked for.
+/// `fromRanges` is the half a list of names cannot show and the half an editor draws: a row naming
+/// the right method with ranges against the wrong file highlights whatever text sits at those
+/// offsets. Incoming and outgoing rows differ only in which key holds the item, so one function
+/// draws both.
 pub(crate) fn drawn_calls(answer: &serde_json::Value) -> String {
     let Some(rows) = answer.as_array() else {
         return "null".to_owned();
@@ -206,9 +202,8 @@ pub(crate) fn drawn_calls(answer: &serde_json::Value) -> String {
 
 /// The edits in a `WorkspaceEdit`, by file, in whichever of the two shapes it arrived in.
 ///
-/// Both are read here because ya-lsp sends both: `documentChanges` to a client that
-/// advertised it and the older `changes` map to one that did not, and a test that could only
-/// read one of them would be blind to half of what ships.
+/// ya-lsp sends both (`documentChanges` to a client that advertised it, the older `changes` map
+/// otherwise), and a test reading only one would be blind to half of what ships.
 pub(crate) fn edits_in(answer: &serde_json::Value) -> Vec<(String, Vec<lsp_types::TextEdit>)> {
     if let Some(changes) = answer["documentChanges"].as_array() {
         return changes
@@ -240,7 +235,52 @@ pub(crate) fn edits_in(answer: &serde_json::Value) -> Vec<(String, Vec<lsp_types
     files
 }
 
-/// Every symbol in an outline, parents and children alike, in no particular order.
+/// A `Location[]` answer as `file.rb:line:character`, short enough to assert on whole.
+///
+/// Every list of places a client is sent has this shape, so the two lists asserted whole read it
+/// the same way. A non-array answer (`null`, or the `LocationLink[]` a link-supporting client
+/// negotiates) is an empty list here, not a panic; which one it is belongs in the test that cares.
+pub(crate) fn located(answer: &serde_json::Value) -> Vec<String> {
+    let Some(locations) = answer.as_array() else {
+        return Vec::new();
+    };
+    locations
+        .iter()
+        .map(|location| {
+            let file = location["uri"]
+                .as_str()
+                .unwrap_or_default()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let start = &location["range"]["start"];
+            format!("{file}:{}:{}", start["line"], start["character"])
+        })
+        .collect()
+}
+
+/// [`located`] for the richer shape: a `LocationLink`'s target and the span inside it.
+pub(crate) fn linked(answer: &serde_json::Value) -> Vec<String> {
+    let Some(links) = answer.as_array() else {
+        return Vec::new();
+    };
+    links
+        .iter()
+        .map(|link| {
+            let file = link["targetUri"]
+                .as_str()
+                .unwrap_or_default()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let start = &link["targetSelectionRange"]["start"];
+            format!("{file}:{}:{}", start["line"], start["character"])
+        })
+        .collect()
+}
+
 pub(crate) fn all_symbols(outline: &serde_json::Value) -> Vec<&serde_json::Value> {
     let mut queue: Vec<&serde_json::Value> = outline
         .as_array()
@@ -256,11 +296,11 @@ pub(crate) fn all_symbols(outline: &serde_json::Value) -> Vec<&serde_json::Value
     flat
 }
 
-/// The symbols whose `selectionRange` their own `range` does not contain.
+/// The symbols whose `selectionRange` is not contained by their own `range`.
 ///
-/// The protocol requires containment, and VS Code enforces it by throwing — which discards
-/// the whole outline, not the one bad symbol. "None" is the assertion; naming the offenders
-/// is what makes a failure readable.
+/// The protocol requires containment, and VS Code enforces it by throwing, which discards the whole
+/// outline, not just the bad symbol. The assertion is "none"; naming the offenders makes a failure
+/// readable.
 pub(crate) fn uncontained(outline: &serde_json::Value) -> Vec<String> {
     pub(crate) fn point(value: &serde_json::Value) -> (u64, u64) {
         (
@@ -288,16 +328,15 @@ pub(crate) fn uncontained(outline: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// The file back, with `mark` under every byte of each span, and every untouched line
-/// dropped.
+/// The file back, with `mark` under every byte of each span, and every untouched line dropped.
 ///
-/// Lines with nothing on them go so that an assertion is about what was answered; the ones
-/// that stay carry their own text, which is what makes "and not the one in the comment"
-/// something the fixture *shows* rather than something a test name claims.
+/// Empty lines go, so an assertion is about what was answered; the lines that stay carry their own
+/// text, which lets the fixture *show* "and not the one in the comment" instead of a test name
+/// claiming it.
 ///
-/// One merge rule, for the pictures that draw two answers at once: a `d` landing on a cell
-/// something else already marked **uppercases** that mark rather than replacing it, so
-/// "both requests said this span" and "only one did" are different characters.
+/// One merge rule, for pictures of two answers at once: a `d` landing on a cell already marked
+/// **uppercases** that mark instead of replacing it, so "both requests said this span" and "only
+/// one did" look different.
 pub(crate) fn draw<'s>(
     source: &str,
     spans: impl Iterator<Item = (&'s serde_json::Value, char)>,
@@ -339,9 +378,9 @@ pub(crate) fn draw<'s>(
 pub(crate) struct Harness {
     pub(super) analysis: Analysis,
     pub(super) outgoing: Receiver<Message>,
-    /// Notifications `ask` stepped over on its way to a response. Without this, asking a
-    /// question silently throws away every `showMessage` and `publishDiagnostics` the
-    /// handler sent first, and a test that looks for one quietly cannot find it.
+    /// Notifications `ask` stepped over on its way to a response. Without this, asking a question
+    /// silently drops every `showMessage` and `publishDiagnostics` the handler sent first, and a
+    /// test looking for one cannot find it.
     stashed: std::cell::RefCell<Vec<Message>>,
     pub(crate) root: tempfile::TempDir,
     version: i32,
@@ -349,15 +388,18 @@ pub(crate) struct Harness {
 
 /// The registrar the real server builds, for a client that takes every dynamic registration.
 ///
-/// Built the way `server::run` builds it rather than stubbed, because the thing worth pinning is
-/// that a gem root the bundle resolved to comes back as a registration the client would act on —
-/// and a stub would pin the harness instead. The reach across into `server::capabilities` is
-/// test-only and deliberate: production code goes the other way, which is why what crosses the
-/// thread boundary there is a closure and not that module's types.
+/// Built the way `server::run` builds it, not stubbed, because what is worth pinning is that a gem
+/// root the bundle resolved to comes back as a registration the client would act on; a stub would
+/// pin the harness instead. Reaching into `server::capabilities` is test-only and deliberate:
+/// production code goes the other way, which is why a closure crosses the thread boundary there,
+/// not that module's types.
 pub(crate) fn document_registrar() -> crate::analysis::DocumentRegistrar {
     let capabilities = crate::server::capabilities::every_dynamic_registration_accepted();
-    let requested =
-        crate::server::capabilities::dynamic_documents(PositionEncoding::Utf16, &capabilities);
+    let requested = crate::server::capabilities::dynamic_documents(
+        PositionEncoding::Utf16,
+        &capabilities,
+        std::path::Path::new("/project"),
+    );
     Box::new(move |prefixes| {
         crate::server::capabilities::document_registrations(&requested, prefixes)
     })
@@ -370,8 +412,8 @@ impl Harness {
 
     /// A harness whose workspace holds `config` as its `ya-lsp.toml`.
     ///
-    /// The file layer and not the client's, which is the layer the harness itself uses — so a
-    /// test written this way outranks the harness's own settings and can turn off something it
+    /// The file layer, not the client's. The harness itself uses the client layer, so a test
+    /// written this way outranks the harness's settings and can turn off something the harness
     /// switches on.
     pub(crate) fn configured(config: &str) -> Self {
         let root = tempfile::tempdir().expect("tempdir");
@@ -384,8 +426,8 @@ impl Harness {
     }
 
     pub(crate) fn at(root: tempfile::TempDir, encoding: PositionEncoding) -> Self {
-        // An empty environment, so gem discovery cannot wander off into whatever Ruby the
-        // machine running the tests happens to have installed.
+        // An empty environment, so gem discovery cannot wander into whatever Ruby the test machine
+        // has installed.
         Self::at_with_env(root, encoding, gems::Env::default())
     }
 
@@ -394,10 +436,10 @@ impl Harness {
         encoding: PositionEncoding,
         env: gems::Env,
     ) -> Self {
-        // `Env::default()` carries no gem roots at all, system ones included, so nothing
-        // here can reach the machine's Ruby. This still turns the two off: extracting and
-        // indexing the vendored signatures is ~800 files of work that no test in this
-        // module is asking about. A fixture that wrote its own configuration keeps it.
+        // `Env::default()` has no gem roots at all, system ones included, so nothing here can reach
+        // the machine's Ruby. This still turns the two off: extracting and indexing the vendored
+        // signatures is hundreds of files of work no test here asks about. A fixture that wrote its
+        // own configuration keeps it.
         let config = root.path().join("ya-lsp.toml");
         if !config.exists() {
             std::fs::write(
@@ -408,16 +450,15 @@ impl Harness {
         }
 
         let (sender, receiver) = crossbeam_channel::unbounded();
-        // **The harness is a Rails project and says so**, rather than leaving it to detection.
-        // `rails.enabled` defaults to `auto`, which asks whether there is a
-        // `config/application.rb` or a lockfile that holds railties — and a `tempdir` with three
-        // files in it has neither, so every fixture that writes `has_many` would silently stop
-        // being about Rails. Writing one of those markers into the fixture instead would put a
-        // file in the index (`config/application.rb` is Ruby) or a lockfile in front of gem
-        // discovery, and both move counts these tests assert on.
+        // **The harness is a Rails project and says so**, instead of relying on detection.
+        // `rails.enabled` defaults to `auto`, which looks for a `config/application.rb` or a
+        // lockfile holding railties, and a `tempdir` with three files has neither, so every fixture
+        // writing `has_many` would silently stop being about Rails. Writing one of those markers
+        // into the fixture would put a file in the index (`config/application.rb` is Ruby) or a
+        // lockfile in front of gem discovery, and both change counts these tests assert on.
         //
-        // It is the **client's** layer, so a fixture that writes its own `ya-lsp.toml` still
-        // wins — which is what lets a test turn a family of it back off and mean it.
+        // It is the **client's** layer, so a fixture that writes its own `ya-lsp.toml` still wins,
+        // which lets a test turn a family back off and mean it.
         let options = serde_json::json!({ "rails": { "enabled": true } });
         let (workspace, problems) =
             Workspace::load_with_env(root.path().to_path_buf(), Some(options), env);
@@ -431,6 +472,27 @@ impl Harness {
                 ClientSupport {
                     hierarchical_symbols: true,
                     definition_links: true,
+                    // **The exception, and it is the shape that ships.** No client asks for links
+                    // here: the one client that sends `textDocument/implementation` declares
+                    // `definition.linkSupport` and nothing for this, so `Location[]` goes out in
+                    // every real session. `takes_implementation_links` turns this on for the test
+                    // that asserts it.
+                    implementation_links: false,
+                    // **Not an exception like the one above**, because the clients differ: every
+                    // editor that sends `typeDefinition` declares `linkSupport` for it, and the
+                    // agent that declares none never sends this request. So the richer shape ships
+                    // here, and the flat one has its own test.
+                    type_definition_links: true,
+                    // Same as the goto above, for the same reason: every editor that sends
+                    // `declaration` declares `linkSupport` for it, and the one client that declares
+                    // none never sends it.
+                    declaration_links: true,
+                    // Both on, because they go together: the action that opens a generated document
+                    // is offered only to a client that can be shown one and read one.
+                    // `takes_no_generated_content` turns the second off for the test asserting what
+                    // a client like Neovim gets instead: nothing.
+                    show_document: true,
+                    generated_content: true,
                     work_done_progress: true,
                     versioned_edits: true,
                     hint_refresh: true,
@@ -454,24 +516,124 @@ impl Harness {
         DocUri::from_path(&path).unwrap()
     }
 
-    /// Index the workspace and push the first round of diagnostics, as `spawn` does.
+    /// Index the workspace and run the pipeline out, as `spawn` and the run loop do together.
+    ///
+    /// Running to the end is what creates the generated documents here: the generator pass is the
+    /// pipeline's last stage, so a fixture that stopped at the workspace index would have no Rails
+    /// members in its graph. A fixture with no gems skips the bundle stage and reaches the pass by
+    /// the shorter route, as a gemless project does in production.
     pub(crate) fn index(&mut self) {
         self.analysis.index_workspace();
         self.analysis.publish_diagnostics();
+        // Deliberately **without** `queue_background_indexing`: a fixture that wants a bundle
+        // queues one itself, and `requests`' cold-server fixtures depend on the bundle staying
+        // unqueued. So the workspace stage hands straight to the generator pass, the route a
+        // project with no gems takes in production too.
+        while self.analysis.step_pipeline() {}
     }
 
-    /// Queue the gems and run the background index to completion, as the run loop would
-    /// during a stretch with no editor traffic.
+    /// Queue the gems and run the pipeline to completion, as the run loop would during a stretch
+    /// with no editor traffic.
+    ///
+    /// Separate from [`Self::index`] because its callers write their gem roots *after* indexing the
+    /// workspace, so the bundle must be queued a second time. The final settle flushes whatever the
+    /// test itself made dirty.
     pub(crate) fn index_gems(&mut self) {
         self.analysis.queue_background_indexing();
-        while self.analysis.step_gem_indexing() {}
+        while self.analysis.step_pipeline() {}
         self.analysis.settle();
     }
 
-    /// Make this harness's client one that takes no dynamic registration at all.
+    /// Negotiate `LocationLink`s for `textDocument/implementation`.
     ///
-    /// A setter rather than a sixth constructor: what changes is one value, and every fixture in
-    /// this module is still the right project to ask the question of.
+    /// A mutator, not a constructor, because it is one test's question (the wire shape), and every
+    /// other test wants the shape a real client gets.
+    pub(crate) fn takes_implementation_links(&mut self) {
+        self.analysis.client.implementation_links = true;
+    }
+
+    /// The other direction, for the goto whose default here is the richer shape.
+    pub(crate) fn takes_no_type_definition_links(&mut self) {
+        self.analysis.client.type_definition_links = false;
+    }
+
+    /// The same, for the fourth goto.
+    pub(crate) fn takes_no_declaration_links(&mut self) {
+        self.analysis.client.declaration_links = false;
+    }
+
+    /// The name this harness's server registers its one command under.
+    ///
+    /// Per root, so a test cannot hard-code it; `show_generated_command` explains why.
+    pub(crate) fn show_generated_command(&self) -> String {
+        crate::analysis::show_generated_command(self.analysis.workspace.root())
+    }
+
+    /// A client that can be shown a document but cannot read one, like Neovim today.
+    pub(crate) fn takes_no_generated_content(&mut self) {
+        self.analysis.client.generated_content = false;
+    }
+
+    /// And the other half off: a client that could read a generated document and has no way to
+    /// be shown one.
+    pub(crate) fn takes_no_show_document(&mut self) {
+        self.analysis.client.show_document = false;
+    }
+
+    /// Every code action offered at one position, by title.
+    ///
+    /// The range is a point: what an editor sends when nothing is selected, and the only shape the
+    /// generated-document action reads.
+    pub(crate) fn code_action_titles(
+        &mut self,
+        uri: &DocUri,
+        line: u32,
+        column: u32,
+    ) -> Vec<String> {
+        let at = serde_json::json!({ "line": line, "character": column });
+        let answer = self.ask(
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "range": { "start": at, "end": at },
+                "context": { "diagnostics": [] },
+            }),
+        );
+        answer
+            .as_array()
+            .map(|actions| {
+                actions
+                    .iter()
+                    .map(|action| action["title"].as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The command one code action carries, by the title it is offered under.
+    pub(crate) fn code_action_command(
+        &mut self,
+        uri: &DocUri,
+        line: u32,
+        column: u32,
+        title: &str,
+    ) -> Option<serde_json::Value> {
+        let at = serde_json::json!({ "line": line, "character": column });
+        let answer = self.ask(
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "range": { "start": at, "end": at },
+                "context": { "diagnostics": [] },
+            }),
+        );
+        answer
+            .as_array()?
+            .iter()
+            .find(|action| action["title"] == title)
+            .map(|action| action["command"].clone())
+    }
+
     pub(crate) fn takes_no_registration(&mut self) {
         self.analysis.documents = crate::analysis::no_document_registrar();
     }
@@ -490,9 +652,9 @@ impl Harness {
 
     /// Every server-initiated request for `method`, sent since the last read.
     ///
-    /// The server starts three of its own — the file watcher's registration, the document
-    /// registration that claims a gem's source, and the inlay-hint refresh — and they travel the
-    /// same channel as the notifications above rather than a second one.
+    /// The server starts three of its own (the file watcher's registration, the document
+    /// registration claiming a gem's source, and the inlay-hint refresh), and they share the
+    /// notifications' channel.
     pub(crate) fn requests(&self, method: &str) -> Vec<Request> {
         self.sent(|message| matches!(message, Message::Request(sent) if sent.method == method))
             .into_iter()
@@ -505,9 +667,9 @@ impl Harness {
 
     /// Everything the server has sent, with whatever this caller did not ask for put back.
     ///
-    /// **Put back rather than dropped.** Two of these readers are now used in one test — a
-    /// registration is a `Request` and the sentence explaining a decline is a `Notification` — and
-    /// while this drained unconditionally, whichever ran first took the other's messages with it.
+    /// **Put back, not dropped**, because one test can use two of these readers (a registration is
+    /// a `Request`, the sentence explaining a decline is a `Notification`), and draining everything
+    /// would let whichever ran first take the other's messages.
     fn sent(&self, wanted: impl Fn(&Message) -> bool) -> Vec<Message> {
         let mut pending: Vec<Message> = self.stashed.borrow_mut().drain(..).collect();
         while let Ok(message) = self.outgoing.try_recv() {
@@ -568,8 +730,18 @@ impl Harness {
     /// A `workspace/didChangeWatchedFiles`, as a client sends it: the file system changed
     /// and nothing else did — no `didOpen`, no `didSave`, no buffer anywhere.
     pub(crate) fn watch(&mut self, uris: &[&DocUri]) {
+        self.watched(uris, Watched::ByTheClient);
+    }
+
+    /// The same change, seen by ya-lsp's own watcher instead.
+    ///
+    /// Two entry points instead of one with an argument at forty call sites: the client's is what
+    /// nearly every test means, and the difference (whether a saved buffer yields to the disk)
+    /// matters to only a handful.
+    pub(crate) fn watched(&mut self, uris: &[&DocUri], watched: Watched) {
         self.run(Task::WatchedFiles {
             uris: uris.iter().map(|uri| (*uri).clone()).collect(),
+            watched,
         });
     }
 
@@ -579,6 +751,12 @@ impl Harness {
             text: text.to_owned(),
             version: Some(1),
         });
+    }
+
+    /// A `didSave`, which carries no text: the buffer the server already has is what was written.
+    /// It changes whether a later change on disk may replace that buffer.
+    pub(crate) fn save(&mut self, uri: &DocUri) {
+        self.run(Task::DidSave { uri: uri.clone() });
     }
 
     /// A whole-buffer change, which is what a client sends for a paste or a revert.
@@ -592,14 +770,13 @@ impl Harness {
         );
     }
 
-    /// A `didChange` with **no settle behind it**, which is the only way to reach the
-    /// state a deferred index creates.
+    /// A `didChange` with **no settle behind it**: the only way to reach the state a deferred index
+    /// creates.
     ///
-    /// `Harness::run` settles whenever the analysis is dirty, so an ordinary `edit` leaves
-    /// the graph current and every rebase the identity — which made the first draft of the
-    /// three tests below pass without exercising a single line of `Rebase`. The deferred
-    /// server never settles here either: it answers, and the index catches up on the
-    /// debounce.
+    /// `Harness::run` settles whenever the analysis is dirty, so an ordinary `edit` leaves the
+    /// graph current and every rebase the identity, and a test built on it would pass without
+    /// running a line of `Rebase`. The deferred server does not settle here either: it answers, and
+    /// the index catches up on the debounce.
     pub(crate) fn edit_without_indexing(&mut self, uri: &DocUri, changes: Vec<TextChange>) {
         self.version += 1;
         let version = self.version;
@@ -622,8 +799,8 @@ impl Harness {
 
     /// Send a request through the real dispatch path and take its result.
     ///
-    /// Going through `serve` rather than calling the handler keeps the tests honest about
-    /// settling, cancellation, and the `null`-versus-error distinction.
+    /// Going through `serve` instead of calling the handler keeps tests honest about settling,
+    /// cancellation and the `null`-versus-error distinction.
     pub(crate) fn ask(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         let id = RequestId::from(1);
         self.analysis.serve(Request {
@@ -642,11 +819,10 @@ impl Harness {
         panic!("{method} was never answered");
     }
 
-    /// The same, for a request whose answer may be an error rather than a result.
+    /// The same, for a request whose answer may be an error instead of a result.
     ///
-    /// `ask` unwraps, which is right for the eighteen handlers — none of them can fail —
-    /// and wrong for the one thing that can now answer an error without anybody's handler
-    /// deciding to: a request that crashed.
+    /// `ask` unwraps, which is right for the handlers (none of them can fail) and wrong for the one
+    /// error no handler decides to send: a request that crashed.
     pub(crate) fn ask_raw(&mut self, method: &str, params: serde_json::Value) -> Response {
         let id = RequestId::from(1);
         self.analysis.serve(Request {
@@ -665,10 +841,9 @@ impl Harness {
 
     /// Index RBS as though something had read `source` and generated it.
     ///
-    /// A stand-in producer for the side table, deliberately in the tests rather than in
-    /// the server: the mapping is built *before* the first
-    /// generator, because a version that types `@story.title` and then jumps to a file the
-    /// user does not have is worse than one that does not type it.
+    /// A stand-in producer for the side table, kept in the tests, not the server: it exercises the
+    /// mapping without any real generator, because a generator that types `@story.title` and then
+    /// jumps to a file the user does not have is worse than one that does not type it.
     pub(crate) fn synthesize(
         &mut self,
         source: &DocUri,
@@ -679,7 +854,7 @@ impl Harness {
             .analysis
             .synthesized
             .record(
-                &mut self.analysis.graph,
+                self.analysis.graph.graph_mut(),
                 &mut self.analysis.types,
                 source,
                 vec![synthesized::Part {
@@ -692,8 +867,8 @@ impl Harness {
             .into_iter()
             .next()
             .unwrap_or_default();
-        // What every other indexing entry point leaves to its caller, for the same reason:
-        // a batch marks itself dirty once rather than per file.
+        // What every other indexing entry point leaves to its caller, for the same reason: a batch
+        // marks itself dirty once, not per file.
         self.analysis.mark_dirty();
         self.analysis.settle();
         uri
@@ -729,6 +904,60 @@ impl Harness {
         )
     }
 
+    pub(crate) fn type_definition_at(
+        &mut self,
+        uri: &DocUri,
+        source: &str,
+        needle: &str,
+    ) -> serde_json::Value {
+        self.ask(
+            "textDocument/typeDefinition",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": position_of(source, needle),
+            }),
+        )
+    }
+
+    /// The type's places as `file.rb:line:character`, read from the **link** shape.
+    ///
+    /// [`located`] reads the flat one, and this goto defaults to links here; see the
+    /// `ClientSupport` this harness negotiates.
+    pub(crate) fn type_definition_list(
+        &mut self,
+        uri: &DocUri,
+        source: &str,
+        needle: &str,
+    ) -> Vec<String> {
+        linked(&self.type_definition_at(uri, source, needle))
+    }
+
+    pub(crate) fn declaration_at(
+        &mut self,
+        uri: &DocUri,
+        source: &str,
+        needle: &str,
+    ) -> serde_json::Value {
+        self.ask(
+            "textDocument/declaration",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": position_of(source, needle),
+            }),
+        )
+    }
+
+    /// The signatures as `file.rbs:line:character`, read from the **link** shape, for
+    /// [`Harness::type_definition_list`]'s reason.
+    pub(crate) fn declaration_list(
+        &mut self,
+        uri: &DocUri,
+        source: &str,
+        needle: &str,
+    ) -> Vec<String> {
+        linked(&self.declaration_at(uri, source, needle))
+    }
+
     pub(crate) fn references_at(
         &mut self,
         uri: &DocUri,
@@ -755,23 +984,33 @@ impl Harness {
         include_declaration: bool,
     ) -> Vec<String> {
         let found = self.references_at(uri, source, needle, include_declaration);
-        let Some(locations) = found.as_array() else {
-            return Vec::new();
-        };
-        locations
-            .iter()
-            .map(|location| {
-                let file = location["uri"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned();
-                let start = &location["range"]["start"];
-                format!("{file}:{}:{}", start["line"], start["character"])
-            })
-            .collect()
+        located(&found)
+    }
+
+    pub(crate) fn implementation_at(
+        &mut self,
+        uri: &DocUri,
+        source: &str,
+        needle: &str,
+    ) -> serde_json::Value {
+        self.ask(
+            "textDocument/implementation",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": position_of(source, needle),
+            }),
+        )
+    }
+
+    /// Implementations as `file.rb:line:character`, in the order they were ranked.
+    pub(crate) fn implementation_list(
+        &mut self,
+        uri: &DocUri,
+        source: &str,
+        needle: &str,
+    ) -> Vec<String> {
+        let found = self.implementation_at(uri, source, needle);
+        located(&found)
     }
 
     pub(crate) fn symbol_search(&mut self, query: &str) -> serde_json::Value {
@@ -910,15 +1149,14 @@ impl Harness {
         )
     }
 
-    /// What the editor would paint at the `~`: the file back, with a `w` under every byte
-    /// of a write and an `r` under every byte of a read.
+    /// What the editor would paint at the `~`: the file back, with a `w` under every byte of a
+    /// write and an `r` under every byte of a read.
     ///
-    /// Drawn rather than asserted as ranges for the reason the signature card is: a
-    /// highlight one line or one column out is a bug anybody can see at a glance here, and
-    /// a list of `{line, character}` pairs is a bug nobody can see at all. Lines with
-    /// nothing on them are dropped so the assertion is about what lit up, but the ones that
-    /// remain carry their own text — which is what makes "and not the one in the comment"
-    /// something the fixture *shows* rather than something a test name claims.
+    /// Drawn, not asserted as ranges, for the signature card's reason: a highlight one line or
+    /// column out is obvious here, and invisible in a list of `{line, character}` pairs. Empty
+    /// lines are dropped so the assertion is about what lit up, but the remaining lines carry their
+    /// own text, so the fixture *shows* "and not the one in the comment" instead of a test name
+    /// claiming it.
     pub(crate) fn highlight_map(&mut self, uri: &DocUri, marked: &str) -> String {
         let found = self.highlight(uri, marked);
         let source = marked.replace('~', "");
@@ -942,13 +1180,13 @@ impl Harness {
 
     /// `documentHighlight` and `definition` at one cursor, in one picture.
     ///
-    /// `w` and `r` are what the highlight lit, and a definition target landing in this file
-    /// **uppercases** the cell it lands on. So a `W` is the two requests agreeing, an `R` is
-    /// a jump to a place the file only reads, and a lone `d` is a jump to a span nothing lit
-    /// — which is the disagreement lane 2 of the audit counts, drawn where it happened.
+    /// `w` and `r` are what the highlight lit, and a definition target in this file **uppercases**
+    /// the cell it lands on. So `W` is the two requests agreeing, `R` is a jump to a place the file
+    /// only reads, and a lone `d` is a jump to a span nothing lit: the disagreement the audit
+    /// counts, drawn where it happened.
     ///
-    /// Both requests are asked of one open buffer at one offset, which is the only way the
-    /// comparison means anything.
+    /// Both requests are asked of one open buffer at one offset, the only way the comparison means
+    /// anything.
     pub(crate) fn agreement_map(&mut self, uri: &DocUri, marked: &str) -> String {
         let position = marked_position(marked);
         let source = marked.replace('~', "");
@@ -969,8 +1207,7 @@ impl Harness {
             &source,
             lit.iter()
                 .map(|span| {
-                    // LSP numbers them `Text` 1, `Read` 2, `Write` 3; `Text` is never
-                    // answered.
+                    // LSP numbers them `Text` 1, `Read` 2, `Write` 3; `Text` is never answered.
                     let mark = if span["kind"].as_u64() == Some(3) {
                         'w'
                     } else {
@@ -1005,8 +1242,8 @@ impl Harness {
 
     /// Prepare at `needle`, then expand the first item the way an editor does.
     ///
-    /// The item is echoed back verbatim, `data` and all — which is the only way the two
-    /// follow-ups are ever reached, and therefore the only honest way to test them.
+    /// The item is echoed back verbatim, `data` and all: the only way the two follow-ups are ever
+    /// reached, so the only honest way to test them.
     pub(crate) fn expand(
         &mut self,
         method: &str,
@@ -1061,8 +1298,8 @@ impl Harness {
 
     /// Prepare at `needle`, expand it the way an editor does, and draw the rows.
     ///
-    /// The item goes back verbatim — `data`, `uri` and both ranges — because that is all the
-    /// client sends and `outgoingCalls` reads more of it than `incomingCalls` does.
+    /// The item goes back verbatim (`data`, `uri` and both ranges), because that is all the client
+    /// sends, and `outgoingCalls` reads more of it than `incomingCalls`.
     pub(crate) fn call_rows(
         &mut self,
         method: &str,
@@ -1078,12 +1315,11 @@ impl Harness {
 
     /// The rows of a hierarchy answer, drawn the way Ruby writes what they are.
     ///
-    /// The keyword makes the kind visible — `module Comparable` in a list of supertypes is
-    /// the answer's most surprising claim and also its most correct one — and the detail
-    /// column is what separates the project's two rows from the gems' eight. Drawn rather
-    /// than asserted field by field, as the signature card and the highlight map are: a row
-    /// in the wrong place, with the wrong kind, or pointing at the wrong file is one thing
-    /// to read here and three assertions to write otherwise.
+    /// The keyword shows the kind (`module Comparable` in a supertype list is the answer's most
+    /// surprising and most correct claim), and the detail column separates the project's rows from
+    /// the gems'. Drawn, not asserted field by field, like the signature card and the highlight
+    /// map: a row in the wrong place, of the wrong kind or pointing at the wrong file is one thing
+    /// to read here and three assertions otherwise.
     pub(crate) fn hierarchy_rows(
         &mut self,
         method: &str,
@@ -1111,14 +1347,13 @@ impl Harness {
 
     /// Rename at `needle`, then draw every file the answer would change.
     ///
-    /// **The assertion is the renamed Ruby**, which is the whole point of drawing it. A span
-    /// one byte out writes code that is visibly broken — a name run into the one beside it,
-    /// a hash key changed along with its value, an `end` eaten — where a list of
-    /// `{line, character}` pairs shows nobody anything. The files no edit touched are not
-    /// drawn, so what an expected block holds is exactly what the rename claims to change.
+    /// **The assertion is the renamed Ruby.** A span one byte out writes visibly broken code (a
+    /// name run into its neighbour, a hash key changed with its value, an `end` eaten), where a
+    /// list of `{line, character}` pairs shows nobody anything. Untouched files are not drawn, so
+    /// an expected block holds exactly what the rename claims to change.
     ///
-    /// The edits are applied through `TextDocument::apply`, the same code incremental sync
-    /// uses, and in reverse so that each one lands before anything ahead of it has moved.
+    /// The edits are applied through `TextDocument::apply`, the same code incremental sync uses, in
+    /// reverse so each lands before anything ahead of it moves.
     pub(crate) fn renamed(&mut self, uri: &DocUri, source: &str, needle: &str, to: &str) -> String {
         let answer = self.ask(
             "textDocument/rename",
@@ -1128,12 +1363,38 @@ impl Harness {
                 "newName": to,
             }),
         );
+        self.drawn_edits(&answer)
+    }
+
+    /// Move a file, as an editor's own explorer does, and draw every file the answer changes.
+    ///
+    /// `to` is relative to the workspace root, because the rule under test reads it: a move is a
+    /// *path* changing, and half the cases are about which directory it lands in. The file is never
+    /// actually moved: the request is the one the client sends *before* moving anything, and the
+    /// answer is what it applies alongside.
+    pub(crate) fn moved_file(&mut self, from: &DocUri, to: &str) -> String {
+        let answer = self.ask(
+            "workspace/willRenameFiles",
+            serde_json::json!({
+                "files": [{
+                    "oldUri": from.as_str(),
+                    "newUri": DocUri::from_path(&self.root.path().join(to))
+                        .expect("a path under the root")
+                        .as_str(),
+                }],
+            }),
+        );
+        self.drawn_edits(&answer)
+    }
+
+    /// The Ruby a `WorkspaceEdit` would leave behind, file by file.
+    fn drawn_edits(&self, answer: &serde_json::Value) -> String {
         if answer.is_null() {
             return "null".to_owned();
         }
         let mut drawn = Vec::new();
-        for (uri, edits) in edits_in(&answer) {
-            let at = DocUri::from_uri_str(&uri).expect("a document URI");
+        for (uri, edits) in edits_in(answer) {
+            let at = DocUri::from_graph_uri(&uri).expect("a document URI");
             let mut text = TextDocument::new(
                 self.analysis
                     .with_text(&at, |text| text.text().to_owned())
@@ -1162,9 +1423,8 @@ impl Harness {
 
     /// The first `count` rows offered at the `~`, spelled the way the editor draws them.
     ///
-    /// The detail is the owner, and including it is what makes an assertion here readable
-    /// as a *ranking* rather than as a list of names — the owner is what the order is
-    /// supposed to be about.
+    /// The detail is the owner, and including it makes an assertion readable as a *ranking*, not
+    /// just a list of names: the owner is what the order is about.
     pub(crate) fn first_rows(&mut self, uri: &DocUri, marked: &str, count: usize) -> Vec<String> {
         let found = self.complete(uri, marked);
         let Some(items) = found["items"].as_array() else {
@@ -1185,8 +1445,8 @@ impl Harness {
 
     /// The labels offered at the `~`, with Ruby's keywords dropped.
     ///
-    /// Keywords are in every expression list and are not what any of these tests are about;
-    /// one test asserts they are there and the rest would be unreadable with them.
+    /// Keywords are in every expression list and are not what these tests are about; one test
+    /// asserts they are there, and the rest would be unreadable with them.
     pub(crate) fn declarations_at(&mut self, uri: &DocUri, marked: &str) -> Vec<String> {
         let found = self.complete(uri, marked);
         let Some(items) = found["items"].as_array() else {
@@ -1214,13 +1474,10 @@ impl Harness {
         }
     }
 
-    /// rubydex spells method declarations with parentheses: `Person#shout()`, not
-    /// `Person#shout`. Looking one up without them silently returns `None`.
     /// The RBS the generators wrote from one of the workspace's files.
     ///
-    /// The text rather than its effects, for the handful of properties that are about
-    /// what was written — optionality, arity, which of two annotations won — and would
-    /// otherwise be asserted through three layers of lookup.
+    /// The text, not its effects, for the few properties about what was written (optionality,
+    /// arity, which of two annotations won) that would otherwise go through three layers of lookup.
     pub(crate) fn generated_rbs(&self, relative: &str) -> String {
         let uri = DocUri::from_path(&self.root.path().join(relative)).expect("a file uri");
         self.analysis.synthesized.text(&uri).unwrap_or_default()
@@ -1245,17 +1502,17 @@ impl Harness {
 
     /// The RBS the generators wrote for one source document, addressed by its URI.
     ///
-    /// [`Harness::generated_rbs`] asks the same question from a relative path; this is for the
-    /// callers that already hold the [`DocUri`] `write` handed back.
+    /// [`Harness::generated_rbs`] asks the same question from a relative path; this is for callers
+    /// already holding the [`DocUri`] `write` returned.
     pub(crate) fn generated_for(&self, source: &DocUri) -> Option<String> {
         self.analysis.synthesized.text(source)
     }
 
     /// How many declarations the graph holds under one name.
     ///
-    /// [`Harness::has`] answers "is this declared at all", which cannot tell "declared once"
-    /// from "declared by two generators that both thought they owned it" — the failure the
-    /// macro readers are most likely to have.
+    /// [`Harness::has`] answers "is this declared at all", which cannot tell "declared once" from
+    /// "declared by two generators that both thought they owned it", the macro readers' likeliest
+    /// failure.
     pub(crate) fn declarations_of(&self, name: &str) -> usize {
         self.analysis
             .graph
@@ -1263,16 +1520,20 @@ impl Harness {
             .map_or(0, |declarations| declarations.len())
     }
 
+    /// Whether the graph holds a declaration under `name`.
+    ///
+    /// rubydex spells method declarations with parentheses: `Person#shout()`, not `Person#shout`.
+    /// Looking one up without them silently returns `false`.
     pub(crate) fn has(&self, name: &str) -> bool {
         self.analysis.graph.get(name).is_some()
     }
 
     /// How many definitions the graph holds for one document.
     ///
-    /// [`Harness::has`] cannot answer "was this indexed": a *declaration* is built by
-    /// `Resolver::resolve` and a document that was indexed and not yet resolved has none,
-    /// so it reads the same as one that was never indexed at all. A **definition** is put
-    /// there by the indexing itself, which is what the deferral's tests ask.
+    /// [`Harness::has`] cannot answer "was this indexed": `Resolver::resolve` builds
+    /// *declarations*, so a document indexed but not yet resolved has none and looks like one never
+    /// indexed. A **definition** is created by indexing itself, which is what the deferral's tests
+    /// ask about.
     pub(crate) fn definitions_in(&self, uri: &DocUri) -> usize {
         self.analysis
             .graph
@@ -1282,13 +1543,18 @@ impl Harness {
             .map_or(0, |document| document.definitions().len())
     }
 
-    /// Documents rubydex knows about, minus the synthetic `rubydex:built-in` one.
+    /// Documents rubydex knows about that are files, which is what every caller means.
+    ///
+    /// The graph also holds three kinds that are not: rubydex's own `rubydex:built-in`, the
+    /// `core:ya-lsp/object.rbs` seed beside it, and whatever the generator pass wrote under
+    /// `ya-lsp-generated:`. Filtering on `file:` instead of excluding those three means a new kind
+    /// cannot be forgotten and show up as a document the workspace does not have.
     pub(crate) fn document_count(&self) -> usize {
         self.analysis
             .graph
             .documents()
             .values()
-            .filter(|document| !document.uri().starts_with("rubydex:"))
+            .filter(|document| document.uri().starts_with("file:"))
             .count()
     }
 }
@@ -1296,9 +1562,9 @@ impl Harness {
 // ---------------------------------------------------------------------------------------
 // The fixtures and project builders more than one module's tests read
 //
-// A fixture with a single reader lives beside that reader; these are the ones two or more
-// modules ask the same question of, and duplicating them is how two copies of "the same"
-// project quietly stop being the same.
+// A fixture with a single reader lives beside that reader. These are the ones two or more modules
+// ask the same question of, and duplicating them is how two copies of "the same" project quietly
+// drift apart.
 // ---------------------------------------------------------------------------------------
 
 /// `class Foo` with no `end`: Prism reports it, and it is unambiguously the user's problem.
@@ -1385,13 +1651,12 @@ end
 $shelf = nil
 ";
 
-/// An rbs root shaped the way Ruby's own is, with RDoc's markup in it.
+/// An rbs root shaped like Ruby's own, with RDoc's markup in it.
 ///
-/// Synthetic rather than the vendored copy, deliberately: what the tests below pin is the
-/// *card*, and pinning a card against 800 files of upstream prose would break on every rbs
-/// release for a reason that has nothing to do with ya-lsp. Every shape that matters is
-/// here — the call-seq header, a `<code>` span, an indented example, a dead `rdoc-ref:`
-/// link — and each was copied from the real `String#upcase` comment.
+/// Synthetic, not the vendored copy, on purpose: these tests pin the *card*, and pinning it against
+/// hundreds of files of upstream prose would break on every rbs release for reasons unrelated to
+/// ya-lsp. Every shape that matters is here (the call-seq header, a `<code>` span, an indented
+/// example, a dead `rdoc-ref:` link), each copied from the real `String#upcase` comment.
 pub(crate) const CORE_RBS: &str = "\
 class String
   # <!--
@@ -1408,9 +1673,9 @@ class String
 end
 ";
 
-/// A class with an overloaded constructor, which is how RBS spells a method that can be
-/// called more than one way — and, since only a constant receiver resolves exactly, the
-/// shape of overload a signature card can actually be asked for.
+/// A class with an overloaded constructor: how RBS spells a method callable more than one way, and,
+/// since only a constant receiver resolves exactly, the overload shape a signature card can
+/// actually be asked about.
 pub(crate) const OVERLOAD_RBS: &str = "\
 class Coordinate
   # A point, from a pair or from text.
@@ -1460,14 +1725,20 @@ pub(crate) fn with_signatures(source: &str) -> (Harness, DocUri) {
     (harness, uri)
 }
 
-/// Signatures with return types in them, which is what the return-type table is built
-/// from.
+/// Signatures with return types, which is what the return-type table is built from.
 ///
-/// Small, and deliberately real in shape. `upcase` returns a `String` so a chain composes;
-/// `length` returns an `Integer` so a link can change class; `join` is a generic whose head
-/// is the answer; `tap` is declared on `Kernel` and returns `self`, which is the case a
-/// table keyed by the receiver's own name would get wrong twice over — wrong owner, and
-/// then `Kernel` instead of the receiver.
+/// Small, and real in shape:
+///
+/// - `upcase` returns a `String`, so a chain composes.
+/// - `length` returns an `Integer`, so a link can change class.
+/// - `join` is a generic whose head is the answer.
+/// - `tap` is declared on `Kernel` and returns `self`, which a table keyed by the receiver's own
+///   name would get wrong twice (wrong owner, then `Kernel` instead of the receiver).
+/// - `map` and `sort_by` tell the two type variables apart: both declare `[U]` and hand the block a
+///   `U`, but only `map` returns it, so `map` is answered by the block and `sort_by` by the
+///   receiver. Both are on `Array`, not `Enumerable`, as in `vendor/rbs`, which the argument rule
+///   requires: a member reached through an ancestor may not answer the receiver's own type
+///   argument, because `Hash` includes `Enumerable[[K, V]]`.
 pub(crate) const TYPED_RBS: &str = "\
 module Kernel
   def tap: () { (self) -> void } -> self
@@ -1485,11 +1756,14 @@ class String
          | (Integer index) -> Integer
   def bytes: () -> Array[Integer]
            | () { (Integer byte) -> void } -> self
+  def pair: () -> [String, Integer]
+          | [X] () { ([String, Integer]) -> X } -> X
 end
 
 class Integer
   def succ: () -> Integer
   def digits: () -> Array[Integer]
+  def to_s: () -> String
 end
 
 class Float
@@ -1498,19 +1772,46 @@ class Float
 end
 
 class Array[E]
+  include Enumerable[E]
+
   def join: (?String separator) -> String
   def first: () -> E
           | (Integer count) -> Array[E]
+  def each: () { (E element) -> void } -> self
+  def each_slice: (Integer count) { (Array[E] slice) -> void } -> self
+  def map: [U] () { (E) -> U } -> Array[U]
+  def sort_by: [U] () { (E) -> U } -> Array[E]
 end
 
-module Enumerable
-  def sort: () -> Array[untyped]
+class Hash[K, V]
+  def []: (K key) -> V
+  def keys: () -> Array[K]
+end
+
+module Enumerable[E]
+  def entries: () -> Array[untyped]
+  def walk: () { (E) -> void } -> self
+end
+
+class Minted
+  def self.new: () -> String
+end
+
+class NilClass
+  def nil?: () -> bool
+end
+
+class TrueClass
+end
+
+class FalseClass
 end
 
 GREETING: String
 MYSTERY: Ghost
 ";
 
+/// A workspace whose only signatures are [`TYPED_RBS`], plus one file of the user's code.
 pub(crate) fn with_types(source: &str) -> (Harness, DocUri) {
     let dir = tempfile::tempdir().expect("tempdir");
     let signatures = dir.path().join("sig");
@@ -1538,16 +1839,15 @@ pub(crate) fn with_types(source: &str) -> (Harness, DocUri) {
 
 /// Which class the cursor at `~` completes against, named by the methods offered.
 ///
-/// The class rather than the list, because the list is what every other completion test is
-/// about and the *type* is what these are: a chain that answers with `Integer`'s members
-/// where `String`'s were meant is a wrong answer whose rows are all individually plausible.
+/// The class, not the list, because the list is what other completion tests are about and the
+/// *type* is what these are about: a chain answering with `Integer`'s members where `String`'s were
+/// meant is wrong in a way where every row looks plausible.
 pub(crate) fn class_at(harness: &mut Harness, uri: &DocUri, marked: &str) -> String {
     let offered = harness.declarations_at(uri, marked);
     let has = |name: &str| offered.iter().any(|label| label == name);
-    // Each class is named by what it has *and by what it does not*. Absence is the load
-    // bearing half: the name-based fallback offers every method in the graph, so a test
-    // that only looked for `upcase` would call it `String` and pass while the whole tier
-    // was broken.
+    // Each class is named by what it has *and by what it does not*. Absence is the load-bearing
+    // half: the name-based fallback offers every method in the graph, so a test checking only for
+    // `upcase` would call it `String` and pass while the whole tier was broken.
     let only = |mine: &[&str], theirs: &[&str]| {
         mine.iter().all(|name| has(name)) && !theirs.iter().any(|name| has(name))
     };
@@ -1555,6 +1855,10 @@ pub(crate) fn class_at(harness: &mut Harness, uri: &DocUri, marked: &str) -> Str
         () if only(&["upcase", "length", "scan"], &["succ", "join"]) => "String".to_owned(),
         () if only(&["succ", "digits"], &["upcase", "join"]) => "Integer".to_owned(),
         () if only(&["join", "first"], &["upcase", "succ"]) => "Array".to_owned(),
+        // One member, here so `nil` can be told from the fall-through at all: a class with no
+        // members offers an empty list, and `completion` replaces an empty list with the name-based
+        // one. A `nil` answer is an answer; see `types.md`.
+        () if only(&["nil?"], &["upcase", "succ", "join"]) => "NilClass".to_owned(),
         () if offered.is_empty() => "(nothing)".to_owned(),
         () => "(everything, which is the name-based list)".to_owned(),
     }
@@ -1562,9 +1866,9 @@ pub(crate) fn class_at(harness: &mut Harness, uri: &DocUri, marked: &str) -> Str
 
 /// The labels a completion response offered, and whether the receiver was resolved at all.
 ///
-/// The second half is what tells a real answer from the fall-through: `precise: false` is
-/// the name-based list, which matches **every method in the project** by name and is what
-/// completion degrades to when it cannot type the receiver.
+/// The second half tells a real answer from the fall-through: `precise: false` is the name-based
+/// list, which matches **every method in the project** by name and is what completion degrades to
+/// when it cannot type the receiver.
 pub(crate) fn offered(answer: &serde_json::Value) -> (Vec<String>, bool) {
     let items = answer["items"].as_array().cloned().unwrap_or_default();
     let precise = items
@@ -1608,10 +1912,9 @@ end
 
 /// Build a project with one installed gem, and an `Env` pointing at it.
 ///
-/// The gem is a real one in shape: unpacked under `gems/<full name>/lib`, with the
-/// serialised gemspec RubyGems writes beside it. The gem home deliberately sits *outside*
-/// the project, which is where a version manager puts it; the vendored case, where it does
-/// not, has its own test.
+/// The gem is real in shape: unpacked under `gems/<full name>/lib`, with the serialised gemspec
+/// RubyGems writes beside it. The gem home sits *outside* the project on purpose, where a version
+/// manager puts it; the vendored case has its own test.
 pub(crate) fn project_with_gem(
     gem_source: &str,
 ) -> (tempfile::TempDir, tempfile::TempDir, gems::Env) {
@@ -1621,8 +1924,8 @@ pub(crate) fn project_with_gem(
 /// The same gem, with its one file put where the caller says.
 ///
 /// `relative` is under the gem root, so `lib/shouty/test/utils.rb` is a library file inside a
-/// directory called `test` — which is what `environment::Fence::only_the_suite` exists to tell
-/// apart from a suite, and what no path test alone can.
+/// directory called `test`: what `environment::Fence::only_the_suite` exists to tell apart from a
+/// suite, and no path test alone can.
 pub(crate) fn project_with_gem_file(
     relative: &str,
     gem_source: &str,
@@ -1657,21 +1960,19 @@ pub(crate) fn project_with_gem_file(
 
 /// A project whose ancestry is written down, for pinning the *order* of a list.
 ///
-/// Every other fixture in this module asks whether a name is offered. This one asks where
-/// it lands, which is a question a green suite and a millisecond benchmark can both miss:
-/// `"hello".` opening on `DelegateClass, Digest, append_as_bytes, …` passes both.
+/// Other fixtures here ask whether a name is offered. This one asks where it lands, which a green
+/// suite and a millisecond benchmark can both miss: `"hello".` opening on
+/// `DelegateClass, Digest, append_as_bytes, …` passes both.
 ///
-/// The shape is chosen so every rung of the ancestor chain holds exactly one method: `Item`
-/// includes `Auditable` and inherits `Record`, and `Object` sits past both. Reopening
-/// `String` and `Object` is what lets a literal receiver be ranked here at all — this
-/// harness has no core signatures by design, and adding them would be ~800 files of work
-/// for a question about ordering.
+/// Every rung of the ancestor chain holds exactly one method: `Item` includes `Auditable` and
+/// inherits `Record`, and `Object` sits past both. Reopening `String` and `Object` lets a literal
+/// receiver be ranked at all, since this harness deliberately has no core signatures.
 ///
-/// `Item#initialize` and its `private def stash` are here so the pinned lists carry the
-/// other half of the question: not only where a row lands, but whether Ruby would let it be
-/// written at all. Both are absent from every explicit receiver below — and from the class
-/// body, where `self` is the class rather than an instance. They appear in exactly one list,
-/// the expression inside `#price`, which is the only cursor here that could write either.
+/// `Item#initialize` and its `private def stash` make the pinned lists answer the other half too:
+/// not just where a row lands, but whether Ruby would allow it at all. Both are absent from every
+/// explicit receiver below, and from the class body (where `self` is the class, not an instance).
+/// They appear in exactly one list: the expression inside `#price`, the only cursor here that could
+/// write either.
 pub(crate) const ANCESTRY: &str = "\
 module Store
   DEFAULT_CURRENCY = 1
@@ -1731,8 +2032,8 @@ pub(crate) fn project_with_engine(
         std::fs::create_dir_all(path.parent().expect("a relative path")).unwrap();
         std::fs::write(path, source).unwrap();
     }
-    // Kept alive by the caller: `elsewhere` is a `TempDir` and dropping it would delete the
-    // bundle out from under the test.
+    // Kept alive by the caller: `elsewhere` is a `TempDir`, and dropping it would delete the bundle
+    // out from under the test.
     let root = elsewhere.keep();
     (dir, root, env)
 }
@@ -1755,8 +2056,8 @@ class Story
 end
 ";
 
-/// The byte span of `needle` in `text`, for building a mapping out of a fixture rather than
-/// out of hand-counted offsets that go stale the moment a line moves.
+/// The byte span of `needle` in `text`, for building a mapping from a fixture instead of from
+/// hand-counted offsets that go stale when a line moves.
 pub(crate) fn span(text: &str, needle: &str) -> (u32, u32) {
     let at = text
         .find(needle)
@@ -1767,17 +2068,15 @@ pub(crate) fn span(text: &str, needle: &str) -> (u32, u32) {
 
 /// A project with a model, a file that declares columns, and Ruby's own signatures.
 ///
-/// The declaring file is deliberately **not** at `db/schema.rb`, and that is what makes
-/// this fixture worth keeping beside the real schema reader: what these tests pin is the
-/// side table — replace rather than append, no mapping means no place, a deleted source
-/// takes its declarations with it — and every generator relies on the same
-/// table from a different kind of file. Pointing them at the real schema would test the
-/// schema reader instead, and would stop testing the withheld answer at all, because a real
-/// reader maps every declaration it writes.
+/// The declaring file is deliberately **not** `db/schema.rb`, which is what makes this fixture
+/// worth keeping beside the real schema reader. These tests pin the side table (replace, don't
+/// append; no mapping means no place; a deleted source takes its declarations with it), which every
+/// generator relies on from a different kind of file. Using the real schema would test the schema
+/// reader instead, and would stop testing the withheld answer, because a real reader maps every
+/// declaration it writes.
 ///
-/// So the tests here play a generator, and what they hand over is exactly what
-/// [`Analysis::synthesize`] hands over: RBS text, and one span of it per line that implied
-/// it.
+/// So these tests play a generator, handing over exactly what [`Analysis::synthesize`] hands over:
+/// RBS text, and one span of it per line that implied it.
 pub(crate) fn synthetic_project(caller: &str) -> (Harness, DocUri, DocUri) {
     let dir = tempfile::tempdir().expect("tempdir");
     let signatures = dir.path().join("sig");
@@ -1801,13 +2100,12 @@ pub(crate) fn synthetic_project(caller: &str) -> (Harness, DocUri, DocUri) {
     (harness, schema, uri)
 }
 
-/// The mapping a generator would record beside [`SCHEMA_RBS`]: the `title` column, and
-/// deliberately not the `byline` one.
+/// The mapping a generator would record beside [`SCHEMA_RBS`]: the `title` column, and deliberately
+/// not `byline`.
 ///
-/// One mapping short on purpose. Half of what this table is for is the answer it *withholds*
-/// — a generator that emits a declaration and forgets to say where it came from must lose
-/// the jump rather than invent one — and a fixture where everything is mapped could not tell
-/// the two apart.
+/// One mapping short on purpose. Half of this table's job is the answer it *withholds*: a generator
+/// that emits a declaration and forgets its source must lose the jump, not invent one, and a fully
+/// mapped fixture could not tell the two apart.
 pub(crate) fn title_only(schema: &DocUri) -> Vec<synthesized::Mapping> {
     vec![synthesized::Mapping {
         generated: span(SCHEMA_RBS, "  def title: () -> String\n"),
@@ -1821,9 +2119,8 @@ pub(crate) fn title_only(schema: &DocUri) -> Vec<synthesized::Mapping> {
 
 /// A Rails application, as small as one can be and still be one.
 ///
-/// Two tables and one model between them: `stories` is claimed, `widgets` is not, and the
-/// difference between them is the whole of what "the schema does not type more receivers,
-/// it makes the ones already typed answer" means in a fixture.
+/// Two tables and one model: `stories` is claimed, `widgets` is not. The difference is what "the
+/// schema does not type more receivers, it makes the typed ones answer" means in a fixture.
 pub(crate) const SCHEMA_RB: &str = "\
 ActiveRecord::Schema[7.1].define(version: 2024_01_01_000000) do
   create_table \"stories\", force: :cascade do |t|
@@ -1861,11 +2158,11 @@ pub(crate) fn rails_project(caller: &str) -> (Harness, DocUri, DocUri) {
     (harness, schema, uri)
 }
 
-/// The same two tables as [`SCHEMA_RB`], as pg_dump would have written them.
+/// The same two tables as [`SCHEMA_RB`], as pg_dump would write them.
 ///
-/// Deliberately the same database, because the claim is that the *format* is the only
-/// difference — so the two fixtures declaring the same thing is the assertion, and a
-/// dump that happened to describe some other schema would hide it.
+/// Deliberately the same database, because the claim is that the *format* is the only difference:
+/// both fixtures declaring the same thing is the assertion, and a dump of some other schema would
+/// hide it.
 pub(crate) const STRUCTURE_SQL: &str = "\
 SET statement_timeout = 0;
 
@@ -1910,10 +2207,9 @@ pub(crate) fn sql_project(caller: &str) -> (Harness, DocUri, DocUri) {
 
 /// A Rails application with three models and every association shape that matters.
 ///
-/// `Story` has one of each; `Comment` is the element type two collections share, which is
-/// what makes "one relation class per element type" observable; `Tag` exists so that a
-/// `has_many :through` has an intermediate to find. `Ghost` is named by nothing and defined
-/// by nothing, which is the decline every wrong inflection ends at.
+/// `Story` has one of each. `Comment` is the element type two collections share, which makes "one
+/// relation class per element type" observable. `Tag` gives a `has_many :through` an intermediate
+/// to find. `Ghost` is named by nothing and defined by nothing: where every wrong inflection ends.
 pub(crate) fn models_project(caller: &str) -> (Harness, DocUri, DocUri) {
     let dir = tempfile::tempdir().expect("tempdir");
     let signatures = dir.path().join("sig");
@@ -1967,9 +2263,9 @@ pub(crate) fn models_project(caller: &str) -> (Harness, DocUri, DocUri) {
 /// A workspace shaped like the half of Rails the concern edge is about: a concern whose class-side
 /// methods reach an includer through an `extend` no file writes.
 ///
-/// Two spellings of the convention and one module that is not it, because the gate has to
-/// be the nested `module ClassMethods` rather than `extend ActiveSupport::Concern` — 6 of
-/// the 17 such modules in six corpora hand-roll the hook and 3 write neither.
+/// Two spellings of the convention and one module that is neither, because the gate must be the
+/// nested `module ClassMethods`, not `extend ActiveSupport::Concern`: some real concerns hand-roll
+/// the hook, and some write neither.
 pub(crate) const CONCERNS: &str = "\
 module ActiveSupport
   module Concern
@@ -2029,16 +2325,16 @@ class ApplicationRecord
 end
 ";
 
-/// The third spelling of the same edge, and the one no `ClassMethods` module appears in.
+/// The third spelling of the same edge, with no `ClassMethods` module anywhere.
 ///
-/// `ActiveSupport::Concern` `class_eval`s an `included do` block on each including class, so a
-/// bare `extend M` in one puts `M`'s **instance** methods on that class's singleton. It is what
-/// `activemodel/lib/active_model/api.rb` writes — `extend ActiveModel::Naming` and
+/// `ActiveSupport::Concern` `class_eval`s an `included do` block on each including class, so a bare
+/// `extend M` inside one puts `M`'s **instance** methods on that class's singleton. It is what
+/// `activemodel/lib/active_model/api.rb` writes (`extend ActiveModel::Naming` and
 /// `extend ActiveModel::Translation`, reached by every model through `ActiveRecord::Base`'s
-/// `include ActiveModel::API` — and what installs `model_name` and `human_attribute_name`.
+/// `include ActiveModel::API`), and what installs `model_name` and `human_attribute_name`.
 ///
-/// The `def`s are in **`Naming`'s own file** and not in this one, which is the whole point of the
-/// fixture: the concern names a module and the module is somewhere else.
+/// The `def`s are in **`Naming`'s own file**, not this one, which is the point of the fixture: the
+/// concern names a module that lives elsewhere.
 pub(crate) const EXTENDING_CONCERN: &str = "\
 module Nameable
   extend ActiveSupport::Concern
@@ -2068,8 +2364,8 @@ end
 ";
 
 /// The application's **own** concern, written where Rails puts one and installing its
-/// `ClassMethods` by hand rather than through `ActiveSupport::Concern` — 6 of the corpus'
-/// 17 do exactly this, and a gate on the `extend` would decline every one of them.
+/// `ClassMethods` by hand instead of through `ActiveSupport::Concern`. Real concerns do this, and a
+/// gate on the `extend` would decline every one.
 pub(crate) const OWN_CONCERN: &str = "\
 module Countable
   def self.included(base)
@@ -2096,18 +2392,17 @@ module Recountable
 end
 ";
 
-/// The **other** spelling of the same edge: `class_methods do`, which writes no `module
-/// ClassMethods` for the gate to find.
+/// The **other** spelling of the same edge: `class_methods do`, which writes no
+/// `module ClassMethods` for the gate to find.
 ///
 /// `ActiveSupport::Concern#class_methods` builds that module at run time and `module_eval`s the
-/// block on it, so rubydex — which has no namespace for a block body — files every `def` here as
-/// an *instance* member of the concern and the class object reaches none of them. The six
-/// corpora write this spelling **120** times against 17 files holding a `module ClassMethods`, so
-/// it is the majority one.
+/// block on it, so rubydex (which has no namespace for a block body) files every `def` here as an
+/// *instance* member of the concern, and the class object reaches none of them. It is the more
+/// common spelling in real projects.
 ///
-/// Every arm of the reader is in here: a `def` with each shape of parameter, an operator name RBS
-/// cannot spell, a `def self.` that `extend` installs on nothing, both spellings of `private`, and
-/// a `class_methods do` written in a **class**, where the call raises `NoMethodError`.
+/// Every arm of the reader is here: a `def` with each parameter shape, an operator name RBS cannot
+/// spell, a `def self.` that `extend` installs nowhere, both spellings of `private`, and a
+/// `class_methods do` written in a **class**, where the call raises `NoMethodError`.
 pub(crate) const BLOCK_CONCERN: &str = "\
 module Tallyable
   extend ActiveSupport::Concern
@@ -2147,8 +2442,8 @@ class Ledger
 end
 ";
 
-/// The mailer file the entry-point reader takes, and the base it inherits which the
-/// application does not define — `ActionMailer::Base` is a gem's, and is read anyway.
+/// The mailer file the entry-point reader takes, and its base, which the application does not
+/// define: `ActionMailer::Base` is a gem's, and is read anyway.
 pub(crate) const MAILERS: &str = "\
 class UserMailer < ApplicationMailer
   def welcome(user)
@@ -2192,14 +2487,13 @@ pub(crate) fn routes_project(caller: &str) -> (Harness, DocUri) {
     (harness, uri)
 }
 
-/// One spelling — `name` — used every way a Ruby file uses one.
+/// One spelling, `name`, used every way a Ruby file uses one.
 ///
-/// A parameter in two methods, a block parameter shadowing one of them, a method and a call
-/// to it, an instance variable in two different objects, and the same six letters in a
-/// comment and in a string. That last pair is not decoration: matching words is what an
-/// editor does when no server answers, and lighting up the comment is exactly how it is
-/// wrong. `MAX` is here so the exact half — a constant the resolver linked — is pinned by
-/// the same file as the half that is a scope walk.
+/// A parameter in two methods, a block parameter shadowing one, a method and a call to it, an
+/// instance variable in two different objects, and the same letters in a comment and a string. That
+/// last pair matters: matching words is what an editor does when no server answers, and lighting up
+/// the comment is exactly how it goes wrong. `MAX` pins the exact half (a constant the resolver
+/// linked) in the same file as the scope-walk half.
 pub(crate) const OCCURRENCES: &str = "\
 class Person
   MAX = 10
@@ -2232,9 +2526,9 @@ end
 
 /// `source` with the cursor at the end of `needle`, which must occur in it exactly once.
 ///
-/// Naming a position by the text around it rather than by an index is what keeps these
-/// readable while the fixture grows: `on("def greet(name")` says which of the seven `name`s
-/// it means, and `on("(name", 2)` would not.
+/// Naming a position by its surrounding text instead of an index keeps these readable as the
+/// fixture grows: `on("def greet(name")` says which of the seven `name`s it means, and
+/// `on("(name", 2)` would not.
 pub(crate) fn cursor_after(source: &str, needle: &str) -> String {
     let at = source.find(needle).expect("the needle is in the fixture");
     assert!(
@@ -2250,8 +2544,8 @@ pub(crate) fn on(needle: &str) -> String {
     cursor_after(OCCURRENCES, needle)
 }
 
-/// A constant in a namespace, used four ways across two files, with a second constant of the
-/// same name in another namespace that must not move.
+/// A constant in a namespace, used four ways across two files, plus a same-named constant in
+/// another namespace that must not move.
 pub(crate) const HR: &str = "\
 module HR
   class Person
@@ -2272,10 +2566,10 @@ end
 
 /// The model a template renders, and the template that renders it.
 ///
-/// Deliberately ordinary Rails: a collection assigned to an instance variable, a block local
-/// taken out of it, a method call on that local, a constant, and markup wrapped around all of
-/// it. Every ERB test below reads one of these two files, so what any of them asserts is
-/// about the *technique* rather than about a fixture written to suit it.
+/// Ordinary Rails on purpose: a collection assigned to an instance variable, a block local taken
+/// from it, a method call on that local, a constant, and markup around it all. Every ERB test below
+/// reads one of these two files, so each asserts something about the *technique*, not about a
+/// fixture written to suit it.
 pub(crate) const STORY: &str = "\
 class Story
   TAGLINE = \"news\"
@@ -2293,12 +2587,11 @@ pub(crate) const VIEW: &str = "\
 <% end %>
 ";
 
-/// What one request answered, short enough to put in a table cell.
+/// What one request answered, short enough for a table cell.
 ///
-/// An empty array and a `null` are drawn the same way on purpose: to the user they are the
-/// same answer, and which one a handler returns is decided per request for reasons that have
-/// nothing to do with templates — except in `foldingRange`, which is why that one has a test
-/// of its own.
+/// An empty array and a `null` are drawn the same on purpose: to the user they are the same answer,
+/// and which one a handler returns is decided per request for reasons unrelated to templates.
+/// `foldingRange` is the exception, which is why it has its own test.
 pub(crate) fn shape(answer: &serde_json::Value) -> String {
     let count = |len: usize| match len {
         0 => "\u{2014}".to_owned(),
@@ -2317,11 +2610,9 @@ pub(crate) fn shape(answer: &serde_json::Value) -> String {
     }
 }
 
-/// The controller `app/views/stories/*` names, holding the two shapes a corpus has: an
-/// instance variable assigned something nameable, and one assigned an ActiveRecord chain.
-/// 88 of the corpus's 318 receiver sites are the first and most of the rest are the
-/// second, so a fixture with only the first would be a fixture written to flatter the
-/// feature.
+/// The controller `app/views/stories/*` names, holding the two shapes real projects have: an
+/// instance variable assigned something nameable, and one assigned an ActiveRecord chain. Both are
+/// common, so a fixture with only the first would flatter the feature.
 pub(crate) const CONTROLLER: &str = "\
 class StoriesController
   def show

@@ -3,83 +3,64 @@ paths:
   - "src/analysis/code_actions.rs"
 ---
 
-# The refactorings, and the second module that writes
+# Refactorings: the second module that writes
 
-- **This is the second module that edits the user's files; it inherits `renaming.md`'s bar.** The
-  question is "what can be refactored *exactly*", not "how much". The naive extract-to-method
-  slices the selection out verbatim and passes no parameters, so any extraction touching a local
-  assigned outside it produces a method that raises `NameError` on its first call. Every guard here is a *refusal*, which is why the module is on `COVERAGE_FLOORS` at
-  100:100 — an untested guard is an action still offered where it should not be, invisible until
-  somebody applies it.
-- **A refusal here is silent; that is the difference from a rename.** A rename is a deliberate
-  keystroke, so declining earns a `window/showMessage`. A code action is a menu the editor opens on
-  its own; an absent action is the whole of what needs saying, and a notification per cursor
-  movement would be intolerable. `messages.rs` is not involved, and neither are the titles: a title
-  is part of one request's answer, like a hover card or a completion label.
-- **Three gates, and the last is not decoration.** (1) Nothing is offered where the file does not
-  parse — recovery hands out spans that do not nest, and an edit placed by one lands elsewhere in
-  the buffer. (2) Every guard refuses rather than approximating. (3) **Every action is applied to a
-  copy and the result parsed before it is offered.** Swept over a real application, gate 3 removes
-  actions every guard above it allowed, and both families it caught are spellings nothing here
-  anticipated:
-  a `do … end` block carrying an `ensure`, which a brace block cannot; and two adjacent string
-  literals joined by a line continuation, which are one string with two nodes. The first is what an
-  RSpec `around` hook looks like.
-- **`{ }` and `do … end` do not bind the same way, and the guard also catches a syntax error.** With
-  braces the block belongs to the nearest call; with `do … end` to the outermost command. So a
-  toggle is declined when the block's own call is a command (no parentheses, at least one argument)
-  or when a command call encloses it *in its arguments*. `puts show [1, 2].map { |n| n * 2 }` prints
-  `[2, 4]` and its `do … end` spelling prints an `Enumerator`; it parses and it runs. The same test
-  refuses `it "works" do … end`, whose brace form is a syntax error.
-- **`attr_reader :count` reads an *instance's* `@count`, so the accessor is offered only where the
-  variable is an instance's.** Inside `def self.count` or a `class << self` it would read a different
-  variable, return `nil`, and look right. `scopes::accessor_site` answers it, because the algebra
-  that knows the difference is `SelfContext`'s level and a second copy in the caller would drift. It
-  also hands back where the namespace body begins, which is where the declaration goes.
-- **Placement is the whole of extract-to-variable.** Hoisting an expression out of a branch, a loop
-  or the right of an `&&` changes how often it runs. The rule: nothing between the selection and its
-  statement may be a construct deciding whether or how many times its child is evaluated — **and the
-  statement has to own its lines**. That second half is semantic, not cosmetic: `a ? b : c` puts each
-  arm in its own statement list and so does `foo.bar if baz`, so in both the "statement" found is a
-  fragment that neither begins nor ends its line, and one textual test refuses both. The
-  classification table's default is `Opaque`, not a value: a node kind nobody has thought about
-  declines both questions, and Prism has 150 of them.
-- **The chain is the ancestor chain because pre-order says so, not because it is sorted.** A node
-  containing the selection is on the path to it, and a walk announces a parent before its children,
-  so recording every containing node in visit order *is* the path. Two things it needs that a naive
-  walk does not: the **thirteen typed hooks the generic one never fires for** (`ranges::Selection`
-  names the same thirteen), and a dedup comparing the *classification* as well as the span, because
-  a file's `ProgramNode` and the statement list inside it are the same bytes and dropping the second
-  leaves top-level code with no statement list.
-- **A local the extraction writes and the rest of the method reads has no single value to hand back,
-  so it is declined.** `scopes::crossing` answers both halves — which locals a range reads before
-  writing, and whether anything it writes is touched afterwards — from the scope stack rather than
-  from names, so a block's `n` and the method's `n` are not confused. Two locals spelled alike are
-  **not** a case; working that out removed a guard rather than adding one, since a run lies inside
-  one scope, an inner `n` shadows an outer one throughout, and a block inside the run writes its own
-  before reading it.
-- **The extracted method mirrors the one it came from, written after its `end`.** `def self.x`
-  extracts into `def self.` or the call does not resolve; `def obj.x` is an island and is declined;
-  an endless `def` has no `end` to write beside. Inserting after the enclosing method's `end` also
-  keeps the lexical context — inside a `class << self` the sibling lands inside it too, with no rule
-  about that written anywhere.
-- **A multi-line string literal in the run is refused; it is the one failure the parse gate cannot
-  see.** The body is re-indented on the way out, and re-indenting a string changes what it says while
-  leaving a file that still parses. The heredoc half is caught by the same rule's other half — an
-  opener without its body does not parse alone.
-- **Names are made free of the file by a whole-word search over the source, deliberately
-  over-strict.** A mention in a comment moves on to `extracted_2`. A name nothing in the file spells
-  cannot shadow a local, a receiverless call, or anything else — a property of the search rather
-  than of a list it would otherwise have to enumerate.
-- **Declined in a template, for a reason no other request has.** Every action writes a **line**, and
-  in a template a line belongs to the markup. `erb::ruby_view` keeps the offsets so everything that
-  reads answers unchanged, and there is nothing it can do about a line starting `<td>`.
-- **The test drawing is the rewritten Ruby** (`renaming.md`'s rule, same reason): a span one byte out
-  writes visibly broken code where a list of `{line, character}` pairs shows nobody anything. The one
-  exception is `an_action_is_a_title_a_kind_and_a_list_of_spans`, which pins the shape the caller
-  converts, once.
-- **No `quickfix`, and the reason is the diagnostic table's shape.** Two of its ten rules are
-  statements about the user's code; the other eight are rubydex saying *it* gave up. A fix needs a
-  rule that knows what the code should say instead, and "the indexer could not follow this" does not.
-  The autocorrect half of `codeAction` is RuboCop's, served over its own `textDocument/codeAction`
-  from 1.89, so this composes rather than competes.
+`code_actions::at` builds four refactorings from one buffer and a Prism tree. The fifth action,
+*show generated RBS*, lives in `requests::generated_actions` (`synthesized.md`). It writes nothing,
+so none of the gates below apply to it.
+
+## The three gates, all required
+
+1. **Offer nothing where the file doesn't parse.** Recovery spans don't nest, so an edit would land
+   in the wrong place.
+2. **Every guard refuses; none approximates.** The bar is `renaming.md`'s: refactor *exactly* or
+   not at all. That is why the module is in `COVERAGE_FLOORS` at 100: an untested guard is an action
+   offered where it should not be.
+3. **Apply every action to a copy and parse the result before offering it.** On a real app this
+   catches shapes nobody anticipated, such as a `do … end` with `ensure` (an RSpec `around`), and two
+   string literals joined by `\`.
+
+## Per action
+
+- **Toggle `{ }` ↔ `do … end`:** braces bind to the nearest call, and `do … end` to the outermost
+  command. Decline when the block's own call is a command (no parentheses, at least one argument),
+  or when a command encloses it in its arguments.
+- **Generate `attr_reader`:** offer it only where `@x` belongs to an instance. `scopes::accessor_site`
+  decides that and returns where the declaration goes.
+- **Extract to variable, where placement is the whole job:**
+  - Between the selection and its statement, there must be no construct that decides whether or how
+    often its child runs.
+  - The statement must own its lines, which refuses `a ? b : c` and `x if y`.
+  - A node kind nobody has classified defaults to `Opaque`, which declines.
+- **Extract to method:**
+  - Decline when the extracted code writes a local that the rest of the method reads.
+    `scopes::crossing` decides that from the scope stack, not from names.
+  - Mirror the source method (`def self.x` → `def self.`), and write the new method after its `end`.
+    Decline in `def obj.x` and in an endless `def`.
+  - Refuse a multi-line string in the run: re-indenting it changes the string and still parses.
+- **Pick fresh names by a whole-word search of the file**, deliberately over-strict. A name
+  mentioned in a comment also moves on to `extracted_2`.
+
+## The ancestor chain
+
+- **Build it in pre-order**: every node that contains the selection, in visit order, is the path.
+- Hook the 13 typed visits that the generic hook never fires for. `ranges::Selection` names the
+  same 13.
+- Dedupe on classification plus span. A `ProgramNode` and its statement list have the same bytes.
+
+## Settled
+
+- **Declined refactorings are silent.** A code-action menu opens on its own, so no `showMessage`.
+  Titles are part of the answer and do not go in `messages.rs`.
+- **Honour `only`, using the dotted hierarchy and matching on segment boundaries.** `refactor`
+  matches `refactor.extract` but not `refactorings.x`. `CodeActionKind::EMPTY` is advertised, so a
+  `quickfix`-only request must get no refactorings.
+- **A stale keystroke doesn't settle for `codeAction`, but a cold server does.** Settling costs
+  about 300 ms on a large file just for the fifth action. The split is `requests::settles` versus
+  `requests::needs_the_graph`.
+- **No actions in a template.** Every action writes a whole line, and in ERB a line belongs to the
+  markup.
+- **There are no `quickfix`es.** Most diagnostic rules are rubydex giving up, which has no fix.
+  RuboCop serves autocorrect over its own `codeAction`.
+- **Tests show the rewritten Ruby.** The exception is
+  `an_action_is_a_title_a_kind_and_a_list_of_spans`, which pins the shape once.

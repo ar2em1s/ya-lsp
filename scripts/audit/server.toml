@@ -1,35 +1,31 @@
-# What every server the audit starts is configured with.
+# The settings every audited server gets.
 #
-# This is **not** a workspace `ya-lsp.toml` and must never be copied into one. A corpus is a
-# clone pinned to a commit, and `config.check_clean` refuses to measure one whose working tree
-# is dirty — so the audit configures its servers the way an editor does, through
-# `initializationOptions`, and writes nothing into any of the six. The keys and their spellings
-# are the server's own (`workspace::config::PartialConfig`), which deserializes this with
-# `deny_unknown_fields`: a key that does not exist rejects the whole layer rather than itself,
-# and every setting in it silently stops applying.
+# **Never copy this into a workspace `ya-lsp.toml`.** A corpus is a clone pinned to a commit, and
+# `config.check_clean` refuses to measure a dirty one. So the audit configures its servers the way
+# an editor does, through `initializationOptions`, and writes nothing into any corpus.
 #
-# A workspace `ya-lsp.toml` would still outrank all of this. None of the six has one.
+# **Use the server's own spellings** (`workspace::config::PartialConfig`). It deserializes this
+# with `deny_unknown_fields`, so one unknown key rejects the whole layer, and every setting in it
+# silently stops applying.
+#
+# A workspace `ya-lsp.toml` would outrank all of this. No corpus has one.
 
 [log]
-# The audit asks tens of thousands of questions of six servers and, until this file existed,
-# kept not one word of what it asked. A finding is a corpus, a path and an offset; what the
-# server did with it — whether the request even arrived, whether it settled first, how long it
-# took, what it answered — was written nowhere and could only be recovered by re-running the
-# position by hand.
+# A finding is a corpus, a path and an offset. The log is what the server did with it: whether
+# the request arrived, whether it settled first, how long it took, what it answered. Without it,
+# the only way to find out is to re-run the position by hand.
 #
-# **On, because it is nearly free and was measured rather than assumed.** lobsters, one release
-# binary, 777 positions on 2026-09-14: 27.6 s with the file against 27.1 s without it, for 2.4 MB
-# and 13,716 lines of which 6,494 are a request's own pair. Half a second of a 360 s budget. Turn
-# it off here if a corpus one day makes that untrue, and record the number that showed it.
+# **On, because it is nearly free**, measured: a fraction of a second per corpus. Turn it off if a
+# corpus ever makes that untrue, and record the number that showed it.
 file = true
-# **Relative to the ya-lsp checkout and not to the corpus**, resolved by `config.server_options`
-# before it is sent. Both readings keep a corpus clean — all six gitignore `tmp` — but only this
-# one cannot: the audit's own log has no way to end up inside a pinned clone, however a corpus'
-# `.gitignore` changes upstream. One file for all six servers; `O_APPEND` and the pid on every
-# line are what make that readable, and they are the same two properties two editor windows on
-# one project rely on.
+# **Relative to the ya-lsp checkout, not the corpus**, resolved by `config.server_options` before
+# it is sent. Every corpus gitignores `tmp` today, but only this reading guarantees the log never
+# lands inside a pinned clone, whatever a corpus' `.gitignore` becomes upstream.
+#
+# One file for all six servers. `O_APPEND` and the pid on every line keep it readable: the same
+# two properties two editor windows on one project rely on.
 file_path = "tmp/ya-lsp.log"
-# The whole point of the file. `level` is deliberately left alone: `client.py` sets
-# `YA_LSP_LOG`, which outranks `[log] level` and decides stderr only, so the sweep's own console
-# output is unchanged by anything in this file.
+# The whole point of the file. `level` is left alone on purpose: `client.py` sets `YA_LSP_LOG`,
+# which outranks `log.level` and decides stderr only, so nothing here changes the sweep's console
+# output.
 file_level = "debug"

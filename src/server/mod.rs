@@ -1,11 +1,12 @@
 //! LSP lifecycle, capability negotiation, and the message dispatch loop.
 //!
-//! The main thread only reads from the connection and routes. Everything that touches the
-//! graph happens on the analysis thread, which holds a clone of the connection's sender and
-//! writes its own responses. That keeps the main thread free to answer `$/cancelRequest` and
-//! `shutdown` promptly even while analysis is busy.
+//! The main thread only reads from the connection and routes. Everything that touches the graph
+//! runs on the analysis thread, which holds a clone of the connection's sender and writes its own
+//! responses. So the main thread stays free to answer `$/cancelRequest` and `shutdown` while
+//! analysis is busy.
 
 pub mod capabilities;
+pub(crate) mod watcher;
 
 use std::path::Path;
 
@@ -17,8 +18,9 @@ use lsp_types::{
 };
 
 use crate::{
-    analysis::{self, Cancellations, ClientSupport, Task, TextChange, position::PositionEncoding},
-    messages,
+    analysis::{
+        self, Cancellations, ClientSupport, Task, TextChange, Watched, position::PositionEncoding,
+    },
     workspace::{
         DocUri, Workspace,
         config::{CONFIG_FILE_NAME, IndexConfig},
@@ -32,16 +34,16 @@ use crate::{
 ///
 /// Returns an error if the LSP handshake fails or the transport breaks.
 pub fn run_stdio(reload: crate::logging::Reload) -> anyhow::Result<()> {
-    // Before the handshake, not after it: a client that sends a malformed `initialize` — or none
-    // at all — is exactly when one needs to know which build was answering, and by then `serve`
-    // has already returned. Spelled as `--version` spells it, so one pattern finds both.
+    // Before the handshake, not after. A client that sends a malformed `initialize`, or none, is
+    // exactly when you need to know which build answered, and by then `serve` has returned. Spelled
+    // as `--version` spells it, so one pattern finds both.
     tracing::info!("ya-lsp {} starting", env!("CARGO_PKG_VERSION"));
 
     let (connection, io_threads) = Connection::stdio();
 
-    // `serve` takes the connection by value on purpose. lsp-server's writer thread only stops
-    // once every clone of `Connection::sender` is dropped, so holding one here would make the
-    // join below block forever after a clean shutdown.
+    // `serve` takes the connection by value on purpose. lsp-server's writer thread stops only once
+    // every clone of `Connection::sender` is dropped, so holding one here would make the join below
+    // block forever after a clean shutdown.
     let result = serve(connection, reload);
 
     // Join the transport threads even on failure, or the process leaks them on exit.
@@ -56,11 +58,15 @@ fn serve(connection: Connection, reload: crate::logging::Reload) -> anyhow::Resu
         .initialize_start()
         .context("waiting for the initialize request")?;
 
+    // Kept beside the parsed copy for the one client capability `lsp-types` has no field for:
+    // `workspace.textDocumentContent`, read in `ClientSupport::negotiate`. One clone at startup is
+    // cheaper than any way of keeping it typed.
+    let raw_params = initialize_params.clone();
     let params: InitializeParams =
         serde_json::from_value(initialize_params).context("parsing initialize params")?;
 
-    // Encoding is negotiated before anything else: the wrong choice is invisible on ASCII and
-    // silently corrupts every position on a line with an emoji, accent, or CJK character.
+    // Encoding is negotiated first. A wrong choice is invisible on ASCII and silently corrupts
+    // every position on a line with an emoji, accent or CJK character.
     let encoding = PositionEncoding::negotiate(
         params
             .capabilities
@@ -73,13 +79,11 @@ fn serve(connection: Connection, reload: crate::logging::Reload) -> anyhow::Resu
     let (workspace, mut problems) =
         Workspace::load(root.clone(), params.initialization_options.clone());
 
-    // Before the first line that describes the workspace, and that ordering is the point: this
-    // is where `[log]` first exists, and everything worth putting in a file — the config, the
-    // Ruby, the bundle, every request — happens after it. A `[log]` that cannot be honoured is a
-    // problem shown beside the config's own.
+    // Before the first line that describes the workspace, on purpose. This is where `[log]` first
+    // exists, and everything worth a log file (the config, the Ruby, the bundle, every request)
+    // comes after. A `[log]` that cannot be honoured is shown beside the config's own problems.
     problems.extend(reload.apply(&workspace.config().log, &root));
-    // After the log is pointed and not before: the detection runs inside `Workspace::load`,
-    // which is earlier than `[log]` exists.
+    // After the log is pointed: detection runs inside `Workspace::load`, before `[log]` exists.
     workspace.say_which_way_rails_went();
 
     let changed = workspace.config().changed_from_defaults();
@@ -101,40 +105,46 @@ fn serve(connection: Connection, reload: crate::logging::Reload) -> anyhow::Resu
         .initialize_finish(
             initialize_id,
             serde_json::json!({
-                "capabilities": capabilities::advertised(encoding),
+                "capabilities": capabilities::advertised(encoding, &root),
                 "serverInfo": capabilities::server_info(),
             }),
         )
         .context("sending the initialize response")?;
 
-    // After the handshake and not inside it: file watching has no static form in the protocol,
-    // so the response cannot announce it and `client/registerCapability` is the only way to ask.
-    // `initialize_finish` is what waits for `initialized`, which is the point a server is
-    // allowed to send requests of its own.
-    register_file_watchers(
+    // After the handshake, not inside it. File watching has no static form in the protocol, so only
+    // `client/registerCapability` can ask for it. `initialize_finish` waits for `initialized`,
+    // after which a server may send its own requests.
+    let client_watches = register_file_watchers(
         &connection,
         &params.capabilities,
         &root,
         &workspace.config().index,
     );
+    // Cloned before the workspace moves onto the analysis thread. The watcher outlives it and keeps
+    // the startup configuration; see `watcher::Collector`.
+    let index = workspace.config().index.clone();
 
-    // The one file the watcher above covers, spelled the way an incoming notification will be.
-    // Held here rather than on the analysis thread because the routing decision is the main
-    // thread's: a reload drops the whole graph, so it must not be queued for anything else.
+    // The one file the watcher above covers, spelled as an incoming notification will spell it.
+    // Held here, not on the analysis thread, because routing is the main thread's decision: a
+    // reload drops the whole graph, so it must not queue behind anything.
     let config = DocUri::from_path(&root.join(CONFIG_FILE_NAME));
 
     let cancellations = Cancellations::default();
-    // Negotiated here, where the client's capabilities are, and sent from the analysis thread,
-    // which is the only place that ever learns the gem roots. What crosses is the closure rather
-    // than the table behind it, so the thread that answers requests does not have to name the
-    // module that negotiates capabilities — see `analysis::DocumentRegistrar`.
-    let requested = capabilities::dynamic_documents(encoding, &params.capabilities);
+    // Negotiated here, where the client's capabilities are. Sent from the analysis thread, the only
+    // place that learns the gem roots. What crosses is a closure, not the table behind it, so the
+    // request thread never names the capabilities module; see `analysis::DocumentRegistrar`.
+    let requested = capabilities::dynamic_documents(encoding, &params.capabilities, &root);
     let documents: analysis::DocumentRegistrar =
         Box::new(move |prefixes| capabilities::document_registrations(&requested, prefixes));
     let analysis = analysis::spawn(
         workspace,
         encoding,
-        ClientSupport::negotiate(&params.capabilities),
+        ClientSupport::negotiate(
+            &params.capabilities,
+            raw_params
+                .get("capabilities")
+                .unwrap_or(&serde_json::Value::Null),
+        ),
         documents,
         connection.sender.clone(),
         cancellations.clone(),
@@ -146,43 +156,54 @@ fn serve(connection: Connection, reload: crate::logging::Reload) -> anyhow::Resu
         show_warning(&connection, &problem);
     }
 
+    // After the analysis thread exists, since the task sender comes from it. Only where the client
+    // has no watcher of its own.
+    let watching = (!client_watches)
+        .then(|| watcher::watch(root, index, config.clone(), analysis.sender().clone()))
+        .flatten();
+
     let outcome = main_loop(
         &connection,
         analysis.sender(),
         &cancellations,
         config.as_ref(),
     );
+    // Before the join. The watcher's collector thread holds a clone of the task sender. A live
+    // sender means the channel never disconnects, the run loop never breaks, and the join waits
+    // forever.
+    drop(watching);
     // The analysis thread holds a clone of the sender; it has to go before `connection` does.
     analysis.join();
     outcome
 }
 
-/// Ask the client to watch `ya-lsp.toml` and the project's Ruby, or say why it will not.
+/// Ask the client to watch `ya-lsp.toml` and the project's Ruby. Returns whether it will.
+///
+/// `false` is not a failure and is not logged as one: many clients take no dynamic registration. It
+/// decides whether [`watcher::watch`] runs. **A client that took the registration keeps sending
+/// events, and the server never watches the same tree twice.**
 fn register_file_watchers(
     connection: &Connection,
     capabilities: &ClientCapabilities,
     root: &Path,
     index: &IndexConfig,
-) {
+) -> bool {
     let Some(registration) = capabilities::watched_files(root, index, capabilities) else {
-        // Not a warning — plenty of clients are like this and it is nobody's mistake — but not
-        // silence either. The alternative is a `git checkout` that changes nothing the server
-        // can see, with nothing anywhere connecting the two.
-        tracing::info!("{}", messages::cannot_watch_files());
-        return;
+        return false;
     };
-    // A string id in the server's own id space, as `Progress::begin` uses: client and server
-    // number their requests independently, so this cannot collide with anything the client sent.
-    // The answer is read and dropped by the loop below, which warns if it is an error.
+    // A string id in the server's own id space, as `Progress::begin` uses. Client and server number
+    // their requests independently, so this cannot collide. The loop below reads and drops the
+    // answer, warning on an error.
     //
-    // `json!` rather than `to_value`, as the initialize response above: the one point where
-    // this can fail to serialize is `config_watcher`, which answers `None` there, and a second
-    // guard here would be a branch nothing can take.
+    // `json!`, not `to_value`, as in the initialize response above. The one thing that could fail
+    // to serialize is `config_watcher`, which answers `None` there, so a second guard here would be
+    // a branch nothing can take.
     let _ = connection.sender.send(Message::Request(Request {
         id: RequestId::from("ya-lsp/config-watcher".to_owned()),
         method: "client/registerCapability".to_owned(),
         params: serde_json::json!({ "registrations": [registration] }),
     }));
+    true
 }
 
 fn main_loop(
@@ -211,13 +232,12 @@ fn main_loop(
                     anyhow::bail!("the analysis thread stopped");
                 }
             }
-            // Responses to server-initiated requests — `window/workDoneProgress/create` and
-            // the `client/registerCapability` above. Neither answer changes what the server
-            // does next: the progress token is ours either way, and a refused registration
-            // cannot be retried into a client that does not do registrations. Read and dropped
-            // rather than left unread, because an unread response is a message the transport
-            // keeps buffering forever — but a refusal is logged, because the two things it
-            // costs a user are a missing spinner and a `ya-lsp.toml` that stops reloading.
+            // Responses to our own requests: `window/workDoneProgress/create` and the
+            // `client/registerCapability` above. Neither answer changes what the server does: the
+            // progress token is ours either way, and a refused registration cannot be retried.
+            // - **Read and dropped**, because the transport buffers an unread response forever.
+            // - **A refusal is logged**, because it costs the user a missing spinner or a
+            //   `ya-lsp.toml` that stops reloading.
             Message::Response(response) => match response.response_result {
                 Err(error) => tracing::warn!(
                     "the client refused server request {:?}: {}",
@@ -233,8 +253,8 @@ fn main_loop(
 
 /// Translate a notification into analysis work, or handle it here if it must not queue.
 ///
-/// `config` is the `ya-lsp.toml` the watcher was registered for; see the `didChangeWatchedFiles`
-/// arm for what it is compared against.
+/// `config` is the `ya-lsp.toml` the watcher was registered for; the `didChangeWatchedFiles` arm
+/// says what it is compared against.
 fn route_notification(
     notification: Notification,
     cancellations: &Cancellations,
@@ -243,7 +263,7 @@ fn route_notification(
     match notification.method.as_str() {
         "textDocument/didOpen" => {
             let params: DidOpenTextDocumentParams = parse(notification)?;
-            let uri = document_uri(&params.text_document.uri)?;
+            let uri = opened_uri(&params.text_document)?;
             Some(Task::DidOpen {
                 uri,
                 text: params.text_document.text,
@@ -253,9 +273,9 @@ fn route_notification(
         "textDocument/didChange" => {
             let params: DidChangeTextDocumentParams = parse(notification)?;
             let uri = document_uri(&params.text_document.uri)?;
-            // Incremental sync: every change has to reach the analysis thread, in order.
-            // Each range is expressed against the text the previous change produced, so
-            // keeping only the last one — which full sync allowed — would corrupt the buffer.
+            // Incremental sync: every change must reach the analysis thread, in order. Each range
+            // is expressed against the text the previous change produced, so keeping only the last
+            // would corrupt the buffer.
             let changes: Vec<TextChange> = params
                 .content_changes
                 .into_iter()
@@ -286,28 +306,32 @@ fn route_notification(
             })
         }
         "workspace/didChangeWatchedFiles" => {
-            // Split, not widened. A reload drops the whole graph and re-runs the gem index, so
-            // it stays reserved for the one file that decides what the whole index is; every
-            // other path re-indexes itself and nothing else. Watchers are the client's, shared
-            // across every server it runs and every registration each one made, and nothing
-            // stops a client delivering all of them here — so the third case, ignoring the
-            // change, is the common one and the analysis thread is where it is decided, since
-            // that is where the workspace lives.
+            // Three outcomes per path:
+            // - **The config file**: reload. It drops the whole graph and re-runs the gem index, so
+            //   it is reserved for the one file that decides what the index is.
+            // - **Any other path**: re-index that file alone.
+            // - **Ignore it**: the common case. Watchers are the client's, shared across every
+            //   server it runs, so a client may deliver anything here. The analysis thread decides,
+            //   since the workspace lives there.
             let params: lsp_types::DidChangeWatchedFilesParams = parse(notification)?;
             let mut seen = std::collections::HashSet::with_capacity(params.changes.len());
             let mut uris = Vec::with_capacity(params.changes.len());
             for change in &params.changes {
-                let Some(uri) = DocUri::from_lsp(&change.uri) else {
+                // **File-backed only, on purpose.** A watcher watches paths, so nothing can report
+                // a change to an unsaved buffer. A path-less URI here means a client confused two
+                // notifications, and the buffer it names is already its own newest copy.
+                let Some(uri) = DocUri::from_lsp(&change.uri).filter(|uri| !uri.is_untitled())
+                else {
                     continue;
                 };
                 if config == Some(&uri) {
-                    // The reload re-indexes the whole workspace from disk, so whatever else
-                    // this notification carried is covered by it and by more than it asked for.
+                    // The reload re-indexes the whole workspace from disk, which covers everything
+                    // else this notification carried.
                     return Some(Task::ReloadConfig);
                 }
-                // A create and a change for one path in one notification is ordinary — a
-                // generator writes a file, a checkout rewrites it — and indexing it twice is
-                // work the debounce cannot coalesce because it is not the resolve.
+                // A create and a change for one path in one notification is ordinary (a generator
+                // writes a file, a checkout rewrites it). Indexing twice is work the debounce
+                // cannot coalesce, since it only coalesces the resolve.
                 if seen.insert(uri.clone()) {
                     uris.push(uri);
                 }
@@ -316,13 +340,15 @@ fn route_notification(
                 tracing::trace!("nothing in the watched change has a path this server can read");
                 return None;
             }
-            Some(Task::WatchedFiles { uris })
+            Some(Task::WatchedFiles {
+                uris,
+                watched: Watched::ByTheClient,
+            })
         }
         "workspace/didChangeConfiguration" => {
-            // LSP wraps the payload in `settings`, and its content is whatever the server said
-            // it wanted — here, the same shape as `initializationOptions`. A client that sends
-            // `null` (VS Code does, when it has nothing to say) means "back to the defaults",
-            // which is exactly what dropping the layer produces.
+            // LSP wraps the payload in `settings`, in whatever shape the server asked for: here,
+            // the shape of `initializationOptions`. A `null` (VS Code sends one when it has nothing
+            // to say) means "back to the defaults", which is what dropping the layer produces.
             let params: lsp_types::DidChangeConfigurationParams = parse(notification)?;
             let options = match params.settings {
                 serde_json::Value::Null => None,
@@ -331,8 +357,8 @@ fn route_notification(
             Some(Task::ChangeConfig { options })
         }
         "$/cancelRequest" => {
-            // Recorded here rather than queued: tasks are processed in order, so a cancel sent
-            // through the analysis queue would always arrive after the request it cancels.
+            // Recorded here, not queued. Tasks run in order, so a queued cancel would always arrive
+            // after the request it cancels.
             if let Some(params) = parse::<lsp_types::CancelParams>(notification) {
                 cancellations.cancel(request_id(params.id));
             }
@@ -348,10 +374,40 @@ fn route_notification(
 fn document_uri(uri: &lsp_types::Uri) -> Option<DocUri> {
     let canonical = DocUri::from_lsp(uri);
     if canonical.is_none() {
-        // Untitled buffers and remote schemes have nothing on disk to index.
+        // A remote scheme, or a document of this server's own: nothing to index either way.
         tracing::debug!("ignoring non-file document {}", uri.as_str());
     }
     canonical
+}
+
+/// The document a `didOpen` names, or `None` for one this server will not index.
+///
+/// **`languageId` matters for one kind of document only.**
+/// - **A file on disk** is classified by its extension. An `.erb` is a template whatever the client
+///   calls it, and the extension is what `workspace::indexes`, `erb::is_template` and every Rails
+///   convention read. The field decides nothing here.
+/// - **An unsaved buffer** has no extension, and VS Code calls a new tab `plaintext` until a
+///   language is picked. A parse error in a document outside the project is published, so indexing
+///   a shopping list as Ruby would show a wall of red. Such a buffer is admitted on the client's
+///   word alone.
+///
+/// **The word must be `ruby`, not `erb`.** Five places recognise a template by its path with no
+/// table or buffer in reach (`erb::is_template_uri` is a free function over a URI). An unsaved ERB
+/// buffer would be indexed as Ruby with its markup in: the wall of red again.
+///
+/// `didOpen` is the only notification carrying a `languageId`, so it is the only place an unsaved
+/// buffer can be admitted. A `didChange` for a buffer never opened is dropped; see the `didChange`
+/// arm in `Analysis::handle`.
+fn opened_uri(document: &lsp_types::TextDocumentItem) -> Option<DocUri> {
+    let uri = document_uri(&document.uri)?;
+    if uri.is_untitled() && document.language_id != "ruby" {
+        tracing::debug!(
+            "ignoring unsaved {} buffer {uri}; only Ruby is indexed without a file behind it",
+            document.language_id
+        );
+        return None;
+    }
+    Some(uri)
 }
 
 fn parse<T: serde::de::DeserializeOwned>(notification: Notification) -> Option<T> {
@@ -372,13 +428,12 @@ fn request_id(id: lsp_types::NumberOrString) -> lsp_server::RequestId {
     }
 }
 
-/// Hand work to the analysis thread. `false` means the thread is no longer there.
+/// Hand work to the analysis thread. `false` means the thread is gone.
 ///
-/// The caller ends the loop on `false`, and that is the whole point of the return value. A
-/// language server whose analysis thread has died answers nothing, and answering nothing is
-/// indistinguishable from thinking: no error reaches the editor, no process exits, and the
-/// user waits for a hover that is never coming. Exiting is the one thing that gets noticed —
-/// every editor restarts a server that stops, and none restarts one that goes quiet.
+/// The caller ends the loop on `false`, which is the point of the return value. A server whose
+/// analysis thread died answers nothing, and that looks exactly like thinking: no error reaches the
+/// editor, no process exits, the user waits for a hover that never comes. Exiting gets noticed:
+/// every editor restarts a server that stops, none restarts one that goes quiet.
 #[must_use]
 fn send(analysis: &crossbeam_channel::Sender<Task>, task: Task) -> bool {
     if analysis.send(task).is_err() {
@@ -531,9 +586,44 @@ mod tests {
     }
 
     #[test]
-    fn a_document_with_nothing_on_disk_behind_it_is_ignored() {
-        // Untitled buffers and remote schemes have no file to index. Dropping the notification
-        // is the whole handling; the alternative is a document keyed by a URI nothing else uses.
+    fn an_unsaved_buffer_is_routed_on_the_client_s_word_and_nothing_else_is() {
+        // The only place the door opens. A buffer with no file behind it is work for all four
+        // notifications when the client calls it Ruby, and for none otherwise. `languageId` travels
+        // on `didOpen` alone, so the other three route on the URI, and the analysis thread drops a
+        // change for a buffer it never opened (`Analysis::handle`'s `DidChange` arm).
+        let buffer = |language: &str| {
+            serde_json::json!({
+                "textDocument": {
+                    "uri": "untitled:Untitled-1",
+                    "languageId": language,
+                    "version": 1,
+                    "text": "class Person\nend\n",
+                },
+                "contentChanges": [{ "text": "x" }]
+            })
+        };
+        for method in [
+            "textDocument/didOpen",
+            "textDocument/didChange",
+            "textDocument/didClose",
+            "textDocument/didSave",
+        ] {
+            assert!(
+                route(method, buffer("ruby")).is_some(),
+                "{method} on an unsaved Ruby buffer queued nothing"
+            );
+        }
+        // A new VS Code tab is `plaintext` until the user picks a language, and a shopping list
+        // indexed as Ruby would show a wall of parse errors, since a document outside the project
+        // publishes them. ERB is refused for its own reason: a template is recognised by its path,
+        // and this has none. See `opened_uri`.
+        for language in ["plaintext", "markdown", "erb"] {
+            assert!(
+                route("textDocument/didOpen", buffer(language)).is_none(),
+                "an unsaved {language} buffer was indexed as Ruby"
+            );
+        }
+        // A scheme with neither a file nor a client to vouch for it is still refused.
         for method in [
             "textDocument/didOpen",
             "textDocument/didChange",
@@ -544,7 +634,7 @@ mod tests {
                 method,
                 serde_json::json!({
                     "textDocument": {
-                        "uri": "untitled:Untitled-1",
+                        "uri": "ya-lsp-generated:file:///p/db/schema.rb#class:Story",
                         "languageId": "ruby",
                         "version": 1,
                         "text": "class Person\nend\n",
@@ -552,7 +642,10 @@ mod tests {
                     "contentChanges": [{ "text": "x" }]
                 }),
             );
-            assert!(task.is_none(), "{method} on an untitled buffer queued work");
+            assert!(
+                task.is_none(),
+                "{method} on a generated document queued work"
+            );
         }
     }
 
@@ -560,9 +653,8 @@ mod tests {
 
     #[test]
     fn a_watched_file_change_reloads_the_config() {
-        // All three kinds, because the watcher is registered for all three: a deleted
-        // `ya-lsp.toml` means back to the defaults, and one created where there was none means
-        // the opposite.
+        // All three kinds, because the watcher is registered for all three. A deleted `ya-lsp.toml`
+        // means back to the defaults; a new one means the opposite.
         for kind in [1, 2, 3] {
             assert!(
                 matches!(
@@ -583,9 +675,9 @@ mod tests {
 
     #[test]
     fn the_config_is_recognised_however_the_client_spells_it() {
-        // The watcher is registered with our spelling of the root, but the notification comes
-        // back through the client's URI writer. Percent-encoding is where the two diverge, and
-        // a comparison that missed it would silently stop reloading.
+        // The watcher is registered with our spelling of the root, but the notification comes back
+        // through the client's URI writer. Percent-encoding is where they diverge, and a comparison
+        // that missed it would silently stop reloading.
         assert!(matches!(
             route(
                 "workspace/didChangeWatchedFiles",
@@ -599,15 +691,13 @@ mod tests {
 
     #[test]
     fn a_watched_change_to_anything_else_is_a_file_to_re_index_and_not_a_reload() {
-        // A reload drops the whole graph and re-runs the gem index. Watchers belong to the
-        // client and are shared across every server it runs, so a client is free to deliver
-        // changes this server never asked for, and answering each with a full re-index would
-        // be ruinous. A same-named file in a subdirectory is here for the same reason: it is not
-        // the file this workspace is configured by, so it is an ordinary path like any other.
+        // A reload drops the whole graph and re-runs the gem index. Watchers are the client's and
+        // shared across every server it runs, so a client may deliver changes this server never
+        // asked for; a full re-index for each would be ruinous. A same-named file in a subdirectory
+        // is not this workspace's config, so it is an ordinary path.
         //
-        // Whether an ordinary path is one this workspace indexes at all is decided on the
-        // analysis thread, which is where the workspace and its globs live. Routing's job is
-        // only to keep it away from the expensive arm.
+        // Whether this workspace indexes an ordinary path is decided on the analysis thread, where
+        // the workspace and its globs live. Routing only keeps it away from the expensive arm.
         for uri in [
             "file:///tmp/ya-lsp-route/lib/person.rb",
             "file:///tmp/ya-lsp-route/Gemfile.lock",
@@ -617,7 +707,7 @@ mod tests {
                 "workspace/didChangeWatchedFiles",
                 serde_json::json!({ "changes": [{ "uri": uri, "type": 2 }] }),
             ) {
-                Some(Task::WatchedFiles { uris }) => {
+                Some(Task::WatchedFiles { uris, .. }) => {
                     assert_eq!(uris.len(), 1);
                     assert_eq!(uris[0].as_str(), uri);
                 }
@@ -628,9 +718,10 @@ mod tests {
 
     #[test]
     fn a_watched_change_with_no_file_behind_it_queues_nothing() {
-        // Same rule as `didOpen` on an untitled buffer: a URI with no path is a document
-        // nothing else in the process can key, so there is no work to queue for it. The empty
-        // notification is here because a client that sends one must not cost a task either.
+        // **The one notification that still refuses an unsaved buffer.** A watcher watches paths,
+        // so a change reported for a path-less document means a client confused two notifications,
+        // and the buffer is already its own newest copy. The empty notification is here because it
+        // must not cost a task either.
         for changes in [
             serde_json::json!([{ "uri": "untitled:Untitled-1", "type": 2 }]),
             serde_json::json!([]),
@@ -648,9 +739,9 @@ mod tests {
 
     #[test]
     fn one_path_named_twice_in_a_notification_is_indexed_once() {
-        // A save arrives as create-then-change, and a branch switch names the same path more
-        // than once often enough to matter. Indexing is per file and the resolve debounce
-        // cannot coalesce it, so the duplicate is dropped here where it is cheap to see.
+        // A save arrives as create-then-change, and a branch switch often names one path more than
+        // once. Indexing is per file and the resolve debounce cannot coalesce it, so the duplicate
+        // is dropped here, where it is cheap to see.
         match route(
             "workspace/didChangeWatchedFiles",
             serde_json::json!({
@@ -661,7 +752,7 @@ mod tests {
                 ]
             }),
         ) {
-            Some(Task::WatchedFiles { uris }) => assert_eq!(
+            Some(Task::WatchedFiles { uris, .. }) => assert_eq!(
                 uris.iter().map(DocUri::as_str).collect::<Vec<_>>(),
                 vec![
                     "file:///tmp/ya-lsp-route/lib/person.rb",
@@ -674,10 +765,9 @@ mod tests {
 
     #[test]
     fn one_notification_reloads_once_however_many_changes_it_carries() {
-        // A save can arrive as create-then-change, and a reload is expensive enough that two of
-        // them for one edit is worth ruling out here rather than trusting the client. The `.rb`
-        // beside them is dropped rather than queued as well: the reload re-indexes the whole
-        // workspace from disk, so re-indexing that one file too would be work already done.
+        // A save can arrive as create-then-change, and a reload is expensive enough that two for
+        // one edit is worth ruling out here. The `.rb` beside them is dropped too: the reload
+        // re-indexes the whole workspace from disk already.
         let task = route(
             "workspace/didChangeWatchedFiles",
             serde_json::json!({
@@ -697,10 +787,9 @@ mod tests {
     #[test]
     fn a_workspace_with_no_spellable_config_path_reloads_for_nothing() {
         // `workspace_root` ends at `.` when the client sent no folder and the process has no
-        // working directory, and there is no URI for that — so no watcher was registered and
-        // there is no file to recognise. Reloading on whatever arrives would be a re-index
-        // triggered by a request nobody made; the change goes down the per-file arm instead,
-        // where a root that strips off nothing rejects it.
+        // working directory. There is no URI for that, so no watcher was registered and there is no
+        // file to recognise. Reloading on whatever arrives would be a re-index nobody asked for, so
+        // the change goes down the per-file arm, where a root that strips nothing rejects it.
         let task = route_notification(
             notification(
                 "workspace/didChangeWatchedFiles",
@@ -719,8 +808,8 @@ mod tests {
 
     #[test]
     fn changed_settings_are_carried_rather_than_re_read() {
-        // These never touch the filesystem — they are the editor's own settings, and the editor
-        // is the only thing that knows them.
+        // These never touch the filesystem: they are the editor's own settings, and only the editor
+        // knows them.
         match route(
             "workspace/didChangeConfiguration",
             serde_json::json!({ "settings": { "diagnostics": { "rules": { "undefined-method": "warning" } } } }),
@@ -738,8 +827,8 @@ mod tests {
 
     #[test]
     fn null_settings_mean_back_to_the_defaults() {
-        // VS Code sends `null` when it has nothing to say. Dropping the layer is exactly what
-        // "the defaults" means, so the task is still sent — with no options on it.
+        // VS Code sends `null` when it has nothing to say. Dropping the layer is what "the
+        // defaults" means, so the task is still sent, with no options.
         match route(
             "workspace/didChangeConfiguration",
             serde_json::json!({ "settings": null }),
@@ -753,8 +842,8 @@ mod tests {
 
     #[test]
     fn a_cancel_is_recorded_here_rather_than_queued() {
-        // Tasks are processed in order, so a cancel sent through the analysis queue would
-        // always arrive after the request it cancels had already been answered.
+        // Tasks run in order, so a cancel sent through the analysis queue would always arrive after
+        // its request was answered.
         for (sent, expected) in [
             (serde_json::json!(42), RequestId::from(42)),
             (serde_json::json!("abc"), RequestId::from("abc".to_owned())),
@@ -798,8 +887,8 @@ mod tests {
 
     #[test]
     fn malformed_params_are_dropped_rather_than_taking_the_server_down() {
-        // A notification has no reply, so there is nowhere to report this but the log. What
-        // matters is that one bad message does not end the session.
+        // A notification has no reply, so the log is the only place to report this. One bad message
+        // must not end the session.
         for method in [
             "textDocument/didOpen",
             "textDocument/didChange",
@@ -817,11 +906,10 @@ mod tests {
 
     #[test]
     fn work_for_a_gone_analysis_thread_is_reported_rather_than_dropped() {
-        // Sending must not panic — the analysis thread can be joined while the main loop still
-        // holds a message — but it must not shrug either. The thread is the only thing that
-        // answers anything, so once it is gone the loop has nothing left to do but stop, and
-        // stopping is what an editor can see. Dropping the work in silence leaves a server that
-        // reads its input forever and replies to none of it.
+        // Sending must not panic: the analysis thread can be joined while the main loop still holds
+        // a message. It must not shrug either. The thread is the only thing that answers, so once
+        // it is gone the loop stops, which an editor can see. Dropping work silently leaves a
+        // server that reads forever and replies to nothing.
         let (sender, receiver) = crossbeam_channel::unbounded::<Task>();
         drop(receiver);
         assert!(!send(&sender, Task::ReloadConfig));
@@ -829,9 +917,8 @@ mod tests {
 
     #[test]
     fn the_loop_stops_once_the_analysis_thread_is_gone() {
-        // The end-to-end shape of the rule above: a request arrives, there is nobody to answer
-        // it, and `serve` fails rather than looping. rubydex 0.2.5 panics in its resolver after
-        // a document is deleted, so this is a real way to arrive here and not a hypothetical.
+        // The end-to-end shape of the rule above: a request arrives, nobody can answer it, and
+        // `serve` fails instead of looping. A rubydex resolver panic is a real way to get here.
         let (client, server) = Connection::memory();
         let (analysis, receiver) = crossbeam_channel::unbounded::<Task>();
         drop(receiver);
@@ -946,8 +1033,8 @@ mod tests {
         }
 
         fn response(&self, id: &RequestId) -> Response {
-            // Generous but finite: a server that stops answering should fail the test rather
-            // than hang the suite.
+            // Generous but finite: a server that stops answering fails the test instead of hanging
+            // the suite.
             let deadline = std::time::Duration::from_secs(30);
             loop {
                 match self.connection.receiver.recv_timeout(deadline) {
@@ -968,8 +1055,8 @@ mod tests {
 
     #[test]
     fn a_client_that_hangs_up_ends_the_loop_cleanly() {
-        // No `shutdown`, no `exit` — the editor process died. The loop ends when the receiver
-        // does, and `serve` still joins the analysis thread on the way out.
+        // No `shutdown`, no `exit`: the editor process died. The loop ends with the receiver, and
+        // `serve` still joins the analysis thread on the way out.
         let root = workspace();
         let client = Client::start(root.path());
         client.finish().expect("a hang-up is not an error");
@@ -977,9 +1064,8 @@ mod tests {
 
     #[test]
     fn a_response_to_a_server_request_is_read_and_dropped() {
-        // `window/workDoneProgress/create` is the only request the server makes today, and its
-        // answer carries nothing to act on. It still has to be read: an unread response is a
-        // message the transport buffers forever.
+        // The answer to `window/workDoneProgress/create` carries nothing to act on. It still has to
+        // be read: the transport buffers an unread response forever.
         let root = workspace();
         let mut client = Client::start(root.path());
         client
@@ -1003,10 +1089,10 @@ mod tests {
 
     #[test]
     fn a_notification_the_server_does_not_route_leaves_the_loop_running() {
-        // `route_notification` answering `None` is tested on its own above; this is the other
-        // half of it — the loop must send nothing and carry on. Clients send notifications the
-        // server never advertised (`$/setTrace`, `telemetry/event`) as a matter of course, and
-        // treating one as a dead end would end the session on a message that means nothing.
+        // `route_notification` answering `None` is tested above; this is the other half: the loop
+        // sends nothing and carries on. Clients routinely send notifications the server never
+        // advertised (`$/setTrace`, `telemetry/event`), and ending the session on one would end it
+        // on nothing.
         let root = workspace();
         let mut client = Client::start(root.path());
         client.notify("$/setTrace", serde_json::json!({ "value": "verbose" }));
@@ -1032,9 +1118,8 @@ mod tests {
 
     #[test]
     fn a_shutdown_that_is_never_followed_by_exit_is_a_protocol_error() {
-        // lsp-server waits for `exit` after answering `shutdown`; anything else is a client
-        // that has lost the thread of the protocol, and the error has to reach `run_stdio`
-        // rather than being swallowed into a clean return.
+        // lsp-server waits for `exit` after answering `shutdown`. Anything else is a client that
+        // lost the protocol, and the error must reach `run_stdio`, not become a clean return.
         let root = workspace();
         let mut client = Client::start(root.path());
         let id = client.request("shutdown", serde_json::Value::Null);
@@ -1052,9 +1137,8 @@ mod tests {
 
     #[test]
     fn the_config_watcher_is_registered_with_the_client() {
-        // Without this registration `ya-lsp.toml` reloads in exactly one editor — the one
-        // whose extension brings a watcher of its own — and "changes take effect without a
-        // restart" is false everywhere else.
+        // Without this registration, `ya-lsp.toml` reloads only in an editor whose extension brings
+        // its own watcher. "Changes take effect without a restart" would be false everywhere else.
         let root = workspace();
         let mut client = Client::start_with(
             root.path(),
@@ -1078,8 +1162,8 @@ mod tests {
             "the watcher has to name this workspace's config and no other file"
         );
 
-        // Answering is the client's half of the round trip, and the server has to stay up
-        // whichever way it is answered.
+        // Answering is the client's half of the round trip. The server must stay up whichever way
+        // it answers.
         client
             .connection
             .sender
@@ -1101,8 +1185,8 @@ mod tests {
     #[test]
     fn a_refused_registration_is_logged_rather_than_swallowed() {
         // The server cannot retry into a client that does not do registrations, so the error
-        // changes nothing it does — but it costs the user a `ya-lsp.toml` that stops reloading,
-        // and the log is the only place that can say so.
+        // changes nothing it does. But it costs the user a `ya-lsp.toml` that stops reloading, and
+        // only the log can say so.
         let root = workspace();
         let mut client = Client::start_with(
             root.path(),
@@ -1132,9 +1216,9 @@ mod tests {
 
     #[test]
     fn a_client_that_did_not_ask_for_registrations_is_not_sent_one() {
-        // The protocol has no static form for file watching, so there is nothing else to try —
-        // and sending it anyway is not free: a client that does not implement
-        // `client/registerCapability` answers with an error, and some log it as one.
+        // File watching has no static form in the protocol, so there is nothing else to try.
+        // Sending anyway is not free: a client without `client/registerCapability` answers with an
+        // error, and some log it.
         let root = workspace();
         let mut client = Client::start(root.path());
         let id = client.request(
@@ -1143,8 +1227,8 @@ mod tests {
                 "textDocument": { "uri": "file:///nowhere/absent.rb" }
             }),
         );
-        // The registration, if there were one, would have been sent before this request was
-        // even read — so the first message that is not a notification has to be its answer.
+        // A registration would have been sent before this request was read, so the first
+        // non-notification message must be its answer.
         let deadline = std::time::Duration::from_secs(30);
         loop {
             match client.connection.receiver.recv_timeout(deadline) {
@@ -1162,8 +1246,8 @@ mod tests {
 
     #[test]
     fn a_config_problem_is_shown_to_the_user_rather_than_logged_and_forgotten() {
-        // A broken `ya-lsp.toml` must not take the server down, and must not be swallowed into
-        // the log either: the file is the user's, and only the user can fix it.
+        // A broken `ya-lsp.toml` must not take the server down, nor be buried in the log: the file
+        // is the user's, and only the user can fix it.
         let root = tempfile::tempdir().expect("tempdir");
         std::fs::write(root.path().join("ya-lsp.toml"), "this is not toml\n").unwrap();
 
@@ -1183,8 +1267,8 @@ mod tests {
 
     #[test]
     fn initialize_params_that_do_not_parse_end_the_handshake() {
-        // Nothing has been negotiated yet, so there is no encoding to answer in and no
-        // workspace to open. Failing out is the only honest thing left.
+        // Nothing is negotiated yet: no encoding to answer in, no workspace to open. Failing is the
+        // only honest option.
         let (server_side, client_side) = Connection::memory();
         let server =
             std::thread::spawn(move || serve(server_side, crate::logging::Reload::default()));
@@ -1208,8 +1292,8 @@ mod tests {
 
     #[test]
     fn a_client_that_never_says_initialized_ends_the_handshake() {
-        // The protocol requires `initialized` after the response. lsp-server treats anything
-        // else as a client that has lost the thread, and the error has to reach `run_stdio`.
+        // The protocol requires `initialized` after the response. lsp-server treats anything else
+        // as a client that lost the protocol, and the error must reach `run_stdio`.
         let root = workspace();
         let (server_side, client_side) = Connection::memory();
         let server =

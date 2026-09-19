@@ -1,183 +1,127 @@
-# ya-lsp — the commands, in one place.
+# ya-lsp: the commands, in one place.
 #
-# `make` on its own lists them. Everything here is what CI runs, spelled the same way, so a
-# green `make ci` locally means a green CI run.
+# `make` on its own lists them. Everything here is what CI runs, spelled the same way, so a green
+# `make ci` locally means a green CI run.
 #
-# Two tool versions are pinned below. They are cargo *subcommands*, which cargo cannot express
-# as dependencies — it never builds a dependency's binaries — so `make setup` installs them and
-# this file is the single place their versions are written down.
+# Two tool versions are pinned below. They are cargo *subcommands*, which cargo cannot express as
+# dependencies (it never builds a dependency's binaries), so `make setup` installs them, and this
+# file is the one place their versions are written down.
 
 CARGO         ?= cargo
 NIGHTLY       ?= +nightly
 ARGS          ?=
 EXTENSION_DIR := editors/vscode
 
-# The coverage bars, both enforced by `scripts/coverage.sh` — cargo-llvm-cov can fail a build on
-# lines but has no `--fail-under-branches`, which is the whole reason that script exists.
+# The coverage bars, enforced by `scripts/coverage.sh`: cargo-llvm-cov can fail a build on lines
+# but has no `--fail-under-branches`, which is why that script exists.
 #
-# One bar for both, and branches is the one that took the work: it started at 79.08%. What is
-# left is ~28 conditions that no input reaches — `let ... else` on a rubydex lookup a consistent
-# graph cannot fail, a non-UTF-8 filename APFS will not create, a panicked analysis thread. Raise
-# these as real arms get covered; never meet one by deleting a guard, which is the same edit as
-# widening `#[coverage(off)]`. `make coverage-branches` names every arm still untaken.
+# One bar for both. What stays uncovered is conditions no input reaches: `let ... else` on a
+# rubydex lookup a consistent graph cannot fail, a non-UTF-8 filename APFS will not create, a
+# panicked analysis thread. Raise these as real arms get covered; never meet one by deleting a
+# guard, which is the same edit as widening `#[coverage(off)]`. `make coverage-branches` names
+# every arm still untaken.
 MIN_LINES     ?= 95
 MIN_BRANCHES  ?= 95
 
-# And a floor every file clears on its own, so one bad file cannot hide inside a good average:
-# the project sits at 97%, and a new 200-line module landing at 80% would move that by less than
-# a point. It is deliberately *below* the project bar rather than equal to it. Two reasons, both
-# from the numbers. `workspace/rbs.rs` is the binding file at ~94%, and what is left there is
-# continuation lines of multi-line `tracing::info!` calls, which only run when the level is
-# enabled — covering them means raising the log level, which asserts nothing. And a 36-line file
-# like `main.rs` moves five points per uncovered line, so a high uniform bar measures file size
-# more than it measures testing. Named modules that must be complete go in COVERAGE_FLOORS below.
+# A floor every file clears on its own, so one bad file cannot hide inside a good average: a new
+# module landing at 80% barely moves the project number. Deliberately *below* the project bar:
+# - some files' remaining lines are continuations of multi-line `tracing::info!` calls, which run
+#   only when the level is on, and covering them means raising the log level, which asserts
+#   nothing;
+# - a small file like `main.rs` moves several points per uncovered line, so a high uniform bar
+#   measures file size more than testing.
+# Named modules that must be complete go in COVERAGE_FLOORS below.
 MIN_FILE_LINES ?= 90
 
-# Modules held to 100%, above the project-wide bar. `cargo-llvm-cov`'s own
-# `--fail-under-file-lines` cannot express this — it applies one number to every file, which in
-# practice is whatever the weakest file can pass — so `scripts/coverage.sh` gates them. Each entry
-# is `path=lines[:branches]`; a path missing from the report is an error, not a pass.
+# Modules held to 100%, above the project-wide bar. cargo-llvm-cov's `--fail-under-file-lines`
+# cannot express this (it applies one number to every file, in practice whatever the weakest file
+# can pass), so `scripts/coverage.sh` gates them. Each entry is `path=lines[:branches]`; a path
+# missing from the report is an error, not a pass.
 #
-# Two questions decide membership and both have to answer yes. **Is being wrong here silent and
-# wide?** — a visibly broken hover is found in a day, a mis-parsed lockfile is not. **Is 100
-# structurally reachable?** — a file whose gap is `usize::try_from` on a 64-bit build can never
-# hold the bar however important it is, and listing it would only teach people to edit this list.
+# Both questions must answer yes:
+# 1. **Is being wrong here silent and wide?** A visibly broken hover is found in a day; a
+#    mis-parsed lockfile is not.
+# 2. **Is 100 structurally reachable?** A file whose gap is `usize::try_from` on a 64-bit build can
+#    never hold the bar, and listing it would only teach people to edit this list.
 #
-#   position.rs      LSP position <-> byte offset and incremental edits. A wrong answer here
-#                    silently corrupts the user's file, and no other test would notice.
-#   uri.rs           the workspace root, and the one spelling of a document key. Get it wrong
-#                    and `didOpen` forks a second document, or the whole wrong tree is indexed.
+#   position.rs      LSP position <-> byte offset and incremental edits. Wrong here silently
+#                    corrupts the user's file, and no other test would notice.
+#   uri.rs           the workspace root and the one spelling of a document key. Wrong, and
+#                    `didOpen` forks a second document, or the wrong tree is indexed.
 #   config.rs        decides every default, so it decides every other answer.
 #   capabilities.rs  the wire contract, fixed at `initialize` and never renegotiated.
-#   diagnostics.rs   the rule -> severity table; a transposed row squiggles working code, and a
-#                    renamed rule silently stops matching the user's ya-lsp.toml keys.
+#   diagnostics.rs   the rule -> severity table. A transposed row squiggles working code; a renamed
+#                    rule silently stops matching the user's ya-lsp.toml keys.
 #   licenses.rs      what `--licenses` prints. Wrong here is a licence nobody granted.
-#   features.rs      which bodies of knowledge apply to a project. On this list for `config.rs`'s
-#                    reason: it decides what every later answer is made of, and being wrong is
-#                    silent in both directions — a family switched off answers nothing with no
-#                    error anywhere, and `auto` guessing wrong brings Rails' conventions to a
-#                    project that is not Rails and cites a controller that does not exist. Pure
-#                    decisions over a path and a lockfile, like bundler.rs.
-#   logging.rs       where the log goes. On this list for `config.rs`'s reason rather than a new
-#                    one: it decides whether anything is written at all, and being wrong there is
-#                    silent by construction — a filter that came out one level too quiet, or a
-#                    file sink that never opened, looks exactly like a server with nothing to
-#                    say. It is also the module a bug report is assembled from, so a defect in
-#                    it is a defect in every later diagnosis. The one line that cannot be tested
-#                    — installing the global subscriber — is deliberately in `main.rs` instead.
-#   ruby_version.rs  which Ruby, and therefore which stdlib. Pure text; the failure it exists to
-#                    prevent is macOS's vestigial 2.6 answering for a 4.0 project.
-#   bundler.rs       Gemfile.lock -> sources and specs. Pure text, no I/O, so there is nothing it
-#                    cannot be asked; mis-parse a line and those gems are silently not indexed.
-#   code_actions.rs  the second module that writes, and it is on this list for `rename.rs`'s
-#                    reason rather than for a new one: the failure is not a bad answer but a
-#                    broken buffer. Every guard in it is a *refusal*, so an untested one is an
-#                    action still being offered where it should not be — which is invisible
-#                    until somebody applies it.
-#   render.rs        the one place a construct is spelled for a human, shared by hover, the
-#                    outline and the picker. `is_nameable` shipped a page of anonymous classes.
-#                    It now also owns RDoc's markup -> markdown, which is the same shape of
-#                    failure one layer down: a `<vowel>` a renderer eats does not look broken,
+#   features.rs      which bodies of knowledge apply, so what every later answer is made of. Silent
+#                    both ways: a family switched off answers nothing, and `auto` guessing wrong
+#                    cites a controller that does not exist.
+#   logging.rs       whether anything is written at all. A filter one level too quiet, or a file
+#                    sink that never opened, looks exactly like a server with nothing to say, and
+#                    every later bug report is assembled from it. The one untestable line
+#                    (installing the global subscriber) is in `main.rs`.
+#   ruby_version.rs  which Ruby, and so which stdlib. Pure text; it stops macOS's vestigial 2.6
+#                    answering for a 4.0 project.
+#   bundler.rs       Gemfile.lock -> sources and specs. Pure text; mis-parse a line and those gems
+#                    are silently not indexed.
+#   code_actions.rs  writes, like rename.rs: the failure is a broken buffer. Every guard is a
+#                    *refusal*, so an untested one is an action offered where it should not be,
+#                    invisible until somebody applies it.
+#   render.rs        the one place a construct is spelled for a human (hover, outline, picker),
+#                    plus RDoc markup -> markdown: a `<vowel>` a renderer eats does not look broken,
 #                    it looks like a sentence with a word missing.
-#   references.rs    a truncated find-all-references looks exactly like a complete one, so the
-#                    cap and the synthetic-reference filter are both silent when wrong.
-#   ranges.rs        folding and expand-selection. Advertising a folding provider takes the
-#                    editor's indentation guess *out of play*, so a construct this module fails
-#                    to recognise is not a visible bug — it is folding that quietly stops
-#                    existing for that shape, everywhere, which is the first question answering
-#                    yes. Lines only: `make coverage-branches F=ranges` finds no arm untaken,
-#                    while the summary reports 98% because two merged regions are counted apart.
-#   messages.rs      every sentence a user reads. Pure formatting with no I/O, so like
-#                    bundler.rs there is nothing it cannot be asked. Lines are the whole gate
-#                    here — the file has no branch regions at all — and lines are exactly what
-#                    catches the failure it exists to prevent: an arm of a message that
-#                    ships without one test having read it. The enumeration test guards the set
-#                    of messages; only this guards the insides of one.
-#   rename.rs        the only module in the crate that *writes*. Every other wrong answer shows
-#                    the user something unhelpful; a rule here that stops firing edits their
-#                    files — Ruby 3.1's `{ x:, y: }` renames the hash key along with the value
-#                    and still parses, which is the widest and quietest failure ya-lsp can have.
-#                    Pure decisions over a string and a resolution, so every arm is reachable.
-#   scopes.rs        which variable is which, and listed for rename rather than for the
-#                    highlighting it was written for: a scope bug that lights up the wrong
-#                    occurrences is seen the first time anybody looks, and the same bug behind a
-#                    rename writes over the wrong one. The second question was already yes; this
-#                    release is what turned the first one.
-#   erb.rs           the Ruby view of a template. Every offset in the file depends on it, and
-#                    the way it goes wrong is that a byte moves: ruby-lsp's own scanner pads by
-#                    character, which shortens the buffer once per accent and three times per
-#                    emoji and puts every answer below on the wrong column — silently, and only
-#                    for people who do not write their markup in English. Pure bytes in, bytes
-#                    out, no I/O and no platform, so like bundler.rs there is nothing it cannot
-#                    be asked; it landed at 100 of lines *and* branches on its first release.
-#   synthesized.rs   where a declaration ya-lsp wrote itself was really declared. The whole of
-#                    what stands between a generated declaration and a jump into a file that
-#                    does not exist, and both ways it goes wrong are silent: a mapping that
-#                    points at the wrong span opens the wrong line confidently, and one that
-#                    answers where it should have withheld opens nothing at all. Every
-#                    generated declaration in the release goes through one function here. Pure
-#                    lookups over a map, no I/O and no platform, like bundler.rs — and
-#                    `generated_uri` is deliberately total rather than fallible, so there is no
-#                    unreachable arm to make 100 impossible. It landed at 100 of lines *and*
-#                    branches on its first release.
-#   generated.rs     the RBS this crate writes, and where each declaration in it came from.
-#                    Thirty lines of builder, and `append` shifts every span in one generator's
-#                    output by the length of another's — off by one there is a jump that opens
-#                    the wrong line confidently, which is the same failure synthesized.rs is on
-#                    this list for, one layer earlier. Pure string building, no I/O.
-#   structs.rs       `Struct.new` and `Data.define`, and the same argument rails/ is here for
-#                    with the Rails word taken out: it decides which constant a member hangs on
-#                    and which name it is, both of them by reading a literal, and both failures
-#                    are silent — a member on the wrong constant answers confidently about a
-#                    class the user is not looking at, and a call it declines looks exactly like
-#                    a project that writes no structs. Pure text and no I/O, like bundler.rs.
-#   hints.rs         the one answer nobody asked for, which is what turns the first question
-#                    yes: a label is painted into the margin of every line whether anybody
-#                    wanted it or not and is read as fact, so a guess that reaches one is the
-#                    widest and quietest thing this crate can be wrong about — and nobody files
-#                    a bug saying "this type was inferred from six letters". The guard is one
-#                    `retain` on the tier and one predicate on the shape, both of them
-#                    *refusals*, which is `code_actions.rs`' argument: an untested refusal is a
-#                    label still being drawn where it should not be. Pure decisions over a
-#                    buffer and a graph, no I/O; it landed at 100 of lines and branches on its
-#                    first release.
-#   environment.rs   the test-tree tag and the one place the rule is written down, read by five
-#                    surfaces of which three must never act on it. Both ways it goes wrong are
-#                    silent: a rule that fires too widely deletes a row nobody knows to look
-#                    for — its first spelling dropped every declaration with no definitions,
-#                    which is the top of the object model — and one that stops firing restores
-#                    a leak whose whole symptom is a list that is a little longer than it
-#                    should be. No lane of the audit scores it either, so the suite is the only
-#                    instrument there is. Pure decisions over a path and a set, no I/O, like
-#                    bundler.rs; it landed at 100 of lines and branches on its first release.
-#   rails/           the *whole* of what ya-lsp knows about Rails — which is the reason it is
-#                    one directory and the reason every file of it is on this list: a
-#                    convention that reaches the wrong class answers confidently and wrongly
-#                    about the file the user is looking at, and a convention that reaches
-#                    nothing looks exactly like a project that does not follow it. Pure text
-#                    and no I/O, like bundler.rs, so there is nothing any of them cannot be
-#                    asked. `rails/mod.rs` is deliberately *not* listed: it is the convention
-#                    tables and the `pub use` list, so it has no executable line and
-#                    `llvm-cov` emits no row for it — and a floor whose path is not in the
-#                    report is an error here, on purpose.
+#   references.rs    a truncated find-all-references looks exactly like a complete one, so the cap
+#                    and the synthetic-reference filter are both silent when wrong.
+#   ranges.rs        folding and expand-selection. Advertising a folding provider takes away the
+#                    editor's indentation guess, so a construct this misses quietly loses folding
+#                    everywhere. Lines only: `make coverage-branches F=ranges` finds no untaken
+#                    arm, but the summary counts two merged regions apart.
+#   messages.rs      every sentence a user reads. Pure formatting with no branch regions, so lines
+#                    are the whole gate, and exactly what catches a message arm that ships unread.
+#                    The enumeration test guards the set; this guards each message.
+#   rename.rs        writes the user's files. A rule that stops firing edits them wrongly: Ruby
+#                    3.1's `{ x:, y: }` renames the hash key with the value and still parses, the
+#                    widest and quietest failure ya-lsp can have.
+#   scopes.rs        which variable is which, listed for rename, not highlighting: a scope bug that
+#                    lights the wrong occurrences is seen at once; behind a rename it overwrites
+#                    the wrong one.
+#   erb.rs           the Ruby view of a template; every offset depends on it. Padding by character
+#                    instead of byte shifts every answer below an accent or emoji, silently, and
+#                    only for people who do not write their markup in English.
+#   synthesized.rs   where a generated declaration was really declared. Silent both ways: a wrong
+#                    mapping opens the wrong line confidently, a missing one opens nothing.
+#                    `generated_uri` is total, so no unreachable arm blocks 100.
+#   generated.rs     the RBS this crate writes, and where each declaration came from. `append`
+#                    shifts every span by another generator's length; off by one is a jump to the
+#                    wrong line, synthesized.rs' failure one layer earlier.
+#   structs.rs       `Struct.new` and `Data.define`: rails/'s argument without Rails. A member on
+#                    the wrong constant answers confidently about the wrong class, and a declined
+#                    call looks exactly like a project with no structs.
+#   hints.rs         the answer nobody asked for: a label painted on every line and read as fact,
+#                    so a guess reaching one is the widest, quietest wrong answer. Its guards are
+#                    refusals, `code_actions.rs`' argument.
+#   environment.rs   the test-tree tag, read by several surfaces, some of which must never act on
+#                    it. Too wide deletes rows nobody knows to look for; too narrow restores a leak
+#                    whose only symptom is a slightly longer list. No audit lane scores it, so the
+#                    suite is the only instrument.
+#   rails/           *everything* ya-lsp knows about Rails, which is why it is one directory and
+#                    every file is listed: a convention reaching the wrong class answers wrongly
+#                    and confidently, and one reaching nothing looks like a project that does not
+#                    follow it. `rails/mod.rs` is *not* listed: it has no executable line, so
+#                    llvm-cov emits no row, and a floor missing from the report is an error.
 #
-# Deliberately *not* here, so the next reader does not re-litigate it:
-#   signatures.rs    highest blast radius in the crate — a bug indexed 7 of Array's 197 methods
-#                    through a green suite — but four of its fourteen branches are `try_from`
+# Deliberately *not* here:
+#   signatures.rs    highest blast radius in the crate, but some of its branches are `try_from`
 #                    guards that cannot fail on a 64-bit build. Not reachable, so not listed.
 #   symbols.rs       VS Code *throws* on a bad selectionRange, discarding the whole outline; its
 #                    residual gap is a 64-deep nesting walk no Ruby file produces.
-#   progress.rs      already at 100, but a stream left open is a visible spinner, not a silent
-#                    wrong answer. Being at 100 is not by itself a reason to be on this list.
-#   analysis/synthesize.rs  the pass itself. Its residual is three lines and one arm, none
-#                    reachable: `workspace_relative`'s `to_path()` failing, which a `DocUri`
-#                    cannot do by construction, and the two arguments of the settle's
-#                    `tracing::debug!`, which the macro evaluates only when that level is on.
-#                    98.75 of lines and 98.00 of branches.
-#   annotations.rs   pure text like rails/ and it answers the first question yes — but its
-#                    residual line is a match arm over Prism's keyword-parameter list, which
-#                    holds exactly two node kinds and cannot hold a third. Not reachable, so
-#                    not listed; it sits at 99.7 of lines and 100 of branches.
+#   progress.rs      at 100, but a stream left open is a visible spinner, not a silent wrong
+#                    answer. Being at 100 is not by itself a reason to be listed.
+#   analysis/synthesize.rs  the pass itself. Its residual is unreachable: `workspace_relative`'s
+#                    `to_path()` failing, which a `DocUri` cannot do, and the arguments of a
+#                    `tracing::debug!` the macro evaluates only when that level is on.
+#   annotations.rs   pure text and silent when wrong, but its residual line is a match arm over
+#                    Prism's two-kind keyword-parameter list. Not reachable, so not listed.
 COVERAGE_FLOORS ?= \
   analysis/position.rs=100:100 \
   analysis/ranges.rs=100 \
@@ -220,8 +164,8 @@ COVERAGE_FLOORS ?= \
   workspace/features.rs=100:100
 
 # cargo-llvm-cov builds into its own target directory. Mixing stable- and nightly-built objects
-# in it merges nightly counters against a stable covmap and reports a plausible, entirely wrong
-# number, so the toolchain that produced it is stamped and a change wipes it.
+# there merges nightly counters against a stable covmap and reports a plausible, entirely wrong
+# number, so the toolchain that produced it is stamped, and a change wipes it.
 COV_TARGET    := target/llvm-cov-target
 COV_STAMP     := $(COV_TARGET)/.ya-lsp-toolchain
 
@@ -280,15 +224,13 @@ fmt-check:
 lint:
 	$(CARGO) clippy --all-targets -- -D warnings
 
-# Only the **broken** class is denied, and the other two rustdoc lints are allowed here on
-# purpose. `private_intra_doc_links` fires 101 times and every one of them is correct: this crate
-# is private modules almost end to end, and the only ways to silence one are to make an internal
-# item `pub` or to downgrade a link that works in an editor into plain text — both worse than the
-# warning. `redundant_explicit_links` is 13 more of pure style. What is left is the class that
-# points at **nothing**, and that is a rename whose comment did not follow it: `List::Concerns`
-# outlived the enum it named by three commits, and of the 17 found the day this target was added,
-# 8 were names moved by the last three refactors and 2 had never resolved at all. A grep finds
-# those only if somebody already suspects them; rustdoc finds them every run.
+# Only the **broken** class is denied; the other two rustdoc lints are allowed on purpose.
+# - `private_intra_doc_links` fires often, and correctly: this crate is private modules almost end
+#   to end, and the only fixes are making an internal item `pub` or turning a link that works in
+#   an editor into plain text, both worse than the warning.
+# - `redundant_explicit_links` is pure style.
+# What is left is a link that points at **nothing**: a rename its comment did not follow. A grep
+# finds those only if somebody already suspects them; rustdoc finds them every run.
 ## docs-check: fail on a doc link that points at nothing
 .PHONY: docs-check
 docs-check:
@@ -314,7 +256,7 @@ test-one:
 coverage: coverage-run coverage-check
 
 # Runs the suite once and leaves the raw profiles behind, so every report below reads the same
-# run instead of re-running the tests for each format.
+# run instead of re-running the tests per format.
 .PHONY: coverage-run
 coverage-run:
 	@mkdir -p $(COV_TARGET)
@@ -356,22 +298,21 @@ coverage-clean:
 
 # ---------------------------------------------------------------------------- the corpora
 
-# The six benchmark corpora, pinned. `scripts/corpora.toml` is the table — repository, commit,
-# Ruby and licence — and `scripts/corpora.py` is what makes a machine match it. The reasoning
-# lives in both of those files and in `.claude/rules/corpora.md`; what belongs here is only the
-# entry point.
+# The six benchmark corpora, pinned. `scripts/corpora.toml` is the table (repository, commit,
+# Ruby, licence), and `scripts/corpora.py` makes a machine match it. The reasoning lives in both
+# files and in `.claude/rules/corpora.md`; only the entry point belongs here.
 #
-# **This target needs a network and a Ruby toolchain, so it is not in `make ci` and is not a CI
-# job either.** The canary is one 12 MB clone; this is six applications and their bundles.
+# **Needs a network and a Ruby toolchain, so it is in neither `make ci` nor CI.** The canary is
+# one small clone; this is six applications and their bundles.
 #
-# **It never installs a Ruby.** Each corpus declares one and the script resolves it against what
+# **It never installs a Ruby.** Each corpus declares one, and the script resolves it against what
 # asdf has, printing the `asdf install ruby X` line when it cannot. `--allow-nearest` accepts
 # another patch of the same MAJOR.MINOR, preferring one whose bundle already resolves, and says
 # so in the manifest.
 #
 # `make corpora-status ARGS=--json` is the manifest a measurement carries beside its numbers:
-# without it an absolute count taken today cannot be compared with one taken last week, because
-# nothing recorded which commit or how much of the bundle was installed.
+# without it, an absolute count from today cannot be compared with one from last week, because
+# nothing recorded the commit or how much of the bundle was installed.
 
 ## corpora: clone, pin, bundle and configure all six benchmark corpora
 .PHONY: corpora
@@ -411,36 +352,29 @@ corpora-status:
 # ---------------------------------------------------------------------------- the canary
 
 # A real Rails application, opened the way an editor opens it. `scripts/canary.py` carries the
-# reasoning; these are the numbers, and they live here for the same reason the coverage bars do
-# — so a local run and the CI run cannot disagree about them.
+# reasoning; these are the numbers, kept here for the coverage bars' reason: a local run and the
+# CI run cannot disagree about them.
 #
-# Nothing automated had ever opened a real application before this target existed. Every
-# performance number in three plans came from a private repository, which makes them
-# unreproducible by anyone else and unrunnable by CI, and the behaviours that only appear in a
-# real app were pinned by fixtures imitating their shape.
-#
-# **It does not cover gems**, and the reason is a cost rather than an oversight: resolving
-# lobsters' bundle needs `bundle install`, which needs Ruby 4.0.0 and a hand-built `sqlite3`.
-# That is a large amount of CI for a project whose headline is that it needs no Ruby. The gem
-# numbers stay manual, and a green canary does not cover them.
+# **It does not cover gems**, for cost, not oversight: resolving lobsters' bundle needs
+# `bundle install`, a recent Ruby and a hand-built `sqlite3`, a lot of CI for a project whose
+# headline is that it needs no Ruby. A green canary says nothing about gems.
 #
 # lobsters is BSD-3-Clause, (c) 2012-2019 Joshua Stein. It is **cloned, never vendored**: no
-# artifact this project ships contains any of it, so no notice is owed, which is
-# `licensing.md`'s "the rule is per artifact, not per repository". That is a property of how it
-# is used and not of the licence — copy one file out of it into `tests/`, or cache a tarball in
-# this repository, and the obligation attaches.
+# artifact this project ships contains any of it, so no notice is owed (`licensing.md`: the rule
+# is per artifact, not per repository). That is a property of how it is used, not of the licence:
+# copy one file into `tests/`, or cache a tarball here, and the obligation attaches.
 #
-# The SHA is pinned because an unpinned target turns a canary into a flake and makes every
-# number it asserts meaningless across runs. The ceiling is an order of magnitude above the
-# 20.99 ms measured on 2026-09-03: a shared runner with a cold page cache is not that machine,
-# and what this catches — the accidental quadratic, the discovery rule that stops matching —
-# moves the number by a factor rather than by a percent.
-# The repository, the commit and the Ruby live in `scripts/corpora.toml`, which pins all six
-# corpora and is where `make corpora` reads them from. They are deliberately not repeated here:
-# `canary.md`'s rule is that the asserted *counts* live in the `Makefile` and nowhere else, and a
-# second copy of a SHA is a second copy that goes stale. `CANARY_DIR` is the one path both need.
+# The commit is pinned because an unpinned target turns a canary into a flake and makes its
+# numbers meaningless across runs. The ceiling is an order of magnitude above a typical local
+# index: a shared runner with a cold page cache is slower, and what this catches (an accidental
+# quadratic, a discovery rule that stops matching) moves the number by a factor, not a percent.
+#
+# The repository, commit and Ruby live in `scripts/corpora.toml`, which pins all six corpora. They
+# are deliberately not repeated here: `canary.md`'s rule is that the asserted *counts* live in the
+# `Makefile` and nowhere else, and a second copy of a SHA goes stale. `CANARY_DIR` is the one path
+# both need.
 CANARY_DIR      ?= tmp/corpora/lobsters
-CANARY_FILES    ?= 606
+CANARY_FILES    ?= 612
 CANARY_WARNINGS ?= 14
 CANARY_MAX_MS   ?= 500
 
@@ -452,16 +386,15 @@ canary: release canary-clone
 	  --files $(CANARY_FILES) --parse-warnings $(CANARY_WARNINGS) \
 	  --max-index-ms $(CANARY_MAX_MS)
 
-# One implementation of "fetch a pinned commit", in `scripts/corpora.py`, which this delegates
-# to. It fetches one commit rather than cloning a history, and never deletes what is already
-# there: a working tree with local edits fails the checkout instead of losing them.
+# One implementation of "fetch a pinned commit", in `scripts/corpora.py`. It fetches one commit,
+# not a history, and never deletes what is there: a working tree with local edits fails the
+# checkout instead of losing them.
 #
-# **Every question it asks is asked of `<dir>/.git` and never of `git -C`'s answer, because the
-# corpus workspaces live inside this repository and git searches *upwards*.** `git -C tmp/x
-# rev-parse --git-dir` in an empty `tmp/x` succeeds and answers about **ya-lsp** — so the obvious
-# spelling of "is this a repo yet?" skips the `init`, adds a remote to ya-lsp, fetches lobsters
-# into ya-lsp's object store and then runs `checkout --detach` on the working tree being
-# developed in. It was written that way once; what stopped it was an unrelated dirty tree.
+# **Every question is asked of `<dir>/.git`, never of `git -C`'s answer, because the corpus
+# workspaces live inside this repository and git searches *upwards*.** `git -C tmp/x rev-parse
+# --git-dir` in an empty `tmp/x` succeeds and answers about **ya-lsp**. The obvious spelling of
+# "is this a repo yet?" would then skip the `init`, add a remote to ya-lsp, fetch lobsters into
+# ya-lsp's object store, and run `checkout --detach` on the working tree being developed in.
 ## canary-clone: fetch the pinned commit of the canary workspace
 .PHONY: canary-clone
 canary-clone:
@@ -470,29 +403,26 @@ canary-clone:
 # ---------------------------------------------------------------------------- the audit
 
 # `scripts/audit/` opens every sweepable corpus, asks a stratified sample of real cursors, and
-# scores the answers. `.claude/rules/audit.md` is the rule; what belongs here is the entry point
-# and the one path both halves of it need.
+# scores the answers. `.claude/rules/audit.md` is the rule; only the entry point and the one path
+# both halves need belong here.
 #
-# **Two commands and not one, because the second needs no server.** `score` sweeps and records;
-# `report` diffs that recording against the committed baseline. Splitting them is what lets a diff
-# be re-read, re-cut and re-run in CI from an artifact long after the machine that swept is gone —
-# and a report that had to re-sweep to say what moved could only ever be run where the corpora are.
+# **Two commands, because the second needs no server.** `score` sweeps and records; `report`
+# diffs that record against the committed baseline. So a diff can be re-read, re-cut and re-run in
+# CI from an artifact long after the sweeping machine is gone; a report that had to re-sweep could
+# only run where the corpora are.
 #
-# **It needs the corpora, so it is not in `make ci` and is not a CI job.** `make corpora` is six
-# applications and their bundles; the audit itself needs only the clones, and a corpus that is
-# missing or has drifted from its pin is skipped by name rather than measured. That is the same
-# reason `canary` is out of `ci`, one order of magnitude further along.
+# **It needs the corpora, so it is in neither `make ci` nor CI.** The audit needs only the clones,
+# and a corpus that is missing or has drifted from its pin is skipped by name, not measured.
 #
-# The baseline is committed and the ledger is committed, and **neither holds a word of corpus
-# source** — `corpora.md`'s licence rule, which is blanket. A finding travels into the baseline as
-# a path and a byte offset, a ledger row as `sha256(line)`. The identifier under the cursor reaches
-# the terminal and stops there.
+# The baseline and the ledger are committed, and **neither holds a word of corpus source**
+# (`corpora.md`'s licence rule, which is blanket). A finding enters the baseline as a path and a
+# byte offset, a ledger row as `sha256(line)`. The identifier under the cursor reaches the
+# terminal and stops there.
 AUDIT_RUN ?= tmp/audit-run.json
 
-# `ARGS` reaches `score` and **not** `report`, because the two take different flags — `-n` is not
-# a thing you can report on — and because it would be the wrong knob anyway: the record is already
-# only the corpora that were swept, so `ARGS=--only lobsters` restricts the diff by restricting
-# what there is to diff.
+# `ARGS` reaches `score`, **not** `report`: the two take different flags (`-n` means nothing to a
+# report), and the record already holds only the corpora that were swept, so
+# `ARGS=--only lobsters` restricts the diff by restricting what there is to diff.
 ## audit: sweep all six corpora, then diff against the committed baseline
 .PHONY: audit
 audit: release
@@ -519,14 +449,19 @@ audit-prefix: release
 audit-rank: release
 	@python3 scripts/audit rank $(ARGS)
 
+## audit-latency: what one request makes a person wait — p50/p95/max, and the empty count
+.PHONY: audit-latency
+audit-latency: release
+	@python3 scripts/audit latency $(ARGS)
+
 ## audit-ledger: what is in audit/ledger.json, and whether it still applies
 .PHONY: audit-ledger
 audit-ledger:
 	@python3 scripts/audit ledger $(ARGS)
 
-# Blessing the last sweep as the new baseline is a **separate** target and never a flag on
-# `audit`, because it is the one step that changes what a future run is judged against. It merges:
-# a run over one corpus keeps the other four's recorded numbers and says which it carried.
+# Blessing the last sweep as the baseline is a **separate** target, never a flag on `audit`: it is
+# the one step that changes what future runs are judged against. It merges: a run over one corpus
+# keeps the other corpora's recorded numbers and says which it carried.
 ## audit-baseline: record the last `make audit` sweep as the committed baseline
 .PHONY: audit-baseline
 audit-baseline:
@@ -570,37 +505,35 @@ ext-lint:
 .PHONY: setup
 setup: setup-coverage setup-notices
 
-# Split out for the reason `setup-coverage` is, and it was the one that needed it: `ci.yml` used
-# to spell `cargo install cargo-about --locked --features cli --version ^0.9` itself, beside a
-# hand-written `cargo about generate | diff`. So the pin lived in two places, and the committed
-# notice could be checked against a different tool than the one that wrote it — which is the
-# failure the whole check exists to catch, one level up.
+# Split out, like `setup-coverage`, so CI installs cargo-about at the version written above, with
+# no second copy of the pin. A notice checked with a different tool than the one that wrote it is
+# the failure the check exists to catch.
 ## setup-notices: install just cargo-about
 .PHONY: setup-notices
 setup-notices:
 	$(CARGO) install cargo-about --locked --features cli --version "$(CARGO_ABOUT_VERSION)"
 
 # Split out so CI installs exactly what a local `make coverage` needs, at exactly the version
-# written above, without the workflow carrying a second copy of the number.
+# written above, with no second copy of the number in the workflow.
 ## setup-coverage: install just the nightly toolchain and cargo-llvm-cov
 .PHONY: setup-coverage
 setup-coverage:
 	rustup toolchain install nightly --component llvm-tools-preview
 	$(CARGO) install cargo-llvm-cov --locked --version $(CARGO_LLVM_COV_VERSION)
 
-# `docs-check` is in here for the reason `fmt-check` is: it is hermetic, it costs a `cargo doc`
-# over a tree that is already built, and the thing it catches is invisible to every other target.
-# A doc link that points at nothing breaks no build, fails no test and moves no coverage number.
+# `docs-check` is here for `fmt-check`'s reason: it is hermetic, costs a `cargo doc` over an
+# already-built tree, and catches something invisible to every other target. A doc link that
+# points at nothing breaks no build, fails no test and moves no coverage number.
 #
-# `notices-check` is in here because the `server` job runs it, and the header above promises a
-# green `make ci` means a green CI run. It costs `make setup` — cargo-about — the same way
-# `coverage` costs nightly and cargo-llvm-cov, and it is the target most likely to fail on a
-# branch that touched `Cargo.toml`, which is exactly when nobody thinks to run it.
+# `notices-check` is here because the `server` job runs it, and the header promises a green
+# `make ci` means a green CI run. It needs `make setup` (cargo-about), as `coverage` needs nightly
+# and cargo-llvm-cov, and it is the target most likely to fail on a branch that touched
+# `Cargo.toml`: exactly when nobody thinks to run it.
 #
-# `canary` is deliberately not in here. Everything above is hermetic: it needs the source tree
-# and nothing else. The canary clones 12 MB from GitHub, so folding it in would make every local
-# `make ci` need a network — and a target that fails on a plane teaches people to skip it. CI
-# runs it as its own job, where the name in the checks list says what it covers.
+# `canary` is deliberately not here. Everything above is hermetic: it needs the source tree and
+# nothing else. The canary clones from GitHub, so folding it in would make every local `make ci`
+# need a network, and a target that fails on a plane teaches people to skip it. CI runs it as its
+# own job, where its name in the checks list says what it covers.
 ## ci: everything CI checks about the server
 .PHONY: ci
 ci: fmt-check lint docs-check test notices-check coverage

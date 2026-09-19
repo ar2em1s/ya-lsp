@@ -38,8 +38,8 @@ test('a configured path wins over the bundled one', () => {
 });
 
 test('a configured path that is not there is an error, not a silent fall back', () => {
-  // Falling back would run a different binary than the one asked for, and the difference would
-  // show up as behaviour nobody could account for.
+  // Falling back would run a different binary than the one asked for, and the difference would show
+  // up as behaviour nobody could explain.
   const resolved = resolveServer(
     lookup({ configured: '/build/ya-lsp', present: ['/ext/server/ya-lsp'] })
   );

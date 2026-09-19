@@ -1,69 +1,73 @@
-//! `Struct.new(:x, :y)` and `Data.define(:x, :y)` — the one generator that is not Rails.
+//! `Struct.new(:x, :y)` and `Data.define(:x, :y)`: the one generator that is not Rails.
 //!
-//! Both are plain Ruby and entirely static: read a literal list of names out of a call, say
-//! which members it installs. They are here rather than in
-//! [`workspace::rails`](crate::workspace::rails) because that directory is the crate's only
-//! Rails knowledge and a `Struct` is not Rails'.
+//! Both are plain Ruby and fully static: read a literal list of names out of a call, and say which
+//! members it installs. They live here, not in [`workspace::rails`](crate::workspace::rails),
+//! because that directory is the crate's only Rails knowledge and a `Struct` is not Rails'.
 //!
 //! # Which calls name a class
 //!
 //! `Struct.new` returns an anonymous class, so the name comes from what the call is assigned to.
-//! Two shapes give it one: `Point = Struct.new(:x, :y)` and
-//! `class Line < Struct.new(:start, :end)`. The subclass form is rare only because RuboCop's
-//! `Style/StructInheritance` flags it by default — suppressed, not absent — and it names its
-//! class as plainly as the constant does. A call held by a local, an instance variable or a
-//! `let` block names no class and declares nothing.
+//! Two shapes give it one:
+//! - `Point = Struct.new(:x, :y)`;
+//! - `class Line < Struct.new(:start, :end)`. RuboCop's `Style/StructInheritance` flags it by
+//!   default, so it is rarer, but it names its class as plainly.
+//!
+//! A call held by a local, an instance variable or a `let` block names no class and declares
+//! nothing.
 //!
 //! Two shapes are declined although a class is there:
-//!
 //! - **A namespace no file writes.** `class Reports::Reg::Metric` would introduce `Reports::Reg`
-//!   itself, at the cost of that namespace's own singleton members. Narrowed rather than
-//!   removed: where the owner's immediate parent is a `module` the application writes down,
+//!   itself, costing that namespace its own singleton members. Where the owner's immediate parent
+//!   is a `module` the application writes down,
 //!   [`Declarations::open`](crate::generated::Declarations) opens it as a body and the call
-//!   declares. This is the one thing the reader asks the graph;
-//!   [`Namespaces`](crate::generated::Namespaces) owns the test, because the schema reader
-//!   reaches the same shape.
+//!   declares. This is the one thing the reader asks the graph.
+//!   [`Namespaces`](crate::generated::Namespaces) owns the test, because the schema reader reaches
+//!   the same shape.
 //! - **`Foo::Point = Struct.new(:x)`.** A path on the left of an assignment is *resolved*, not
-//!   nested, so inside `module A` it may be `A::Foo::Point` or the top-level `Foo::Point`. That
-//!   is a constant lookup, and this pass runs before anything is resolved.
+//!   nested: inside `module A` it may be `A::Foo::Point` or the top-level `Foo::Point`. That is a
+//!   constant lookup, and this pass runs before anything is resolved.
 //!
 //! # Which names count
 //!
-//! Every positional argument must be a symbol literal; a `keyword_init:` hash is an option and
-//! is skipped. **Anything else in positional position declines the whole call** —
-//! `Struct.new(*NAMES)` names members this reader cannot see, and a class missing methods is
-//! worse than one with none. `Struct.new("Name", :x)` falls under that rule and genuinely puts
-//! its members elsewhere, on `Struct::Name`.
+//! Every positional argument must be a symbol literal. A `keyword_init:` hash is an option and is
+//! skipped.
 //!
-//! A symbol that is not a legal method name is declined **on its own**, not with the call:
+//! **Anything else in a positional slot declines the whole call.** `Struct.new(*NAMES)` names
+//! members this reader cannot see, and a class missing methods is worse than one with none.
+//! `Struct.new("Name", :x)` falls under the same rule, and really does put its members elsewhere,
+//! on `Struct::Name`.
+//!
+//! A symbol that is not a legal method name is declined **on its own**, not with the call.
 //! [`Synthesized::record`](super::synthesized::Synthesized::record) refuses a whole generated
-//! document over a name this crate cannot spell, and one unspellable member is not worth the
-//! rest of the file. `rails::enums` declines a label the same way.
+//! document over one name this crate cannot spell, and one member is not worth the rest of the
+//! file. `rails::enums` declines a label the same way.
 //!
 //! # A `def` in the block wins
 //!
-//! A member this would install whose name the block also `def`s is **not declared** — the `def`
-//! is the one with a place to jump to. Those `def`s are not declared as members either: rubydex
-//! has already indexed them (as `private Object#…`, since a `def` in a block belongs to no class
-//! it can name), so they answer on the name rung, and a declaration here would be text this
-//! crate wrote pointing at a `def` rubydex owns.
+//! A member whose name the block also `def`s is **not declared**: the `def` is the one with a place
+//! to jump to.
+//!
+//! Those `def`s are not declared as members either. rubydex already indexed them (as
+//! `private Object#…`, since a `def` in a block belongs to no class it can name), so they answer on
+//! the name rung. A declaration here would be text this crate wrote pointing at a `def` rubydex
+//! owns.
 //!
 //! # What each installs
 //!
-//! `Struct` is mutable and `Data` is not, which is the whole difference:
+//! `Struct` is mutable and `Data` is not; that is the whole difference:
 //!
 //! | | per name | fixed |
 //! | --- | --- | --- |
 //! | `Struct.new` | `x`, `x=` | `[]`, `each`, `members`, `self.members` |
 //! | `Data.define` | `x` | `with`, `to_h`, `deconstruct_keys` |
 //!
-//! Fixed members are [`Source::Interface`], per-name ones [`Source::Struct`] — directly below a
-//! hand-written annotation, because a `sig` above a `def` overriding a reader is the one
-//! collision either can reach.
+//! Fixed members are [`Source::Interface`]; per-name ones are [`Source::Struct`], directly below a
+//! hand-written annotation, because a `sig` above a `def` overriding a reader is the one collision
+//! either can reach.
 //!
-//! `Struct#each` is declared `untyped` although Ruby returns `self`: [`Facts`] holds one
-//! declaration per `(owner, name)`, and `each` returns the struct with a block and an
-//! `Enumerator` without one. Nothing is the only honest single answer;
+//! `Struct#each` is declared `untyped` although Ruby returns `self`. [`Facts`] holds one
+//! declaration per `(owner, name)`, and `each` returns the struct with a block and an `Enumerator`
+//! without one. `untyped` is the only honest single answer;
 //! [`Types::harvest`](super::types::Types::harvest) drops it, leaving the name rung. `Data#with`
 //! has no such split and chains.
 
@@ -86,8 +90,8 @@ enum Shape {
 impl Shape {
     /// The call this shape is written as: `Struct.new` and `Data.define`.
     ///
-    /// Read off the receiver and the message together, because neither half is evidence on its
-    /// own — `Struct.build` is somebody's own method and `Foo.define` is not a `Data`.
+    /// Read off the receiver and the message together, because neither half is evidence alone:
+    /// `Struct.build` is somebody's own method, and `Foo.define` is not a `Data`.
     fn of(node: &CallNode<'_>) -> Option<Self> {
         let receiver = node.receiver()?;
         let constant = receiver.as_constant_read_node()?;
@@ -116,25 +120,26 @@ impl Shape {
 
     /// The members every class of this shape has, whatever names it was given.
     ///
-    /// `%s` in a return type is the owning class's own name, which is the only thing either
-    /// table needs from outside itself. The `bool` is the singleton side, and it is `true`
-    /// exactly once: `members` is the one fixed member Ruby defines on both sides. Declaring
-    /// only the instance half leaves `Point.members` on the name rung with a candidate list
-    /// three entries *longer* than before this reader ran, **which is how a generator makes an
-    /// answer worse without making one wrong**.
+    /// `%s` in a return type is the owning class's own name, the only thing either table needs from
+    /// outside itself.
+    ///
+    /// The `bool` is the singleton side, and it is `true` exactly once: `members` is the one fixed
+    /// member Ruby defines on both sides. Declaring only the instance half would leave
+    /// `Point.members` on the name rung with a *longer* candidate list than before this reader ran,
+    /// **which is how a generator makes an answer worse without making one wrong**.
     fn framework(self) -> &'static [(&'static str, &'static str, &'static str, bool)] {
         match self {
-            // `[]` takes a member's name or its index and can return any of them; `each` is the
-            // two-armed case argued in this module's header; `members` is the one that chains.
+            // `[]` takes a member's name or index and can return any member; `each` is the
+            // two-armed case from the module header; `members` is the one that chains.
             Self::Struct => &[
                 ("[]", "(untyped)", "untyped", false),
                 ("each", "() ?{ (untyped) -> void }", "untyped", false),
                 ("members", "()", "Array[Symbol]", false),
                 ("members", "()", "Array[Symbol]", true),
             ],
-            // `with` hands back the same class, which is what makes a `Data` chain through a
-            // copy. Both hashes are keyed by the member names, so `Symbol` is exact and the
-            // value side is the same `untyped` the readers have.
+            // `with` hands back the same class, which is what lets a `Data` chain through a copy.
+            // Both hashes are keyed by the member names, so `Symbol` is exact, and the value side
+            // is the readers' `untyped`.
             Self::Data => &[
                 ("with", "(**untyped)", "%s", false),
                 ("to_h", "()", "Hash[Symbol, untyped]", false),
@@ -151,10 +156,11 @@ impl Shape {
 
 /// Read every `Struct.new` and `Data.define` in `source` that names a class.
 ///
-/// `file` is how the source should be spelled to a reader and goes into every provenance line.
-/// `namespaces` is what may be spelled around a name — the one thing this reader needs that the
-/// text cannot tell it, and the reason is [`Reader::spellable`]. Text in otherwise — no I/O, the
-/// same contract every generator has.
+/// - `file` is how the source is spelled to a reader, and goes into every provenance line.
+/// - `namespaces` is what may be spelled around a name: the one thing the text cannot tell this
+///   reader (see [`Reader::spellable`]).
+///
+/// Text in, no I/O: the contract every generator has.
 #[must_use]
 pub fn read(source: &str, file: &str, namespaces: &Namespaces) -> Facts {
     let parsed = ruby_prism::parse(source.as_bytes());
@@ -185,12 +191,11 @@ struct Reader<'src> {
 impl Reader<'_> {
     /// One body, and then the class and module bodies written as statements of it.
     ///
-    /// Statements and not a walk of the whole tree, which is [`super::annotations`]' bound and is
-    /// taken here for both of its reasons: the depth stays the depth of `module A; class B`
-    /// rather than the depth of every method body in the file, and it says what every reader
-    /// here says — a constant assigned inside a `describe` block is not a statement of the
-    /// enclosing body. Three assignments in six corpora are that shape and all three are in
-    /// specs.
+    /// Statements, not a walk of the whole tree: [`super::annotations`]' bound, taken for both of
+    /// its reasons.
+    /// - The depth stays that of `module A; class B`, not of every method body in the file.
+    /// - It says what every reader here says: a constant assigned inside a `describe` block is not
+    ///   a statement of the enclosing body. In practice that shape appears only in specs.
     fn walk(&mut self, body: Option<Node<'_>>) {
         let Some(statements) = body.and_then(|body| body.as_statements_node()) else {
             return;
@@ -201,9 +206,9 @@ impl Reader<'_> {
                 continue;
             }
             let (path, inner) = if let Some(class) = statement.as_class_node() {
-                // The superclass is read *before* the nesting is pushed, because
-                // `class Line < Struct.new(:x)` declares members on `Line` and the call is
-                // written outside its body.
+                // The superclass is read *before* the nesting is pushed:
+                // `class Line < Struct.new(:x)` declares members on `Line`, and the call is written
+                // outside its body.
                 let name = spelling(self.source, &class.constant_path());
                 if let Some(node) = class.superclass()
                     && let Some(call) = node.as_call_node()
@@ -244,9 +249,9 @@ impl Reader<'_> {
 
     /// Whether this owner's name can be written without introducing a namespace.
     ///
-    /// [`Namespaces::spellable`] is the rule, and it is there rather than here because the
-    /// schema generator declares on a nested model too — two generators ask the question and
-    /// neither may answer it differently.
+    /// [`Namespaces::spellable`] is the rule. It lives there, not here, because the schema
+    /// generator declares on a nested model too: two generators ask the question, and they must not
+    /// answer it differently.
     fn spellable(&self, owner: &Owner) -> bool {
         self.namespaces.spellable(owner.name())
     }
@@ -273,9 +278,8 @@ impl Reader<'_> {
                 .join(", ")
         );
         let mut say = |owner: Owner, name: String, parameters: &str, returns: &str, at, from| {
-            // Instance side only: `block_methods` collects receiverless `def`s, which are
-            // instance methods, and a `def members` in the block says nothing about
-            // `Point.members`.
+            // Instance side only: `block_methods` collects receiverless `def`s, which are instance
+            // methods. A `def members` in the block says nothing about `Point.members`.
             if matches!(owner, Owner::Instance(_)) && shadowed.contains(&name) {
                 return;
             }
@@ -287,9 +291,9 @@ impl Reader<'_> {
                 because: match from {
                     // The file really does declare a member per name it wrote.
                     Source::Struct => format!("From `{}`, {call}.", self.file),
-                    // And it really does not declare the fixed half: the card carries no place,
-                    // and a line claiming the file
-                    // said so would be the only thing on it suggesting there is one.
+                    // And it really does not declare the fixed half: the card carries no place, and
+                    // a line claiming the file said so would be the only thing on it suggesting
+                    // one.
                     _ => format!(
                         "Every `{}` has this; ya-lsp writes it, and no file declares it.",
                         shape.owned()
@@ -340,19 +344,19 @@ impl Reader<'_> {
     }
 }
 
-/// The member names one call was given, and where each of them is written.
+/// The member names one call was given, and where each is written.
 ///
 /// `None` for a call this reader may not believe: no positional arguments at all, or one that is
-/// not a symbol literal. The `(whole symbol, the name inside it)` pair is what an editor shows
-/// and what it selects, which is `rails::enums`' shape for a label — `point.x` should land on
-/// the `:x` and highlight the `x`.
+/// not a symbol literal.
+///
+/// The `(whole symbol, name inside it)` pair is what an editor shows and selects, the same shape
+/// `rails::enums` uses for a label: `point.x` lands on the `:x` and highlights the `x`.
 fn members(source: &str, node: &CallNode<'_>) -> Option<Vec<Named>> {
     let arguments = node.arguments()?;
     let mut names = Vec::new();
     for argument in arguments.arguments().iter() {
-        // `keyword_init: true` is an option and not a member. It changes how the constructor is
-        // called and nothing this reader declares, which is why it is skipped rather than
-        // refused — 81 of the corpus' 268 calls write one.
+        // `keyword_init: true` is an option, not a member. It changes how the constructor is called
+        // and nothing this reader declares, so it is skipped rather than refused. It is common.
         if argument.as_keyword_hash_node().is_some() {
             continue;
         }
@@ -374,10 +378,10 @@ fn members(source: &str, node: &CallNode<'_>) -> Option<Vec<Named>> {
 
 /// Whether a symbol can be written as a `def` name in RBS.
 ///
-/// A struct member always can in practice — `Struct.new` raises on anything else — so this is
-/// the belt for a source that never runs: an unparseable name would take
-/// [`Synthesized::record`](super::synthesized::Synthesized::record)'s gate down on the whole
-/// document, which costs every other member in the file rather than the one.
+/// A struct member always can in practice (`Struct.new` raises on anything else), so this is the
+/// belt for a source that never runs. An unparseable name would trip
+/// [`Synthesized::record`](super::synthesized::Synthesized::record)'s gate on the whole document,
+/// costing every other member in the file.
 fn is_method_name(name: &str) -> bool {
     let mut characters = name.chars();
     characters
@@ -388,9 +392,9 @@ fn is_method_name(name: &str) -> bool {
 
 /// The names of the methods a call's block `def`s, if it has one.
 ///
-/// Statements of the block body only, for the same depth reason [`Reader::walk`] gives, and
-/// receiverless only: a `def self.build` inside the block is on the struct's singleton and
-/// shadows nothing this reader declares on the instance side.
+/// - Statements of the block body only, for the depth reason [`Reader::walk`] gives.
+/// - Receiverless only: a `def self.build` inside the block is on the struct's singleton and
+///   shadows nothing declared on the instance side.
 fn block_methods(node: &CallNode<'_>) -> Vec<String> {
     let Some(body) = node
         .block()
@@ -408,10 +412,10 @@ fn block_methods(node: &CallNode<'_>) -> Vec<String> {
         .collect()
 }
 
-/// The constant a `class` or `module` keyword names, exactly as it is written.
+/// The constant a `class` or `module` keyword names, exactly as written.
 ///
-/// Sliced rather than walked, so `class Admin::Setting` nests one name and not two and joining
-/// the stack with `::` reproduces what rubydex calls the same class. A leading `::` is dropped.
+/// Sliced, not walked, so `class Admin::Setting` nests one name, not two, and joining the stack
+/// with `::` reproduces what rubydex calls the same class. A leading `::` is dropped.
 fn spelling(source: &str, node: &Node<'_>) -> String {
     let location = node.location();
     source
@@ -428,8 +432,8 @@ mod tests {
     use crate::analysis::testing::*;
     use crate::generated::{Namespaces, declaring, declaring_kinds};
 
-    /// Every namespace the fixtures below nest into, so that [`Reader::spellable`] is not
-    /// what each of them is testing. The one test that *is* about it names its own sets.
+    /// Every namespace the fixtures below nest into, so [`Reader::spellable`] is not what each of
+    /// them tests. The one test that *is* about it names its own sets.
     fn known() -> Namespaces {
         declaring_kinds(&["Vite", "Vite::Manifest", "Reports", "Reports::Reg"], &[])
     }
@@ -442,7 +446,7 @@ mod tests {
 
     /// The whole of what one `Struct.new` declares, pinned as a document.
     ///
-    /// Every other test here reads one line out of this; this one is the shape — which bodies
+    /// Every other test here reads one line out of this one. This one pins the shape: which bodies
     /// open, which side each `def` is on, and which of the two sentences each member carries.
     #[test]
     fn the_rbs_a_struct_declares() {
@@ -473,8 +477,8 @@ end
 
     /// The other half of the same pin: no writers, and `with` hands the class back.
     ///
-    /// `-> Coord` is what makes `coord.with(lat: 1).lng` answer, and it is the one return type in
-    /// this module that is not fixed text.
+    /// `-> Coord` is what makes `coord.with(lat: 1).lng` answer; it is the one return type in this
+    /// module that is not fixed text.
     #[test]
     fn the_rbs_a_data_declares() {
         assert_eq!(
@@ -496,8 +500,8 @@ end
 
     /// The subclass spelling, which declares on the class it names.
     ///
-    /// The call is written outside the body it declares into, which is why the superclass is
-    /// read before the nesting is pushed rather than by the walk of the body.
+    /// The call is written outside the body it declares into, which is why the superclass is read
+    /// before the nesting is pushed, not by the walk of the body.
     #[test]
     fn a_class_that_inherits_a_struct_declares_its_members() {
         let declared = rbs("class Line < Struct.new(:start_line)\n  def span; end\nend\n");
@@ -529,19 +533,19 @@ end
         );
     }
 
-    /// A namespace nobody defines has two safe spellings and no third, which is the whole rule.
+    /// A namespace nobody defines has two safe spellings and no third: the whole rule.
     ///
-    /// `module Reports::Missing` is a whole application's spelling for a `Reports` that Zeitwerk
-    /// conjures and no file writes, and a joined `class Reports::Missing::Metric` introduces
-    /// `Reports::Missing` itself — as a **class** — which costs it its own singleton members.
-    /// There is a safe spelling when the parent is a `module` the application writes down, and
-    /// none at all when it is not: an explicit `class Reports` wrapper declares a kind this
-    /// crate cannot know, measured at 234 chatwoot positions.
+    /// `module Reports::Missing` is a common application spelling for a `Reports` that Zeitwerk
+    /// conjures and no file writes. A joined `class Reports::Missing::Metric` introduces
+    /// `Reports::Missing` itself, as a **class**, which costs it its own singleton members.
+    /// - When the parent is a `module` the application writes down, there is a safe spelling.
+    /// - When it is not, there is none: an explicit `class Reports` wrapper declares a kind this
+    ///   crate cannot know, and that costs real answers.
     #[test]
     fn a_namespace_nobody_defines_declares_only_where_there_is_a_safe_spelling() {
         let source = "module Reports::Missing\n  Metric = Data.define(:name)\nend\n";
-        // The parent is a `module` a file writes down, so it is opened as a body of its own
-        // and the members are declared.
+        // The parent is a `module` a file writes down, so it is opened as a body of its own and the
+        // members are declared.
         let module = declaring(&["Reports::Missing"]);
         assert!(
             read(source, "f.rb", &module)
@@ -551,14 +555,14 @@ end
             "{}",
             read(source, "f.rb", &module).render(&module).rbs
         );
-        // The same file with the parent a **class** instead: nothing declares `Reports`, the
-        // joined name would introduce the parent, and no wrapper can be written for it — so
-        // the call declares nothing at all.
+        // The same file with the parent a **class** instead: nothing declares `Reports`, the joined
+        // name would introduce the parent, and no wrapper can be written for it. So the call
+        // declares nothing.
         let class = declaring_kinds(&["Reports::Missing"], &[]);
         assert!(read(source, "f.rb", &class).render(&class).rbs.is_empty());
-        // And once something writes `Reports` down, every segment is declared, the joined name
-        // introduces nothing, and it is spelled exactly as it is written.
-        // The something may be a **gem**, which is what the graph projection widens.
+        // Once something writes `Reports` down, every segment is declared, the joined name
+        // introduces nothing, and it is spelled as written. The something may be a **gem**, which
+        // is what the graph projection adds.
         let defined = declaring_kinds(&["Reports", "Reports::Missing"], &[]);
         assert!(
             read(source, "f.rb", &defined)
@@ -566,8 +570,8 @@ end
                 .rbs
                 .starts_with("class Reports::Missing::Metric\n")
         );
-        // A top-level constant has no namespace to ask about, which is why the commonest
-        // spelling never reaches this rule at all.
+        // A top-level constant has no namespace to ask about, so the commonest spelling never
+        // reaches this rule.
         assert!(
             read("Point = Struct.new(:x)\n", "f.rb", &declaring(&[]))
                 .render(&declaring(&[]))
@@ -576,11 +580,11 @@ end
         );
     }
 
-    /// A call whose members this reader cannot see declares nothing at all.
+    /// A call whose members this reader cannot see declares nothing.
     ///
-    /// The splat has two real occurrences; the string is `Struct.new("Name", :x)`,
-    /// which defines `Struct::Name` and so really does put the members somewhere else; and a
-    /// call with no arguments has nothing to say.
+    /// - The splat is a real shape.
+    /// - `Struct.new("Name", :x)` defines `Struct::Name`, so its members really are elsewhere.
+    /// - A call with no arguments has nothing to say.
     #[test]
     fn a_call_this_cannot_read_the_names_out_of_declares_nothing() {
         for source in [
@@ -607,7 +611,7 @@ end
     /// A name that is not a legal method name is declined on its own.
     ///
     /// One member this crate cannot spell would make `Synthesized::record` refuse the whole
-    /// document, which costs every other member in the file rather than the one.
+    /// document, costing every other member in the file.
     #[test]
     fn a_name_that_is_not_a_method_name_is_declined_by_itself() {
         let declared = rbs("Point = Struct.new(:x, :\"a b\", :Y, :\"9\", :_z)\n");
@@ -616,7 +620,7 @@ end
         for refused in ["a b", "def Y", "def 9"] {
             assert!(!declared.contains(refused), "{refused}: {declared}");
         }
-        // And a call whose every name is refused says nothing rather than opening an empty body.
+        // A call whose every name is refused says nothing, rather than opening an empty body.
         assert_eq!(rbs("Point = Struct.new(:\"a b\")\n"), "");
     }
 
@@ -629,7 +633,7 @@ end
             rbs("Point = Struct.new(:x) do\n  def x; 1; end\n  def to_h; {}; end\nend\n");
         assert!(!declared.contains("def x:"), "{declared}");
         assert!(declared.contains("def x=:"), "{declared}");
-        // `to_h` is not one a `Struct` declares here at all, so nothing changes for it.
+        // `to_h` is not one a `Struct` declares here, so nothing changes for it.
         assert!(!declared.contains("to_h"), "{declared}");
         let data = rbs("Coord = Data.define(:lat) do\n  def to_h; {}; end\nend\n");
         assert!(!data.contains("def to_h:"), "{data}");
@@ -666,10 +670,10 @@ end
         }
     }
 
-    /// Neither name on its own is evidence, and neither is a call that names no class.
+    /// Neither name alone is evidence, and neither is a call that names no class.
     ///
-    /// The last three are 94 of the corpus' 268: a local, an instance variable and a bare
-    /// expression each name a class whose name dies with the method.
+    /// The last three are common: a local, an instance variable and a bare expression each hold a
+    /// class whose name dies with the method.
     #[test]
     fn only_the_two_calls_assigned_to_a_class_declare_anything() {
         for source in [
@@ -691,8 +695,7 @@ end
 
     /// A constant assigned inside a block is not a statement of the enclosing body.
     ///
-    /// The bounding rule every reader here applies, and the three occurrences in six corpora
-    /// are all in specs.
+    /// The bounding rule every reader here applies. In practice this shape appears only in specs.
     #[test]
     fn a_constant_written_inside_a_block_declares_nothing() {
         assert_eq!(
@@ -701,7 +704,7 @@ end
         );
     }
 
-    /// A `class` with no body still gets walked past rather than stopping the file.
+    /// A `class` with no body is walked past, not a reason to stop reading the file.
     #[test]
     fn an_empty_body_is_walked_past() {
         let declared = rbs("class Empty\nend\nmodule Also\nend\nPoint = Struct.new(:x)\n");
@@ -710,8 +713,8 @@ end
 
     /// Where the jump lands: the whole `:x`, selecting the `x` inside it.
     ///
-    /// The reader and the writer point at the same symbol, which is `enum`'s answer for the four
-    /// members one label installs.
+    /// The reader and the writer point at the same symbol, as `enum`'s four members point at one
+    /// label.
     #[test]
     fn a_member_points_at_the_symbol_that_named_it() {
         let source = "Point = Struct.new(:x)\n";
@@ -739,7 +742,7 @@ end
         );
     }
 
-    /// A file that mentions neither macro says nothing, which is what most of the list does.
+    /// A file that mentions neither macro says nothing, which is what most files do.
     #[test]
     fn a_file_with_no_call_declares_nothing() {
         assert_eq!(rbs("class Story\n  def title; end\nend\n"), "");
@@ -749,11 +752,12 @@ end
 
     /// End to end: a constant assigned a `Struct.new` is a class with members.
     ///
-    /// Three things at once, and the first is the one the whole pass rests on: `Point` is a
-    /// **constant assignment** to rubydex and a `class Point` to the RBS this pass writes, and
-    /// the two are one constant — the same property a generated `module` rests on, reached
-    /// from the other side. Then the member types the chain off it, and the jump lands on the `:x`
-    /// that named it.
+    /// Three things at once:
+    /// 1. `Point` is a **constant assignment** to rubydex and a `class Point` to the RBS this pass
+    ///    writes, and the two are one constant. The whole pass rests on this, the same property a
+    ///    generated `module` rests on, reached from the other side.
+    /// 2. The member types the chain off it.
+    /// 3. The jump lands on the `:x` that named it.
     #[test]
     fn a_struct_constant_is_a_class_whose_members_type_and_jump() {
         let source = "Point.new(1, 2).x\n";
@@ -784,11 +788,10 @@ end
         );
     }
 
-    /// `Data.define`'s `with` hands the class back, which is the one return type it can chain on.
+    /// `Data.define`'s `with` hands the class back: the one return type it can chain on.
     ///
-    /// Also the two halves of the shape rule in one project: a `Data` gets no writer, and a call
-    /// assigned to a local rather than to a constant declares nothing at all — 94 of the 268
-    /// uses measured are that second shape.
+    /// Also both halves of the shape rule in one project: a `Data` gets no writer, and a call
+    /// assigned to a local, not a constant, declares nothing. The second shape is common.
     #[test]
     fn a_data_chains_through_with_and_a_local_declares_nothing() {
         let source = "Coord.new.with.north\n";
@@ -815,15 +818,13 @@ end
 
     /// A namespace nobody defines keeps its own members, **and** the struct under it declares.
     ///
-    /// `module Reports::Registry` is a whole Rails application's spelling for a `Reports` that
-    /// Zeitwerk conjures and no file writes. Declaring `class Reports::Registry::Metric` is the
-    /// first thing in the graph to introduce `Reports`, and it costs `Reports::Registry` its
-    /// **own** singleton members — measured over chatwoot as 12 positions that resolved before
-    /// the declaration and fell to the name list with it.
+    /// `module Reports::Registry` is a common Rails spelling for a `Reports` that Zeitwerk conjures
+    /// and no file writes. Declaring `class Reports::Registry::Metric` would be the first thing in
+    /// the graph to introduce `Reports`, and would cost `Reports::Registry` its **own** singleton
+    /// members: positions that resolved before the declaration fall to the name list.
     ///
-    /// **The namespace is opened rather than the call declined**, so both halves are asserted
-    /// here: the module still answers for itself, and `Metric#name` exists rather than being
-    /// the price of that.
+    /// **The namespace is opened, not the call declined**, so both halves are asserted here: the
+    /// module still answers for itself, and `Metric#name` exists without being the price of that.
     #[test]
     fn a_struct_under_a_namespace_nobody_defines_declares_and_costs_nothing() {
         let source = "Reports::Registry.supported?(1)\n";
@@ -849,8 +850,8 @@ end
             "class Reports::Source\n  def go\n    Reports::Registry.supported?(1)\n  end\nend\n",
         );
         // A **third** file naming it, and it is load-bearing: with one reference the answer
-        // survives the joined name and with two it does not, which is why this reproduced over
-        // a corpus long before it reproduced here. Chatwoot's third is the spec.
+        // survives the joined name, and with two it does not. That is why this reproduced over a
+        // real application long before it reproduced here, where the third reference was the spec.
         harness.write("spec/services/reports/registry_spec.rb", source);
         let uri = harness.write("app/main.rb", source);
         harness.index();
@@ -866,10 +867,10 @@ end
         let _ = (&registry_uri, &source_uri);
         let card = card(&mut harness, &uri, source, "supported?");
         assert!(card.contains("Reports::Registry.supported?"), "{card}");
-        // The tier and not the list length: this workspace holds exactly one `supported?`, so
-        // a receiver that fails to resolve still names the right method — on the *name* rung,
-        // with the footnote that says so. Over a corpus the same failure spells itself as a
-        // candidate list, and asserting on the list is what made this look unreproducible here.
+        // The tier, not the list length. This workspace holds exactly one `supported?`, so a
+        // receiver that fails to resolve still names the right method, on the *name* rung, with the
+        // footnote that says so. Over a real application the same failure shows as a candidate
+        // list, and asserting on the list is what made this look unreproducible here.
         assert!(
             !card.contains("Matched on the method name alone"),
             "the module keeps its own singleton: {card}"
@@ -878,10 +879,9 @@ end
 
     /// One file feeding two generators merges into one document, and both halves survive.
     ///
-    /// Worth asking of every pair of generators: a rank collision is resolved before
-    /// render, so a bug there is a duplicate `def` that only shows up when two generators meet.
-    /// The struct and the schema are the pair worth asking, because they are the two that
-    /// declare a *typed* member on a class the other has never heard of.
+    /// A rank collision is resolved before render, so a bug there is a duplicate `def` that only
+    /// shows when two generators meet. The struct and the schema are the pair to ask, because they
+    /// are the two that declare a *typed* member on a class the other has never heard of.
     #[test]
     fn a_file_that_writes_a_macro_and_a_struct_declares_both() {
         let source = "Story.new.title\nPoint.new(1).x\n";

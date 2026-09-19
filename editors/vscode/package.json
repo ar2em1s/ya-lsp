@@ -2,7 +2,7 @@
   "name": "yalsp",
   "displayName": "ya-lsp",
   "description": "A standalone Ruby language server. No Ruby runtime required.",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "license": "MIT",
   "icon": "images/logo.png",
   "publisher": "ar2em1s",
@@ -582,14 +582,17 @@
             "default": [
               "**/*.rb",
               "**/*.erb",
+              "**/*.jbuilder",
+              "**/*.builder",
+              "**/*.ruby",
               "**/*.rbs",
               "**/*.rake",
               "**/*.gemspec",
+              "**/*.ru",
               "**/Rakefile",
-              "**/Gemfile",
-              "**/config.ru"
+              "**/Gemfile"
             ],
-            "markdownDescription": "Globs, relative to the workspace folder, of the files to index. Everything ya-lsp knows about your code comes from these, so narrowing it is the quickest way to make navigation stop working. The default covers Ruby that is not named `.rb` — your `Rakefile`, `Gemfile`, `config.ru`, `lib/tasks/*.rake` and your own `.gemspec` — and the RBS signatures in `sig/`. Overridden by `[index] include` in a workspace `ya-lsp.toml`.",
+            "markdownDescription": "Globs, relative to the workspace folder, of the files to index. Everything ya-lsp knows about your code comes from these, so narrowing it is the quickest way to make navigation stop working. The default covers Ruby that is not named `.rb` — your `Rakefile`, `Gemfile`, your rackup files (`config.ru` and any other `.ru`), `lib/tasks/*.rake`, your own `.gemspec`, and the view templates Rails compiles from Ruby rather than markup (`.jbuilder`, `.builder`, `.ruby`) — and the RBS signatures in `sig/`. **It is replaced, not extended**: a list of your own has to spell out every default you still want. Overridden by `[index] include` in a workspace `ya-lsp.toml`.",
             "scope": "resource",
             "order": 1
           },
@@ -621,13 +624,6 @@
             "scope": "resource",
             "order": 3
           },
-          "ya-lsp.index.respectGitignore": {
-            "type": "boolean",
-            "default": true,
-            "markdownDescription": "Skip anything git ignores. Right for a code indexer by default — it prunes `vendor/bundle`, `node_modules` and `tmp` for free — but a project whose Ruby is generated into an ignored directory needs it off. Overridden by `[index] respect_gitignore` in a workspace `ya-lsp.toml`.",
-            "scope": "resource",
-            "order": 4
-          },
           "ya-lsp.index.maxFiles": {
             "type": "integer",
             "default": 50000,
@@ -649,6 +645,14 @@
         "extensions": [
           ".erb",
           ".rhtml"
+        ]
+      },
+      {
+        "id": "ruby",
+        "extensions": [
+          ".jbuilder",
+          ".builder",
+          ".ruby"
         ]
       }
     ],

@@ -1,9 +1,8 @@
 //! A Sorbet `sig` and a YARD `@return`, as a body of knowledge.
 //!
 //! The reader is [`analysis::annotations`](crate::analysis::annotations), which ends at a
-//! [`Facts`](crate::generated::Facts) directly rather than at a syntax type of its own. That is
-//! the asymmetry this seam was designed from: it was already written the way the registry wants,
-//! and it is not a Rails one.
+//! [`Facts`](crate::generated::Facts) directly, not at a syntax type of its own. It is also not
+//! about Rails, which made it the natural first fit for this registry.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -35,11 +34,9 @@ static WANTS: [Wants; 1] = [Wants {
 pub struct Annotations {
     /// What the reader made of each listed file, by URI.
     ///
-    /// **This reader ends at [`Facts`] directly rather than at a syntax type**, which is the
-    /// asymmetry the whole seam was designed from: it was already written the way the registry
-    /// wants and it is not a Rails one. So the memo holds facts here where Rails' holds a parse,
-    /// and cloning a hundred-odd files' worth of them is the parse this saves several hundred
-    /// times over.
+    /// **This reader ends at [`Facts`] directly, not at a syntax type**, so the memo holds facts
+    /// here where Rails' holds a parse. Cloning them is far cheaper than re-parsing the files on
+    /// every pass.
     sources: HashMap<String, (Fresh, Facts)>,
     /// How many files it has read.
     pub reads: u64,
@@ -70,17 +67,17 @@ impl super::Knowledge for Annotations {
         list == ANNOTATED && features.annotations
     }
 
-    /// What each annotated file's reader already made of it, handed over as it is.
+    /// What each annotated file's reader already made of it, handed over as is.
     ///
-    /// The whole generator, because this module's memo holds [`Facts`] rather than a parse: the
-    /// reader ends there directly, so declaring is a clone and a merge.
+    /// The whole generator: this module's memo holds [`Facts`], not a parse, so declaring is a
+    /// clone and a merge.
     fn declare(&mut self, declaring: &Declaring<'_>, into: &mut Declared) -> Counted {
         let mut typed = 0;
         for key in declaring.context.documents(ANNOTATED) {
             let Some(facts) = self.facts(key).cloned() else {
                 continue;
             };
-            let Some(uri) = DocUri::from_uri_str(key) else {
+            let Some(uri) = DocUri::from_graph_uri(key) else {
                 continue;
             };
             typed += facts.len();
@@ -100,7 +97,7 @@ impl super::Knowledge for Annotations {
         // deleted and written again is a different file.
         self.sources.retain(|uri, _| listed.contains(uri.as_str()));
         for key in listed {
-            let Some(uri) = DocUri::from_uri_str(key) else {
+            let Some(uri) = DocUri::from_graph_uri(key) else {
                 continue;
             };
             let fresh = (sources.fresh)(&uri);

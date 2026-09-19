@@ -1,54 +1,49 @@
 //! The long tail: every remaining Rails macro that names a member, as one table.
 //!
-//! Individually none of these earns a reader, and they are all the same shape — a name, a
-//! signature, a span, and a rule for when to decline. What makes them one table rather than a
-//! reader each is that every one installs a fixed set of members whose names are *affixes* on the
-//! names the call was given, and whose types are either written down here or come from one class
-//! the call names.
+//! None of these earns a reader of its own, and they all share one shape: a name, a signature, a
+//! span, and a rule for when to decline. They form one table because each installs a fixed set of
+//! members whose names are *affixes* on the names the call gave, and whose types are either written
+//! here or come from one class the call names.
 //!
 //! # What the table is made of
 //!
 //! [`Installs`] names the family, [`super::LONG_TAIL`] says which macro is in which, and [`row`]
-//! is every family's members side by side, so "what does this crate claim Rails installs" is
+//! lists every family's members side by side, so "what does this crate claim Rails installs" is
 //! answered by reading one function. A [`Row`] has three parts:
 //!
-//! - **[`Names`]** — where the names come from. `class_attribute :a, :b` gives two; a
-//!   `has_secure_token` with no arguments gives the one Rails defaults to; a `store_accessor`
-//!   gives all but its first.
-//! - **[`Shape`]** — one member per name, spelled as an [`Affix`] around it, with the side it
-//!   hangs on, its parameters, and either a type written here or a reference to the one class
-//!   the call names.
-//! - **[`Typing`]** — where [`Returns::Named`] comes from, and the gate it has to pass.
+//! - **[`Names`]**: where the names come from. `class_attribute :a, :b` gives two; a
+//!   `has_secure_token` with no arguments gives Rails' default; a `store_accessor` gives all but
+//!   its first.
+//! - **[`Shape`]**: one member per name, spelled as an [`Affix`] around it, with its side, its
+//!   parameters, and either a type written here or a reference to the one class the call names.
+//! - **[`Typing`]**: where [`Returns::Named`] comes from, and the gate it must pass.
 //!
-//! # The four that read and declare nothing
+//! # The four that are read and declare nothing
 //!
-//! Being *read* and declining is the only way a name stays reviewable: a macro absent from the
-//! table looks exactly like one nobody thought about. They are two categories, which
-//! [`Installs::Nothing`] and [`Installs::Elsewhere`] keep apart.
+//! Being *read* and then declining is the only way a name stays reviewable: a macro missing from
+//! the table looks exactly like one nobody thought about. They fall into two categories, kept apart
+//! by [`Installs::Nothing`] and [`Installs::Elsewhere`].
 //!
-//! There is no method to declare. `normalizes` appends to `normalized_attributes` and defines
-//! nothing per call; `encrypts` re-encrypts an attribute that already exists without changing
-//! what it returns; `generates_token_for` installs `generate_token_for` and `find_by_token_for`,
-//! both defined once in `ActiveRecord::TokenFor`.
+//! **No method to declare.** `normalizes` appends to `normalized_attributes` and defines nothing
+//! per call; `encrypts` re-encrypts an existing attribute without changing what it returns;
+//! `generates_token_for` installs `generate_token_for` and `find_by_token_for`, both defined once
+//! in `ActiveRecord::TokenFor`.
 //!
-//! There is nowhere to put it. `helper_method` writes a real method per call into
-//! `_helpers_for_modification` — a module the **view context** includes, not the controller — and
-//! that host is the one thing in Rails this crate has no type for: a template's implicit
-//! receiver. Declaring the member on the controller instead would restate a `def` rubydex
-//! already has and put a second *place* under a name that had one. A bare `current_user` in a
-//! template already hovers and jumps on the name rung, so the gap is the receiver rather than
-//! the declaration, and `analysis::views` closes it. This table's job there is to be the
-//! **allow-list**: `helper_method` is exactly which of a controller's methods Rails exposes, and
-//! a feature built without it would offer every action and every private method to a template.
+//! **Nowhere to put it.** `helper_method` writes a real method per call into
+//! `_helpers_for_modification`, a module the **view context** includes, not the controller, and a
+//! template's implicit receiver is not a class this table can declare onto. Declaring the member on
+//! the controller would restate a `def` rubydex already has and add a second *place* under a name
+//! that had one. `analysis::views` answers the template side instead, and this table's job there is
+//! to be the **allow-list**: `helper_method` is exactly which controller methods Rails exposes, and
+//! without it every action and private method would be offered to a template.
 //!
-//! # `delegated_type`'s static half ships and its fan-out does not
+//! # `delegated_type`: the static half ships, the fan-out does not
 //!
 //! Whatever its `types:` holds, it installs `entryable_types`, `entryable_name` and
-//! `build_entryable` — not `entryables`, and `entryable_type` is the polymorphic *column* rather
-//! than a method the macro writes. Those four ship. The per-element fan-out (a scope, a
-//! predicate, a reader and an id reader for each entry in `types:`) is declined: it needs each
-//! element to be a class the application defines and needs a relation of the owning class, which
-//! is a reader and not a table row.
+//! `build_entryable` (not `entryables`; `entryable_type` is the polymorphic *column*, not a method
+//! the macro writes). Those ship. The per-element fan-out (a scope, a predicate, a reader and an id
+//! reader per entry in `types:`) is declined: it needs each element to be an application class and
+//! a relation of the owning class, which is a reader's job, not a table row's.
 
 use std::collections::BTreeSet;
 
@@ -98,23 +93,22 @@ pub(super) enum Installs {
     Nothing,
     /// Read, and the method it installs goes somewhere this crate does not model.
     ///
-    /// One member: `helper_method`. It is not [`Installs::Nothing`] and the difference is the
-    /// whole of why it is declined — `abstract_controller/helpers.rb` really does write
-    /// `def current_user(...)` per call, onto the controller's `_helpers` module, which the
-    /// **view context** includes. A template's implicit receiver has no type here, so there is
-    /// nothing for that member to hang on that anything would reach; and what a template's bare
-    /// call answers *today* — a jump and a hover, on the name rung — is already right, and is
-    /// not improved by declaring a second copy of a `def` rubydex already has.
+    /// One member: `helper_method`. It differs from [`Installs::Nothing`], and that difference is
+    /// why it is declined: `abstract_controller/helpers.rb` really does write
+    /// `def current_user(...)` per call, onto the controller's `_helpers` module, which the **view
+    /// context** includes. There is no class here to hang that member on that anything would reach,
+    /// and declaring a second copy of a `def` rubydex already has would not improve the template's
+    /// answer.
     Elsewhere,
 }
 
 impl Installs {
     /// Whether this family reads a call and says nothing about it.
     ///
-    /// Two variants and two different reasons, which is the point of their being two: there is
-    /// **no method** ([`Installs::Nothing`]) or there is **nowhere to put it**
-    /// ([`Installs::Elsewhere`]). Both decline here and only one of them is a dead end: what
-    /// `helper_method` names is reachable through `analysis::views`.
+    /// Two variants, two reasons, which is why there are two: there is **no method**
+    /// ([`Installs::Nothing`]), or **nowhere to put it** ([`Installs::Elsewhere`]). Both decline
+    /// here, but only one is a dead end: what `helper_method` names is reachable through
+    /// `analysis::views`.
     pub(super) fn declines(self) -> bool {
         matches!(self, Self::Nothing | Self::Elsewhere)
     }
@@ -140,27 +134,26 @@ pub(super) enum Names {
 pub(super) enum Typing {
     /// Every type is written in the table. Nothing to look up and nothing to decline.
     Fixed,
-    /// One class, from `class_name:` or from the name camelized — [`super::ASSOCIATIONS`]' own
-    /// rule, and gated the same way: a class the application does not define declares nothing.
+    /// One class, from `class_name:` or from the camelized name: [`super::ASSOCIATIONS`]' own rule,
+    /// gated the same way (a class the application does not define declares nothing).
     OwnClass,
     /// One class, fixed by the macro and declared by a **gem**.
     ///
-    /// `ActiveStorage::Attached::One` is not this application's class and never will be, so the
-    /// gate cannot be [`Model::signatures`](super::Model::signatures)' `known`. It is whether
-    /// the graph has the constant at all, which is the caller's to answer — a bundle without
-    /// Active Storage in it declares nothing here rather than naming a class no jump can reach.
+    /// `ActiveStorage::Attached::One` is not and never will be this application's class, so the
+    /// gate cannot be [`Model::signatures`](super::Model::signatures)' `known`. It is whether the
+    /// graph holds the constant at all, which the caller answers: a bundle without Active Storage
+    /// declares nothing here, instead of naming a class no jump can reach.
     Gem(&'static str),
     /// The second positional names an attribute of this same class, and phase two asks what
     /// that one returns.
     Aliased,
-    /// The constant the call's `type:` names, written down with **no gate at all** — the one
-    /// place in this directory a class name is declared without asking whether anything defines
-    /// it, and `delegate`'s inversion is why. A `serialize` declares no member: the member is the
-    /// **column**, which certainly exists, and all this changes is the type it answers with. So
-    /// a `type:` naming something unreachable degrades to no answer, which is exactly where the
-    /// attribute already was, while declining would leave the column's own type standing — and
-    /// that one is *known* to be wrong, because a serialized column is `text` in the database
-    /// and never a `String` in Ruby.
+    /// The constant the call's `type:` names, written with **no gate at all**: the one place in
+    /// this directory a class name is declared without asking whether anything defines it, for
+    /// `delegate`'s inverted reason. A `serialize` declares no member (the member is the
+    /// **column**, which certainly exists); it only changes the type the column answers. So a
+    /// `type:` naming something unreachable degrades to no answer, where the attribute already was,
+    /// while declining would leave the column's own type standing, which is *known* to be wrong: a
+    /// serialized column is `text` in the database and never a `String` in Ruby.
     Written,
 }
 
@@ -171,10 +164,10 @@ pub(super) enum Affix {
     Around(&'static str, &'static str),
     /// A name of its own, installed **only** when the call took the macro's default.
     ///
-    /// `has_secure_password` aliases `authenticate` to `authenticate_password` and does it
-    /// `if attribute == :password`, so a call that named something else installs
-    /// `authenticate_recovery` and no bare `authenticate`. One clause, and without it this
-    /// declares the commonest method in the family or invents one, with no third option.
+    /// `has_secure_password` aliases `authenticate` to `authenticate_password` only
+    /// `if attribute == :password`, so a call naming something else installs
+    /// `authenticate_recovery` and no bare `authenticate`. Without this one clause, this would
+    /// either leave out the family's commonest method or invent one.
     Default(&'static str),
 }
 
@@ -197,10 +190,10 @@ pub(super) struct Shape {
     returns: Returns,
     /// The keywords that turn this member off, each read as "written, and written as `false`".
     ///
-    /// `class_attribute :setting, instance_writer: false` really does not install
-    /// `setting=` on the instance, and declaring one would be a member that raises. The lists
-    /// differ per side on purpose: `instance_predicate: false` removes the **class**-side
-    /// predicate too, which is `attribute.rb`'s own `if instance_predicate` around both.
+    /// `class_attribute :setting, instance_writer: false` really installs no instance `setting=`,
+    /// and declaring one would be a member that raises. The lists differ per side on purpose:
+    /// `instance_predicate: false` removes the **class**-side predicate too, per `attribute.rb`'s
+    /// own `if instance_predicate` around both.
     off: &'static [&'static str],
 }
 
@@ -222,12 +215,11 @@ const PREDICATE: &[&str] = &["instance_predicate"];
 /// The instance predicate, which needs the reader as well as the predicate.
 const INSTANCE_PREDICATE: &[&str] = &["instance_predicate", "instance_reader", "instance_accessor"];
 
-/// The three members every family in this table is built out of, on the instance side.
+/// The three members every family in this table is built from, on the instance side.
 ///
-/// Spelled as base values and varied with `..`, rather than as three `const fn`s: a helper whose
-/// only caller is a `const` item is compiled but never *run*, so a constructor here would be
-/// three functions this file's own coverage bar could never reach. Struct update syntax says the
-/// same thing and is a value rather than a call.
+/// Base values varied with `..`, not three `const fn`s: a helper called only from a `const` item is
+/// compiled but never *run*, so a constructor here would be three functions this file's coverage
+/// bar could never reach. Struct update syntax says the same thing as a value, not a call.
 const READ: Shape = Shape {
     name: Affix::Around("", ""),
     singleton: false,
@@ -250,9 +242,9 @@ const ASK: Shape = Shape {
     ..READ
 };
 
-/// `class_attribute :setting` — six members, and four keywords that remove them.
+/// `class_attribute :setting`: six members, and four keywords that remove them.
 ///
-/// `class_eval "class << self; def #{name}; ...; def #{name}=(value); ...", then the instance
+/// `class_eval "class << self; def #{name}; ...; def #{name}=(value); ..."`, then the instance
 /// halves, then `def #{name}?; !!self.#{name}; end` on both sides.
 const CLASS_ATTRIBUTE: &[Shape] = &[
     Shape {
@@ -282,7 +274,7 @@ const CLASS_ATTRIBUTE: &[Shape] = &[
     },
 ];
 
-/// `mattr_reader :x` — `def self.#{sym}; @@#{sym}; end`, and the instance half unless it is off.
+/// `mattr_reader :x`: `def self.#{sym}; @@#{sym}; end`, and the instance half unless turned off.
 const MODULE_READER: &[Shape] = &[
     Shape {
         singleton: true,
@@ -294,7 +286,7 @@ const MODULE_READER: &[Shape] = &[
     },
 ];
 
-/// `mattr_writer :x` — the same pair, assigning.
+/// `mattr_writer :x`: the same pair, assigning.
 const MODULE_WRITER: &[Shape] = &[
     Shape {
         singleton: true,
@@ -306,7 +298,7 @@ const MODULE_WRITER: &[Shape] = &[
     },
 ];
 
-/// `mattr_accessor :x` — both, which is what Rails' own `mattr_accessor` calls.
+/// `mattr_accessor :x`: both, which is what Rails' own `mattr_accessor` calls.
 const MODULE_ACCESSOR: &[Shape] = &[
     Shape {
         singleton: true,
@@ -326,10 +318,10 @@ const MODULE_ACCESSOR: &[Shape] = &[
     },
 ];
 
-/// `accepts_nested_attributes_for :author` — `def #{name}_attributes=(attributes)`, and nothing
-/// else. Rails also raises unless the association exists, which this deliberately does not
-/// check: a `has_many` written in a concern is an association this reader cannot see, and
-/// declining there would cost the member for the one shape a concern body exists to support.
+/// `accepts_nested_attributes_for :author`: `def #{name}_attributes=(attributes)` and nothing else.
+/// Rails also raises unless the association exists, which this deliberately does not check: a
+/// `has_many` written in a concern is invisible to this reader, and declining would lose the member
+/// in exactly the shape a concern body exists for.
 const NESTED_ATTRIBUTES: &[Shape] = &[Shape {
     name: Affix::Around("", "_attributes="),
     singleton: false,
@@ -340,10 +332,10 @@ const NESTED_ATTRIBUTES: &[Shape] = &[Shape {
 
 /// One store key: what it reads back, what it takes, and whether it changed.
 ///
-/// A reader, a writer and `#{key}_changed?` per key, in a `GeneratedStoreMethods` module the
-/// macro includes. The other three it writes — `_change`, `_was`, `_before_last_save` — are the
-/// same shape and are declined for the reason `synthesized.md` gives: what a store holds is
-/// `untyped`, so each of them is a name and no more.
+/// A reader, a writer and `#{key}_changed?` per key, in a `GeneratedStoreMethods` module the macro
+/// includes. The other three it writes (`_change`, `_was`, `_before_last_save`) have the same shape
+/// and are left out for the reason `synthesized.md` gives: a store holds `untyped`, so each would
+/// be just a name.
 const STORE: &[Shape] = &[
     READ,
     WRITE,
@@ -353,10 +345,10 @@ const STORE: &[Shape] = &[
     },
 ];
 
-/// `alias_attribute :new, :old` — the three that are the attribute itself.
+/// `alias_attribute :new, :old`: the three members that are the attribute itself.
 ///
-/// The macro aliases the whole pattern set, the dirty-tracking members included. The type is the
-/// aliased attribute's, which is a fact some other document states — see [`Typing::Aliased`].
+/// The macro aliases the whole pattern set, dirty tracking included. The type is the aliased
+/// attribute's, a fact another document states; see [`Typing::Aliased`].
 const ALIAS_ATTRIBUTE: &[Shape] = &[
     Shape {
         returns: Returns::Named,
@@ -366,8 +358,8 @@ const ALIAS_ATTRIBUTE: &[Shape] = &[
     ASK,
 ];
 
-/// `has_secure_token :token` — `define_method("regenerate_#{attribute}") { update! ... }`, and
-/// `update!` answers `true` or raises. The attribute itself is a column and is the schema's.
+/// `has_secure_token :token`: `define_method("regenerate_#{attribute}") { update! ... }`, and
+/// `update!` answers `true` or raises. The attribute itself is a column and belongs to the schema.
 const SECURE_TOKEN: &[Shape] = &[Shape {
     name: Affix::Around("regenerate_", ""),
     singleton: false,
@@ -376,11 +368,11 @@ const SECURE_TOKEN: &[Shape] = &[Shape {
     off: ALWAYS,
 }];
 
-/// `composed_of` and the two attachment macros — a reader of one class, and a writer.
+/// `composed_of` and the two attachment macros: a reader of one class, and a writer.
 ///
-/// `reader_method` and `writer_method` in `aggregations.rb`, and the two `class_eval`'d methods
-/// at the top of `has_one_attached`. Three families share the pair because they *are* the same
-/// pair; what differs is where [`Typing`] gets the class from.
+/// `reader_method` and `writer_method` in `aggregations.rb`, and the two `class_eval`'d methods at
+/// the top of `has_one_attached`. Three families share the pair because they *are* the same pair;
+/// only where [`Typing`] gets the class differs.
 const READER_AND_WRITER: &[Shape] = &[
     Shape {
         returns: Returns::Named,
@@ -389,7 +381,7 @@ const READER_AND_WRITER: &[Shape] = &[
     WRITE,
 ];
 
-/// `has_rich_text :body` — `def #{name}`, `def #{name}?` and a writer.
+/// `has_rich_text :body`: `def #{name}`, `def #{name}?` and a writer.
 const RICH_TEXT: &[Shape] = &[
     Shape {
         returns: Returns::Named,
@@ -399,21 +391,20 @@ const RICH_TEXT: &[Shape] = &[
     ASK,
 ];
 
-/// `serialize :codes, type: Array` — the column, answering the class the coder round-trips
-/// through. Nothing is defined; `decorate_attributes` replaces the type of a member that
-/// already exists.
+/// `serialize :codes, type: Array`: the column, answering the class the coder round-trips through.
+/// Nothing is defined; `decorate_attributes` replaces the type of a member that already exists.
 const SERIALIZE: &[Shape] = &[Shape {
     returns: Returns::Named,
     ..READ
 }];
 
-/// The eight `has_secure_password` installs, out of `secure_password.rb`.
+/// The eight methods `has_secure_password` installs, from `secure_password.rb`.
 ///
 /// `attr_reader attribute` and `attr_accessor :"#{attribute}_confirmation"`,
 /// `:"#{attribute}_challenge"`; then `define_method` for the writer, `authenticate_#{attribute}`
-/// and `#{attribute}_salt`. Every one of them is `nil` until something assigns it, which is what
-/// the `?`s are. `authenticate_` answers the record or `false`, so the honest common type is
-/// `untyped` rather than a `bool` that would be wrong for the branch everybody uses.
+/// and `#{attribute}_salt`. Each is `nil` until assigned, hence the `?`s. `authenticate_` answers
+/// the record or `false`, so the honest common type is `untyped`, not a `bool` that would be wrong
+/// for the branch everybody uses.
 const SECURE_PASSWORD: &[Shape] = &[
     Shape {
         returns: Returns::Fixed("String?"),
@@ -473,9 +464,9 @@ const SECURE_PASSWORD: &[Shape] = &[
 
 /// The four names a `delegated_type` installs whatever its `types:` holds.
 ///
-/// The role itself is a polymorphic `belongs_to`, which names no class at all — the association
-/// reader declines exactly that shape, and `untyped` here is a member that exists rather than
-/// one it invents.
+/// The role itself is a polymorphic `belongs_to`, which names no class; the association reader
+/// declines exactly that shape, and `untyped` here is a member that exists instead of one it
+/// invents.
 const DELEGATED_TYPE: &[Shape] = &[
     READ,
     Shape {
@@ -508,14 +499,13 @@ const DELEGATED_TYPE: &[Shape] = &[
     },
 ];
 
-/// Nothing at all — the four families that are read and decline.
+/// Nothing at all: the four families that are read and decline.
 const DECLARES_NOTHING: &[Shape] = &[];
 
 /// Every family's row: where its names come from, how it is typed, and what it installs.
 ///
-/// The one function in this crate that says what Rails installs for a macro nobody reads out of
-/// Rails, so each of the lists above was read out of the framework's own source at `7ba5fa3`
-/// rather than remembered — the file each came from is named in `synthesized.md`.
+/// The one function in this crate that states what Rails installs for macros nobody reads out of
+/// Rails, so each list above was read from the framework's own source, not remembered.
 pub(super) fn row(installs: Installs) -> Row {
     let (names, typing, shapes) = match installs {
         Installs::ClassAttribute => (Names::All, Typing::Fixed, CLASS_ATTRIBUTE),
@@ -558,7 +548,7 @@ pub(super) fn row(installs: Installs) -> Row {
 /// One name a call gave, and the member name it produces.
 #[derive(Debug)]
 struct Named {
-    /// What the members are built around — the key with its `prefix:` and `suffix:` applied.
+    /// What the members are built around: the key with its `prefix:` and `suffix:` applied.
     member: String,
     /// What the call wrote, for the provenance line.
     wrote: String,
@@ -578,35 +568,33 @@ impl From<(String, (u32, u32))> for Named {
 
 /// The body a macro was written in: who owns what it declares, and what it already answers.
 ///
-/// Three fields rather than three arguments, because every one of them is a property of the
-/// *body* and none of them is a property of the call — and [`Tail::declare`] and
-/// [`Tail::declare_derived`] both need all three.
+/// Three fields, not three arguments, because each is a property of the *body*, not the call, and
+/// [`Tail::declare`] and [`Tail::declare_derived`] both need all three.
 pub(super) struct Host<'body> {
     /// The class or module the macro is written in, spelled with its nesting.
     pub(super) class: &'body str,
     /// Whether that body is a `module`, which decides both halves' [`Owner`].
     pub(super) module: bool,
-    /// Every `def` the body writes itself, by `(is a def self., name)`. See
-    /// `ModelClass::defined` for why this reader asks and no other one does.
+    /// Every `def` the body writes itself, by `(is a def self., name)`. See `ModelClass::defined`
+    /// for why only this reader asks.
     pub(super) defined: &'body BTreeSet<(bool, String)>,
 }
 
 /// One long-tail macro call, read.
 #[derive(Debug)]
 pub(super) struct Tail {
-    /// The macro as written, for the provenance line. Twenty-nine names reach seventeen families,
-    /// so
-    /// the spelling cannot be recovered from [`Installs`]: `cattr_accessor` is a
-    /// [`Installs::ModuleAccessor`] and is not a `mattr_accessor`.
+    /// The macro as written, for the provenance line. Twenty-nine names map to seventeen families,
+    /// so the spelling cannot be recovered from [`Installs`]: `cattr_accessor` is an
+    /// [`Installs::ModuleAccessor`] but is not a `mattr_accessor`.
     spelled: String,
     installs: Installs,
-    /// Every name this call gave a member for: the name the members are built around, the text
-    /// the call actually wrote, and its span.
+    /// Every name this call gave a member for: the name the members are built around, the text the
+    /// call actually wrote, and its span.
     ///
     /// The two differ for exactly one family. `store_accessor :settings, :color, prefix: true`
     /// installs `settings_color`, and a provenance line reading ``store_accessor :settings_color``
-    /// would quote a call nobody made — so the member is named from the first and the sentence
-    /// under it from the second.
+    /// would quote a call nobody made, so the member is named from the first and the sentence from
+    /// the second.
     names: Vec<Named>,
     /// The class the call names, for [`Typing::OwnClass`] and [`Typing::Gem`].
     class: Option<String>,
@@ -621,10 +609,10 @@ pub(super) struct Tail {
 
 /// Read one call of a macro in [`LONG_TAIL`], or decline it.
 ///
-/// `None` for a name that is not in the table, for a family that declares nothing, and — the
-/// case that does the work — for a call this cannot take a **name** out of. A splat, a constant
-/// and an interpolated string are all Ruby that only runs, and a member named from one of them
-/// would be a member no `respond_to?` answers.
+/// `None` for a name not in the table, for a family that declares nothing, and (the case that
+/// matters) for a call this cannot take a **name** from. A splat, a constant and an interpolated
+/// string are all Ruby that only runs, and a member named from one would be a member no
+/// `respond_to?` answers.
 pub(super) fn read(source: &str, node: &CallNode<'_>, called: &str) -> Option<Tail> {
     let (_, installs) = LONG_TAIL.iter().find(|(name, _)| *name == called)?;
     if installs.declines() {
@@ -649,8 +637,8 @@ pub(super) fn read(source: &str, node: &CallNode<'_>, called: &str) -> Option<Ta
     let class = match table.typing {
         Typing::Gem(name) => Some(name.to_owned()),
         Typing::OwnClass => Some(class_named(source, node, &names.first()?.member)?),
-        // No `type:` is `Object`, and `Object` is every member there is — so the honest
-        // spelling of it is the one RBS has for "this says nothing".
+        // No `type:` means `Object`, and `Object` covers every member there is, so the honest
+        // spelling is RBS's word for "this says nothing".
         Typing::Written => Some(
             keyword(node, "type")
                 .map(|written| constant_spelling(source, &written))
@@ -673,8 +661,8 @@ pub(super) fn read(source: &str, node: &CallNode<'_>, called: &str) -> Option<Ta
 
 /// The names one call gives members for, and whether they came from the macro's default.
 ///
-/// Empty is `None` rather than an empty list: a call this could read no name out of declares
-/// nothing, and saying that once here is what keeps every caller below from checking.
+/// Empty is `None`, not an empty list: a call with no readable name declares nothing, and saying so
+/// once here keeps every caller below from checking.
 fn named(
     source: &str,
     node: &CallNode<'_>,
@@ -695,8 +683,8 @@ fn named(
         let mut found = Vec::new();
         for node in nodes {
             match node.as_array_node() {
-                // `store_accessor :settings, [ :a, :b ]` — Rails calls `keys.flatten`, so an
-                // array literal and a list of symbols are one spelling with two shapes.
+                // `store_accessor :settings, [ :a, :b ]`: Rails calls `keys.flatten`, so an array
+                // literal and a list of symbols are one spelling in two shapes.
                 Some(array) => {
                     found.extend(array.elements().iter().filter_map(|element| one(&element)));
                 }
@@ -707,16 +695,16 @@ fn named(
     };
     let found = match from {
         Names::All => literals(&arguments),
-        // The **first** argument specifically, and not the first literal among them: the second
-        // is the attribute this aliases, so `alias_attribute NAME, :title` reading past an
-        // unspellable first name would declare `title` as an alias of itself — three members
-        // the class already has, on a line that aliases nothing.
+        // The **first** argument specifically, not the first literal: the second is the aliased
+        // attribute, so reading past an unspellable first name in `alias_attribute NAME, :title`
+        // would declare `title` as an alias of itself, three members the class already has, on a
+        // line that aliases nothing.
         Names::Alias => arguments.first().and_then(one).into_iter().collect(),
         Names::First(default) => match arguments.first() {
             Some(first) => literals(std::slice::from_ref(first)),
             // Rails' own parameter default, and the only way a name is ever invented here: the
-            // macro really does install `regenerate_token` for a `has_secure_token` that named
-            // nothing, and the span is the macro's own word because no name was written.
+            // macro really installs `regenerate_token` for a `has_secure_token` that named nothing,
+            // and the span is the macro's own word because no name was written.
             None if !default.is_empty() => {
                 return Some((vec![Named::from((default.to_owned(), at))], true));
             }
@@ -746,9 +734,9 @@ fn class_named(source: &str, node: &CallNode<'_>, name: &str) -> Option<String> 
 
 /// What a `store_accessor`'s `prefix:` and `suffix:` put around every key.
 ///
-/// `None` declines the **whole call**, and that is the one place in this file where an option it
-/// cannot read costs every member rather than one: a prefix changes what each accessor is
-/// *called*, so reading the keys and ignoring it declares a set of names none of which exists.
+/// `None` declines the **whole call**: the one place in this file where an unreadable option costs
+/// every member, not one. A prefix changes what each accessor is *called*, so reading the keys and
+/// ignoring it would declare names none of which exist.
 fn affixes(source: &str, node: &CallNode<'_>) -> Option<(String, String)> {
     let store = node
         .arguments()
@@ -786,8 +774,8 @@ fn affixes(source: &str, node: &CallNode<'_>) -> Option<(String, String)> {
 /// Which `instance_*` keywords this call wrote as `false`.
 ///
 /// Written *and* written as the literal, which is the difference between reading an option and
-/// guessing at one: `instance_writer: options[:writer]` is Ruby that only runs, and a call that
-/// writes it keeps the member rather than losing it.
+/// guessing: `instance_writer: options[:writer]` is Ruby that only runs, and a call writing it
+/// keeps the member.
 fn turned_off(node: &CallNode<'_>, table: &Row) -> Vec<String> {
     let mut off = Vec::new();
     for shape in table.shapes {
@@ -803,30 +791,29 @@ fn turned_off(node: &CallNode<'_>, table: &Row) -> Vec<String> {
 }
 
 impl Tail {
-    /// Whether this call's type is a fact some other document states — the pass's second phase.
+    /// Whether this call's type is a fact another document states: the pass's second phase.
     ///
-    /// One family, and it is `alias_attribute`: `alias_attribute :sent_at, :created_at` needs
-    /// `created_at`'s type, which is a **column**, written into the schema's generated document
-    /// in this same pass with nothing resolved and nothing indexed. It is the question a
-    /// `delegate` asks twice, asked once, and the second consumer of [`Facts::returns`].
+    /// One family: `alias_attribute`. `alias_attribute :sent_at, :created_at` needs `created_at`'s
+    /// type, which is a **column**, written into the schema's generated document in this same pass,
+    /// before anything is resolved or indexed. It is the question a `delegate` asks twice, asked
+    /// once, and the second consumer of [`Facts::returns`].
     pub(super) fn derived(&self) -> bool {
         matches!(row(self.installs).typing, Typing::Aliased)
     }
 
     /// Every column this call re-types, so the schema can decline to declare it.
     ///
-    /// One family, and it is `serialize`. The column stays where it is and the *type* it answers
-    /// with is replaced, which is `attributes.rb`'s sentence for `attribute` and
-    /// `attribute_methods/serialization.rb`'s behaviour for this one — and, unlike either of
-    /// them, it is a re-type that is right even when the new type is `untyped`: a `text` column
-    /// carrying YAML answers a `Hash` or an `Array` in Ruby and never the `String` the schema
-    /// says. Withdrawing it removes an answer that is known to be wrong.
-    /// **`store` withdraws nothing, and that is measured rather than forgotten.** Rails
-    /// implements it by calling `serialize` on the store column, so in principle it re-types one
-    /// too — but both of the corpus' two `store` columns are `json`/`jsonb`, which is not one of
-    /// [`super::COLUMN_TYPES`]' ten and which the schema therefore already declares `untyped`.
-    /// Withdrawing there would remove a member and put nothing in its place, where withdrawing a
-    /// `text` column removes a `String` that is known to be wrong.
+    /// One family: `serialize`. The column stays; the *type* it answers is replaced, as
+    /// `attributes.rb` says of `attribute` and as `attribute_methods/serialization.rb` does for
+    /// this one. Unlike either, the re-type is right even when the new type is `untyped`: a `text`
+    /// column holding YAML answers a `Hash` or `Array` in Ruby, never the `String` the schema says.
+    /// Withdrawing removes an answer known to be wrong.
+    ///
+    /// **`store` withdraws nothing, deliberately.** Rails implements it by calling `serialize` on
+    /// the store column, so in principle it re-types one too, but store columns are typically
+    /// `json`/`jsonb`, which is not one of [`super::COLUMN_TYPES`]' ten, so the schema already
+    /// declares them `untyped`. Withdrawing would remove a member and replace it with nothing,
+    /// whereas withdrawing a `text` column removes a `String` known to be wrong.
     pub(super) fn retypes(&self) -> impl Iterator<Item = &str> {
         matches!(self.installs, Installs::Serialize)
             .then(|| self.names.iter().map(|named| named.member.as_str()))
@@ -834,14 +821,14 @@ impl Tail {
             .flatten()
     }
 
-    /// Say every member this call installs, or decline the ones it cannot type.
+    /// Say every member this call installs, or decline those it cannot type.
     ///
-    /// `known` is every class the application defines — [`Typing::OwnClass`]' gate, and
-    /// [`super::ASSOCIATIONS`]' — and `framework` is the subset of the classes a **gem**
-    /// declares that this workspace's bundle actually has. A `has_one_attached` in a project
-    /// with no Active Storage names `ActiveStorage::Attached::One`, which is a class no jump can
-    /// reach and no chain can continue through, so the call declares nothing at all rather than
-    /// a member typed as a name that is not in the graph.
+    /// `known` is every class the application defines ([`Typing::OwnClass`]'s gate, and
+    /// [`super::ASSOCIATIONS`]'), and `framework` is the subset of gem-declared classes this
+    /// workspace's bundle really has. A `has_one_attached` in a project without Active Storage
+    /// names `ActiveStorage::Attached::One`, a class no jump can reach and no chain can continue
+    /// through, so the call declares nothing instead of a member typed as a name missing from the
+    /// graph.
     pub(super) fn declare(
         &self,
         facts: &mut Facts,
@@ -859,9 +846,9 @@ impl Tail {
             (Some(name), Typing::Gem(_)) if framework.contains(name) => name.clone(),
             (Some(name), Typing::Written) => name.clone(),
             (_, Typing::Fixed) => String::new(),
-            // A class this workspace cannot name is the same answer a misspelled association
-            // gets, and it is the whole call rather than one member: the reader is the macro's
-            // reason to exist and a writer without it is a member nothing can be assigned to.
+            // A class this workspace cannot name gets the same answer as a misspelled association,
+            // and it costs the whole call, not one member: the reader is the macro's reason to
+            // exist, and a writer without it is a member nothing can be assigned to.
             _ => return,
         };
         self.emit(facts, file, host, &table, &named);
@@ -869,11 +856,11 @@ impl Tail {
 
     /// The second phase, for the one family that needs it.
     ///
-    /// `project` is the union of everything phase one said, and what it is asked is the aliased
-    /// attribute's own type on this same class. **What it answers is never a reason to decline**
-    /// — an `alias_attribute` derives no *name*, because `attribute_aliases` installs the
-    /// pattern set whatever the old name turns out to be, so an alias of something nothing typed
-    /// is `untyped` and still a member: the type declines, the name never does.
+    /// `project` is the union of everything phase one said, asked for the aliased attribute's own
+    /// type on this same class. **Its answer is never a reason to decline**: an `alias_attribute`
+    /// derives no *name* (`attribute_aliases` installs the pattern set whatever the old name turns
+    /// out to be), so an alias of something untyped is `untyped` and still a member. The type
+    /// declines; the name never does.
     pub(super) fn declare_derived(
         &self,
         facts: &mut Facts,
@@ -882,9 +869,9 @@ impl Tail {
         project: &Facts,
         defined: &BTreeSet<(bool, String)>,
     ) {
-        // The one guard, and it is the alias' target rather than the family: `read` records a
-        // target for exactly the family phase two owns, so a `class_attribute` in the same class
-        // body reaches here and leaves without a second test having to say so.
+        // The one guard, on the alias target, not the family: `read` records a target for exactly
+        // the family phase two owns, so a `class_attribute` in the same body reaches here and
+        // leaves without a second test.
         let Some(aliased) = self.aliased.as_deref() else {
             return;
         };
@@ -910,7 +897,7 @@ impl Tail {
         table: &Row,
         // `named` is the one class this call names, already through whichever gate `Typing` set.
         // Empty for a `Typing::Fixed` family, which is why no shape in one may carry a
-        // `Returns::Named` — `no_fixed_family_names_a_class` is that invariant.
+        // `Returns::Named`; `no_fixed_family_names_a_class` holds that.
         named: &str,
     ) {
         for Named { member, wrote, at } in &self.names {
@@ -924,13 +911,12 @@ impl Tail {
                 }
                 let spelled = match shape.name {
                     Affix::Around(before, after) => format!("{before}{member}{after}"),
-                    // Installed only for the macro's own default, which is the one thing the
-                    // call did not write down.
+                    // Installed only for the macro's own default, the one thing the call did not
+                    // write down.
                     Affix::Default(literal) if self.defaulted => literal.to_owned(),
                     Affix::Default(_) => continue,
                 };
-                // The body's own `def` wins, and `ModelClass::defined` says why this reader asks
-                // and no other one does.
+                // The body's own `def` wins; `ModelClass::defined` says why only this reader asks.
                 if host.defined.contains(&(shape.singleton, spelled.clone())) {
                     continue;
                 }
@@ -959,10 +945,10 @@ impl Tail {
     }
 }
 
-/// The class a family names that a gem declares, when it names one.
+/// The class a family names that a gem declares, if it names one.
 ///
-/// Read off the same table everything else is, so [`super::framework_classes`] cannot fall out
-/// of step with what [`row`] actually returns.
+/// Read off the same table as everything else, so [`super::framework_classes`] cannot drift from
+/// what [`row`] returns.
 pub(super) fn gem_class(installs: Installs) -> Option<&'static str> {
     match row(installs).typing {
         Typing::Gem(name) => Some(name),
@@ -985,7 +971,7 @@ mod tests {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
-    /// Everything one body declares, with `Money` a class the application defines and Active
+    /// Everything one body declares, with `Money` a class the application defines, and Active
     /// Storage and Action Text in the bundle.
     fn rbs(body: &str) -> String {
         read_model(&format!("class Story < ApplicationRecord\n{body}end\n"))
@@ -1001,8 +987,7 @@ mod tests {
             .rbs
     }
 
-    /// The RBS a concern's `mattr_accessor` declares, which is what [`Owner::ModuleSingleton`]
-    /// exists for.
+    /// The RBS a concern's `mattr_accessor` declares: what [`Owner::ModuleSingleton`] exists for.
     fn module_rbs(body: &str) -> String {
         read_model(&format!("module Storyish\n{body}end\n"))
             .signatures(
@@ -1018,10 +1003,9 @@ mod tests {
 
     /// What one call of every family declares, pinned as a document.
     ///
-    /// Seventeen families and seventeen expected blocks, asserted whole: what a macro installs
-    /// is a claim about Rails, and a `contains` would let one
-    /// of them grow a member nobody meant. Each was checked against the framework's own source
-    /// at `7ba5fa3` — `synthesized.md` names the file for each.
+    /// Seventeen families and seventeen expected blocks, asserted whole: what a macro installs is a
+    /// claim about Rails, and a `contains` would let one grow a member nobody meant. Each was
+    /// checked against the framework's own source.
     #[test]
     fn the_rbs_each_family_declares() {
         let expected: [(&str, &str); 17] = [
@@ -1124,9 +1108,9 @@ mod tests {
   def self.entryable_types: () -> Array[String]
 ",
             ),
-            // The sixteenth family is `alias_attribute` and it is phase two's; the seventeenth
-            // row is the four that read and decline, one of which stands for all of them here
-            // and all four of which `every_macro_the_table_names_is_read` asks about.
+            // The sixteenth family is `alias_attribute`, which belongs to phase two; the
+            // seventeenth row is the four that read and decline. One of them stands for all four
+            // here, and `every_macro_the_table_names_is_read` asks about each.
             ("  normalizes :email, with: ->(e) { e }\n", ""),
         ];
         for (call, declared) in expected {
@@ -1134,11 +1118,11 @@ mod tests {
         }
     }
 
-    /// The document with its provenance comments stripped, and the `class Story` around it.
+    /// The document with its provenance comments stripped, and the `class Story` around it removed.
     ///
-    /// The comment above every declaration is one sentence written by one `format!` and asserted
-    /// whole in [`the_provenance_quotes_the_call_that_was_written`]; repeating it above sixty
-    /// expected `def`s would pin the same string sixty times and hide what each family installs.
+    /// The comment above every declaration is one sentence from one `format!`, asserted whole in
+    /// [`the_provenance_quotes_the_call_that_was_written`]; repeating it above sixty expected
+    /// `def`s would pin one string sixty times and hide what each family installs.
     fn without_provenance(rendered: &str) -> String {
         rendered
             .lines()
@@ -1153,9 +1137,9 @@ mod tests {
 
     /// One sentence per member, quoting the call the user really wrote.
     ///
-    /// The `store` line is the reason this is its own test: the member is `settings_color` and
-    /// the call wrote `:color`, so a provenance line built from the member name would quote a
-    /// call that is not in the file.
+    /// The `store` line is why this is its own test: the member is `settings_color` and the call
+    /// wrote `:color`, so a provenance line built from the member name would quote a call that is
+    /// not in the file.
     #[test]
     fn the_provenance_quotes_the_call_that_was_written() {
         assert_eq!(
@@ -1174,13 +1158,13 @@ end
     }
 
     /// Every name in the table declares something, or is one of the four that deliberately does
-    /// not — and which of the two it is, is asserted here rather than left to the reader.
+    /// not, and which of the two is asserted here.
     #[test]
     fn every_macro_the_table_names_is_read() {
         for (called, installs) in LONG_TAIL {
-            // One call written so that every family finds what it needs in it: two positional
-            // names, an `accessors:` for `store`, a `types:` for `delegated_type` and a
-            // `class_name:` for `composed_of`.
+            // One call written so every family finds what it needs: two positional names, an
+            // `accessors:` for `store`, a `types:` for `delegated_type`, and a `class_name:` for
+            // `composed_of`.
             let call = format!(
                 "  {called} :thing, :other, accessors: [ :key ], types: [], \
                  class_name: \"Money\"\n"
@@ -1189,8 +1173,8 @@ end
             if installs.declines() {
                 assert_eq!(declared, "", "{called} declared something");
             } else if installs == Installs::AliasAttribute {
-                // Phase two's, and `an_alias_attribute_takes_its_type_from_the_attribute_it_aliases`
-                // is where it is read; phase one saying nothing about it is the assertion here.
+                // Phase two's; `an_alias_attribute_takes_its_type_from_the_attribute_it_aliases` is
+                // where it is read, and phase one saying nothing is the assertion here.
                 assert_eq!(declared, "", "{called} declared in phase one");
             } else {
                 assert!(!declared.is_empty(), "{called} declared nothing");
@@ -1201,9 +1185,9 @@ end
     /// The bare `authenticate` is installed only when the call took the macro's own default.
     ///
     /// `secure_password.rb` aliases it `if attribute == :password`, so this is the one
-    /// [`Affix::Default`] in the table and the one place a name is spelled without the call
-    /// having written it. `has_secure_password :recovery` is in
-    /// [`the_rbs_each_family_declares`] and has no `authenticate` in its expected block.
+    /// [`Affix::Default`] in the table and the one place a name is spelled without the call writing
+    /// it. `has_secure_password :recovery` is in [`the_rbs_each_family_declares`] with no
+    /// `authenticate` in its expected block.
     #[test]
     fn the_bare_authenticate_is_only_installed_for_the_default_attribute() {
         let declared = without_provenance(&rbs("  has_secure_password\n"));
@@ -1220,9 +1204,8 @@ end
     /// A family whose types are all written in the table may not carry a [`Returns::Named`].
     ///
     /// [`Tail::emit`] resolves that variant to the one class the call names, which a
-    /// [`Typing::Fixed`] row never has — so a shape added to the wrong list would declare a
-    /// member returning the empty string, which is RBS nothing can parse and which would cost
-    /// the whole generated document.
+    /// [`Typing::Fixed`] row never has, so a shape added to the wrong list would declare a member
+    /// returning the empty string: RBS nothing can parse, costing the whole generated document.
     #[test]
     fn no_fixed_family_names_a_class() {
         for (called, installs) in LONG_TAIL {
@@ -1242,13 +1225,12 @@ end
     /// A `def` in the same body wins, and the macro's member is not declared beside it.
     ///
     /// Solidus writes `mattr_accessor :user_class` in `module Spree` and a `def self.user_class`
-    /// two lines under it. Rails' macro really does define `def self.user_class`, and the `def`
-    /// then replaces it — so declaring both puts a line of Rails' beside the one that answers,
-    /// and `Spree.user_class` is called 167 times in that repository. Ten members across five
-    /// applications are shadowed this way and this is the largest of them.
+    /// two lines below. Rails' macro really defines `def self.user_class`, and the `def` then
+    /// replaces it, so declaring both would put a Rails line beside the one that really answers,
+    /// for a heavily used method.
     #[test]
     fn a_def_in_the_same_body_shadows_the_member_a_macro_would_install() {
-        // Both sides, and each only on its own: `def self.pam` leaves the instance reader alone.
+        // Both sides, each only its own: `def self.pam` leaves the instance reader alone.
         let declared = without_provenance(&rbs(
             "  mattr_accessor :pam\n  def self.pam\n  end\n\n  def other=(value)\n  end\n\n  \
              mattr_accessor :other\n",
@@ -1263,8 +1245,8 @@ end
   def self.other=: (untyped) -> untyped
 "
         );
-        // Phase two asks the same question, which it has to: an `alias_attribute` and a `def` of
-        // the aliased name is the same collision one document later.
+        // Phase two must ask the same question: an `alias_attribute` plus a `def` of the aliased
+        // name is the same collision, one document later.
         let model = read_model(
             "class Story\n  alias_attribute :sent_at, :created_at\n  def sent_at?\n  end\nend\n",
         );
@@ -1288,8 +1270,8 @@ end
             "  class_attribute(*names)\n",
             "  class_attribute NAME\n",
             "  accepts_nested_attributes_for \"#{prefix}_author\"\n",
-            // `Names::Keys` — the first argument is the column, so a call with only one gives
-            // no keys at all.
+            // `Names::Keys`: the first argument is the column, so a call with only one gives no
+            // keys.
             "  store_accessor :settings\n",
             "  store :settings, coder: JSON\n",
             "  composed_of\n",
@@ -1309,7 +1291,7 @@ end
         assert!(
             !declared("  class_attribute :a, instance_accessor: false\n").contains("\n  def a:")
         );
-        // The predicate keyword removes *both* sides, which is `attribute.rb`'s own
+        // The predicate keyword removes *both* sides, per `attribute.rb`'s own
         // `if instance_predicate` around the class-side branch as well as the instance one.
         let no_predicate = declared("  class_attribute :a, instance_predicate: false\n");
         assert!(!no_predicate.contains("def a?"), "{no_predicate}");
@@ -1320,11 +1302,11 @@ end
         );
     }
 
-    /// A `prefix:` this cannot read costs the whole call, and it is the only option that does.
+    /// An unreadable `prefix:` costs the whole call, and it is the only option that does.
     ///
-    /// Every other keyword in this file removes one member or changes one type. A prefix changes
-    /// what each accessor is *called*, so reading the keys and ignoring it declares a set of
-    /// names none of which exists.
+    /// Every other keyword here removes one member or changes one type. A prefix changes what each
+    /// accessor is *called*, so reading the keys and ignoring it would declare names none of which
+    /// exist.
     #[test]
     fn a_store_prefix_this_cannot_read_declines_every_key() {
         assert_eq!(
@@ -1350,11 +1332,11 @@ end
         );
     }
 
-    /// A gem that is not in the bundle declares nothing at all.
+    /// A gem not in the bundle declares nothing at all.
     ///
-    /// Not a member typed `untyped` and not a member typed as a name nothing defines — the whole
-    /// call, because the reader *is* the macro's reason to exist and a writer with no reader is
-    /// a member nothing can be assigned to.
+    /// Not a member typed `untyped`, nor one typed as a name nothing defines: the whole call,
+    /// because the reader *is* the macro's reason to exist, and a writer without a reader is a
+    /// member nothing can be assigned to.
     #[test]
     fn an_attachment_declines_when_the_gem_is_not_in_the_bundle() {
         for call in [
@@ -1376,9 +1358,9 @@ end
         }
     }
 
-    /// A `composed_of` naming a class the application does not define declares nothing, which is
-    /// [`ASSOCIATIONS`](super::super::ASSOCIATIONS)' rule reached by the same road — and the
-    /// camelized name is the same fallback a `belongs_to` has.
+    /// A `composed_of` naming a class the application does not define declares nothing:
+    /// [`ASSOCIATIONS`](super::super::ASSOCIATIONS)' rule, reached the same way, with the same
+    /// camelized fallback a `belongs_to` has.
     #[test]
     fn a_composed_of_is_gated_on_the_class_it_names() {
         assert_eq!(rbs("  composed_of :balance\n"), "");
@@ -1388,12 +1370,12 @@ end
         assert_eq!(rbs("  composed_of :balance, class_name: \"Nothing\"\n"), "");
     }
 
-    /// A `mattr_accessor` in a concern hangs on the module — **both halves, in one body**.
+    /// A `mattr_accessor` in a concern hangs on the module: **both halves, in one body**.
     ///
-    /// The whole of what [`Owner::ModuleSingleton`](crate::generated::Owner) exists for: the
-    /// render key is `(is_module, name)`, so a plain `Owner::Singleton` here would open
-    /// `class Storyish` beside the `module Storyish` the instance half opened, and RBS holds one
-    /// declaration of a constant or the other.
+    /// This is all [`Owner::ModuleSingleton`](crate::generated::Owner) exists for: the render key
+    /// is `(is_module, name)`, so a plain `Owner::Singleton` would open `class Storyish` beside the
+    /// `module Storyish` the instance half opened, and RBS keeps only one declaration of a
+    /// constant.
     #[test]
     fn a_concerns_module_attribute_declares_both_sides_in_the_module_body() {
         assert_eq!(
@@ -1413,15 +1395,15 @@ end
         );
     }
 
-    /// `alias_attribute` is phase two's, and what it derives is a **type** and never a name.
+    /// `alias_attribute` belongs to phase two, and it derives a **type**, never a name.
     ///
-    /// The type declines and the name never does: `attribute_aliases` installs the pattern
-    /// set whatever the old name turns out to be, so an alias of something nothing typed is
-    /// `untyped` and still three members.
+    /// The type declines; the name never does: `attribute_aliases` installs the pattern set
+    /// whatever the old name turns out to be, so an alias of something untyped is `untyped` and
+    /// still three members.
     #[test]
     fn an_alias_attribute_takes_its_type_from_the_attribute_it_aliases() {
-        // A second macro in the same body, so that phase two is asked about one it does not own
-        // and leaves it alone — which is the guard `declare_derived` opens with.
+        // A second macro in the same body, so phase two is asked about one it does not own and
+        // leaves it alone: the guard `declare_derived` opens with.
         let model = read_model(
             "class Story\n  class_attribute :setting\n  alias_attribute :sent_at, :created_at\nend\n",
         );
@@ -1464,9 +1446,9 @@ end
   def sent_at?: () -> bool
 "
         );
-        // A first argument this cannot spell declares nothing — and it is the *first* argument
-        // rather than the first literal among them, because reading past it would take `:title`
-        // as the name and declare three members aliasing the attribute they already are.
+        // An unspellable first argument declares nothing, and it is the *first* argument, not the
+        // first literal, because reading past it would take `:title` as the name and declare three
+        // members aliasing the attribute they already are.
         assert_eq!(
             read_model("class Story\n  alias_attribute NAME, :title\nend\n")
                 .derived("app/models/story.rb", &project)
@@ -1489,8 +1471,8 @@ end
         );
     }
 
-    /// Only a `serialize` tells the schema to withdraw a column, and a `class_attribute` of the
-    /// same name does not.
+    /// Only a `serialize` tells the schema to withdraw a column; a `class_attribute` of the same
+    /// name does not.
     #[test]
     fn only_a_serialize_re_types_a_column() {
         let model = read_model(
@@ -1514,12 +1496,10 @@ end
 
     /// The long tail end to end: two families, and the two shapes the whole table has.
     ///
-    /// A `store_accessor` key is `untyped` and is therefore a **name** and no more — the half of
-    /// the long tail that is navigational, exactly as a `delegate` is — and a
-    /// `class_attribute` is six
-    /// members across both sides of the class, of which the predicate is the one thing a macro
-    /// that says nothing about its type still types: `!!self.setting` is a `bool` whatever
-    /// `setting` turns out to hold.
+    /// A `store_accessor` key is `untyped`, so it is a **name** and no more (the navigational half
+    /// of the long tail, like a `delegate`). A `class_attribute` is six members across both sides
+    /// of the class, and its predicate is the one thing a type-less macro still types:
+    /// `!!self.setting` is a `bool` whatever `setting` holds.
     #[test]
     fn a_long_tail_macro_is_a_member_on_both_sides_and_its_predicate_is_a_bool() {
         let source = "Story.new.setting?\n";
@@ -1532,17 +1512,17 @@ end
         harness.watch(&[&story]);
         harness.settle();
 
-        // The type is pinned as text in `tail.rs`; a card does not print a return type, which
-        // true of every card. What this asks is the other half: the member
-        // reaches the editor and says which line of the user's own file declared it.
+        // The type is pinned as text in `tail.rs`, and a card does not print a return type (true of
+        // every card). What this checks is the other half: the member reaches the editor and says
+        // which line of the user's own file declared it.
         let predicate = card(&mut harness, &uri, source, "setting?");
         assert_eq!(
             predicate,
             "```ruby\nStory#setting?\n```\n\n*From `app/models/story.rb`, \
              `class_attribute :setting`.*"
         );
-        // Asked after the hover, because a completion fixture replaces the document's text and
-        // the positions the hover was asked at are the old text's.
+        // Asked after the hover, because a completion fixture replaces the document's text, and the
+        // hover's positions refer to the old text.
         let offered = harness.declarations_at(&uri, "Story.~\n");
         assert!(
             ["setting", "setting=", "setting?"]
@@ -1568,11 +1548,11 @@ end
 
     /// A `serialize` re-types its column, and the class it names may be a **generic** one.
     ///
-    /// The reason this is an end-to-end test and not a rendering one: `Array` and `Hash` are the
-    /// two classes the corpus writes as a `type:` and both take type arguments in RBS. If
-    /// rubydex's parser refused a bare one, `Synthesized::record`'s gate would throw away the
-    /// *whole* generated document — every other member in the file with it — and every unit test
-    /// in `tail.rs` would still pass, because none of them parses what it renders.
+    /// Why this is end to end and not a rendering test: `Array` and `Hash` are the usual `type:`
+    /// classes, and both take type arguments in RBS. If rubydex's parser refused a bare one,
+    /// `Synthesized::record`'s gate would throw away the *whole* generated document (every other
+    /// member in the file with it), and every unit test in `tail.rs` would still pass, because none
+    /// parses what it renders.
     #[test]
     fn a_serialize_re_types_its_column_with_a_class_that_takes_type_arguments() {
         let source = "Story.new.description.first\n";
@@ -1603,11 +1583,10 @@ end
 
     /// The attachment macros type a receiver only when the class they name is in the graph.
     ///
-    /// `ActiveStorage::Attached::One` is nobody's application class and it is not under an
-    /// engine's `app/` either — it is in activestorage's `lib/`, one directory from `Blob` and on
-    /// the far side of the engine gate — so `Context::classes` can never hold it and the
-    /// gate is a lookup rather than a projection. What this pins is that the lookup is what
-    /// decides, and `tail.rs` pins the decline on its own.
+    /// `ActiveStorage::Attached::One` is nobody's application class and not under an engine's
+    /// `app/` either: it lives in activestorage's `lib/`, one directory from `Blob`, on the far
+    /// side of the engine gate. So `Context::classes` can never hold it, and the gate is a lookup,
+    /// not a projection. This pins that the lookup decides; `tail.rs` pins the decline on its own.
     #[test]
     fn an_attachment_declares_only_when_the_class_it_names_is_in_the_graph() {
         let source = "Story.new.avatar.attach\n";

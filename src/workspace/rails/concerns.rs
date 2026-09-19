@@ -1,7 +1,6 @@
 //! `class_methods do`: the `def`s in it, and the module `ActiveSupport::Concern` builds for them.
 //!
-//! `ActiveSupport::Concern#class_methods` is four lines of Ruby and every one of them matters
-//! here:
+//! `ActiveSupport::Concern#class_methods` is four lines of Ruby, and every one matters here:
 //!
 //! ```ruby
 //! def class_methods(&class_methods_module_definition)
@@ -11,77 +10,81 @@
 //! end
 //! ```
 //!
-//! It builds — or reopens — a nested `ClassMethods` module and evaluates the block on it, and
-//! `append_features` then ends with `base.extend const_get(:ClassMethods)`. So a `def` written in
-//! that block is a **class method of every class that includes the concern**, by exactly the same
-//! edge a hand-written `module ClassMethods` reaches — and by the same edge an `included do` holding
-//! a bare `extend M` reaches, with no such module written anywhere.
+//! It builds (or reopens) a nested `ClassMethods` module and evaluates the block on it, and
+//! `append_features` ends with `base.extend const_get(:ClassMethods)`. So a `def` in that block is
+//! a **class method of every class that includes the concern**. Three spellings reach that same
+//! edge:
+//! - `class_methods do … end`;
+//! - a hand-written `module ClassMethods`;
+//! - an `included do` holding a bare `extend M`, with no such module written anywhere.
 //!
-//! **Three spellings, one destination, and no file writes the line that gets them there.** rubydex
-//! is right to find nothing: `base.extend` runs at load time, and there is no `extend` in anybody's
-//! source to record. What this file does is spend that edge — writing each `def` onto the singleton
-//! of every class that includes the concern, so an ordinary ancestor walk finds it and nothing
-//! outside this directory knows the convention.
+//! **No file writes the line that gets them there.** rubydex is right to find nothing:
+//! `base.extend` runs at load time, and no source has an `extend` to record. This file spends
+//! that edge: it writes each `def` onto the singleton of every class that includes the concern,
+//! so an ordinary ancestor walk finds it and nothing outside this directory knows the convention.
 //!
 //! # Why the block is still not a macro host
 //!
-//! [`super::models::HOSTS`] declines `class_methods do` and stays right: the block is evaluated on
-//! a plain `Module`, which has no `has_many`, so a macro written there is broken Ruby rather than a
-//! declaration this directory was missing. The `def`s in it were never the question that test
-//! asked. Over six corpora the block holds **no macro at all** and **270 `def`s**.
+//! `models::HOSTS` declines `class_methods do`, correctly: the block is evaluated on a plain
+//! `Module`, which has no `has_many`, so a macro there is broken Ruby, not a missed declaration.
+//! The `def`s in it were never that test's question, and in practice the block holds `def`s and
+//! no macros.
 //!
 //! # The spelling, and why it is a fan-out
 //!
-//! One `def self.` per including class, which is the shape a class-side [`scope`](super::relations)
-//! already has. The obvious alternative — one `module <concern>::ClassMethods`, `extend`ed onto the
-//! includers by a line this generator writes — is not available, and the reason is measured rather
-//! than stylistic: **a mixin that arrives in a document indexed after its class was resolved is
-//! never linearized onto that class**, and a generated document is always that shape. The
-//! instance-side `include` the route helpers use is the one exception; every singleton-side
-//! spelling fails, in RBS and in Ruby alike — `extend M`, `class << self; include M; end` and
-//! `singleton_class.include M` all leave the member unreachable, and re-indexing the class's own
-//! file afterwards does not repair it. What does reach a class object is a member written straight
-//! onto it, so that is what is written.
+//! One `def self.` per including class: the shape a class-side [`scope`](super::relations)
+//! already has.
 //!
-//! The cost of the fan-out is the includers this pass cannot enumerate — but it can enumerate
-//! them: [`Context::includers`](crate::analysis::synthesize) resolves the `include` edges of the
-//! whole project after the walk, transitively through concerns that include concerns, and hands
-//! the classes at the end of those chains to every reader in this directory.
+//! The obvious alternative is one `module <concern>::ClassMethods`, `extend`ed onto the includers
+//! by a line this generator writes. It does not work: **a mixin that arrives in a document indexed
+//! after its class was resolved is never linearized onto that class**, and a generated document
+//! is always that shape.
+//! - The instance-side `include` the route helpers use is the one exception.
+//! - Every singleton-side spelling fails, in RBS and Ruby alike: `extend M`,
+//!   `class << self; include M; end` and `singleton_class.include M` all leave the member
+//!   unreachable, and re-indexing the class's own file afterwards does not repair it.
+//!
+//! What does reach a class object is a member written straight onto it, so that is what is
+//! written.
+//!
+//! The fan-out needs the includers, and they can be enumerated: `Context::includers` in
+//! `analysis::synthesize` resolves the `include` edges of the whole project after the walk,
+//! transitively through concerns that include concerns, and hands the classes at the ends of
+//! those chains to every reader in this directory.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use ruby_prism::{CallNode, StatementsNode};
 
-use super::syntax::{constant_spelling, def_header, parameters_of, spellable, symbol_or_string};
+use super::syntax::{constant_spelling, def_span, parameters_of, spellable, symbol_or_string};
 use crate::generated::{At, Declared, Facts, Namespaces, Owner, Source};
 
 /// One `def` written as a statement of a `class_methods do` block.
 #[derive(Debug)]
 pub struct ClassMethod {
     name: String,
-    /// Which of the two spellings wrote it, for the provenance sentence alone: a reader sent to
-    /// the `def` should be told whether the file says `class_methods do` or `module ClassMethods`,
-    /// because those are the two lines they will be looking at.
+    /// Which of the two spellings wrote it, for the provenance sentence: a reader sent to the `def`
+    /// should be told whether the file says `class_methods do` or `module ClassMethods`, the two
+    /// lines they will be looking at.
     spelled: &'static str,
     /// The RBS parameter list the `def`'s own parameters imply, every type `untyped`.
     parameters: String,
-    /// The `def` keyword through the end of the parameter list, and the name inside it — so the
-    /// declaration this renders is mapped back to the line a user actually wrote.
+    /// The `def` keyword through the end of the parameter list, and the name inside it, so the
+    /// rendered declaration maps back to the line a user wrote.
     at: (u32, u32),
     name_at: (u32, u32),
 }
 
 /// The block's statements, when this call is the one that opens one.
 ///
-/// A `class_methods` written **in a class** is declined and is not an oversight: `class_methods`
-/// is defined on `ActiveSupport::Concern`, which is extended onto modules, so the call raises
-/// `NoMethodError` in a class body. Six corpora write it in a class **zero** times.
+/// A `class_methods` written **in a class** is declined on purpose: `class_methods` is defined on
+/// `ActiveSupport::Concern`, which is extended onto modules, so the call raises `NoMethodError` in
+/// a class body.
 ///
-/// Whether the call has a **receiver** is not asked here, and deliberately: `models::bare` has
-/// already asked it of every call it hands over, and it is the one that knows the answer — a
-/// receiver naming the `with_options` merger the enclosing block was handed is still a call the
-/// body itself is making, and this function cannot see that block. Asking twice would put an arm
-/// here that the caller makes unreachable.
+/// Whether the call has a **receiver** is deliberately not asked here. `models::bare` already asked
+/// it of every call it hands over, and only it knows the answer: a receiver naming the
+/// `with_options` merger the enclosing block was handed is still the body's own call, and this
+/// function cannot see that block. Asking twice would add an arm the caller makes unreachable.
 pub(super) fn body<'pr>(
     node: &CallNode<'pr>,
     called: &str,
@@ -93,24 +96,22 @@ pub(super) fn body<'pr>(
     node.block()?.as_block_node()?.body()?.as_statements_node()
 }
 
-/// The `def`s of a `module ClassMethods` written out by hand, as statements of a module body.
+/// The `def`s of a hand-written `module ClassMethods`, as statements of a module body.
 ///
-/// The minority spelling and the one the crate read first: six corpora hold **17** files with a
-/// hand-written `module ClassMethods` against **120** `class_methods do` calls. Both build the
-/// same module — `ActiveSupport::Concern#class_methods` calls `const_get(:ClassMethods)` when one
-/// already exists — so both feed one list and a concern that writes both gets one set of members.
+/// The rarer spelling. Both build the same module (`ActiveSupport::Concern#class_methods` calls
+/// `const_get(:ClassMethods)` when one already exists), so both feed one list, and a concern that
+/// writes both gets one set of members.
 ///
-/// **It is read from the source rather than taken off the graph**, although the graph really does
-/// hold this module: a reader of the source declares the fact whether or not the edge was
-/// recorded, and the two spellings then arrive by one road. The nested module is a real
-/// declaration either way; what neither spelling gives anybody is the `extend` onto the includer,
-/// which is what [`declare`] writes.
+/// **Read from the source, not taken off the graph**, although the graph does hold this module. A
+/// source reader declares the fact whether or not the edge was recorded, and both spellings then
+/// arrive by one road. The nested module is a real declaration either way; what neither spelling
+/// gives anybody is the `extend` onto the includer, which [`declare`] writes.
 ///
-/// A **class** is declined, as [`body`] declines one and for the same sentence: a class cannot be
-/// `include`d, so a `ClassMethods` nested in one reaches no singleton at all.
+/// A **class** is declined, for [`body`]'s reason: a class cannot be `include`d, so a
+/// `ClassMethods` nested in one reaches no singleton.
 ///
-/// Only statements of the body, which is this directory's rule everywhere: a `module ClassMethods`
-/// inside an `if` is Ruby that only runs.
+/// Only statements of the body, this directory's rule everywhere: a `module ClassMethods` inside an
+/// `if` is Ruby that only runs.
 pub(super) fn nested(
     source: &str,
     statements: &StatementsNode<'_>,
@@ -124,8 +125,8 @@ pub(super) fn nested(
         let Some(nested) = statement.as_module_node() else {
             continue;
         };
-        // The name exactly, and not its last segment: `module Foo::ClassMethods` written inside
-        // another module is a module of `Foo`'s, which this concern does not extend onto anybody.
+        // The name exactly, not its last segment: `module Foo::ClassMethods` inside another module
+        // belongs to `Foo`, which this concern does not extend onto anybody.
         if constant_spelling(source, &nested.constant_path()) != CLASS_METHODS {
             continue;
         }
@@ -142,30 +143,29 @@ pub(super) fn nested(
 pub(super) struct Extended {
     /// The constant as the file spells it, resolved against the project by the caller.
     pub name: String,
-    /// The `extend Foo` statement and the constant inside it, so a reader can be sent to the
-    /// line that installed the member when nothing better is available.
+    /// The `extend Foo` statement and the constant inside it, so a reader can be sent to the line
+    /// that installed the member when nothing better is available.
     pub at: At,
 }
 
 /// The modules an `included do` block `extend`s, which land on every including class.
 ///
-/// `ActiveSupport::Concern` `class_eval`s the block on each includer, so a bare `extend M` in one
-/// puts `M`'s **instance** methods on that class's singleton — the same destination
-/// `class_methods do` reaches, by a spelling with no `ClassMethods` module in it at all.
-/// `activemodel/lib/active_model/api.rb` is two such lines, `extend ActiveModel::Naming` and
-/// `extend ActiveModel::Translation`, reached by every model in an application through
-/// `ActiveRecord::Base`'s `include ActiveModel::API` — and they are what installs `model_name`
-/// and `human_attribute_name`.
+/// `ActiveSupport::Concern` `class_eval`s the block on each includer, so a bare `extend M` in it
+/// puts `M`'s **instance** methods on that class's singleton: the destination `class_methods do`
+/// reaches, with no `ClassMethods` module at all.
 ///
-/// **What this returns is a name and never a member**, which is the difference between this half
-/// and the two above and the reason it is finished elsewhere: the `def`s are in `M`'s own file,
-/// which is not this one and which no list of this directory's would put in front of a reader.
-/// `analysis::synthesize` asks the graph for them.
+/// Real example: `activemodel/lib/active_model/api.rb` holds `extend ActiveModel::Naming` and
+/// `extend ActiveModel::Translation`. Every model reaches them through `ActiveRecord::Base`'s
+/// `include ActiveModel::API`, and they install `model_name` and `human_attribute_name`.
 ///
-/// A **class** is declined for [`body`]'s reason: `included` is `ActiveSupport::Concern`'s and a
-/// class is not something an `include` can name.
+/// **This returns a name, never a member.** That is how it differs from the two above, and why it
+/// is finished elsewhere: the `def`s are in `M`'s own file, which no list in this directory would
+/// hand a reader. `analysis::synthesize` asks the graph for them.
 ///
-/// Only statements of the block, and only a bare `extend` — `Foo.extend M` is somebody else's
+/// A **class** is declined for [`body`]'s reason: `included` is `ActiveSupport::Concern`'s, and an
+/// `include` cannot name a class.
+///
+/// Only statements of the block, and only a bare `extend`: `Foo.extend M` is somebody else's
 /// method, and an `extend` inside an `if` is Ruby that only runs.
 pub(super) fn extended(
     source: &str,
@@ -203,7 +203,7 @@ pub(super) fn extended(
                 continue;
             };
             // A constant and nothing else: `extend Module.new { … }` names no module this can
-            // follow, and naming none is the answer.
+            // follow, so it names none.
             if argument.as_constant_read_node().is_none()
                 && argument.as_constant_path_node().is_none()
             {
@@ -226,20 +226,20 @@ pub(super) fn extended(
 /// The `def`s one module declares in its own body, read out of that module's own file.
 ///
 /// The far end of [`extended`]. `extend ActiveModel::Naming` inside an `included do` says which
-/// module; this says what a class gains by it, and the two are in different files — which is why
-/// this takes a name as well as a source, and why `analysis::synthesize` asks the graph which file
-/// to hand over.
+/// module; this says what a class gains by it. The two are in different files, which is why this
+/// takes a name as well as a source, and why `analysis::synthesize` asks the graph which file to
+/// hand over.
 ///
-/// **The module's own body and never its ancestors.** `extend M` really does install the instance
-/// methods of `M`'s ancestors, and following them is the right reading of Ruby and the wrong
-/// reading of a project: Rails writes `include` statements inside a `def` in these modules, and a
-/// walk over them made `Category.valid?` — which raises in Ruby — answer
-/// `ActiveModel::Validations#valid?` and put six instance methods into a class object's
-/// completion list. So this reads the statements of one body, as every reader here does.
+/// **The module's own body, never its ancestors.** `extend M` really does install the instance
+/// methods of `M`'s ancestors, and following them is right for Ruby and wrong for a project: Rails
+/// writes `include` statements inside a `def` in these modules. Walking them made `Category.valid?`
+/// (which raises in Ruby) answer `ActiveModel::Validations#valid?`, and put instance methods into a
+/// class object's completion list. So this reads the statements of one body, as every reader here
+/// does.
 ///
-/// Visibility, a `def self.` and an unspellable name are all [`read`]'s rules, unchanged: a
-/// `private` `def` is not extended onto anybody and a singleton method of the module is not
-/// installed by an `extend` at all.
+/// Visibility, `def self.` and unspellable names follow [`read`]'s rules unchanged: a `private`
+/// `def` is extended onto nobody, and a singleton method of the module is not installed by an
+/// `extend` at all.
 #[must_use]
 pub fn installed(source: &str, module_name: &str) -> Vec<ClassMethod> {
     let parsed = ruby_prism::parse(source.as_bytes());
@@ -260,8 +260,8 @@ pub fn installed(source: &str, module_name: &str) -> Vec<ClassMethod> {
 
 /// One body, then the class and module bodies written as statements of it.
 ///
-/// [`super::models::Models::walk`]'s shape and for its reason: a generic visitor descends into
-/// every method body in the file, which on a large one is thousands of frames on a 2 MiB stack.
+/// The shape of `models::Models::walk`, for its reason: a generic visitor descends into every
+/// method body in the file, which on a large one is thousands of frames on a 2 MiB stack.
 fn walk_bodies(
     source: &str,
     statements: Option<StatementsNode<'_>>,
@@ -278,10 +278,9 @@ fn walk_bodies(
     }
 
     for statement in statements.body().iter() {
-        // A `class` body is descended into as well as a `module`'s, because the module being
-        // looked for may be nested in one — `Random::Formatter` is the shape, and a walk that
-        // only followed `module` would never reach it. What is *matched* is still a module: an
-        // `extend` names one, and the name is the whole path rather than its last segment.
+        // A `class` body is descended into as well as a `module`'s, because the wanted module may
+        // be nested in one (`Random::Formatter`). What is *matched* is still a module: an `extend`
+        // names one, and the name is the whole path, not its last segment.
         let (path, body) = if let Some(module) = statement.as_module_node() {
             (module.constant_path(), module.body())
         } else if let Some(class) = statement.as_class_node() {
@@ -301,14 +300,13 @@ fn walk_bodies(
     }
 }
 
-/// The nested module Rails builds, spelled the way Ruby spells it.
+/// The nested module Rails builds, spelled as Ruby spells it.
 ///
-/// Public because [`Analysis::contribution`](crate::analysis) filters documents on it — a file
-/// whose whole content is a hand-written `module ClassMethods` calls nothing and references
-/// nothing, so the only thing that can put it in front of a reader is the name of the module
-/// itself. It is exported for [`MODEL_CALLS`](super::MODEL_CALLS)' reason: the table that decides
-/// which documents a generator sees lives outside this directory, so the words in it have to come
-/// from inside it.
+/// Public because [`Analysis::contribution`](crate::analysis) filters documents on it. A file that
+/// is only a hand-written `module ClassMethods` calls nothing and references nothing, so only the
+/// module's name can put it in front of a reader. Exported for [`MODEL_CALLS`](super::MODEL_CALLS)'
+/// reason: the table that decides which documents a generator sees lives outside this directory, so
+/// its words must come from inside it.
 pub const CLASS_METHODS: &str = "ClassMethods";
 
 /// The two spellings, as a provenance sentence names them.
@@ -319,20 +317,18 @@ const EXTENDED: &str = "included do … extend";
 /// Every `def` this block installs on the includer's singleton, in source order.
 ///
 /// Visibility is the file's own, read exactly as [`super::entrypoints`] reads a mailer's: a bare
-/// `private` or `protected` closes the public section and `private :name` names one already
-/// written. The corpora write **19** bare ones inside these blocks, so it is the common case
-/// rather than a guard against a hypothetical.
+/// `private` or `protected` closes the public section, and `private :name` names one already
+/// written. Bare `private` inside these blocks is common, not hypothetical.
 ///
-/// Only statements of the block, which is the rule every reader in this directory keeps: a `def`
-/// inside an `if` inside the block is Ruby that only runs.
+/// Only statements of the block, the rule every reader in this directory keeps: a `def` inside an
+/// `if` inside the block is Ruby that only runs.
 ///
 /// A `def self.` is declined. It is a singleton method of the `ClassMethods` module itself, which
-/// `extend` does not install on anything — the module is the thing being extended, not a thing
-/// extending. Six corpora write **zero** of them.
+/// `extend` installs on nothing: the module is what is extended, not what extends.
 ///
-/// `private` **is** asked for a receiver, where [`body`] is not, and for the opposite reason:
-/// this walk is its own and nothing upstream has narrowed these statements. `something.private`
-/// is a call to somebody else's method and closes nothing.
+/// `private` **is** asked for a receiver, unlike in [`body`], for the opposite reason: this walk is
+/// its own, and nothing upstream has narrowed these statements. `something.private` calls somebody
+/// else's method and closes nothing.
 pub(super) fn read(
     source: &str,
     block: &StatementsNode<'_>,
@@ -370,7 +366,7 @@ pub(super) fn read(
                 parameters: parameters_of(source, written.parameters().as_ref()),
                 name,
                 spelled,
-                at: def_header(&written),
+                at: def_span(&written),
                 name_at: (at.start_offset() as u32, at.end_offset() as u32),
             });
         }
@@ -381,38 +377,38 @@ pub(super) fn read(
 
 /// Where a set of class methods came from, for the sentence above each declaration.
 ///
-/// Three spellings reach one `declare`, and a reader sent to the `def` should be told which line
-/// of which file installed it on the class they asked about.
+/// Three spellings reach one `declare`, and a reader sent to the `def` should be told which line of
+/// which file installed it on the class they asked about.
 pub struct From<'a> {
     /// The file the `def`s were read out of.
     pub file: &'a str,
-    /// The module a class writes `include` for, which is what makes it an includer.
+    /// The module a class `include`s, which is what makes it an includer.
     pub concern: &'a str,
-    /// The module an `included do … extend` names, where that is the shape. `None` for the two
-    /// spellings whose `def`s are in the concern's own body.
+    /// The module an `included do … extend` names, for that shape. `None` for the two spellings
+    /// whose `def`s are in the concern's own body.
     pub via: Option<&'a str>,
 }
 
 /// Declare each of them on the singleton of every class that includes the concern.
 ///
 /// **The name Ruby gives the module is not the name this writes.**
-/// `ActiveSupport::Concern#class_methods` builds `<concern>::ClassMethods` and `append_features`
+/// `ActiveSupport::Concern#class_methods` builds `<concern>::ClassMethods`, and `append_features`
 /// ends with `base.extend const_get(:ClassMethods)`, so the *fact* is one module and one `extend`.
-/// Writing that fact down does not state it: the `extend` would arrive in a generated document,
-/// which is always indexed after the includer was resolved, and such a mixin is never linearized —
-/// the module's doc has the whole measurement. So the edge is spent here instead, once per
-/// includer, and what the includer holds afterwards is what Ruby would have put in front of it.
+/// Writing that down does not make it true for the graph: the `extend` would arrive in a generated
+/// document, always indexed after the includer was resolved, and such a mixin is never linearized
+/// (see the module docs). So the edge is spent here, once per includer, and the includer ends up
+/// holding what Ruby would put in front of it.
 ///
-/// **The span is still the `def` a person typed**, however many classes this writes it onto, which
-/// is the class-side `scope`'s rule and for its reason: one `def` several declarations name is
-/// still one place.
+/// **The span is still the `def` a person typed**, however many classes it is written onto: the
+/// class-side `scope`'s rule, for its reason. One `def` named by several declarations is still one
+/// place.
 ///
-/// `Source::Convention` for the reason a mailer's action is: the `def` is really in the file and
-/// the class method is really installed, but the *type* is this table's and not the file's.
+/// `Source::Convention`, as for a mailer's action: the `def` is really in the file and the class
+/// method is really installed, but the *type* is this table's, not the file's.
 ///
-/// A concern **nothing includes** declares nothing, which is Ruby rather than caution: the module
-/// itself never answers these names — `Tallyable.tally_by` raises — and where no class includes it
-/// there is no class object that could.
+/// A concern **nothing includes** declares nothing. That is Ruby, not caution: the module itself
+/// never answers these names (`Tallyable.tally_by` raises), and with no includer there is no class
+/// object that could.
 pub fn declare(
     facts: &mut Facts,
     from: &From<'_>,
@@ -425,11 +421,11 @@ pub fn declare(
     }
     let From { file, concern, via } = *from;
     for includer in includers.get(concern).into_iter().flatten() {
-        // The one decline this generator owes, and it is the joined-name rule rather than a
-        // judgement about the includer: `Owner::Singleton` opens `class <includer>`, so a name
-        // with a namespace above it that nothing declares would introduce that namespace — RBS
-        // that does not parse, which `Synthesized::record` answers by refusing the whole
-        // document, costing every other declaration the file makes.
+        // The one decline this generator owes, and it is the joined-name rule, not a judgement
+        // about the includer. `Owner::Singleton` opens `class <includer>`, so a name under a
+        // namespace nothing declares would introduce that namespace. That RBS does not parse, and
+        // `Synthesized::record` refuses the whole document for it, costing every other declaration
+        // in the file.
         if !namespaces.spellable(includer) {
             continue;
         }
@@ -469,8 +465,8 @@ mod tests {
     /// The one include every test but two shares.
     const INCLUDED: &[(&str, &str)] = &[("Tallyable", "Ledger")];
 
-    /// What one file declares, told which namespaces the project writes down and which class
-    /// includes the concern — which is the whole of what this reader needs from elsewhere.
+    /// What one file declares, given which namespaces the project writes down and which class
+    /// includes the concern: all this reader needs from elsewhere.
     fn rbs(source: &str, modules: &[&str], includes: &[(&str, &str)]) -> String {
         let namespaces = declaring(modules);
         let mut includers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -489,7 +485,7 @@ mod tests {
                 ..Elsewhere::nothing()
             },
         );
-        // The second entry point, which is what a concern's class methods come out of — see
+        // The second entry point, which a concern's class methods come out of: see
         // [`super::models::Model::class_methods`].
         facts.extend(model.class_methods(
             "app/models/concerns/tallyable.rb",
@@ -499,12 +495,11 @@ mod tests {
         facts.render(&namespaces).rbs
     }
 
-    /// Pinned whole, for the reason the schema's and the delegate's are: every rule in this
-    /// reader shows up in the text, and asserting them one predicate at a time is how a change to
-    /// the shape passes five green tests.
+    /// Pinned whole, like the schema's and the delegate's: every rule in this reader shows in the
+    /// text, and asserting one predicate at a time lets a change of shape pass five green tests.
     ///
-    /// The owner is the **includer** and never the concern: `Ledger` is what Ruby puts these in
-    /// front of, and `Tallyable` itself answers none of them.
+    /// The owner is the **includer**, never the concern: Ruby puts these in front of `Ledger`, and
+    /// `Tallyable` itself answers none of them.
     #[test]
     fn the_rbs_a_class_methods_block_declares() {
         assert_eq!(
@@ -566,17 +561,15 @@ end
         );
     }
 
-    /// The other spelling, and it reaches the same list.
+    /// The other spelling, reaching the same list.
     ///
-    /// A hand-written `module ClassMethods` is 17 files in six corpora against 120
-    /// `class_methods do` calls, and `ActiveSupport::Concern#class_methods` reopens the module a
-    /// file declares rather than building a second one — so a concern that writes both hands its
-    /// includer one set of members.
+    /// `ActiveSupport::Concern#class_methods` reopens the module a file declares instead of
+    /// building a second one, so a concern that writes both hands its includer one set of members.
     ///
-    /// **The block speaks first and that is the order Ruby has**, not the file's: `module_eval`
-    /// runs the block on the module a hand-written one already declared, so a name written both
-    /// ways is the block's. `Facts` keeps the first of an equal-ranked pair, so stating the
-    /// block's `def`s first is what makes that true.
+    /// **The block speaks first, which is Ruby's order**, not the file's: `module_eval` runs the
+    /// block on the module the hand-written one already declared, so a name written both ways is
+    /// the block's. `Facts` keeps the first of an equal-ranked pair, so stating the block's `def`s
+    /// first makes that true.
     #[test]
     fn a_hand_written_class_methods_module_is_the_same_list() {
         let rendered = rbs(
@@ -622,8 +615,8 @@ end
     }
 
     /// A `module ClassMethods` nested in a **class** reaches nobody: a class cannot be `include`d,
-    /// so nothing ever runs the `extend`. And a `module Foo::ClassMethods` is a module of `Foo`'s
-    /// rather than this concern's, so the name is matched whole and not by its last segment.
+    /// so nothing runs the `extend`. And a `module Foo::ClassMethods` belongs to `Foo`, not this
+    /// concern, so the name is matched whole, not by its last segment.
     #[test]
     fn a_class_methods_module_that_extends_onto_nothing_declares_nothing() {
         for source in [
@@ -643,12 +636,14 @@ end
         }
     }
 
-    /// Every shape of `included do` that extends nothing, each a different sentence of Ruby.
+    /// Every shape of `included do` that extends nothing, each a different sentence of Ruby:
+    /// - a statement that is not a call;
+    /// - a call that is not `extend`;
+    /// - an `extend` with a receiver, or with no argument;
+    /// - an argument that is not a constant (`Module.new { … }` names no module to follow).
     ///
-    /// A statement that is not a call; a call that is not `extend`; an `extend` with a receiver or
-    /// with no argument at all; and an argument that is not a constant — `Module.new { … }` names
-    /// no module anything can follow. A block that is not written out reaches none of them, and a
-    /// `class` is not something an `include` can name.
+    /// A block that is not written out reaches none of them, and an `include` cannot name a
+    /// `class`.
     #[test]
     fn an_included_block_that_extends_nothing_installs_nothing() {
         for source in [
@@ -667,7 +662,7 @@ end
                 .collect();
             assert!(found.is_empty(), "{source}: {found:?}");
         }
-        // And the one that does, so the loop above is asserting an absence the reader can see.
+        // And the one that does, so the loop above asserts an absence the reader can see.
         let read =
             read_model("module Nameable\n  included do\n    extend Ns::Naming\n  end\nend\n");
         let found: Vec<(&str, &str)> = read
@@ -679,8 +674,8 @@ end
 
     /// What an `included do … extend M` installs, read out of `M`'s own file.
     ///
-    /// The far end of the third spelling, and the only reader in this directory that is handed a
-    /// **name** as well as a source: the module is in a file the concern only mentions.
+    /// The far end of the third spelling, and the only reader in this directory handed a **name**
+    /// as well as a source: the module is in a file the concern only mentions.
     #[test]
     fn the_defs_a_module_installs_when_it_is_extended() {
         let source = "\
@@ -719,17 +714,17 @@ end
                 .collect()
         };
         assert_eq!(names("Outer::Naming"), vec!["model_name".to_owned()]);
-        // A `class` body is descended into as well as a `module`'s: `Random::Formatter` is a
-        // module nested in a class, and a walk that followed only `module` would never reach it.
+        // A `class` body is descended into as well as a `module`'s: `Random::Formatter` is a module
+        // nested in a class, and a walk that followed only `module` would never reach it.
         assert_eq!(names("Holder::Nested"), vec!["held".to_owned()]);
-        // The name is the whole path and never its last segment, and a name nothing declares
-        // declares nothing.
+        // The name is the whole path, never its last segment, and a name nothing declares declares
+        // nothing.
         assert!(names("Naming").is_empty());
         assert!(names("Outer::Missing").is_empty());
     }
 
     /// `class_methods` is defined on `ActiveSupport::Concern`, which is extended onto **modules**,
-    /// so the call raises `NoMethodError` in a class body. Six corpora write it in one zero times.
+    /// so the call raises `NoMethodError` in a class body.
     #[test]
     fn a_class_methods_in_a_class_declares_nothing() {
         assert_eq!(
@@ -742,9 +737,8 @@ end
         );
     }
 
-    /// The three shapes that are the name without the block, each of which would otherwise reach
-    /// a `None` the reader has to answer for: no block at all, a block passed as an argument
-    /// rather than written out, and one written out with nothing in it.
+    /// The three shapes that are the name without the block, each reaching a `None` the reader must
+    /// handle: no block, a block passed as an argument, and a written-out block with nothing in it.
     #[test]
     fn a_class_methods_without_a_written_block_declares_nothing() {
         for source in [
@@ -775,8 +769,8 @@ end
         );
     }
 
-    /// A concern nothing includes declares nothing, which is Ruby rather than caution: the module
-    /// itself never answers these names.
+    /// A concern nothing includes declares nothing. That is Ruby, not caution: the module itself
+    /// never answers these names.
     #[test]
     fn a_concern_nothing_includes_declares_nothing() {
         let source = "module Tallyable\n  class_methods do\n    def tally_by(column)\n    end\n  \
@@ -788,9 +782,8 @@ end
         assert_eq!(rbs(source, &["Tallyable", "Ledger"], &[]), "");
     }
 
-    /// The joined name has to introduce no namespace, and the name that could is the
-    /// **includer's** — RBS that does not parse, which `Synthesized::record` answers by refusing
-    /// the whole document.
+    /// The joined name must introduce no namespace, and the name that could is the **includer's**:
+    /// RBS that does not parse, for which `Synthesized::record` refuses the whole document.
     #[test]
     fn an_includer_nothing_declares_is_not_joined_onto() {
         let source = "module Tallyable\n  class_methods do\n    def tally_by(column)\n    end\n  \

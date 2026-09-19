@@ -1,77 +1,74 @@
 //! What a template can call, and where a bare word in one comes from.
 //!
-//! Every other answer in this crate starts from something the file under the cursor writes down:
-//! a receiver, a constant, a `def`. A template writes none of them. `<%= time_ago(story) %>` is a
-//! call on an **implicit receiver** whose class Rails builds at render time out of three things
-//! no file names — every module under `app/helpers`, the `helper_method` proxies of the
-//! controller the template's *path* implies, and ActionView's own helper modules — so rubydex
-//! correctly resolves it to nothing.
+//! Every other answer in this crate starts from something the file under the cursor writes: a
+//! receiver, a constant, a `def`. A template writes none of them. `<%= time_ago(story) %>` is a
+//! call on an **implicit receiver** whose class Rails builds at render time from three things no
+//! file names: every module under `app/helpers`, the `helper_method` proxies of the controller the
+//! template's *path* implies, and ActionView's own helper modules. So rubydex correctly resolves it
+//! to nothing.
 //!
-//! **A generated `module` holding the view context cannot work**, which is why this is a rung
-//! and not a declaration. RBS has no way to say *self in this file is X*, so the module would
-//! exist and nothing would reach it; the obvious repair of wrapping the template's Ruby in a
-//! `class … end` is closed by construction, because [`erb::ruby_view`] replaces markup with one
-//! space per byte so every offset rubydex records is the template's own. Declaring the helpers
-//! half in RBS would also give a second *place* to every helper method in the project.
+//! **A generated `module` holding the view context cannot work**, which is why this is a rung, not
+//! a declaration. RBS cannot say *self in this file is X*, so the module would exist and nothing
+//! would reach it. Wrapping the template's Ruby in a `class … end` is ruled out by construction,
+//! because [`erb::ruby_view`] replaces markup with one space per byte so every offset rubydex
+//! records is the template's own. And declaring the helpers half in RBS would give every helper
+//! method in the project a second *place*.
 //!
-//! So it is one table, consulted by [`locator::resolve_typed`](super::locator::resolve_typed) where every other rung is and by
-//! `completion` at the same cursor. The two read one walk, exactly as the concern edge reads
-//! `locator::extended_modules`: resolution takes the first answer, completion collects
-//! all of them, and the gate deciding what the view context *is* is stated once, here.
+//! So it is one table, consulted by [`locator::resolve_typed`](super::locator::resolve_typed) where
+//! every other rung is, and by `completion` at the same cursor. Both read one walk, as the concern
+//! edge reads `locator::extended_modules`: resolution takes the first answer, completion collects
+//! all, and the gate deciding what the view context *is* is written once, here.
 //!
 //! # The three halves
 //!
-//! **`app/helpers`** needs no macro read. Rails globs `**/*_helper.rb` under each `app/helpers`
-//! directory and includes every module it finds, so the `def`s are already in the graph and what
-//! is missing is only the edge — [`rails::is_helper`] and a list of names. This is the large half
-//! by a wide margin of the two an application writes.
+//! - **`app/helpers`** needs no macro read. Rails globs `**/*_helper.rb` under each `app/helpers`
+//!   directory and includes every module it finds, so the `def`s are already in the graph and only
+//!   the edge is missing: [`rails::is_helper`] and a list of names. Of the two halves an
+//!   application writes, this is by far the larger.
+//! - **`helper_method`** is the machinery. `AbstractController::Helpers` writes `def current_user`
+//!   per call onto the controller's `_helpers` module, so the macro hands over a *permission*, not
+//!   a member: the `def` it names is already on the controller.
+//! - **ActionView's own**, [`rails::VIEW_CONTEXT`], is the half no application writes, and the
+//!   largest by call sites. `ActionView::Base` is `include Helpers, ::ERB::Util, Context`, and
+//!   `ActionView::Helpers` `include`s its helper modules at module-body level, so **one name
+//!   reaches all of them**, and rubydex's linearization (actionview is in the bundle, so already in
+//!   the graph) does the walk. Nothing is generated or declared: this half is a name to start an
+//!   ancestor walk from, and a project whose bundle lacks actionview has no such declaration and
+//!   answers nothing, which is the whole of its gate.
 //!
-//! **`helper_method`** is the machinery. `AbstractController::Helpers` writes `def current_user`
-//! per call onto the controller's `_helpers` module, so what the macro hands over is a
-//! *permission* rather than a member: the `def` it names is already on the controller.
-//!
-//! **ActionView's own**, [`rails::VIEW_CONTEXT`], is the half no application writes and the
-//! largest of the three by call sites. `ActionView::Base` is built as
-//! `include Helpers, ::ERB::Util, Context`, and `ActionView::Helpers` `include`s its 24 helper
-//! modules at module-body level, so **one name reaches every one of them** and rubydex's
-//! linearization — which already holds actionview, because it is in the bundle — does the walk.
-//! Nothing is generated and nothing is declared: this half is a name to start an ancestor walk
-//! from, and a project whose bundle has no actionview has no such declaration and so answers
-//! nothing, which is the whole of the gate on it.
-//!
-//! The three are read in that order backwards — export, then `app/helpers`, then ActionView —
-//! and the order is Ruby's own rather than a preference. The proxy sits **on** `_helpers`, an
-//! application's module is `include`d into it, and ActionView's were included into the view
-//! class before either, so `def tag` in `ApplicationHelper` really does shadow
-//! `ActionView::Helpers::TagHelper#tag` for every template in the project.
+//! They are read in reverse order (export, then `app/helpers`, then ActionView), and that order is
+//! Ruby's own: the proxy sits **on** `_helpers`, an application's module is `include`d into it, and
+//! ActionView's were included into the view class before either, so `def tag` in
+//! `ApplicationHelper` really does shadow `ActionView::Helpers::TagHelper#tag` in every template of
+//! the project.
 //!
 //! # What the table refuses
 //!
-//! - **A name in none of the three.** `can?`, `policy`, a decorator's method: the rung is
-//!   additive, so those answer on the name rung exactly as they did. Of the six corpora's 8,732
-//!   bare-word call sites 8,325 answer exactly and **407** are this residue, `can?`'s 151 the
-//!   largest of them.
-//! - **A controller method nobody exported.** `helper_method` is the whole of the gate on that
-//!   half, per name and never per class: a template may call `current_user` because the class
-//!   said so, and may not call `set_story` because it did not.
+//! - **A name in none of the three.** `can?`, `policy`, a decorator's method: the rung is additive,
+//!   so those answer on the name rung as before. They are a small residue of bare-word calls.
+//! - **A controller method nobody exported.** `helper_method` is the whole gate on that half, per
+//!   name, never per class: a template may call `current_user` because the class said so, and may
+//!   not call `set_story` because it did not.
 //! - **A mailer's views do not get the `app/helpers` half.** `include_all_helpers` is
-//!   `ActionController::Base`'s default and `ActionMailer::Base` has no such thing — a mailer
-//!   reaches an application helper only by writing `helper` itself. A mailer template gets its
-//!   own exports, what it named, and ActionView's half, which every view context has.
-//! - **A helper file does not get the export half.** A module under `app/helpers` is *in* the
-//!   view context rather than merely read by it, so [`Views::reachable`] answers for one — but
-//!   `helper_method` is a permission one controller grants and a helper module is included into
-//!   every controller's context, so there is no class to name and none is picked.
+//!   `ActionController::Base`'s default and `ActionMailer::Base` has none, so a mailer reaches an
+//!   application helper only by writing `helper` itself. A mailer template gets its own exports,
+//!   what it named, and ActionView's half, which every view context has.
+//! - **A helper file does not get the export half.** A module under `app/helpers` is *in* the view
+//!   context, not just read by it, so [`Views::reachable`] answers for one. But `helper_method` is
+//!   a permission one controller grants, and a helper module is included into every controller's
+//!   context, so there is no class to name and none is picked.
 //!
-//! Three bounds are stated rather than discovered. **An engine's own files**:
-//! [`rails::is_helper`] and [`erb::is_template`] are asked of the path under the cursor, so a
-//! helper or a template inside an indexed engine gets the *application's* helper modules in
-//! scope. The population is six files across six corpora, which is why it is a sentence here
-//! and not the first time this module reads `environment`. **Partials**: `rails::controller_of` reads the
-//! directory and not the file name, so `shared/_header.html.erb` names a `SharedController`
-//! nothing defines, and a partial under such a directory gets the other two halves only.
-//! **`include_all_helpers = false`**: an application that sets it gets only its matching helper,
-//! and that config is out of reach for the same reason `database.yml` is.
+//! Three bounds, stated up front:
+//!
+//! 1. **An engine's own files.** [`rails::is_helper`] and [`erb::is_template`] are asked of the
+//!    path under the cursor, so a helper or template inside an indexed engine gets the
+//!    *application's* helper modules in scope. Very few files hit this, so it stays a note here
+//!    instead of this module reading `environment`.
+//! 2. **Partials.** `rails::controller_of` reads the directory, not the file name, so
+//!    `shared/_header.html.erb` names a `SharedController` nothing defines, and a partial under
+//!    such a directory gets only the other two halves.
+//! 3. **`include_all_helpers = false`.** An application setting it gets only its matching helper,
+//!    and that config is out of reach for the same reason `database.yml` is.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -89,9 +86,9 @@ use crate::workspace::{DocUri, rails};
 
 /// How a bare name in a template was reached, for the card to say.
 ///
-/// Both are conventions rather than facts a file states, which is what puts this answer in the
-/// *derived* tier beside the view↔renderer rung it sits next to: nothing in the template says
-/// which class renders it, and nothing in it says that `app/helpers` is in scope.
+/// Both are conventions, not facts a file states, which puts this answer in the *derived* tier
+/// beside the view↔renderer rung next to it: nothing in the template says which class renders it,
+/// or that `app/helpers` is in scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InView {
     /// A `def` in a module under `app/helpers`, which Rails includes in every view context.
@@ -99,21 +96,21 @@ pub enum InView {
     /// A `helper_method` written by the class the template's path names, or by one of its
     /// ancestors. The name is the class Rails renders the template from.
     Exported(String),
-    /// A `def` in one of the modules ActionView itself puts in every view context —
-    /// [`rails::VIEW_CONTEXT`]. The outermost rung, so an application's own helper shadows it.
+    /// A `def` in one of the modules ActionView puts in every view context
+    /// ([`rails::VIEW_CONTEXT`]). The outermost rung, so an application's own helper shadows it.
     Framework,
 }
 
 /// One member a bare word in a template reaches.
 pub struct Reached {
     pub declaration: DeclarationId,
-    /// How far out the module that installed it sits, on the chain Rails builds `_helpers` from.
+    /// How far out the installing module sits, on the chain Rails builds `_helpers` from.
     ///
     /// A `helper_method` proxy is written **on** `_helpers`, an application's helper module is
-    /// `include`d into it, and ActionView's own were included into the view class before
-    /// either — so each half is nearer than the next by exactly one step, which is also the
-    /// order the three answer in when more than one holds the name, and Ruby's own answer for a
-    /// module that defines a method its includer also defines.
+    /// `include`d into it, and ActionView's own were included into the view class before either. So
+    /// each half is one step nearer than the next, which is also the order they answer in when
+    /// several hold a name: Ruby's own answer for a module defining a method its includer also
+    /// defines.
     pub step: u16,
 }
 
@@ -123,49 +120,47 @@ pub struct Found {
     pub how: InView,
 }
 
-/// Which modules and which exports a template can see, rebuilt on every settle.
+/// Which modules and exports a template can see, rebuilt on every settle.
 ///
 /// Held beside the graph for [`super::synthesized::Synthesized`]'s reason and filled by the same
 /// pass: both halves are projections of what the generators already walked, and neither is a
-/// declaration. `Default` is a workspace with no Rails in it, which answers nothing and costs a
-/// path test per hover to say so.
+/// declaration. `Default` is a workspace without Rails, which answers nothing and costs a path test
+/// per hover to say so.
 #[derive(Debug, Default)]
 pub struct Views {
     /// Every `app/helpers/**/*_helper.rb` module the user's own code defines, fully spelled and
-    /// sorted, so that two helper modules spelling one name answer the same way on every run.
+    /// sorted, so two helper modules spelling one name answer the same way every run.
     helpers: Vec<String>,
     /// A body that wrote a `helper_method`, and the names it handed over.
     ///
-    /// Keyed by the class or module the macro is written in rather than by the controller it
-    /// ends up reaching, because a concern does not know its includers and does not have to:
-    /// the ancestor walk below crosses the `include` the controller already wrote.
+    /// Keyed by the class or module the macro is written in, not the controller it reaches, because
+    /// a concern does not know its includers and need not: the ancestor walk below crosses the
+    /// `include` the controller already wrote.
     exports: BTreeMap<String, BTreeSet<String>>,
     /// A body that wrote a `helper`, and the modules it put into its own view context.
     ///
-    /// The other half of the mailer story, and the reason the mailer gate below is a bound
-    /// rather than a wall. `ActionMailer::Base` has no `include_all_helpers`, so a mailer
-    /// reaches an application helper only by naming it — and 20 of the six corpora's 26
-    /// `helper` calls are in a mailer, 15 of them mastodon's, which is 22 of the 25 template
-    /// sites that corpus has. A controller writing one is usually saying nothing new; the six
-    /// that do name a module a gem ships, which the `app/helpers` glob does not reach either.
+    /// The other half of the mailer story, and why the mailer gate below is a bound, not a wall.
+    /// `ActionMailer::Base` has no `include_all_helpers`, so a mailer reaches an application helper
+    /// only by naming it, and most `helper` calls are in mailers. In a controller one usually adds
+    /// nothing new, except when it names a module a gem ships, which the `app/helpers` glob does
+    /// not reach either.
     included: BTreeMap<String, BTreeSet<String>>,
-    /// The classes the application defines that a **mailer's** view directory may name.
+    /// The application classes a **mailer's** view directory may name.
     ///
-    /// A second gate and not a widening of the first: `rails::controller_of` produces a name
-    /// nothing but a controller is called, and `rails::mailer_of` produces whatever the
-    /// directory happens to spell — `app/views/shared/` spells `Shared` — so the second is only
-    /// ever consulted against this list.
+    /// A second gate, not a widening of the first: `rails::controller_of` produces a name only a
+    /// controller has, while `rails::mailer_of` produces whatever the directory spells
+    /// (`app/views/shared/` spells `Shared`), so the second is only ever checked against this list.
     mailers: BTreeSet<String>,
-    /// Whether this project wants a view context at all — `[rails] views`.
+    /// Whether this project wants a view context at all: `[rails] views`.
     ///
-    /// A flag and not an empty map, because the two halves of this module fail differently when
-    /// they are empty: `named_by` answers nothing, which is harmless, while the **renderer**
-    /// half asks `rails::controller_of` of a path and would go on citing a controller that does
-    /// not exist. A Sinatra or Hanami application with an `app/views/` is precisely the project
-    /// that has to be able to say no, and an empty map would not have said it.
+    /// A flag, not an empty map, because the module's two halves fail differently when empty:
+    /// `named_by` answers nothing, which is harmless, but the **renderer** half asks
+    /// `rails::controller_of` of a path and would keep citing a controller that does not exist. A
+    /// Sinatra or Hanami application with an `app/views/` is exactly the project that must be able
+    /// to say no, and an empty map cannot say it.
     ///
-    /// `Views::default()` is therefore **off**, which is also what the pass leaves in place when
-    /// the switch says so.
+    /// So `Views::default()` is **off**, which is also what the pass leaves when the switch says
+    /// so.
     enabled: bool,
 }
 
@@ -188,26 +183,26 @@ impl Views {
 
     /// What the document filed under `uri_id` can call, or nothing.
     ///
-    /// `None` for every document that is neither a template nor a helper, which is the first
-    /// test and the cheap one: this is asked of every call in the project that rubydex could
-    /// not resolve, and an ordinary `.rb` file must pay a path test and no more. `None` also
-    /// where all three halves are empty, so that a Rails application with no helpers, no
-    /// exports and no actionview in its bundle costs nothing further.
+    /// `None` for any document that is neither a template nor a helper: the first test, and the
+    /// cheap one. This is asked of every call rubydex could not resolve, so an ordinary `.rb` file
+    /// must pay a path test and no more. Also `None` where all three halves are empty, so a Rails
+    /// application with no helpers, no exports and no actionview in its bundle pays nothing
+    /// further.
     ///
-    /// **A module under `app/helpers` is *in* the view context, not merely read by it.** Rails
-    /// includes every one of them into the same `_helpers`, so a bare call written in one
-    /// reaches the other helper modules and ActionView's own exactly as a template's does — and
-    /// a helper file is the only other place in an application where that is true. What it does
-    /// **not** get is the export half: `helper_method` is a permission one controller grants,
-    /// and a helper module is included into every controller's view context, so there is no
-    /// class for [`rails::controller_of`] to name and no honest way to pick one. That refusal is
-    /// why the renderer lookup below is inside the template arm.
+    /// **A module under `app/helpers` is *in* the view context, not just read by it.** Rails
+    /// includes all of them into the same `_helpers`, so a bare call in one reaches the other
+    /// helper modules and ActionView's exactly as a template's does, and a helper file is the only
+    /// other place in an application where that holds. It does **not** get the export half:
+    /// `helper_method` is a permission one controller grants, and a helper module is included into
+    /// every controller's view context, so there is no class for [`rails::controller_of`] to name
+    /// and no honest way to pick one. That is why the renderer lookup below sits inside the
+    /// template arm.
     #[must_use]
     pub fn reachable(&self, graph: &Graph, uri_id: UriId) -> Option<Reachable> {
         if !self.enabled {
             return None;
         }
-        let path = DocUri::from_uri_str(graph.documents().get(&uri_id)?.uri())?.to_path()?;
+        let path = DocUri::from_graph_uri(graph.documents().get(&uri_id)?.uri())?.to_file_path()?;
         let template = erb::is_template(&path);
         if !template && !rails::is_helper(&path) {
             return None;
@@ -224,10 +219,10 @@ impl Views {
             declaration: rendered.declaration,
             controller: rendered.controller,
         });
-        // A mailer's own views are the one place the glob does not apply — see the module docs
-        // — and a template whose class does not exist at all still gets it, which is what a
-        // partial under `shared/` lives on. What a mailer gets instead is what it asked for by
-        // name, which is the whole of `helper`'s reason for existing.
+        // A mailer's own views are the one place the glob does not apply (see the module docs),
+        // while a template whose class does not exist still gets it, which is what a partial under
+        // `shared/` relies on. A mailer gets instead what it asked for by name, which is `helper`'s
+        // whole purpose.
         let globbed: &[String] = if renderer.as_ref().is_none_or(|renderer| renderer.controller) {
             &self.helpers
         } else {
@@ -242,10 +237,10 @@ impl Views {
         );
 
         // The framework's half, which every view context gets and no file asks for: a mailer's
-        // template, a partial under `shared/` whose controller does not exist, and a helper
-        // module all render through an `ActionView::Base`. Resolved rather than declared —
-        // actionview is in the bundle and therefore in the graph already, so an application
-        // without one answers nothing here and needs no switch to say so.
+        // template, a partial under `shared/` with no controller, and a helper module all render
+        // through an `ActionView::Base`. Resolved, not declared: actionview is in the bundle and so
+        // already in the graph, and an application without it answers nothing here, with no switch
+        // needed.
         let framework = rails::VIEW_CONTEXT
             .iter()
             .filter_map(|name| declared(graph, name))
@@ -262,26 +257,24 @@ impl Views {
     /// Which class Rails renders `path` from: the controller, or the mailer where there is no
     /// controller.
     ///
-    /// **The order is Rails' own and not a preference.** `app/views/user_mailer/` names a
-    /// `UserMailerController` that does not exist, so the mailer is reached exactly where the
-    /// controller is not — and an application that *does* define a `UserMailerController` has
-    /// said something this rule must not overrule.
+    /// **The order is Rails' own.** `app/views/user_mailer/` names a `UserMailerController` that
+    /// does not exist, so the mailer is reached exactly where the controller is not, and an
+    /// application that *does* define a `UserMailerController` has said something this rule must
+    /// not override.
     ///
-    /// **The second half is gated and the first does not have to be.** [`rails::controller_of`]
-    /// produces a name nothing but a controller is called; [`rails::mailer_of`] produces
-    /// whatever the directory happens to spell — `app/views/shared/` spells `Shared` — so it
-    /// answers only for a class this application defines that [`rails::is_mailer`] recognises.
-    /// That gate is [`Views::mailers`](Views), which the pass fills from the superclasses it
-    /// already holds.
+    /// **The second half is gated; the first need not be.** [`rails::controller_of`] produces a
+    /// name only a controller has; [`rails::mailer_of`] produces whatever the directory spells
+    /// (`app/views/shared/` spells `Shared`), so it answers only for an application class
+    /// [`rails::is_mailer`] recognises. That gate is [`Views::mailers`](Views), filled by the pass
+    /// from the superclasses it already holds.
     ///
-    /// Public because this is the one convention two modules read, and they must not disagree:
-    /// here it decides what a template may **call**, and in [`types`](super::types) it decides
-    /// where a template's `@ivar` was **written** and which class a card names. A view context
-    /// built from a mailer beside a card citing a controller would be two answers about one
-    /// path.
+    /// Public because this is the one convention two modules read, and they must agree: here it
+    /// decides what a template may **call**, and in [`types`](super::types) where a template's
+    /// `@ivar` was **written** and which class a card names. A view context built from a mailer
+    /// beside a card citing a controller would be two answers about one path.
     ///
-    /// `None` for every path that is not a template, so a caller holding a path need not test
-    /// that itself, and `None` for the whole of it when `[rails] views` is off.
+    /// `None` for any path that is not a template, so a caller holding a path need not check, and
+    /// `None` for everything when `[rails] views` is off.
     #[must_use]
     pub fn rendered_by(&self, graph: &Graph, path: &Path) -> Option<RenderedBy> {
         if !self.enabled || !erb::is_template(path) {
@@ -310,9 +303,9 @@ impl Views {
 
     /// Every module `declaration` or one of its ancestors named with `helper`.
     ///
-    /// The ancestor walk is [`Views::exported_by`]'s and is load-bearing in the same way:
-    /// mastodon writes `helper :application` once, in `ApplicationMailer`, and means it for
-    /// every mailer under it.
+    /// The ancestor walk is [`Views::exported_by`]'s and matters the same way:
+    /// `helper :application` written once, in `ApplicationMailer`, is meant for every mailer under
+    /// it.
     fn named_by(&self, graph: &Graph, declaration: DeclarationId) -> BTreeSet<String> {
         let mut named: BTreeSet<String> = BTreeSet::new();
         for (name, _) in ancestors_of(graph, declaration) {
@@ -325,11 +318,10 @@ impl Views {
 
     /// Every name `declaration` or one of its ancestors handed to the view context.
     ///
-    /// The ancestor walk is the whole of what makes three of the macro's four hosts work
-    /// without a case for any of them: a `helper_method` in a concern, in a module under
-    /// `app/helpers` that the controller `include`s, and in `ApplicationController` are all one
-    /// question — is the class this template's path names below the body that wrote the macro —
-    /// and rubydex answered it at index time.
+    /// The ancestor walk makes three of the macro's hosts work without special cases: a
+    /// `helper_method` in a concern, in an `app/helpers` module the controller `include`s, and in
+    /// `ApplicationController` are all one question (is the class this template's path names below
+    /// the body that wrote the macro?), which rubydex answered at index time.
     fn exported_by(&self, graph: &Graph, declaration: DeclarationId) -> BTreeSet<String> {
         let mut exported: BTreeSet<String> = BTreeSet::new();
         for (name, _) in ancestors_of(graph, declaration) {
@@ -343,11 +335,10 @@ impl Views {
 
 /// The class a template's path names, resolved against the graph.
 ///
-/// Handed out rather than kept private because two modules ask the same question of one path —
-/// see [`Views::rendered_by`]. What each does with the answer is its own: here the declaration is
-/// an ancestry to walk for what the template may call, and in [`types`](super::types) it is the
-/// documents that class is written in, with the name as the `self` an `@story` has to be written
-/// under to count.
+/// Public because two modules ask the same question of one path; see [`Views::rendered_by`]. Each
+/// uses the answer its own way: here the declaration is an ancestry to walk for what the template
+/// may call, and in [`types`](super::types) it is the documents that class is written in, with the
+/// name as the `self` an `@story` must be written under to count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedBy {
     /// The class, fully qualified, as the path spells it.
@@ -355,11 +346,10 @@ pub struct RenderedBy {
     pub declaration: DeclarationId,
     /// Whether a controller answered rather than a mailer.
     ///
-    /// The one thing the two spellings decide differently, and both readers need it: a view
-    /// context gets the `app/helpers` glob only from a controller, and a card has to say which
-    /// of the two conventions it followed — "the mailer Rails renders this template from" is a
-    /// different sentence, and calling a mailer a controller would be a card that is wrong
-    /// about the one fact it is citing.
+    /// The one thing the two spellings decide differently, and both readers need it: a view context
+    /// gets the `app/helpers` glob only from a controller, and a card must say which convention it
+    /// followed. "The mailer Rails renders this template from" is a different sentence, and calling
+    /// a mailer a controller would make the card wrong about the one fact it cites.
     pub controller: bool,
 }
 
@@ -367,8 +357,8 @@ pub struct RenderedBy {
 struct Renderer {
     name: String,
     declaration: DeclarationId,
-    /// Whether it is a controller rather than a mailer — [`RenderedBy::controller`], and here it
-    /// is the `app/helpers` glob that turns on it.
+    /// Whether it is a controller rather than a mailer ([`RenderedBy::controller`]); here it
+    /// switches the `app/helpers` glob.
     controller: bool,
     exported: BTreeSet<String>,
 }
@@ -379,9 +369,9 @@ pub struct Reachable {
     helpers: Vec<DeclarationId>,
     /// The framework's own half: whichever of [`rails::VIEW_CONTEXT`] the graph holds.
     ///
-    /// Empty for a project whose bundle has no actionview in it, which is the whole of the gate
-    /// on this half — there is no switch and no path test, because a module that is not in the
-    /// graph cannot be walked and a module that is could only have got there from the bundle.
+    /// Empty for a project whose bundle lacks actionview, which is this half's whole gate: no
+    /// switch and no path test, because a module missing from the graph cannot be walked, and one
+    /// present could only have come from the bundle.
     framework: Vec<DeclarationId>,
 }
 
@@ -397,13 +387,13 @@ impl Reachable {
 
     /// The declaration a bare `member` written in this template names.
     ///
-    /// `member` is rubydex's parenthesised spelling, because that is what the caller already
-    /// has and what the lookup needs; the export list holds the symbols the macro was written
-    /// with, so the parentheses come off for that test and only for it.
+    /// `member` is rubydex's parenthesised spelling, because that is what the caller has and what
+    /// the lookup needs; the export list holds the symbols the macro was written with, so the
+    /// parentheses come off for that test only.
     ///
-    /// **The export half answers first**, which is Ruby rather than a preference:
-    /// `helper_method` defines its proxy *on* `_helpers` and `helper` includes a module *into*
-    /// it, so where both hold a name the proxy is what runs.
+    /// **The export half answers first**, which is Ruby, not preference: `helper_method` defines
+    /// its proxy *on* `_helpers` and `helper` includes a module *into* it, so where both hold a
+    /// name, the proxy is what runs.
     #[must_use]
     pub fn member(&self, graph: &Graph, member: &str) -> Option<Found> {
         let name = member.strip_suffix("()").unwrap_or(member);
@@ -428,10 +418,9 @@ impl Reachable {
                 how: InView::Helper,
             });
         }
-        // Last, and that is the whole of what keeps this half additive rather than exclusive:
-        // an application that writes `def tag` in `ApplicationHelper` has shadowed
-        // `ActionView::Helpers::TagHelper#tag` for every one of its templates, and the two
-        // lookups above have already answered by the time this one is asked.
+        // Last, which is what keeps this half additive: an application writing `def tag` in
+        // `ApplicationHelper` has shadowed `ActionView::Helpers::TagHelper#tag` for all its
+        // templates, and the two lookups above have already answered by the time this is asked.
         self.framework
             .iter()
             .find_map(|module| query::find_member_in_ancestors(graph, *module, id, false).ok())
@@ -443,13 +432,13 @@ impl Reachable {
 
     /// Every member a bare word in this template could complete to, nearest first.
     ///
-    /// The collecting half of the same walk, and it must collect rather than stop at the first
-    /// answer: resolution takes one answer and completion takes all of them, so the two share
-    /// the gate and not the loop.
+    /// The collecting half of the same walk, and it must collect instead of stopping at the first
+    /// answer: resolution takes one answer and completion all of them, so they share the gate, not
+    /// the loop.
     ///
-    /// Deduplicated by name the way rubydex's own walk deduplicates: the nearest declaration of
-    /// a name is the one that answers, so a second helper module spelling a name the first
-    /// already spelled is not a second row.
+    /// Deduplicated by name as rubydex's own walk does: the nearest declaration of a name is the
+    /// one that answers, so a second helper module spelling a name the first already spelled is not
+    /// a second row.
     #[must_use]
     pub fn members(&self, graph: &Graph) -> Vec<Reached> {
         let mut seen: BTreeSet<StringId> = BTreeSet::new();
@@ -457,10 +446,10 @@ impl Reachable {
         if let Some(renderer) = &self.renderer {
             for name in &renderer.exported {
                 let id = StringId::from(format!("{name}()").as_str());
-                // Recorded whether or not it resolves, and never tested here: the export list
-                // is a set, so it cannot repeat itself, and what this is for is the helpers
-                // half below — 51 of the six corpora's 149 export sites name a method that is
-                // also an `app/helpers` `def`, and one name is one row.
+                // Recorded whether or not it resolves, and never tested here: the export list is a
+                // set, so it cannot repeat itself. What this is for is the helpers half below:
+                // exports often name a method that is also an `app/helpers` `def`, and one name is
+                // one row.
                 seen.insert(id);
                 if let Ok(member) =
                     query::find_member_in_ancestors(graph, renderer.declaration, id, false)
@@ -477,23 +466,20 @@ impl Reachable {
                 for (_, namespace) in ancestors_of(graph, *module) {
                     for (name, member) in namespace.members() {
                         // `include` installs methods and nothing else: a constant nested in a
-                        // helper module is not reachable from a template through the view
-                        // context.
+                        // helper module is not reachable from a template through the view context.
                         if !matches!(
                             graph.declarations().get(member),
                             Some(Declaration::Method(_))
                         ) {
                             continue;
                         }
-                        // **Visibility is deliberately not read here**, and the framework half
-                        // is what made the question worth answering: ActionView marks 185 of
-                        // its 438 helper `def`s private, so filtering would drop about a third
-                        // of the rows this half adds. It is `completion`'s own rule — a cursor
-                        // with no receiver written sets `private_ok`, because Ruby really does
-                        // let an implicit receiver call a private method — and measuring the
-                        // filter said the same thing twice: over 297 real template lists it
-                        // *lost* 932 rows against 312, because the corpora's own helper modules
-                        // mark 192 methods private and every one of them was already offered.
+                        // **Visibility is deliberately not read here.** A good share of
+                        // ActionView's helper `def`s are private, so filtering would drop many of
+                        // the rows this half adds. It is `completion`'s own rule: a cursor with no
+                        // written receiver sets `private_ok`, because Ruby really lets an implicit
+                        // receiver call a private method. Filtering also lost more rows than it
+                        // removed in real template lists, because applications' own helper modules
+                        // mark many methods private and every one was already offered.
                         if seen.insert(*name) {
                             found.push(Reached {
                                 declaration: *member,
@@ -508,12 +494,11 @@ impl Reachable {
     }
 }
 
-/// The same modules in the same order, each of them once.
+/// The same modules in the same order, each once.
 ///
-/// A module can arrive twice — `helper ApplicationHelper` written in a controller, which the
-/// `app/helpers` glob already found — and a module offered twice is a completion row offered
-/// twice. `retain` over a `Vec` rather than a set, because the order is the answer's order and
-/// the list is a few dozen long.
+/// A module can arrive twice (`helper ApplicationHelper` in a controller, already found by the
+/// `app/helpers` glob), and a module offered twice is a completion row offered twice. `retain` over
+/// a `Vec`, not a set, because the order is the answer's order and the list is a few dozen long.
 fn deduplicated(mut modules: Vec<DeclarationId>) -> Vec<DeclarationId> {
     let mut seen: BTreeSet<DeclarationId> = BTreeSet::new();
     modules.retain(|id| seen.insert(*id));
@@ -523,20 +508,20 @@ fn deduplicated(mut modules: Vec<DeclarationId>) -> Vec<DeclarationId> {
 /// Where each half sits on the chain Rails builds `_helpers` from. See [`Reached::step`].
 ///
 /// The order is Ruby's own: the proxy `helper_method` writes sits **on** `_helpers`, an
-/// application's helper module is `include`d into it, and ActionView's modules were included
-/// into the view class before either — so the framework's half is the furthest away and the one
-/// an application shadows by writing its own `def` of the same name.
+/// application's helper module is `include`d into it, and ActionView's modules were included into
+/// the view class before either, so the framework half is furthest away and the one an application
+/// shadows by writing its own `def` of the same name.
 const EXPORTED: u16 = 0;
 const HELPER: u16 = 1;
 const FRAMEWORK: u16 = 2;
 
-/// A namespace's linearized ancestors, itself first: the name each is filed under and the
-/// members it holds.
+/// A namespace's linearized ancestors, itself first: the name each is filed under and the members
+/// it holds.
 ///
-/// Both callers want both halves — the export table is keyed by name and the completion list is
-/// built out of members — so one walk answers them rather than two that would one day disagree
-/// about which ancestors count. Nothing for a declaration that is not a namespace, which is a
-/// refusal this module can only reach by being handed an id it did not put in its own table.
+/// Both callers want both halves (the export table is keyed by name; the completion list is built
+/// from members), so one walk answers both instead of two that would one day disagree about which
+/// ancestors count. Nothing for a non-namespace declaration, a refusal this module reaches only if
+/// handed an id it did not put in its own table.
 fn ancestors_of(graph: &Graph, declaration: DeclarationId) -> Vec<(&str, &Namespace)> {
     let Some(namespace) = graph
         .declarations()
@@ -550,7 +535,7 @@ fn ancestors_of(graph: &Graph, declaration: DeclarationId) -> Vec<(&str, &Namesp
         .iter()
         .filter_map(|ancestor| match ancestor {
             // A rung rubydex could not linearize names no module, so there is nothing on it to
-            // include and nothing on it to have exported.
+            // include or to have exported.
             Ancestor::Complete(id) => Some(id),
             _ => None,
         })
@@ -564,14 +549,16 @@ fn ancestors_of(graph: &Graph, declaration: DeclarationId) -> Vec<(&str, &Namesp
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use rubydex::model::declaration::MethodDeclaration;
+
     use super::*;
     use crate::analysis::testing::*;
 
     /// A controller, a helper and a template, in the layout the view context reads.
     ///
-    /// The controller exports one of its two methods, deliberately: `helper_method` is a
-    /// permission and the whole of the gate on that half, so a fixture with one method
-    /// could not tell "this template may call it" from "this project defines it once".
+    /// The controller exports one of its two methods, on purpose: `helper_method` is a permission
+    /// and the whole gate on that half, so a fixture with one method could not tell "this template
+    /// may call it" from "this project defines it once".
     fn view_context_app(harness: &Harness) -> DocUri {
         harness.write(
             "app/controllers/stories_controller.rb",
@@ -586,12 +573,11 @@ mod tests {
 
     /// The shape actionview ships, small enough to read and exact where it matters.
     ///
-    /// Written as workspace Ruby rather than pulled out of a bundle, because what this half
-    /// needs from the gem is a *graph* and not a file: `ActionView::Helpers` `include`s its
-    /// helper modules at module-body level, so rubydex linearizes them and one name reaches
-    /// every one. The three `def`s are the three the tests below ask for, and `t` is an alias
-    /// of `translate` because that is how the real `TranslationHelper` writes the commonest
-    /// call in any Rails application.
+    /// Written as workspace Ruby, not pulled from a bundle, because this half needs a *graph* from
+    /// the gem, not a file: `ActionView::Helpers` `include`s its helper modules at module-body
+    /// level, so rubydex linearizes them and one name reaches all. The three `def`s are the three
+    /// the tests ask for, and `t` is an alias of `translate` because that is how the real
+    /// `TranslationHelper` writes the commonest call in any Rails application.
     fn action_view(harness: &Harness) {
         harness.write(
             "lib/action_view/helpers.rb",
@@ -609,14 +595,40 @@ mod tests {
     }
 
     #[test]
+    fn a_declaration_that_is_not_a_namespace_has_no_ancestors() {
+        // Neither id below can reach `ancestors_of` from a request: both callers pass a key from a
+        // table this module filled with namespaces itself. The refusal keeps a wrong id from
+        // reading as a namespace with no members, which would answer an *empty view context* (a
+        // template offered nothing) instead of a declined answer. A fabricated graph is the only
+        // way to pin it, for `indexed`'s reason: no real project has the shape.
+        let mut graph = Graph::default();
+        let object = DeclarationId::from("Object");
+        graph.declarations_mut().insert(
+            DeclarationId::from("ApplicationHelper#time_ago()"),
+            Declaration::Method(Box::new(MethodDeclaration::new(
+                "ApplicationHelper#time_ago()".to_string(),
+                object,
+            ))),
+        );
+        assert!(
+            ancestors_of(&graph, DeclarationId::from("ApplicationHelper#time_ago()")).is_empty(),
+            "a method is not a namespace"
+        );
+        assert!(
+            ancestors_of(&graph, DeclarationId::from("ApplicationHelper")).is_empty(),
+            "nor is a name the graph does not hold"
+        );
+    }
+
+    #[test]
     fn a_project_that_is_not_rails_can_say_so_and_the_view_context_goes_quiet() {
-        // **The case `[rails] views` exists for**, and it is about a wrong answer rather than a
-        // slow one: `rails::controller_of` reads a *path*, so any project with an `app/views/`
-        // gets Rails' convention applied to it — a Sinatra or Hanami application included, where
-        // the controller the card cites does not exist.
+        // **The case `[rails] views` exists for**, and it is about a wrong answer, not a slow one:
+        // `rails::controller_of` reads a *path*, so any project with an `app/views/` gets Rails'
+        // convention applied, including a Sinatra or Hanami application, where the controller the
+        // card cites does not exist.
         //
-        // Off, the same cursor falls to the rung below, which is the answer the workspace would
-        // have given if nobody had written a controller at all.
+        // Off, the same cursor falls to the rung below: the answer the workspace would give if
+        // nobody had written a controller.
         let mut harness = Harness::configured("[rails]\nviews = false\n");
         let view = view_context_app(&harness);
         harness.index();
@@ -629,9 +641,9 @@ mod tests {
         );
 
         // **What the fixture cannot show and the tier can.** There is one `current_user` in the
-        // project, so the name rung finds the same method either way — which is the point: the
-        // difference a user sees is the *tier*, and with the view context off this is a guess
-        // rather than a card reached through the class the path names.
+        // project, so the name rung finds the same method either way, which is the point: the
+        // difference a user sees is the *tier*. With the view context off, this is a guess instead
+        // of a card reached through the class the path names.
         let mut harness = Harness::new();
         let view = view_context_app(&harness);
         harness.index();
@@ -642,11 +654,11 @@ mod tests {
 
     #[test]
     fn a_helper_method_export_is_what_a_template_may_call() {
-        // The view context, first clause. `current_user` in a template already jumps —
-        // there is one method of that name in the project — and it jumped on the *name* rung,
-        // which is the same answer it would give if the controller had never exported it. What
-        // changes is the tier and the gate: the answer is now reached through the class the
-        // path names, and the method the class did **not** export is not reachable at all.
+        // The view context, first clause. `current_user` in a template jumps anyway (there is one
+        // method of that name in the project) on the *name* rung, the same answer as if the
+        // controller had never exported it. What changes is the tier and the gate: the answer is
+        // reached through the class the path names, and a method the class did **not** export is
+        // not reachable at all.
         let mut harness = Harness::new();
         let view = view_context_app(&harness);
         harness.index();
@@ -678,14 +690,14 @@ mod tests {
             "{jump}"
         );
 
-        // The obvious half is the one a two-example probe can see; this is the other
-        // one, and it is thirty times larger over the corpus.
+        // The obvious half is what a two-example probe can see; this is the other one, and it is
+        // much larger in real projects.
         let offered = harness.declarations_at(&view, "<%= curr~ %>\n");
         assert!(offered.contains(&"current_user".to_owned()), "{offered:?}");
 
-        // And the method nobody exported is not in the view context, in either request. It is
-        // still *findable* — one `set_story` in the project, so the name rung answers — and the
-        // card says so, which is the difference this gate exists to keep.
+        // And the method nobody exported is not in the view context, in either request. It is still
+        // *findable* (one `set_story` in the project, so the name rung answers), and the card says
+        // so: the difference this gate exists to keep.
         let unexported = "<%= set_story %>\n";
         let other = harness.write("app/views/stories/edit.html.erb", unexported);
         harness.watch(&[&other]);
@@ -701,10 +713,10 @@ mod tests {
     #[test]
     fn an_export_this_cannot_read_a_name_out_of_hands_over_nothing() {
         // The direction every reader in `workspace/rails` errs in, asked of the one macro whose
-        // answer is a permission rather than a member. A splat and an interpolated symbol are
-        // Ruby that only runs, and a bare `helper_method` is a no-op Rails accepts — so all
-        // three export nothing, and `render_story` goes on answering what it answered before
-        // rather than becoming callable because a call of the right name was written.
+        // answer is a permission, not a member. A splat and an interpolated symbol are Ruby that
+        // only runs, and a bare `helper_method` is a no-op Rails accepts, so all three export
+        // nothing, and `render_story` keeps its previous answer instead of becoming callable
+        // because a call of the right name was written.
         let mut harness = Harness::new();
         harness.write(
             "app/controllers/stories_controller.rb",
@@ -725,20 +737,20 @@ mod tests {
 
     #[test]
     fn every_app_helpers_module_is_in_every_template() {
-        // The other half, and it needs no macro at all: Rails' `all_helpers_from_path` globs
-        // `app/helpers/**/*_helper.rb` and includes every module it finds in every view
-        // context. So this template's controller does not exist — `app/views/comments/` names a
-        // `CommentsController` this application has never written — and the helpers answer
-        // anyway, which is what 489 of the corpus' 913 partials live on.
+        // The other half, which needs no macro: Rails' `all_helpers_from_path` globs
+        // `app/helpers/**/*_helper.rb` and includes every module it finds in every view context. So
+        // this template's controller does not exist (`app/views/comments/` names a
+        // `CommentsController` this application never wrote), and the helpers answer anyway, which
+        // is what most partials rely on.
         let mut harness = Harness::new();
         view_context_app(&harness);
         harness.write(
             "app/helpers/stories_helper.rb",
             "module StoriesHelper\n  def byline\n  end\nend\n",
         );
-        // Under `app/helpers` and not named the way Rails' glob names them: this is solidus'
-        // `controller_helpers/auth.rb` shape, which is reached by an `include` a controller
-        // writes and is in no view context by default.
+        // Under `app/helpers` but not named as Rails' glob names them: solidus'
+        // `controller_helpers/auth.rb` shape, reached by an `include` a controller writes, and in
+        // no view context by default.
         harness.write(
             "app/helpers/legacy/auth.rb",
             "module Legacy\n  module Auth\n    def sign_out\n    end\n  end\nend\n",
@@ -763,9 +775,8 @@ mod tests {
             "a file Rails' own glob does not name is in no view context: {unglobbed}"
         );
 
-        // Every module, not the one whose name matches the directory: `include_all_helpers` is
-        // the Rails default, and an application that turns it off is a bound this states rather
-        // than reads.
+        // Every module, not just the one matching the directory: `include_all_helpers` is the Rails
+        // default, and an application turning it off is a bound this states, not reads.
         let offered = harness.declarations_at(&view, "<%= ~ %>\n");
         for name in ["time_ago", "byline"] {
             assert!(offered.contains(&name.to_owned()), "{name}: {offered:?}");
@@ -778,18 +789,18 @@ mod tests {
         // Three refusals and one precedence, in one fixture, because they are one question.
         //
         // **The export wins.** `helper_method` writes its proxy *on* `_helpers` and `helper`
-        // includes a module *into* it, so where both hold a name the proxy is what runs. A third
-        // of real export sites name a method that is also an `app/helpers` `def`, so this is the
-        // commonest shape the two halves have together and not an edge.
+        // includes a module *into* it, so where both hold a name, the proxy runs. Exports often
+        // name a method that is also an `app/helpers` `def`, so this is the commonest shape the two
+        // halves share, not an edge case.
         //
-        // **One name is one row.** The same pair in a completion list would be the same word
-        // twice, one of which jumps somewhere the call would not go.
+        // **One name is one row.** The same pair in a completion list would be one word twice, one
+        // of which jumps somewhere the call would not go.
         //
-        // **An export naming nothing declares nothing.** `helper_method :missing` is a
-        // permission for a method that does not exist, so the half below it answers instead.
+        // **An export naming nothing declares nothing.** `helper_method :missing` permits a method
+        // that does not exist, so the half below answers instead.
         //
-        // **A constant in a helper module is not in the view context.** `include` installs
-        // methods; `ApplicationHelper::MAX` is reached by writing it out.
+        // **A constant in a helper module is not in the view context.** `include` installs methods;
+        // `ApplicationHelper::MAX` is reached by writing it out.
         let mut harness = Harness::new();
         harness.write(
             "app/controllers/stories_controller.rb",
@@ -801,8 +812,8 @@ mod tests {
             "module ApplicationHelper\n  MAX = 5\n\n  def current_user\n  end\n\n  \
              def time_ago(at)\n  end\nend\n",
         );
-        // Somewhere the view context cannot reach, so that the export declining is visible as
-        // the rung below answering rather than as a hover with nothing on it.
+        // Somewhere the view context cannot reach, so the export declining shows up as the rung
+        // below answering, not as an empty hover.
         harness.write("lib/tools.rb", "module Tools\n  def missing\n  end\nend\n");
         let source = "<%= current_user %> <%= missing %>\n";
         let view = harness.write("app/views/stories/show.html.erb", source);
@@ -842,12 +853,11 @@ mod tests {
 
     #[test]
     fn an_export_written_in_a_concern_reaches_the_controllers_that_include_it() {
-        // 8 of the six corpora's 60 exported names are written in a concern and 7 more in a
-        // module under `app/helpers` that a controller `include`s, so a reader that walked
-        // `app/controllers` and keyed by class would find 24 of solidus' exports and reach 3 of
-        // its 113 sites. Nothing here knows what a concern is: the export list is keyed by the
-        // body that wrote the macro, and the walk from the template's class up its own
-        // ancestors is what crosses the `include` the controller already wrote.
+        // Exports are often written in a concern, or in an `app/helpers` module a controller
+        // `include`s, so a reader that walked `app/controllers` and keyed by class would miss most
+        // of them. Nothing here knows what a concern is: the export list is keyed by the body that
+        // wrote the macro, and the walk from the template's class up its ancestors crosses the
+        // `include` the controller already wrote.
         let mut harness = Harness::new();
         harness.write(
             "app/controllers/concerns/authentication.rb",
@@ -864,8 +874,8 @@ mod tests {
 
         let through = card(&mut harness, &view, source, "current_user");
         assert!(through.contains("Authentication#current_user"), "{through}");
-        // The class the *template* names, not the module the macro is in: what a reader has to
-        // be able to check is that Rails renders this template from there.
+        // The class the *template* names, not the module the macro is in: what a reader must be
+        // able to check is that Rails renders this template from there.
         assert!(
             through.contains("`helper_method` in `StoriesController`"),
             "{through}"
@@ -875,11 +885,10 @@ mod tests {
     #[test]
     fn a_mailer_gets_its_own_exports_and_not_the_applications_helpers() {
         // `AbstractController::Helpers` is in `ActionMailer::Base` too, so `helper_method` in a
-        // mailer is real — 3 of the corpus' 60 — and the view path a mailer renders from is its
-        // own name with no `Controller` on the end. `include_all_helpers` is **not**: it is
-        // `ActionController::Base`'s default, and a mailer reaches an application helper only
-        // by writing `helper` itself, which is a call this reader does not read. So the two
-        // halves separate here and nowhere else.
+        // mailer is real, and the view path a mailer renders from is its name with no `Controller`
+        // suffix. `include_all_helpers` is **not** there: it is `ActionController::Base`'s default,
+        // and a mailer reaches an application helper only by writing `helper` itself, which is a
+        // separate call. So the two halves separate here and nowhere else.
         let mut harness = Harness::new();
         harness.write(
             "app/helpers/application_helper.rb",
@@ -907,10 +916,10 @@ mod tests {
             "a mailer's views are not a controller's: {helper}"
         );
 
-        // And the way back in is the one Rails gives: `helper :application` names the module,
-        // and a mailer that names it has said the only thing that puts an application helper in
-        // front of a mailer template. Most real `helper` calls are in a mailer, and they are the
-        // whole of the gap.
+        // The way back in is the one Rails provides: `helper :application` names the module, and a
+        // mailer naming it has said the only thing that puts an application helper in front of a
+        // mailer template. Most real `helper` calls are in mailers, and they are the whole of the
+        // gap.
         let mailer = harness.write(
             "app/mailers/user_mailer.rb",
             "class UserMailer < ApplicationMailer\n  helper :application\n  \
@@ -924,8 +933,8 @@ mod tests {
             "{named}"
         );
 
-        // And the directory has to name a **mailer**: `mailer_of` spells whatever the path
-        // spells, so the gate is the application's own superclass table and not the path.
+        // And the directory must name a **mailer**: `mailer_of` spells whatever the path spells, so
+        // the gate is the application's own superclass table, not the path.
         let shared = "<%= sender_name %>\n";
         let other = harness.write("app/views/shared/_footer.html.erb", shared);
         harness.watch(&[&other]);
@@ -938,18 +947,17 @@ mod tests {
 
     #[test]
     fn the_view_context_is_additive_and_reaches_no_further_than_a_template() {
-        // Two refusals in one fixture, and both are safety rather than feature.
+        // Two refusals in one fixture, both about safety, not features.
         //
-        // **Additive.** The view context is three halves and the order between them is Ruby's:
-        // lobsters writes `def tag` in `ApplicationHelper` deliberately, to shadow
-        // `ActionView::Helpers::TagHelper#tag`, so a template's `tag` must reach the
-        // application's — while `link_to`, which the application does not redefine, reaches
-        // ActionView's. The application module is `include`d into `_helpers` and ActionView's
-        // were included into the view class before it, so "nearer wins" is the whole rule.
+        // **Additive.** The view context is three halves ordered as Ruby orders them: an
+        // application may write `def tag` in `ApplicationHelper` on purpose, to shadow
+        // `ActionView::Helpers::TagHelper#tag`, so a template's `tag` must reach the application's,
+        // while `link_to`, which the application does not redefine, reaches ActionView's. The
+        // application module is `include`d into `_helpers` and ActionView's were included into the
+        // view class before it, so "nearer wins" is the whole rule.
         //
-        // **A template and nothing else.** The same bare call in a `.rb` file that is not a
-        // helper is an ordinary receiverless call whose `self` is `main`, and Rails puts no
-        // helpers on that.
+        // **A template and nothing else.** The same bare call in a `.rb` file that is not a helper
+        // is an ordinary receiverless call whose `self` is `main`, and Rails puts no helpers there.
         let mut harness = Harness::new();
         action_view(&harness);
         harness.write(
@@ -988,10 +996,9 @@ mod tests {
 
     #[test]
     fn a_name_in_none_of_the_three_halves_still_falls_through() {
-        // The rung is additive at its own edge too, and this is the assertion that says so:
-        // `can?` is cancan's, `policy` is pundit's, and neither is in any half. 407 of the six
-        // corpora's 8,732 bare-word call sites are this residue, `can?`'s 151 the largest, and
-        // every one must go on answering what it answered before this half existed.
+        // The rung is additive at its own edge too, as this asserts: `can?` is cancan's, `policy`
+        // is pundit's, and neither is in any half. Every such call must keep the answer it had
+        // before this half existed.
         let mut harness = Harness::new();
         action_view(&harness);
         harness.write(
@@ -1015,11 +1022,11 @@ mod tests {
 
     #[test]
     fn a_project_whose_bundle_ships_no_actionview_answers_nothing_from_that_half() {
-        // The whole of the gate on the third half, and it is deliberately not a switch: the
-        // half is two *names*, and a name the graph does not hold cannot be walked. So a
-        // project with an `app/views/` and no Rails in its bundle — the Sinatra application
-        // `[rails] views` exists for, and equally a Rails application whose gems are not
-        // installed yet — gets the two halves it has evidence for and the name rung under them.
+        // The third half's whole gate, deliberately not a switch: the half is two *names*, and a
+        // name the graph lacks cannot be walked. So a project with an `app/views/` and no Rails in
+        // its bundle (the Sinatra application `[rails] views` exists for, or a Rails application
+        // whose gems are not installed yet) gets the two halves it has evidence for, with the name
+        // rung under them.
         let mut harness = Harness::new();
         harness.write(
             "app/helpers/application_helper.rb",
@@ -1045,18 +1052,17 @@ mod tests {
 
     #[test]
     fn a_module_under_app_helpers_is_in_the_view_context_rather_than_read_by_it() {
-        // 34 of the 121 positions this half was opened for are in an `app/helpers` file rather
-        // than in a template, and they are the same defect: Rails includes every helper module
-        // into the same `_helpers`, so a bare call written in one reaches the other helper
-        // modules and ActionView's own exactly as a template's does.
+        // Helper files need this as much as templates: Rails includes every helper module into the
+        // same `_helpers`, so a bare call in one reaches the other helper modules and ActionView's
+        // own exactly as a template's does.
         //
-        // **What it does not get is the export half.** `helper_method` is a permission one
-        // controller grants; a helper module is included into every controller's view context,
-        // so there is no class for `rails::controller_of` to name and none is picked — which is
-        // also the one thing that would be wrong if this lane simply reused the template's.
+        // **It does not get the export half.** `helper_method` is a permission one controller
+        // grants; a helper module is included into every controller's view context, so there is no
+        // class for `rails::controller_of` to name and none is picked. That is also the one thing
+        // that would be wrong if this lane simply reused the template's.
         //
         // **And Rails' own glob still decides.** `app/helpers/legacy/auth.rb` is not named
-        // `*_helper.rb`, so it is in no view context and nothing about it changes.
+        // `*_helper.rb`, so it is in no view context and nothing changes for it.
         let mut harness = Harness::new();
         action_view(&harness);
         harness.write(
@@ -1101,12 +1107,12 @@ mod tests {
 
     #[test]
     fn a_mailer_template_gets_the_framework_half_it_does_not_get_the_applications() {
-        // The half that is every view context's, stated against the one template that has the
-        // least: `include_all_helpers` is `ActionController::Base`'s and `ActionMailer::Base`
-        // has no such thing, so a mailer reaches an application helper only by naming it — but
-        // every renderer builds an `ActionView::Base`, so `link_to` and `t` work in a mailer
-        // view and always have. A partial under `shared/`, whose controller does not exist at
-        // all, is the same shape and is why this half reaches the residue the other two leave.
+        // The half every view context has, checked against the template with the least:
+        // `include_all_helpers` is `ActionController::Base`'s and `ActionMailer::Base` has none, so
+        // a mailer reaches an application helper only by naming it, but every renderer builds an
+        // `ActionView::Base`, so `link_to` and `t` work in a mailer view. A partial under
+        // `shared/`, with no controller at all, has the same shape, which is why this half reaches
+        // the residue the other two leave.
         let mut harness = Harness::new();
         action_view(&harness);
         harness.write(
@@ -1141,12 +1147,10 @@ mod tests {
 
     #[test]
     fn erb_util_is_the_second_name_and_it_is_worth_its_row() {
-        // `ActionView::Base` is `include Helpers, ::ERB::Util, Context`, and the middle one is
-        // the smallest of the three by a wide margin: two words over six corpora, `h` and
-        // `json_escape`, at 38 call sites. It is here because `h` is a template idiom and the
-        // row costs one name. `Context` is not, and the reason is the same measurement read the
-        // other way — `output_buffer` and `view_flow` are the renderer's plumbing and no
-        // template in six corpora calls either.
+        // `ActionView::Base` is `include Helpers, ::ERB::Util, Context`, and the middle one is by
+        // far the smallest: in practice `h` and `json_escape`. It is here because `h` is a template
+        // idiom and the row costs one name. `Context` is not, for the same reason read the other
+        // way: `output_buffer` and `view_flow` are renderer plumbing no template calls.
         let mut harness = Harness::new();
         action_view(&harness);
         let source = "<%= h(story.title) %>\n";
@@ -1160,9 +1164,9 @@ mod tests {
     #[test]
     fn the_framework_half_is_offered_in_completion_and_ranks_under_the_applications_own() {
         // The collecting half of the same walk. `Reached::step` carries the chain Rails builds
-        // `_helpers` from — export 0, `app/helpers` 1, ActionView 2 — so a template offers the
-        // word the application itself wrote above the one the framework ships, which is the
-        // order the two would run in.
+        // `_helpers` from (export 0, `app/helpers` 1, ActionView 2), so a template offers the word
+        // the application wrote above the one the framework ships, the order in which the two would
+        // run.
         let mut harness = Harness::new();
         action_view(&harness);
         harness.write(

@@ -1,8 +1,8 @@
-//! `textDocument/semanticTokens` — the identifiers a grammar cannot classify.
+//! `textDocument/semanticTokens`: the identifiers a grammar cannot classify.
 //!
-//! Every editor ships a TextMate grammar for Ruby and it does the lexical half well: keywords,
+//! Every editor ships a TextMate grammar for Ruby, and it does the lexical half well: keywords,
 //! strings, numbers, `@ivars`, `$globals`, `CONSTANTS`. Those are decidable from the characters,
-//! and re-sending them from here would be work for no change on the screen.
+//! and re-sending them from here would change nothing on the screen.
 //!
 //! One thing is not decidable from the characters, and it is everywhere:
 //!
@@ -14,32 +14,30 @@
 //! end
 //! ```
 //!
-//! `size` and `width` are the same characters in the same position and are two different things.
-//! The answer is "was this name assigned anywhere in this scope", and a scope is a parse. Prism
-//! has already decided it — the same bare word arrives as a `LocalVariableReadNode` or as a
-//! `CallNode` — and reading that back is the whole of this module. So the legend is three types
-//! and no modifiers: everything in it is something the parse knows and the characters do not.
+//! `size` and `width` are the same characters in the same position, and two different things. The
+//! answer is "was this name assigned anywhere in this scope", and a scope is a parse. Prism already
+//! decided it (the same bare word arrives as a `LocalVariableReadNode` or as a `CallNode`), and
+//! reading that back is all this module does. So the legend is three types and no modifiers:
+//! everything in it is something the parse knows and the characters do not.
 //!
-//! # Why every call is sent, and not only the ambiguous ones
+//! # Why every call is sent, not only the ambiguous ones
 //!
-//! `foo.bar` is unambiguous — the `.` gives it away — so a strict reading would send `bar` no
-//! token and let the grammar colour it. That is wrong on the screen: `render` would be coloured
-//! in one place and not in another, which reads as a bug rather than a rule. Semantic tokens
-//! replace the grammar's answer wherever they are sent, so what has to be consistent is *the set
-//! of things sent*, not the set of things that were hard.
+//! `foo.bar` is unambiguous (the `.` gives it away), so a strict reading would send `bar` no token
+//! and let the grammar colour it. That looks wrong: `render` would be coloured in one place and not
+//! another, which reads as a bug, not a rule. Semantic tokens replace the grammar's answer wherever
+//! they are sent, so what must be consistent is *the set of things sent*, not the set of things
+//! that were hard.
 //!
-//! What is skipped is what has no name to colour: `a + b`, `list[0]` and `x <=> y` are all calls
-//! in Ruby, and colouring their operators as method names is true, useless and ugly.
+//! What is skipped is what has no name to colour: `a + b`, `list[0]` and `x <=> y` are all calls in
+//! Ruby, and colouring their operators as method names is true, useless and ugly.
 //!
 //! # Why there is no delta
 //!
-//! `semanticTokens/full/delta` lets a client re-ask with a previous result id and be sent the
-//! edits rather than the whole list. It is a wire optimisation, not a different answer, and it
-//! costs the server a cache of every response it has sent per document, keyed by an id it must
-//! invalidate on every edit. ya-lsp declines it: the whole-file answer for the largest file in a
-//! real Rails application is measured in microseconds. See
-//! `analysis::threaded_tests` for the measurement and for what it costs
-//! the requests queued behind it.
+//! `semanticTokens/full/delta` lets a client re-ask with a previous result id and get the edits
+//! instead of the whole list. It is a wire optimisation, not a different answer, and it costs the
+//! server a cache of every response per document, keyed by an id it must invalidate on every edit.
+//! ya-lsp declines it: the whole-file answer for the largest file in a real Rails application is
+//! cheap. `analysis::threaded_tests` measures it, and what it costs the requests queued behind it.
 
 use ruby_prism::{
     BlockLocalVariableNode, BlockParameterNode, CallNode, DefNode, ItLocalVariableReadNode,
@@ -52,14 +50,14 @@ use ruby_prism::{
 /// What a token is, as an index into [`LEGEND`].
 ///
 /// The numbers are the wire format: a client reads them against the legend the server sent at
-/// initialize, so the order of the two must never disagree. `tests::the_legend_is_the_wire`
-/// is what holds them together.
+/// initialize, so the two orders must never disagree. `tests::the_legend_is_the_wire` holds them
+/// together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// A local variable, in any of the eight ways Ruby writes one.
     Variable = 0,
-    /// A parameter, at the point it is declared. Reads of it inside the body are locals, which
-    /// is what they are.
+    /// A parameter, where it is declared. Reads of it inside the body are locals, which is what
+    /// they are.
     Parameter = 1,
     /// A method, by the name where it is called and where it is defined.
     Method = 2,
@@ -67,16 +65,16 @@ pub enum Kind {
 
 /// The token types this server sends, in the order their indices mean.
 ///
-/// Sent verbatim as the `legend.tokenTypes` of the server's capabilities. There are no
-/// modifiers: every modifier LSP defines is either something the grammar has (`readonly` on a
-/// constant) or something no test would be able to say was wrong.
+/// Sent verbatim as the `legend.tokenTypes` of the server's capabilities. No modifiers: every
+/// modifier LSP defines is either something the grammar has (`readonly` on a constant) or something
+/// no test could call wrong.
 pub const LEGEND: [&str; 3] = ["variable", "parameter", "method"];
 
 /// One token, as a byte span in the document and a kind.
 ///
-/// Byte spans, not positions: turning an offset into a line and a character is
-/// [`position`](super::position)'s job and depends on the encoding the client negotiated. This
-/// module would have to be given the document to do it, and it has no other reason to want one.
+/// Byte spans, not positions: turning an offset into a line and character is
+/// [`position`](super::position)'s job, and depends on the encoding the client negotiated. This
+/// module would need the document to do it, and has no other reason to want one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Token {
     pub start: u32,
@@ -86,11 +84,10 @@ pub struct Token {
 
 /// Every token in `source`, in source order.
 ///
-/// Sorted here rather than by the caller because the protocol requires it — the wire format is a
-/// list of *deltas* from the previous token, so an out-of-order entry is not a misplaced colour
-/// but a corrupted rest-of-file. The walk emits in Prism's order, which is close to source order
-/// and is not it: a call's arguments are visited after its receiver, and a `rescue` after the
-/// body it guards.
+/// Sorted here, not by the caller, because the protocol requires it: the wire format is a list of
+/// *deltas* from the previous token, so an out-of-order entry is not a misplaced colour but a
+/// corrupted rest of file. The walk emits in Prism's order, which is close to source order but not
+/// it: a call's arguments are visited after its receiver, and a `rescue` after the body it guards.
 #[must_use]
 pub fn of(source: &str) -> Vec<Token> {
     let result = ruby_prism::parse(source.as_bytes());
@@ -114,9 +111,10 @@ impl Walk<'_> {
     }
 
     fn push_span(&mut self, start: u32, end: u32, kind: Kind) {
-        // A zero-width span is Prism recovering from something half-written — `foo.` gives the
-        // call an empty message exactly at the cursor. A token of length zero is legal on the
-        // wire and invisible on the screen, so it is only weight.
+        // A zero-width span is Prism recovering from something half-written. The shape is not
+        // `foo.` (`is_named` turns that call's empty message away a step earlier); it is `def` at
+        // the end of the file, whose name span is empty and exactly at the cursor. A zero-length
+        // token is legal on the wire and invisible on the screen, so it is only weight.
         if start < end {
             self.found.push(Token { start, end, kind });
         }
@@ -124,10 +122,9 @@ impl Walk<'_> {
 
     /// Whether a call's message is a name rather than an operator.
     ///
-    /// `a + b`, `list[0]` and `x <=> y` are calls, and their messages are `+`, `[]` and `<=>`.
-    /// Ruby really does dispatch them, and colouring them as method names would be true and
-    /// unreadable. A trailing `?`, `!` or `=` is part of a name and not an operator, so the test
-    /// is on the *first* character.
+    /// `a + b`, `list[0]` and `x <=> y` are calls, with messages `+`, `[]` and `<=>`. Ruby really
+    /// dispatches them, and colouring them as method names would be true and unreadable. A trailing
+    /// `?`, `!` or `=` is part of a name, not an operator, so the test is on the *first* character.
     fn is_named(&self, at: &Location<'_>) -> bool {
         self.source[at.start_offset()..at.end_offset()]
             .chars()
@@ -146,17 +143,17 @@ impl<'pr> Visit<'pr> for Walk<'_> {
         ruby_prism::visit_call_node(self, node);
     }
 
-    /// The name in `def render`, which the grammar can see coming from the `def` — and which is
-    /// sent anyway, because the same name at a call site is sent and a colour that changes
-    /// between a definition and its uses reads as a bug rather than as a rule.
+    /// The name in `def render`, which the grammar can see coming from the `def`. Sent anyway,
+    /// because the same name at a call site is sent, and a colour that changes between a definition
+    /// and its uses reads as a bug, not a rule.
     fn visit_def_node(&mut self, node: &DefNode<'pr>) {
         self.push(&node.name_loc(), Kind::Method);
         ruby_prism::visit_def_node(self, node);
     }
 
-    // The eight ways Ruby writes a local. Every one of them is a `variable`: which of them is a
-    // *declaration* is a question Ruby does not really have an answer to — the first assignment
-    // in a scope declares it, and which one that is depends on control flow.
+    // The eight ways Ruby writes a local. Every one is a `variable`: which of them is a
+    // *declaration* is a question Ruby has no real answer to, because the first assignment in a
+    // scope declares it, and which one that is depends on control flow.
 
     fn visit_local_variable_read_node(&mut self, node: &LocalVariableReadNode<'pr>) {
         self.push(&node.location(), Kind::Variable);
@@ -199,8 +196,8 @@ impl<'pr> Visit<'pr> for Walk<'_> {
         self.push(&node.location(), Kind::Variable);
     }
 
-    // Parameters, in the six shapes that carry a name. `def f(a, (b, c))` destructures into
-    // plain required parameters, so the awkward spelling needs no case of its own.
+    // Parameters, in the six shapes that carry a name. `def f(a, (b, c))` destructures into plain
+    // required parameters, so it needs no case of its own.
 
     fn visit_required_parameter_node(&mut self, node: &RequiredParameterNode<'pr>) {
         self.push(&node.location(), Kind::Parameter);
@@ -223,9 +220,8 @@ impl<'pr> Visit<'pr> for Walk<'_> {
         }
     }
 
-    /// A keyword parameter's name span carries its colon (`limit:`), which is not part of the
-    /// name anywhere else it is written. Trimmed so the token covers what a reader would call
-    /// the name.
+    /// A keyword parameter's name span includes its colon (`limit:`), which is not part of the name
+    /// anywhere else it is written. Trimmed so the token covers what a reader calls the name.
     fn visit_required_keyword_parameter_node(&mut self, node: &RequiredKeywordParameterNode<'pr>) {
         self.push_keyword(&node.name_loc());
     }
@@ -243,12 +239,11 @@ impl<'pr> Visit<'pr> for Walk<'_> {
 }
 
 impl Walk<'_> {
-    /// A keyword parameter, whose name span carries the colon Ruby writes after it.
+    /// A keyword parameter, whose name span includes the colon Ruby writes after it.
     ///
-    /// Trimmed unconditionally rather than behind an `ends_with`, because a keyword parameter
-    /// always has one and a branch for the case that cannot happen is a branch no test can
-    /// take. `scopes` guards the same trim, and rightly: there the span arrives from every kind
-    /// of variable and most of them have no colon.
+    /// Trimmed unconditionally, not behind an `ends_with`: a keyword parameter always has one, and
+    /// a branch for an impossible case is a branch no test can take. `scopes` guards the same trim,
+    /// rightly: there the span comes from every kind of variable, and most have no colon.
     fn push_keyword(&mut self, at: &Location<'_>) {
         let start = at.start_offset() as u32;
         let name = self.source[at.start_offset()..at.end_offset()].trim_end_matches(':');
@@ -263,11 +258,11 @@ mod tests {
     use crate::analysis::testing::*;
     use crate::analysis::tokens;
 
-    /// The source with every token underlined beneath the line it is on, named by its kind.
+    /// The source with every token underlined beneath its line, named by its kind.
     ///
-    /// Drawn rather than asserted as spans, for the reason `signature_help`'s fixtures are
-    /// drawn: a token one character short colours the wrong text, which is visible at a glance
-    /// and reads as the bug it is, while a list of triples shows nobody anything.
+    /// Drawn, not asserted as spans, for the reason `signature_help`'s fixtures are drawn: a token
+    /// one character short colours the wrong text, which is visible at a glance and reads as the
+    /// bug it is, while a list of triples shows nobody anything.
     fn drawn(source: &str) -> String {
         let tokens = of(source);
         let mut out = String::new();
@@ -305,8 +300,8 @@ mod tests {
 
     #[test]
     fn the_ambiguity_no_grammar_can_resolve() {
-        // The reason the whole module exists, in four lines. `size` and `width` are the same
-        // characters in the same position; only the parse knows that one of them was assigned.
+        // The reason the module exists, in four lines. `size` and `width` are the same characters
+        // in the same position; only the parse knows one of them was assigned.
         assert_eq!(
             drawn("def render(scale)\n  size = scale * 2\n  size\n  width\nend\n"),
             "\
@@ -325,9 +320,8 @@ end
 
     #[test]
     fn an_operator_is_a_call_with_no_name_to_colour() {
-        // Every one of these is a method call in Ruby. Colouring them would be true and
-        // unreadable, and the test is on the first character so that `empty?`, `save!` and
-        // `name=` keep theirs.
+        // Every one of these is a method call in Ruby. Colouring them would be true and unreadable,
+        // and the test is on the first character so `empty?`, `save!` and `name=` keep theirs.
         assert_eq!(
             drawn("a = [1]\na[0] <=> a.size\na.name = 1\na.empty?\n"),
             "\
@@ -345,9 +339,9 @@ v mmmmmm
 
     #[test]
     fn every_shape_of_local_and_parameter() {
-        // The eight local spellings and the six parameter ones, in one file: each of them is a
-        // visitor override, and an override that stops firing is invisible on the screen
-        // — the identifier simply falls back to the grammar's colour, which is a plausible one.
+        // The eight local spellings and the six parameter ones, in one file. Each is a visitor
+        // override, and an override that stops firing is invisible on the screen: the identifier
+        // falls back to the grammar's colour, which is a plausible one.
         assert_eq!(
             drawn(
                 "\
@@ -393,10 +387,10 @@ end
 
     #[test]
     fn the_order_is_the_source_and_not_the_walk() {
-        // The wire format is a list of deltas from the previous token, so an entry out of order
-        // is not one misplaced colour — every token after it lands somewhere else. Prism's walk
-        // is close to source order and is not it: a call's arguments come after its receiver,
-        // and a `rescue` after the body it guards.
+        // The wire format is deltas from the previous token, so an out-of-order entry is not one
+        // misplaced colour: every token after it lands somewhere else. Prism's walk is close to
+        // source order but not it: a call's arguments come after its receiver, and a `rescue` after
+        // the body it guards.
         let tokens = of("outer(inner(1)) { |x| x }\nbegin\n  a = 1\nrescue => e\n  e\nend\n");
         let starts: Vec<u32> = tokens.iter().map(|token| token.start).collect();
         let mut sorted = starts.clone();
@@ -406,8 +400,8 @@ end
 
     #[test]
     fn a_parameter_with_no_name_has_nothing_to_colour() {
-        // Ruby 3.1 and 3.2 made `*`, `**` and `&` legal on their own, to be forwarded. There is
-        // no name, so there is no token, and each of the three is a visitor of its own.
+        // Ruby 3.1 and 3.2 made bare `*`, `**` and `&` legal, for forwarding. There is no name, so
+        // there is no token, and each of the three is its own visitor.
         assert_eq!(
             drawn("def f(*, **, &)\n  g(*, **, &)\nend\n"),
             "\
@@ -422,10 +416,10 @@ end
 
     #[test]
     fn a_half_typed_call_has_no_name_to_colour_either() {
-        // Two shapes, and both arrive constantly: an editor asks for tokens on every keystroke.
-        // `foo.` recovers into a call whose message is empty and exactly at the cursor — a
-        // zero-width token, legal on the wire and invisible on the screen. `foo.()` is `call`
-        // written with no name at all, and has no message span.
+        // Two shapes, both constant: an editor asks for tokens on every keystroke. `foo.` recovers
+        // into a call whose message is empty and exactly at the cursor: a zero-width token, legal
+        // on the wire and invisible on the screen. `foo.()` is `call` written with no name at all,
+        // and has no message span.
         assert_eq!(
             drawn("x = 1\nx.\n"),
             "\
@@ -447,9 +441,26 @@ v
     }
 
     #[test]
+    fn a_def_with_no_name_yet_has_nothing_to_colour() {
+        // The keystroke after the third character, in a file that ends there: Prism recovers a
+        // `def` whose name span is empty and exactly at the cursor. It is the only shape that
+        // reaches `push_span` zero-width (a call's empty message never gets that far). No
+        // hand-written fixture ends in a bare `def`, so this one does.
+        assert!(of("def").is_empty());
+        assert_eq!(
+            drawn("x = 1\ndef"),
+            "\
+x = 1
+v
+def
+"
+        );
+    }
+
+    #[test]
     fn a_file_that_does_not_parse_still_answers() {
-        // Prism recovers; whatever it managed to read is still worth colouring, and a file
-        // being typed into is not valid Ruby most of the time.
+        // Prism recovers, and whatever it read is still worth colouring: a file being typed into is
+        // invalid Ruby most of the time.
         let tokens = of("def f(a)\n  a\n");
         assert_eq!(tokens.len(), 3, "{tokens:?}");
         assert!(of("").is_empty());
@@ -457,10 +468,9 @@ v
 
     #[test]
     fn the_legend_is_the_wire() {
-        // The numbers `Kind` carries *are* the protocol: a client reads them as indices into
-        // the legend the server sent at initialize. Reordering either without the other
-        // recolours every token in every file, silently and consistently, which is the hardest
-        // kind of wrong to notice.
+        // The numbers `Kind` carries *are* the protocol: a client reads them as indices into the
+        // legend the server sent at initialize. Reordering one without the other recolours every
+        // token in every file, silently and consistently: the hardest kind of wrong to notice.
         assert_eq!(LEGEND.len(), 3);
         assert_eq!(LEGEND[Kind::Variable as usize], "variable");
         assert_eq!(LEGEND[Kind::Parameter as usize], "parameter");
@@ -469,10 +479,9 @@ v
 
     /// A `semanticTokens/full` answer read back into absolute positions and named kinds.
     ///
-    /// The wire format is deltas from the previous token, which is unreadable and is exactly
-    /// what has to be checked: an entry that is off by one does not misplace one colour, it
-    /// misplaces every colour after it. Decoding it here is the only way an assertion can be
-    /// about what the user sees.
+    /// The wire format is deltas from the previous token: unreadable, and exactly what must be
+    /// checked, since an entry off by one misplaces every colour after it. Decoding it here is the
+    /// only way an assertion can be about what the user sees.
     fn decoded(answer: &serde_json::Value) -> Vec<(u64, u64, u64, &'static str)> {
         let data = answer["data"].as_array().expect("token data");
         let mut rows = Vec::new();
@@ -527,10 +536,10 @@ v
 
     #[test]
     fn a_token_length_is_counted_in_the_encoding_the_client_negotiated() {
-        // `имя` is a legal Ruby local and three characters of two bytes each. A length taken as
-        // `end - start` in bytes underlines six units where the client counts three, which
-        // paints the colour over whatever follows. The offsets go through `TextDocument` for
-        // exactly this reason, and a fixture that is all ASCII cannot see it.
+        // `имя` is a legal Ruby local: three characters of two bytes each. A length taken as
+        // `end - start` in bytes underlines six units where the client counts three, painting the
+        // colour over whatever follows. The offsets go through `TextDocument` for exactly this
+        // reason, and an all-ASCII fixture cannot see it.
         let mut harness = Harness::new();
         let source = "имя = 1\nимя\n";
         let uri = harness.write("app/utf.rb", source);

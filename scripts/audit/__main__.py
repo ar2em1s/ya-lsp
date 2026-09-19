@@ -1,39 +1,37 @@
-"""`python3 scripts/audit <command>` — the argument parser and nothing else."""
+"""`python3 scripts/audit <command>`: the argument parser and nothing else."""
 
 import argparse
 import sys
 from pathlib import Path
 
 # **Line-buffered, so a sweep can be watched.** Python block-buffers stdout whenever it is not a
-# terminal, and `make audit` is the one command here that runs for minutes: piped, redirected or
-# backgrounded it printed every per-corpus line at once on exit, which reads exactly like a hang.
-# Set on the stream rather than asked of each `print`, and here rather than in the Makefile, so
-# that it holds however this was invoked. A terminal is line-buffered already, so this is a no-op
-# for the interactive run.
+# terminal, and `make audit` runs for minutes. Piped, redirected or backgrounded, it would print
+# every per-corpus line at exit, which looks exactly like a hang. Set on the stream, here, so it
+# holds however this was invoked. A terminal is line-buffered already.
 sys.stdout.reconfigure(line_buffering=True)
 
-# `scripts/` on the path, so that `audit.*` and the pin table both import by name however this
-# was invoked: `python3 scripts/audit` puts `scripts/audit` itself on the path and neither name
-# is reachable from there.
+# `scripts/` on the path, so `audit.*` and the pin table both import by name.
+# `python3 scripts/audit` puts `scripts/audit` itself on the path, from where neither name is
+# reachable.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import audit                                                              # noqa: E402
 from audit.baseline import PATH as BASELINE                              # noqa: E402
-from audit.commands import (cmd_adjudicate, cmd_cost, cmd_ledger,         # noqa: E402
-                            cmd_prefix, cmd_rank, cmd_report, cmd_sample,
-                            cmd_score)
+from audit.commands import (cmd_adjudicate, cmd_cost, cmd_latency,       # noqa: E402
+                            cmd_ledger, cmd_prefix, cmd_rank, cmd_report,
+                            cmd_sample, cmd_score)
 from audit.config import PER_FILE, PLACES_CAP, ROOT, pins                             # noqa: E402
 from audit.lane3.ledger import PATH as LEDGER                             # noqa: E402
 
 COMMANDS = {"sample": cmd_sample, "cost": cmd_cost, "score": cmd_score,
             "report": cmd_report, "ledger": cmd_ledger, "adjudicate": cmd_adjudicate,
-            "prefix": cmd_prefix, "rank": cmd_rank}
+            "prefix": cmd_prefix, "rank": cmd_rank, "latency": cmd_latency}
 
 
 def main():
-    # The shared flags go on a `parents=` parser rather than on the top level, so that
-    # `audit sample --only lobsters` works. With them on the top level argparse requires
-    # them *before* the subcommand, which is the spelling nobody types.
+    # The shared flags go on a `parents=` parser, so `audit sample --only lobsters` works. On the
+    # top-level parser, argparse would require them *before* the subcommand, a spelling nobody
+    # types.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--server", default=str(ROOT / "target/release/ya-lsp"))
     common.add_argument("--seed", default="0", help="the draw is a function of this and the SHA")
@@ -111,6 +109,21 @@ def main():
                            "the word's start, which is a quarter of the requests")
     seat.add_argument("--trace", type=int, default=0,
                       help="print this many of the worst-ranked positions")
+    wait = sub.add_parser("latency", parents=[common],
+                          help="what one request makes a person wait: p50/p95/max and the empty "
+                               "count beside them, one request in flight")
+    wait.add_argument("-n", type=int, default=0,
+                      help="cursors per corpus to ask (0 = every one drawn of the shape); three "
+                           "requests each, so the whole draw is affordable")
+    wait.add_argument("--shape", default="member",
+                      help="which drawn cursor shape to ask at. `member` is after a dot, where "
+                           "the popup is used and where the empty count re-measures "
+                           "the empty-popup measurement; `any` asks at the whole draw")
+    wait.add_argument("--trace", type=int, default=0,
+                      help="print this many of the slowest cursors per corpus, as path:line")
+    wait.add_argument("--runs", type=int, default=2,
+                      help="sweeps of one binary; the spread between them is the noise floor a "
+                           "later comparison has to beat. 1 skips that table")
     look = sub.add_parser("ledger", parents=[common],
                           help="what is in the ledger, and whether it still applies")
     look.add_argument("--path", default=str(LEDGER), help="the ledger to read")

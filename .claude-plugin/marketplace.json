@@ -1,0 +1,15 @@
+{
+  "name": "ya-lsp",
+  "description": "ya-lsp, developed in this repository: install it from here to test a plugin change before the official entry moves.",
+  "owner": {
+    "name": "ar2em1s"
+  },
+  "plugins": [
+    {
+      "name": "ya-lsp",
+      "description": "Ruby language server: definition, hover, references, type and call hierarchy, rename and completion \u2014 no Ruby runtime.",
+      "source": "./editors/claude-code",
+      "category": "development"
+    }
+  ]
+}

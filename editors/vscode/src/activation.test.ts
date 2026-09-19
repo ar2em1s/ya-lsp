@@ -1,11 +1,12 @@
 /**
  * Load the *bundled* extension against a stubbed editor and activate it.
  *
- * This is as close to "the extension works" as anything can get without an extension host, and
- * it catches the class of failure the other tests cannot: an import esbuild dropped, a value
- * read at module load that only exists inside VS Code, a command declared in package.json that
- * nothing registers. Those all present identically to a user — the extension simply does
- * nothing — and none of them show up in a type check.
+ * The closest thing to "the extension works" without an extension host. It catches what the other
+ * tests cannot, all of which look the same to a user (the extension silently does nothing) and none
+ * of which a type check sees:
+ * - an import esbuild dropped;
+ * - a value read at module load that exists only inside VS Code;
+ * - a command declared in package.json that nothing registers.
  */
 
 import assert from 'node:assert/strict';
@@ -22,8 +23,8 @@ const emitter = () => disposable;
 /**
  * The namespaces this extension uses, stubbed exactly.
  *
- * Exactly, and not permissively: a typo in one of these has to fail the test rather than
- * resolve to something harmless.
+ * Exactly, not permissively: a typo in one of these must fail the test, not resolve to something
+ * harmless.
  */
 const strict: Record<string, unknown> = {
   commands: {
@@ -43,8 +44,8 @@ const strict: Record<string, unknown> = {
     getWorkspaceFolder: () => undefined,
   },
   window: {
-    // `{ log: true }` is what the extension asks for, so the stub answers with the extra methods
-    // a `LogOutputChannel` carries — the client calls them as soon as it starts.
+    // The extension asks for `{ log: true }`, so the stub carries the extra methods of a
+    // `LogOutputChannel`; the client calls them as soon as it starts.
     createOutputChannel: () => ({
       ...disposable,
       appendLine() {},
@@ -63,8 +64,8 @@ const strict: Record<string, unknown> = {
     },
     activeTextEditor: undefined,
   },
-  // The client's protocol converter builds both of these when it turns a protocol relative
-  // pattern into an editor one, and the document-selector test below reads back what it built.
+  // The client's protocol converter builds both of these when it turns a protocol relative pattern
+  // into an editor one, and the document-selector test below reads back what it built.
   Uri: { parse: (value: string) => ({ toString: () => value }) },
   RelativePattern: class {
     constructor(
@@ -78,10 +79,10 @@ const strict: Record<string, unknown> = {
 /**
  * Everything else `vscode` exports, for the language client rather than for us.
  *
- * It subclasses `vscode.CompletionItem` and friends the moment it is imported, and enumerating
- * which ones would tie this test to the client's internals — a version bump would break it for
- * no reason that concerns anybody. So unknown names answer with something that can be extended,
- * called, and read from.
+ * The client subclasses `vscode.CompletionItem` and friends as soon as it is imported. Listing
+ * which would tie this test to the client's internals, so a version bump would break it for no
+ * reason that matters. So unknown names answer with something that can be extended, called and read
+ * from.
  */
 function permissive(): unknown {
   const shape = function (): undefined {
@@ -119,7 +120,7 @@ after(() => {
   (Module as unknown as { _load: unknown })._load = load;
 });
 
-// `out/` next to `dist/`, because this runs against what ships rather than what compiles.
+// `out/` sits next to `dist/`, and this runs against what ships, not what compiles.
 const bundle = path.resolve(__dirname, '..', 'dist', 'extension.js');
 
 test('the bundle loads and exposes the extension host contract', () => {
@@ -129,8 +130,8 @@ test('the bundle loads and exposes the extension host contract', () => {
 });
 
 test('activating with no workspace folders registers every declared command', async () => {
-  // A window with no folder open is a normal state, not an edge case — and it is also the state
-  // in which a crash during activation disables the extension for the whole session.
+  // A window with no folder open is a normal state, not an edge case, and it is also the state in
+  // which an activation crash disables the extension for the whole session.
   const extension = require(bundle) as {
     activate(context: unknown): Promise<void>;
   };
@@ -150,11 +151,10 @@ test('activating with no workspace folders registers every declared command', as
  * A multi-root workspace starts no server until a Ruby file asks for one.
  *
  * `folders[0]` is whichever folder the `.code-workspace` lists first, and activation is
- * `onLanguage:ruby`. Starting a server on that folder because a Ruby file was opened in *any*
- * other one gives a workspace whose first folder holds no Ruby (infrastructure, docs, a sibling
- * service in another language) an index of nothing plus a warning telling it to widen
- * `index.include`, for a folder the user never opened. Counted through `showErrorMessage`, which
- * `start` raises once per folder when it cannot find a server binary.
+ * `onLanguage:ruby`. Starting a server there because a Ruby file opened in *another* folder would
+ * give a first folder with no Ruby (infrastructure, docs, a sibling service) an index of nothing,
+ * plus a warning to widen `index.include`, for a folder the user never opened. Counted through
+ * `showErrorMessage`, which `start` raises once per folder when it cannot find a server binary.
  */
 test('a multi-root workspace starts no server before a Ruby file is opened', async () => {
   const extension = require(bundle) as {
@@ -182,12 +182,11 @@ test('a multi-root workspace starts no server before a Ruby file is opened', asy
 });
 
 /**
- * The single-folder case still starts eagerly, so the fix above cannot be "never start".
+ * A single-folder workspace still starts eagerly, so the fix above cannot be "never start".
  *
  * Nearly every project is one folder, and for those the eager start is the difference between a
- * warm server and one that begins indexing at the first keystroke. A guard that turned it off
- * everywhere would fix the multi-root warning by making the common case slower, which is why
- * both halves are pinned.
+ * warm server and one that starts indexing at the first keystroke. Turning it off everywhere would
+ * fix the multi-root warning by slowing the common case, which is why both halves are pinned.
  */
 test('a single-folder workspace still starts its server eagerly', async () => {
   const extension = require(bundle) as {
@@ -214,11 +213,10 @@ test('a single-folder workspace still starts its server eagerly', async () => {
 /**
  * A template opens a server on its folder, exactly as a Ruby file does.
  *
- * ya-lsp indexes `.erb`, and the extension is where that decision either reaches a
- * user or does not: `startForDocument` filters on `languageId`, so a template in a folder whose
- * Ruby nobody has opened would activate nothing at all and the whole feature would be invisible
- * in the editor it was built for. Counted through `showErrorMessage`, which `start` raises once
- * per folder it tries to serve.
+ * ya-lsp indexes `.erb`, and the extension decides whether that reaches a user: `startForDocument`
+ * filters on `languageId`, so a template in a folder whose Ruby nobody has opened would activate
+ * nothing, and the feature would be invisible in the editor it was built for. Counted through
+ * `showErrorMessage`, which `start` raises once per folder it tries to serve.
  */
 test('a template opens a server on its folder, the way a Ruby file does', async () => {
   const extension = require(bundle) as {
@@ -249,8 +247,8 @@ test('a template opens a server on its folder, the way a Ruby file does', async 
 
   assert.equal(errors.length, 1, 'an open template must start its folder`s server');
 
-  // The guard, so this cannot pass because everything starts a server: a language this
-  // extension does not serve still starts nothing.
+  // The guard, so this cannot pass because everything starts a server: a language this extension
+  // does not serve still starts nothing.
   strict.workspace = {
     ...(strict.workspace as Record<string, unknown>),
     textDocuments: [document('markdown')],
@@ -265,14 +263,13 @@ test('a template opens a server on its folder, the way a Ruby file does', async 
 /**
  * Every folder's client is narrowed to that folder, and the shape survives the real conversion.
  *
- * Moved here from `selector.test.ts` when the wide single-folder form went away. There is one
- * selector shape now — the folder, always — and what it has to get right is containment: its own
- * files claimed, a sibling's refused, and nothing outside either, because what lies outside is the
- * server's to ask for and two clients claiming one gem file is two servers answering one hover.
+ * There is one selector shape: the folder. What it must get right is containment: its own files
+ * claimed, a sibling's refused, and nothing outside either. What lies outside is the server's to
+ * ask for, and two clients claiming one gem file is two servers answering one hover.
  *
- * Run through the *real* converter rather than asserted as a string, because the conversion is the
- * step that can silently drop the pattern — and a dropped pattern does not narrow, it widens to
- * language and scheme alone.
+ * Run through the *real* converter, not asserted as a string, because the conversion is the step
+ * that can silently drop the pattern, and a dropped pattern does not narrow: it widens to language
+ * and scheme alone.
  */
 test('a folder`s client claims its own folder and refuses a sibling`s', () => {
   const { LANGUAGES, documentSelector } = require(bundle) as {
@@ -301,8 +298,8 @@ test('a folder`s client claims its own folder and refuses a sibling`s', () => {
   assert.equal(converted.length, LANGUAGES.length, 'every filter must survive the conversion');
 
   /**
-   * A `vscode.RelativePattern` matches a path only when it is under its base, modelled here because
-   * the stub above is not minimatch. The guard below is what stops this from passing vacuously.
+   * A `vscode.RelativePattern` matches a path only under its base, modelled here because the stub
+   * above is not minimatch. The guard below keeps this from passing vacuously.
    */
   const underBase = (
     filter: { pattern?: { baseUri?: { toString(): string } } },
@@ -334,14 +331,14 @@ test('a folder`s client claims its own folder and refuses a sibling`s', () => {
 });
 
 test('the language client turns a protocol relative pattern into an editor one', () => {
-  // The one link in the multi-root chain that cannot be reasoned about from the types. Client 10
-  // runs every selector through `asDocumentSelector`, which recognises only the protocol's
-  // `{ baseUri, pattern }` shape and converts anything else to `undefined`. An undefined pattern
-  // is not an inert one — `languages.match` then scores on language and scheme alone, so every
-  // folder's client would claim every folder's Ruby files. This is where that shows up.
+  // The one link in the multi-root chain the types cannot vouch for. Client 10 runs every selector
+  // through `asDocumentSelector`, which recognises only the protocol's `{ baseUri, pattern }` shape
+  // and turns anything else into `undefined`. An undefined pattern is not inert: `languages.match`
+  // then scores on language and scheme alone, so every folder's client would claim every folder's
+  // Ruby files. This is where that would show.
   //
-  // `$test/common/*` is the subpath the client's own `exports` map publishes for reaching into
-  // `lib/common`; the bare path was sealed off when 10 added that map.
+  // `$test/common/*` is the subpath the client's own `exports` map publishes for `lib/common`; that
+  // map seals off the bare path.
   const { createConverter } = require('vscode-languageclient/$test/common/protocolConverter') as {
     createConverter(...args: unknown[]): {
       asDocumentSelector(selector: unknown[]): { pattern?: unknown }[];
@@ -362,9 +359,8 @@ test('the language client turns a protocol relative pattern into an editor one',
     'scoped to this folder, not to the whole workspace'
   );
 
-  // The guard, so this cannot pass vacuously: an *editor* `RelativePattern` — whose `baseUri` is
-  // a Uri object rather than a string — is precisely the shape that vanishes. It is what this
-  // extension passed under client 9, where it was copied through untouched.
+  // The guard, so this cannot pass vacuously: an *editor* `RelativePattern`, whose `baseUri` is a
+  // Uri object, not a string, is exactly the shape that vanishes.
   const dropped = converter.asDocumentSelector([
     {
       scheme: 'file',
@@ -380,15 +376,16 @@ test('the language client turns a protocol relative pattern into an editor one',
 });
 
 /**
- * The wiring between `claims.ts`'s predicate and the requests this client actually sends.
+ * The wiring between `claims.ts`' predicate and the requests this client actually sends.
  *
- * `claimedByNestedFolder` is pure and pinned in `claims.test.ts`; what is left here is the part
- * that can only be wrong in `extension.ts` — reading the document from the wrong place in the
- * parameters, or handing the predicate its two strings the wrong way round. Both are silent, and
- * they fail in opposite directions: one leaves every answer in a nested folder doubled, exactly
- * the bug this exists to fix, and the other makes a client answer nothing anywhere.
+ * `claimedByNestedFolder` is pure and pinned in `claims.test.ts`. What is left can only go wrong in
+ * `extension.ts`, silently, in opposite directions:
+ * - reading the document from the wrong place in the parameters leaves every answer in a nested
+ *   folder doubled (the bug this exists to fix);
+ * - handing the predicate its two strings the wrong way round makes a client answer nothing
+ *   anywhere.
  *
- * Driven through the bundle rather than the sources, for the reason every other test here is.
+ * Driven through the bundle, not the sources, like every other test here.
  */
 test('a parent folder`s client sends nothing about a nested folder`s files', async () => {
   const { narrowing } = require(bundle) as {
@@ -433,7 +430,7 @@ test('a parent folder`s client sends nothing about a nested folder`s files', asy
   );
   assert.deepEqual(forwarded, ['file:///repo/shared/user.rb'], 'and only that one was sent');
 
-  // A request naming no document is about the folder, not about a file, and must still go.
+  // A request naming no document is about the folder, not a file, and must still go.
   const symbols: string[] = [];
   assert.deepEqual(
     await middleware.sendRequest('workspace/symbol', { query: 'User' }, undefined, (type) => {
@@ -445,7 +442,7 @@ test('a parent folder`s client sends nothing about a nested folder`s files', asy
   );
   assert.deepEqual(symbols, ['workspace/symbol']);
 
-  // And the text sync, so the outer server is never handed the buffer in the first place.
+  // And the text sync, so the outer server is never handed the buffer at all.
   const opened: string[] = [];
   const document = (uri: string): unknown => ({ uri: { toString: () => uri } });
   const open = (document: unknown): Promise<void> => {

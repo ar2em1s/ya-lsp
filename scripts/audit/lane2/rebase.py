@@ -1,17 +1,13 @@
-"""Check 5 — the same cursor answers the same after an untouching `didChange`.
+"""Check 5: the same cursor answers the same after an untouching `didChange`.
 
-`position::Rebase`'s stated contract, as a measurement: *a deferred answer is never less than an
-eager one*. Three ways it can be broken and they are counted apart, because they are three
-different bugs — the answer disappearing, the answer moving, and the answer keeping its target
-while changing what it claims to know about it.
+`position::Rebase`'s contract, as a measurement: *a deferred answer is never less than an eager
+one*. It can break three ways, counted apart because they are three bugs: the answer disappears, the
+answer moves, or the answer keeps its target but changes what it claims to know.
 
-The edit itself is `client.ask_rebased`'s business: newlines at the very start of the cursor's
-own document and of every sampled document its eager answer pointed into, re-issued immediately
-before each position's requests. Every construct is untouched and every offset moves by exactly
-the number of lines its own document has taken. **Editing once up front instead measured almost
-nothing** — 139 of 11,046 requests reached `Rebase`, 1 of 1,792 on discourse — because the first
-empty deferred answer settles the graph and every position after it is answered by a re-indexed
-one. A zero here was a property of the harness until 2026-09-15.
+The edit is `client.ask_rebased`'s business: newlines at the very start of the cursor's document,
+and of every sampled document its eager answer pointed into, re-sent right before each position's
+requests. Every construct is untouched, and every offset moves by exactly the lines its own document
+has taken. (Editing once up front measures almost nothing; `ask_rebased` says why.)
 """
 
 from audit.answers import targets, tier
@@ -27,13 +23,10 @@ def counters():
 def check(row, place, counts, findings):
     """The three tests, and they are **not** an `elif` chain.
 
-    They were, and the chain hid the worst firing this check has produced. At
-    `FollowMigrationService.new.call` on mastodon the eager answer is one target on a *Resolved*
-    card carrying the signature; after the untouching edit it is 692 targets on a *Guessed* card
-    reading "677 possible definitions". The target sets differ, so the chain reported it as
-    `moved` and stopped — and `rebased-tier`, the counter that says the answer stopped knowing
-    what it was, read 0 for the whole run. Three bugs counted apart has to mean a position can
-    be scored for all three, or the two later tests only ever see positions the first two missed.
+    One position can break all three: an eager answer of one target on a *Resolved* card can come
+    back, after the untouching edit, as hundreds of targets on a *Guessed* card. A chain would
+    report that as `moved` and stop, and `rebased-tier` (the answer no longer knowing what it was)
+    would read 0. Three bugs counted apart means a position can score for all three.
     """
     if not row.deferred:
         return
@@ -45,9 +38,9 @@ def check(row, place, counts, findings):
                          f"{row.at} -> "
                          f"{'card' if row.card and not row.after_card else 'definition'} gone "
                          f"after an untouching edit"))
-    # Both answered, and they are not the same answer. `fewer` is the contract — *never less
-    # than an eager one* — being broken outright; `more` is the other way it goes wrong, and it
-    # is not harmless: an answer that grows from one place to 692 has stopped being an answer.
+    # Both answered, with different answers. `fewer` breaks the contract (*never less than an eager
+    # one*) outright. `more` is the other failure, and not harmless: an answer that grows from one
+    # place to hundreds has stopped being an answer.
     if row.found and row.after and \
             targets(row.found) != targets(row.after, place.shifted, row.index):
         was, now = targets(row.found), targets(row.after, place.shifted, row.index)

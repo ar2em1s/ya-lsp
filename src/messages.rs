@@ -1,31 +1,31 @@
 //! Every sentence ya-lsp says to a user, in one place.
 //!
-//! These strings reach the user twice: as a `window/showMessage` warning, and as a
-//! `tracing::warn!` line on stderr. Both are plain text — no client renders markdown in a
-//! notification — so what is written here is what is read.
+//! Each string reaches the user twice: as a `window/showMessage` warning and as a `tracing::warn!`
+//! line on stderr. Both are plain text (no client renders markdown in a notification), so what is
+//! written here is what is read.
 //!
-//! They live together because the unit of work is the sentence rather than the feature. Spread
-//! beside the code that raises them, every site answers the same four questions on its own — how
-//! to spell a setting, where to break the clause, whether to name a remedy, whether to end with a
-//! period — and duplicates are invisible.
+//! They live together because the unit of work is the sentence, not the feature. Spread beside the
+//! code that raises them, every site answers the same four questions alone (how to spell a setting,
+//! where to break the clause, whether to name a remedy, whether to end with a period), and
+//! duplicates are invisible.
 //!
 //! # The rule
 //!
 //! 1. **A setting is its dotted TOML path**: `gems.max_files`, `index.include`,
-//!    `diagnostics.rules`. Never `[gems].max_files`, never `[gems] max_files`. The dotted form is
-//!    also valid TOML, so it is something the user can paste.
-//! 2. **One colon.** It joins what happened to what follows from it — or, when another library's
-//!    error is the explanation, it introduces that error, which is then the last thing in the
-//!    message and is passed through exactly as that library wrote it.
+//!    `diagnostics.rules`. Never `[gems].max_files` or `[gems] max_files`. The dotted form is also
+//!    valid TOML, so the user can paste it.
+//! 2. **One colon.** It joins what happened to what follows from it. Or, when another library's
+//!    error is the explanation, it introduces that error, which then ends the message, passed
+//!    through exactly as that library wrote it.
 //! 3. **A remedy whenever ya-lsp knows one**, as its own sentence, starting with a verb. "Run
 //!    bundle install" is the difference between a warning and a nag.
 //! 4. **A full stop at the end**, unless the message ends in a foreign error.
-//! 5. **The user's words, not ours.** No term that exists only in this codebase's comments —
-//!    "gem intelligence is incomplete" says less than "navigation into gems will mostly not
-//!    work", and the second is what a user could have written themselves.
+//! 5. **The user's words, not ours.** No term that exists only in this codebase's comments. "Gem
+//!    intelligence is incomplete" says less than "navigation into gems will mostly not work", and
+//!    the second is what a user could have written.
 //!
 //! `messages::tests::every_message_meets_the_rule` enumerates the whole set and checks the
-//! mechanical half of that, so a new message cannot be added without meeting it.
+//! mechanical half of this, so a new message cannot skip it.
 
 use std::{fmt::Display, path::Path};
 
@@ -42,14 +42,14 @@ pub fn initialization_options_ignored(error: &dyn Display) -> String {
 
 /// `ya-lsp.toml` exists but is not valid TOML, or names a key that does not exist.
 ///
-/// No remedy sentence: the parser's own error names the line, the column and the valid keys,
-/// which is a better remedy than anything that could be written here.
+/// No remedy sentence: the parser's own error names the line, the column and the valid keys, a
+/// better remedy than anything written here.
 #[must_use]
 pub fn config_file_ignored(file_name: &str, error: &dyn Display) -> String {
     format!("{file_name} could not be parsed, so the defaults are in use instead: {error}")
 }
 
-/// `ya-lsp.toml` is there and could not be opened — a permission, not a syntax, problem.
+/// `ya-lsp.toml` is there and could not be opened: a permission problem, not a syntax one.
 #[must_use]
 pub fn config_file_unreadable(path: &Path, error: &dyn Display) -> String {
     format!(
@@ -58,10 +58,8 @@ pub fn config_file_unreadable(path: &Path, error: &dyn Display) -> String {
     )
 }
 
-/// One entry of `index.include` or `index.exclude` is not a glob.
-///
-/// The one string this module was worth building for on its own: it was written out twice,
-/// verbatim, in two files, so a fix to either left the other.
+/// One entry of `index.include` or `index.exclude` is not a glob. Raised from two files, so it must
+/// be one string.
 #[must_use]
 pub fn invalid_glob(field: &str, pattern: &str, error: &dyn Display) -> String {
     format!("{field} has an invalid glob {pattern:?}, which is ignored: {error}")
@@ -100,9 +98,9 @@ pub fn rbs_path_has_no_core(path: &Path) -> String {
 
 /// A `trees.migration` entry that is not a `parent/mark` pair.
 ///
-/// The rule is not "a directory called migrate" — `migrate` is an ordinary enough word for
-/// `app/services/migrate/` — so an entry with no parent in it would fence a tree the project
-/// really does load, which is an answer deleted rather than a setting ignored.
+/// The rule is not "a directory called migrate": `migrate` is an ordinary word for
+/// `app/services/migrate/`. An entry with no parent would fence a tree the project really loads,
+/// deleting answers rather than ignoring a setting.
 #[must_use]
 pub fn migration_needs_a_parent(entry: &str) -> String {
     format!(
@@ -112,10 +110,10 @@ pub fn migration_needs_a_parent(entry: &str) -> String {
     )
 }
 
-/// `[log] level` or `[log] file_level` is not something `EnvFilter` can read.
+/// `log.level` or `log.file_level` is not something `EnvFilter` can read.
 ///
-/// Silence here is the expensive kind: the symptom is a log at a level nobody chose, which is
-/// not something anyone traces back to the setting that decides it.
+/// Silence here is expensive: the symptom is a log at a level nobody chose, which nobody traces
+/// back to the setting.
 #[must_use]
 pub fn invalid_log_level(field: &str, value: &str, default: &str) -> String {
     format!(
@@ -124,7 +122,7 @@ pub fn invalid_log_level(field: &str, value: &str, default: &str) -> String {
     )
 }
 
-/// `[log] file` is on and the file cannot be written.
+/// `log.file` is on and the file cannot be written.
 #[must_use]
 pub fn log_file_unwritable(path: &Path, error: &dyn Display) -> String {
     format!(
@@ -159,11 +157,11 @@ pub fn index_truncated(max_files: usize) -> String {
     )
 }
 
-/// The index is at `index.max_files` and a file created since startup cannot be added.
+/// The index is at `index.max_files`, and a file created since startup cannot be added.
 ///
-/// Distinct from [`index_truncated`], which is the walk stopping: this is the cap still
-/// applying *after* the walk, to a file the user has just written. Reaching one says nothing
-/// about the other — a workspace that fitted at startup can be added to until it does not.
+/// Distinct from [`index_truncated`], which is the walk stopping. This is the cap still applying
+/// *after* the walk, to a file the user just wrote. Neither implies the other: a workspace that
+/// fitted at startup can grow until it does not.
 #[must_use]
 pub fn index_full(max_files: usize) -> String {
     format!(
@@ -173,25 +171,30 @@ pub fn index_full(max_files: usize) -> String {
     )
 }
 
-/// The client takes no dynamic registrations, so nothing can be asked to watch the project.
+/// Neither the client nor ya-lsp itself is watching the project.
 ///
-/// Logged rather than shown. It is nobody's mistake and there are plenty of clients like this,
-/// so a notification at every start would be a nag — but silence here is expensive, because
-/// every symptom of it looks like the server being wrong rather than the server being blind.
+/// **This is a failure, not the ordinary case.** ya-lsp watches the project itself wherever the
+/// client cannot, so the only way here is the watcher refusing to start: no inotify watches left, a
+/// root that is gone, a thread that could not be spawned.
+///
+/// Logged, not shown. Silence would be expensive (every symptom looks like the server being wrong,
+/// not blind), but a notification at every start for something the user can only fix by restarting
+/// is a nag.
 #[must_use]
-pub fn cannot_watch_files() -> String {
-    "this editor cannot be asked to watch files, so a git checkout, a rebase or an edit to \
-     ya-lsp.toml made outside it is not noticed: navigation, completion and diagnostics keep \
-     answering against the files as they were when ya-lsp started. Restart ya-lsp after \
-     changing files outside the editor."
-        .to_owned()
+pub fn cannot_watch_files(reason: &str) -> String {
+    format!(
+        "this editor cannot be asked to watch files and ya-lsp could not watch them itself, so a \
+         git checkout, a rebase or an edit made outside the editor is not noticed and \
+         navigation, completion and diagnostics keep answering against the files as they were \
+         when ya-lsp started. Restart ya-lsp after changing files outside the editor: {reason}"
+    )
 }
 
 /// The client takes no dynamic registrations, so nothing outside the project can be claimed.
 ///
-/// Logged rather than shown, for [`cannot_watch_files`]' reasons and with the same cost: the
-/// symptom is a file that answers nothing while every file beside it answers, which reads as the
-/// server being wrong rather than the server never having been asked.
+/// Logged, not shown, for [`cannot_watch_files`]' reasons and at the same cost: the symptom is one
+/// file answering nothing while every file beside it answers, which reads as the server being
+/// wrong, not as the server never having been asked.
 #[must_use]
 pub fn cannot_claim_foreign_files() -> String {
     "this editor cannot be asked to claim files outside the project: hover, go-to-definition and \
@@ -203,9 +206,9 @@ pub fn cannot_claim_foreign_files() -> String {
 
 /// Linking the graph crashed, and everything is being indexed again.
 ///
-/// rubydex 0.2.5 panics inside its resolver after a document is deleted, and there is no
-/// version to upgrade to — so this is a real thing a user meets, and the alternative to saying
-/// it is a server that has quietly stopped answering.
+/// rubydex can panic inside its resolver (after a document is deleted, for example), and there is
+/// no fixed version to upgrade to. The alternative to saying so is a server that has quietly
+/// stopped answering.
 #[must_use]
 pub fn index_rebuilt() -> String {
     "something went wrong while linking this project, so it is being indexed again from \
@@ -216,10 +219,9 @@ pub fn index_rebuilt() -> String {
 
 /// One file crashed the indexer and has been left out.
 ///
-/// The sentence a user gets instead of a server that answers nothing at all. Uncontained, a
-/// panic in the indexer kills the analysis thread and the only symptom is a language server that
-/// looks like it is thinking. Naming the file is the whole point — a gap somebody can see is a
-/// gap somebody can report.
+/// The sentence a user gets instead of a server that answers nothing. Uncontained, an indexer panic
+/// kills the analysis thread, and the only symptom is a server that looks like it is thinking.
+/// Naming the file is the point: a gap somebody can see is a gap somebody can report.
 #[must_use]
 pub fn file_not_indexed(path: &Path) -> String {
     format!(
@@ -242,8 +244,8 @@ pub fn no_core_signatures(path: &Path) -> String {
     )
 }
 
-/// Nowhere to unpack the vendored signatures to, because the platform's cache directory
-/// depends on environment variables that are not set.
+/// Nowhere to unpack the vendored signatures, because the platform's cache directory depends on
+/// environment variables that are not set.
 #[must_use]
 pub fn no_cache_directory() -> String {
     "there is no cache directory to unpack ya-lsp's own copy of Ruby's signatures into: String, \
@@ -266,8 +268,8 @@ pub fn signatures_not_unpacked(path: &Path, error: &dyn Display) -> String {
 
 /// Most of the lockfile resolved to nothing on disk.
 ///
-/// The threshold is a majority rather than "any": default gems live inside Ruby itself, and a
-/// lockfile resolved for seven platforms names six directories that will never exist here.
+/// A majority, not "any": default gems live inside Ruby itself, and a lockfile resolved for seven
+/// platforms names six directories that will never exist here.
 #[must_use]
 pub fn bundle_mostly_missing(
     lockfile: &Path,
@@ -290,17 +292,15 @@ pub fn bundle_mostly_missing(
     )
 }
 
-/// No `.ruby-version` and no `.tool-versions` anywhere from the workspace root up to `$HOME`,
-/// no `RUBY VERSION` in the lockfile, and no `gems.ruby_version`.
+/// No `.ruby-version` or `.tool-versions` anywhere from the workspace root up to `$HOME`, no
+/// `RUBY VERSION` in the lockfile, and no `gems.ruby_version`.
 ///
-/// ya-lsp refuses to guess a Ruby, because guessing once put Apple's vestigial 2.6 stdlib into
-/// the graph and answered `"hello".u` with `unspace`. Refusing is right; refusing *silently*
-/// costs the whole of Ruby's own library — 727 files on a 3.4 install — and the only trace of
-/// it was a `DEBUG` line about the bundle, which is not what went missing.
+/// ya-lsp refuses to guess a Ruby: a guess can pick a vestigial system stdlib (Apple's 2.6) and
+/// answer `"hello".u` with `unspace`. Refusing is right; refusing *silently* costs the whole of
+/// Ruby's own library, with no visible trace of what went missing.
 ///
-/// It says *where* it looked as well as what for, because after the walk those are different
-/// questions: a user who has already written one of these files in a parent directory would
-/// otherwise be told to go and write it again.
+/// It says *where* it looked as well as what for. A user who already wrote one of these files in a
+/// parent directory would otherwise be told to write it again.
 #[must_use]
 pub fn no_ruby_version() -> String {
     "no .ruby-version or .tool-versions in this project or any directory above it, and no RUBY \
@@ -311,10 +311,10 @@ pub fn no_ruby_version() -> String {
         .to_owned()
 }
 
-/// The Ruby version is known and its library directory is nowhere ya-lsp looked.
+/// The Ruby version is known, and its library directory is nowhere ya-lsp looked.
 ///
-/// Distinct from [`no_ruby_version`] because the remedies are: there, ya-lsp does not know
-/// which Ruby to look for; here it looked for the right one and the machine has not got it.
+/// Distinct from [`no_ruby_version`] because the remedies are: there, ya-lsp does not know which
+/// Ruby to look for; here, it looked for the right one and the machine does not have it.
 #[must_use]
 pub fn ruby_library_missing(version: &str) -> String {
     format!(
@@ -348,19 +348,41 @@ pub fn unknown_diagnostic_rule(name: &str, known: &str) -> String {
 
 /// `textDocument/references` found more than it will send.
 ///
-/// Said out loud rather than only logged: a truncated find-all-references is a wrong answer
-/// wearing the shape of a right one, and the user is the only one who can decide what to do
-/// about it.
+/// Shown, not only logged: a truncated find-all-references is a wrong answer shaped like a right
+/// one, and only the user can decide what to do about it.
+///
+/// **It names where the list stops, because what was dropped is not a sample.** Places are ordered
+/// by file before the cap applies, so a truncated answer holds everything up to one point in that
+/// order and nothing after it: whole directories, not a scatter. "Only the first 10,000 are shown"
+/// reads as a sample. A reader who scrolls to the end, sees no use under some directory and
+/// concludes there is none has been misled by the sentence, not by the cap. Large projects do reach
+/// the cap, so people read this.
+///
+/// `stops_at` is `None` only when that last place is not in a file the client can open, which this
+/// request's scope does not reach. The sentence then says what was lost without naming it.
 #[must_use]
-pub fn references_truncated(found: usize, shown: usize) -> String {
-    format!("{found} references found: only the first {shown} are shown.")
+pub fn references_truncated(found: usize, shown: usize, stops_at: Option<&Path>) -> String {
+    let ends = match stops_at {
+        Some(path) => format!(
+            "the list is ordered by file and ends in {}, so no file after it is in the answer.",
+            path.display()
+        ),
+        None => "the list is ordered by file, so whole directories after the point it stops at \
+                 are missing."
+            .to_owned(),
+    };
+    format!("{found} references found and only the first {shown} are shown: {ends}")
 }
 
 /// `typeHierarchy/subtypes` found more than it will send.
 ///
-/// Same shape and same reason as the sentence above it, and reachable for a different one: this
-/// one is hit by asking about a class near the root of the object model rather than by working in
-/// an enormous project. `Object` has one subtype per class in the project and its bundle.
+/// Same reason as the sentence above, **deliberately not the same shape**, and reached differently:
+/// by asking about a class near the root of the object model, not by working in an enormous
+/// project. `Object` has one subtype per class in the project and its bundle.
+///
+/// It does not name where the list stops. The sentence above can only do that because `references`
+/// orders its places by file before the cap; whether a subtype list has a boundary worth naming is
+/// an open question.
 #[must_use]
 pub fn subtypes_truncated(found: usize, shown: usize) -> String {
     format!("{found} subtypes found: only the first {shown} are shown.")
@@ -368,9 +390,9 @@ pub fn subtypes_truncated(found: usize, shown: usize) -> String {
 
 /// `callHierarchy/incomingCalls` found more than it will send.
 ///
-/// The third of the same sentence, and the one reached by ordinary work rather than by an
-/// ordinary mistake: a method named `call` or `name` has callers everywhere, and a tree that
-/// stops at two thousand of them looks exactly like a tree that found two thousand.
+/// The third of the same sentence, reached by ordinary work, not an ordinary mistake: a method
+/// named `call` or `name` has callers everywhere, and a tree that stops at two thousand looks
+/// exactly like one that found two thousand.
 #[must_use]
 pub fn incoming_calls_truncated(found: usize, shown: usize) -> String {
     format!("{found} callers found: only the first {shown} are shown.")
@@ -380,10 +402,9 @@ pub fn incoming_calls_truncated(found: usize, shown: usize) -> String {
 
 /// `textDocument/rename` on a method.
 ///
-/// The one refusal on this list that is a limit of the whole product rather than of one module:
-/// without type inference a method's uses can only be matched by name, which the README says in
-/// those words, and every other answer built on that matching presents itself as a guess. A
-/// rename cannot.
+/// The one refusal here that is a limit of the whole product, not of one module. Without type
+/// inference, a method's uses can only be matched by name (the README says so in those words).
+/// Every other answer built on that matching presents itself as a guess; a rename cannot.
 #[must_use]
 pub fn rename_refuses_methods() -> String {
     "renaming a method is not something ya-lsp can do safely: the uses of a method are found by \
@@ -430,10 +451,30 @@ pub fn rename_refuses_foreign(name: &str) -> String {
     )
 }
 
+/// `textDocument/rename` on a name **every** declaration of which ya-lsp wrote itself.
+///
+/// A generated document does not vote on whether a name may be renamed: `rename::decide` filters it
+/// out before the guard above. So a model, a mailer, a job and any class with one Sorbet `sig` all
+/// rename, in the user's own files and in no generated document. What is left for this sentence is
+/// the name **no** file declares: `Story::ActiveRecord_Relation`, the module the route helpers go
+/// in.
+///
+/// [`rename_refuses_foreign`] is the wrong sentence for those. The name is not in a gem; it is
+/// nowhere, and "rename your own name for it instead" does not apply. The advice here is the only
+/// real one: the name is implied by a file, and renaming that renames this.
+#[must_use]
+pub fn rename_refuses_generated(name: &str) -> String {
+    format!(
+        "renaming {name} is not something ya-lsp can do: ya-lsp worked {name} out from a schema, \
+         a macro or a signature rather than reading it from a file, so no file holds the name to \
+         change. Rename what it was worked out from instead."
+    )
+}
+
 /// A place a rename would have written could not be shown to hold only the old name.
 ///
 /// Nothing has been changed when this is said, and that is the half worth saying: a rename that
-/// edited most of the places a name is written would leave code that no longer runs.
+/// edited most of a name's places would leave code that no longer runs.
 #[must_use]
 pub fn rename_could_not_confirm(name: &str, file: &str) -> String {
     format!(
@@ -467,14 +508,13 @@ mod tests {
 
     /// Every setting `ya-lsp.toml` has, spelled the one way a message may spell it.
     ///
-    /// A message that names a key not on this list names a key that does not exist, which is a
-    /// worse failure than saying nothing: the user goes and adds it.
+    /// A message naming a key not on this list names a key that does not exist, which is worse than
+    /// saying nothing: the user goes and adds it.
     const SETTINGS: &[&str] = &[
         "index.include",
         "index.exclude",
         "index.load_paths",
         "index.max_files",
-        "index.respect_gitignore",
         "log.level",
         "log.file",
         "log.file_path",
@@ -515,9 +555,9 @@ mod tests {
 
     /// One entry per message the server can send, with a sample of every argument.
     ///
-    /// `true` marks a message that ends in another library's error, which is passed through
-    /// exactly as that library wrote it and therefore does not end in a full stop. Adding a
-    /// message without adding it here leaves it ungoverned, which is what this list is for.
+    /// `true` marks a message ending in another library's error, passed through exactly as that
+    /// library wrote it, so it has no full stop. A message missing from this list is ungoverned;
+    /// that is what the list is for.
     fn every_message() -> Vec<(&'static str, String, bool)> {
         let error = "no such file or directory (os error 2)";
         let path = Path::new("/w/ya-lsp.toml");
@@ -564,7 +604,7 @@ mod tests {
                 file_not_indexed(Path::new("/w/app/models/story.rb")),
                 false,
             ),
-            ("cannot_watch_files", cannot_watch_files(), false),
+            ("cannot_watch_files", cannot_watch_files(error), true),
             (
                 "cannot_claim_foreign_files",
                 cannot_claim_foreign_files(),
@@ -605,8 +645,13 @@ mod tests {
                 false,
             ),
             (
-                "references_truncated",
-                references_truncated(35_733, 200),
+                "references_truncated/placed",
+                references_truncated(35_733, 200, Some(Path::new("/w/app/models/story.rb"))),
+                false,
+            ),
+            (
+                "references_truncated/unplaced",
+                references_truncated(35_733, 200, None),
                 false,
             ),
             (
@@ -638,6 +683,11 @@ mod tests {
             (
                 "rename_refuses_foreign",
                 rename_refuses_foreign("ActiveRecord::Base"),
+                false,
+            ),
+            (
+                "rename_refuses_generated",
+                rename_refuses_generated("Story::ActiveRecord_Relation"),
                 false,
             ),
             (
@@ -735,10 +785,9 @@ mod tests {
 
     #[test]
     fn the_enumeration_covers_every_message_there_is() {
-        // The list above is what makes the rule enforceable, and it is only as good as its
-        // completeness. `messages.rs` is one `pub fn` per message, so the source itself is the
-        // inventory to check against — a new message that skips the list fails here rather
-        // than shipping ungoverned.
+        // The list above makes the rule enforceable, and it is only as good as its completeness.
+        // `messages.rs` is one `pub fn` per message, so the source itself is the inventory: a new
+        // message that skips the list fails here instead of shipping ungoverned.
         let source = include_str!("messages.rs");
         let declared: Vec<&str> = source
             .lines()
@@ -763,7 +812,7 @@ mod tests {
         }
     }
 
-    /// Every `<section>.<key>` a message names, for the four sections `ya-lsp.toml` has.
+    /// Every `<section>.<key>` a message names, for every section `ya-lsp.toml` has.
     fn settings_named(message: &str) -> Vec<String> {
         let mut named = Vec::new();
         for section in [

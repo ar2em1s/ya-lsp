@@ -1,41 +1,35 @@
 """The Rails key: the half the neutral key throws away, scored against a **set** of places.
 
-`neutral` drops every macro- and column-declared name, and its stated reason is sound as far as
-it goes — at `story.title` a server that answers `db/schema.rb` and one that answers
-`app/models/story.rb` are both defensible, so exact-location equality cannot adjudicate between
-them. The error is the step after that: it converts *"the location is not scorable"* into *"the
-question is not asked"*, and those are not the same sentence. Three things stay scorable at a
-Rails-derived position without naming a single right place:
+`neutral` drops every macro- and column-declared name, for a sound reason: at `story.title`, a
+server answering `db/schema.rb` and one answering `app/models/story.rb` are both defensible, so
+exact-location equality cannot judge them. But *"the location is not scorable"* does not mean *"the
+question is not asked"*. Three things stay scorable without naming one right place:
 
-  **answered or silent** — recall needs no adjudication at all;
-  **admissible or wrong** — not one right place, a *set* of them, and a name-based guess landing
-      on an unrelated class's `def title` is outside it;
-  **asserted or hedged** — a guess labelled as a guess is a different outcome from one presented
-      as fact, and the tier is exactly that distinction already.
+  **answered or silent**      recall needs no adjudication
+  **admissible or wrong**     not one right place but a *set*; a name-based guess landing on an
+                              unrelated class's `def title` is outside it
+  **asserted or hedged**      a guess labelled as a guess differs from one presented as fact,
+                              and the tier is exactly that distinction
 
-That matters because the discarded half is not a rounding error. Measured over the sample the
-draw opens, 21% (mastodon) to 39% (lobsters) of positions are macro- or column-derived, and on a
-Rails application it is the half a developer spends the day inside.
+The discarded half is large: from a fifth to over a third of sampled positions, depending on the
+corpus, are macro- or column-derived, and on a Rails app it is where a developer spends the day.
 
-**The receiver problem, and why this module is small.** At `story.title` no regex can prove
-`story` is a `Story`. So nothing here infers a type. A position qualifies only where the corpus
-itself pins the receiver: a **bare read inside an instance method of the model that declares the
-name**, where `self` is that model by the language's own rules. That is the shape a model's body
-is made of, and it is decidable from text. It is also a shape the draw does not target, which is
-why this key opens its own files and asks its own questions.
+**The receiver problem, and why this module is small.** At `story.title` no regex can prove `story`
+is a `Story`, so nothing here infers a type. A position qualifies only where the corpus itself pins
+the receiver: a **bare read inside an instance method of the model that declares the name**, where
+`self` is that model by the language's rules. That shape is decidable from text. The draw does not
+target it, so this key opens its own files and asks its own questions.
 
-**The bias hazard, and how it is contained.** An answer key built from ya-lsp's Rails knowledge
-would be ya-lsp's implementation graded against itself. So this module is written from the corpus
-text alone and has never read `workspace/rails/`; the admissible set is deliberately **generous**
-— the schema, the model, its concerns, its superclass, or anywhere outside the repository, since
-answering ActiveRecord's own `def id` is defensible too. Generosity means precision here is
-nearly free; what the scale actually measures is **recall**, with `wrong` reserved for an answer
-that lands on an unrelated file *in this repository* — the one failure mode a name-based guesser
-has and a resolver does not.
+**The bias hazard, and how it is contained.** A key built from ya-lsp's Rails knowledge would grade
+ya-lsp against itself. So:
+- this module is written from the corpus text alone, never from `workspace/rails/`;
+- the admissible set is **generous**: the schema, the model, its concerns, its superclass, or
+  anywhere outside the repository (answering ActiveRecord's own `def id` is defensible);
+- so precision is nearly free, and what this measures is **recall**. `wrong` is reserved for an
+  unrelated file *in this repository*: the failure a name-based guesser has and a resolver does not.
 
-This is a scale ya-lsp was built to pass. It is reported on its own line and never folded into
-the neutral key's, and the honest reading of it is "here is the size of the half the neutral key
-was throwing away, and here is who answers it" — not "here is who is better".
+ya-lsp was built to pass this scale. It is reported on its own line, never folded into the neutral
+key's. Read it as "how big the discarded half is, and who answers it", not "who is better".
 """
 
 import os
@@ -51,12 +45,12 @@ from audit.ruby import masked
 NAME = "rails"
 FINDINGS = ("rails-wrong",)
 TOTAL = "asked"
-# This key poses its own questions, so it runs while the server is alive **and before
-# `ask_rebased` edits the buffers** — see `lane1.asked`.
+# This key poses its own questions, so it runs while the server is alive **and before `ask_rebased`
+# edits the buffers**. See `lane1.asked`.
 ASKS = True
-# Positions per corpus. The whole corpus yields thousands after `build`'s own caps, and the
-# budget buys two requests each; 250 is what the remaining headroom pays for at five corpora.
-# Drawn with the same seed the sample uses, so this line moves only when the pin does.
+# Positions per corpus. A corpus yields thousands after `build`'s own caps, at two requests each;
+# 250 fits the budget's headroom. Drawn with the sample's seed, so this set moves only when the pin
+# does.
 WANTED = 250
 METHODS = ("textDocument/hover", "textDocument/definition")
 
@@ -65,10 +59,9 @@ BASES = ("ApplicationRecord", "ActiveRecord::Base")
 
 CLASS = re.compile(
     r"^([ \t]*)class[ \t]+([A-Z][A-Za-z0-9_:]*)[ \t]*(?:<[ \t]*([A-Za-z0-9_:]+))?", re.M)
-# `[ \t]` and never `\s`: `\s` matches the newline before the line, which puts the match one
-# line early and leaves a `\n` in the captured indent, so `indent + "end"` never matches and the
-# "body" runs to the end of the file. That is how a `def self.` parameter became a `belongs_to`
-# read thirty lines away.
+# `[ \t]`, never `\s`: `\s` matches the newline before the line, which puts the match one line early
+# and leaves a `\n` in the captured indent. Then `indent + "end"` never matches, and the "body" runs
+# to the end of the file.
 INSTANCE_DEF = re.compile(
     r"^([ \t]+)def[ \t]+(?!self[ \t]*\.)([a-z_][A-Za-z0-9_]*[?!=]?)([^\n]*)$", re.M)
 ANY_DEF = re.compile(r"^\s*def\b")
@@ -80,8 +73,8 @@ NAMED = re.compile(
     r"|attr_accessor|attr_reader|attr_writer|alias_attribute|store_accessor|composed_of"
     r"|delegate)\b([^\n]*)$", re.M)
 SYMBOL = re.compile(r":([a-z_][A-Za-z0-9_]*[?!]?)")
-# The macros that name **one** member and then say something else about it. `scope :recent, ->`
-# declares `recent`; the symbols after it are the body's business.
+# The macros that name **one** member, then say something else about it. `scope :recent, ->`
+# declares `recent`; the symbols after it belong to the body.
 FIRST_ONLY = ("scope", "enum", "attribute", "alias_attribute", "composed_of")
 
 CREATE_RB = re.compile(r'^\s*create_table\s+[\'"]([a-z_0-9]+)[\'"](.*?)^\s*end', re.M | re.S)
@@ -93,8 +86,8 @@ COLUMN_SQL = re.compile(r"^\s{4}([a-z_][A-Za-z0-9_]*)\s+[a-zA-Z]", re.M)
 WORD = re.compile(r"[a-z_][A-Za-z0-9_]*")
 ASSIGNED = re.compile(r"^[ \t]*([a-z_][A-Za-z0-9_]*)\s*(?:\|\||&&)?=[^=~]", re.M)
 BLOCK_PARAMS = re.compile(r"\|([^|\n]*)\|")
-# `(?![?!])` drops `deleted_at?`: the predicate is a different generated name from the column,
-# and the cursor would land inside a token this key did not claim.
+# `(?![?!])` drops `deleted_at?`: the predicate is a different generated name from the column, and
+# the cursor would land inside a token this key did not claim.
 BARE_READ = re.compile(r"(?<![.:@$\w])([a-z_][A-Za-z0-9_]*)(?![\w:(?!])")
 
 IRREGULAR = {"person": "people", "man": "men", "woman": "women", "child": "children",
@@ -110,8 +103,9 @@ def underscore(name):
 
 
 def pluralize(word):
-    """Enough of Rails' inflector for a model name. Wrong is safe: the table is then not found
-    and the model is skipped, which removes questions rather than inventing them."""
+    """Enough of Rails' inflector for a model name. Wrong is safe: the table is not found and the
+    model is skipped, which removes questions instead of inventing them.
+    """
     if word in IRREGULAR:
         return IRREGULAR[word]
     for singular, plural in IRREGULAR.items():
@@ -129,9 +123,9 @@ def pluralize(word):
 def schema(corpus):
     """`{table: {column}}`, and the relative paths the dumps live at."""
     tables, files = {}, []
-    # Anywhere, not `db/` at the root: solidus is an engine monorepo and its dump is `core/db/*`.
-    # `db/migrate` is excluded because a `create_table` in a migration is history rather than the
-    # schema.
+    # Anywhere, not only `db/` at the root: solidus is an engine monorepo with its dump in
+    # `core/db/`. `db/migrate` is excluded, because a `create_table` in a migration is history, not
+    # the schema.
     for here, dirs, names in os.walk(corpus.dir):
         dirs[:] = [d for d in dirs
                    if d not in (".git", "node_modules", "migrate", "tmp", "vendor")]
@@ -162,10 +156,10 @@ def schema(corpus):
 def class_at(text):
     """The one class a file declares, or None.
 
-    A file declaring two classes is skipped rather than adjudicated: which one a bare word
-    belongs to then needs a parser, and over-skipping only ever removes questions. Enclosing
-    `module`s are fine and had to be — solidus writes `module Spree; class UnitCancel`, and the
-    stricter rule left it fourteen positions in the whole repository.
+    A file declaring two classes is skipped: which one a bare word belongs to would need a parser,
+    and over-skipping only removes questions. Enclosing `module`s are fine, and must be: solidus
+    nests every model as `module Spree; class Order`, and rejecting that would leave almost nothing
+    to ask.
     """
     if len(CLASS.findall(text)) != 1:
         return None
@@ -203,13 +197,13 @@ def models(corpus):
 def macro_names(text):
     """`{name: macro}` for every member the Rails macros in one body install.
 
-    Only the name itself and its writer — not the twenty further names `enum` or an association
-    also installs. A narrow claim is one that cannot be argued with.
+    Only the name itself and its writer, not the many further names `enum` or an association also
+    installs. A narrow claim cannot be argued with.
     """
     out = {}
     for macro, rest in NAMED.findall(text):
         if macro == "delegate":
-            # `delegate :a, :b, to: :owner` — the names are before `to:`, the target after.
+            # `delegate :a, :b, to: :owner`: the names come before `to:`, the target after.
             rest = rest.split(" to:")[0]
         names = SYMBOL.findall(rest)
         if macro in FIRST_ONLY:
@@ -228,10 +222,10 @@ def reads(path, text, names, places):
         starts.append(at)
         at += len(line) + 1
     out = []
-    # Every `def` in the file, so a body the indent scan cannot close — a `def` written on one
-    # line, an unusual indent — stops at the next one instead of swallowing the rest of the
-    # file. It did: `story_text.rb` handed a `def self.fill_cache!(story)` parameter back as a
-    # `belongs_to` read, thirty lines below the method it was supposedly inside.
+    # Every `def` in the file, so a body the indent scan cannot close (a one-line `def`, an unusual
+    # indent) stops at the next `def` instead of swallowing the rest of the file. Without it, a
+    # `def self.x(arg)` parameter can come back as a `belongs_to` read thirty lines below its
+    # method.
     any_def = [row for row, line in enumerate(lines) if ANY_DEF.match(line)]
     for hit in INSTANCE_DEF.finditer(text):
         indent, signature = hit.group(1), hit.group(3)
@@ -241,8 +235,8 @@ def reads(path, text, names, places):
         while close < limit and lines[close].rstrip() != indent + "end":
             close += 1
         body = "\n".join(lines[start + 1:close])
-        # Parameters, locals and block parameters all shadow the macro. All three are cheap to
-        # see and all three are fatal.
+        # Parameters, locals and block parameters all shadow the macro. All three are cheap to see,
+        # and all three are fatal.
         local = set(WORD.findall(signature))
         local |= set(ASSIGNED.findall(body))
         for params in BLOCK_PARAMS.findall(body):
@@ -262,12 +256,12 @@ def reads(path, text, names, places):
 def build(corpus):
     """Every scorable Rails-derived position in the corpus.
 
-    A row is `(path, line, column, offset, word, macro, admissible)` where `admissible` is the
-    set of repository-relative paths an answer may land in. The byte offset is carried because
-    the ledger keys a position on the sha256 of the line it sits at — see `ruby.line_key` — and
-    a finding names it with `audit.site`. A cursor is only produced inside an **instance method**
-    of the declaring model, where `self` is that model by the language's own rules and no
-    inference is involved.
+    A row is `(path, line, column, offset, word, macro, admissible)`.
+    - `admissible` is the set of repository-relative paths an answer may land in.
+    - `offset` is carried because the ledger keys a position on the sha256 of its line
+      (`ruby.line_key`), and a finding names it with `audit.site`.
+    A cursor is produced only inside an **instance method** of the declaring model, where `self` is
+    that model by the language's rules, with no inference.
     """
     tables, dumps = schema(corpus)
     found = models(corpus)
@@ -279,8 +273,8 @@ def build(corpus):
             names.setdefault(column, "column")
         if not names:
             continue
-        # Anything the model writes a `def` for is a plain method: the neutral key's scale, not
-        # this one. Anything it declares twice under two macros is dropped for the same reason.
+        # Anything the model writes a `def` for is a plain method: the neutral key's scale, not this
+        # one. Anything declared twice under two macros is dropped for the same reason.
         for hit in INSTANCE_DEF.finditer(text):
             names.pop(hit.group(2).rstrip("=?!"), None)
             names.pop(hit.group(2), None)
@@ -296,8 +290,8 @@ def build(corpus):
             if parent:
                 places.add(parent["file"])
         rows += reads(info["file"], text, names, frozenset(places))
-    # One model reading `topic` in forty methods is one question asked forty times: discourse
-    # produced 347 of its 868 positions that way. Two per name per file, twelve per file.
+    # One model reading `topic` in forty methods is one question asked forty times. Cap it: two per
+    # name per file, twelve per file.
     seen, per_name, per_file, kept = set(), {}, {}, []
     for row in rows:
         path, line, column, word = row[0], row[1], row[2], row[4]
@@ -315,9 +309,8 @@ def build(corpus):
 def draw(corpus, seed, want=WANTED):
     """`want` of the corpus' Rails positions, seeded on the pin exactly as the sample is.
 
-    Sorted by file after the draw rather than before it: `ask_all` opens each document the first
-    time it reaches one, so a draw in file order opens each file once instead of once per run of
-    positions in it. The draw itself is unaffected — only the order the questions are asked in.
+    Sorted by file after the draw: `ask_all` opens each document the first time it reaches it, so
+    file order opens each file once. Only the asking order changes, not the draw.
     """
     rows = build(corpus)
     rng = random.Random(f"{seed}:{corpus.name}:{corpus.sha}:rails")
@@ -328,13 +321,13 @@ def draw(corpus, seed, want=WANTED):
 def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
     """Draw this key's own positions, ask them, and score the replies.
 
-    `drawn` and `answers` are the run's own and this key uses neither: the positions it scores
-    are Rails macro sites, which the sample does not target, so it draws its own.
+    `drawn` and `answers` are the run's own, and this key uses neither: Rails macro sites are not a
+    shape the sample targets, so it draws its own.
 
-    Runs while the server is alive and **before `ask_rebased`**: that pass inserts a line into
-    every sampled document, and a model file the draw also reached would then answer one line
-    off for every question below. `opened` is the sample's own set of `didOpen`ed paths, shared
-    so that a model file both reached is opened once — see `client.ask_all`.
+    Runs while the server is alive and **before `ask_rebased`**. That pass inserts a line into every
+    sampled document, so a model file the draw also reached would answer one line off. `opened` is
+    the sample's own set of `didOpen`ed paths, shared so a file both reached is opened once (see
+    `client.ask_all`).
     """
     drawn = draw(corpus, seed)
     counts = {"asked": 0, "answered": 0, "silent": 0, "single": 0, "single-admissible": 0,
@@ -343,8 +336,8 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
     findings = []
     if not drawn:
         return counts, findings
-    # The seven-tuple `ask_all` reads. The first two fields are the sample's strata and this key
-    # draws on neither, so they carry the key's name rather than a stratum it does not have.
+    # The seven-tuple `ask_all` reads. The first two fields are the sample's strata, which this key
+    # does not use, so they carry the key's name.
     posed = [(NAME, macro, path, line, column, offset, word)
              for path, line, column, offset, word, macro, _ in drawn]
     answers = ask_all(client, corpus, posed, methods=METHODS, opened=opened)
@@ -357,9 +350,9 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
         rung = tier(card)
         if card:
             counts["card"] += 1
-            # The tier *is* the hedge. A Derived or Guessed card says out loud that it followed
-            # something; a Resolved one asserts. Reading it off `answers.tier` rather than off a
-            # list of hedge strings keeps one definition of the tier in this harness.
+            # The tier *is* the hedge. A Derived or Guessed card says it followed something; a
+            # Resolved one asserts. Reading `answers.tier`, not a list of hedge strings, keeps one
+            # definition of the tier in this harness.
             if rung != "resolved":
                 counts["hedged"] += 1
         found = locations(answers.get((index, "textDocument/definition")))
@@ -368,31 +361,30 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
             continue
         counts["answered"] += 1
         cell["answered"] += 1
-        # "Some target was admissible" is too generous on its own: forty name-based guesses one
-        # of which happens to be the model file would pass it. `single` asks the other half —
-        # did the server name *one* place.
+        # "Some target was admissible" is too generous alone: forty name-based guesses, one of them
+        # the model file, would pass. `single` asks the other half: did the server name *one* place?
         if len(found) == 1:
             counts["single"] += 1
         verdicts = set()
         for target, _ in found:
             verdicts.add(place(corpus, target, admissible))
-        # One verdict per position and admissible wins, because a position where *any* target is
-        # defensible is not a position where the server guessed wrong.
+        # One verdict per position, and admissible wins: where *any* target is defensible, the
+        # server did not guess wrong.
         for verdict in ("admissible", "outside", "unplaced", "wrong"):
             if verdict not in verdicts:
                 continue
             counts[verdict] += 1
             if verdict == "wrong":
                 cell["wrong"] += 1
-                # Recorded, not just counted. `wrong` is the one verdict this scale hands out
-                # that names a defect rather than a gap, so it has to be reportable at the
-                # position rather than as a number in a column.
+                # Recorded, not just counted. `wrong` is the one verdict here that names a defect,
+                # not a gap, so it must be reportable at the position.
                 got = [Path(path_of(target) or target).name for target, _ in found[:3]]
-                # **The tier is in the line, because the two are different bugs.** A Guessed
-                # card landing on an unrelated file is the name-based rung doing exactly what it
-                # says on the label; a **Resolved** one making the same landing is the top tier
-                # claiming the code names a place it does not. Both are `wrong` on this scale
-                # and only one of them is a broken promise.
+                # **The tier goes in the line, because they are different bugs.**
+                # - A Guessed card landing on an unrelated file is the name rung doing what its
+                #   label says.
+                # - A **Resolved** card landing there is the top tier claiming the code names a
+                #   place it does not.
+                # Both are `wrong` here; only the second is a broken promise.
                 findings.append(("rails-wrong", site(path, offset),
                                  f"[{rung}] {macro} `{word}` at {path}:{line + 1} -> "
                                  f"{', '.join(got)}"
@@ -406,12 +398,12 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
 
 
 def place(corpus, target, admissible):
-    """One target, as this scale's vocabulary.
+    """One target, in this scale's vocabulary.
 
-    `outside` is the repository's own boundary and is **admissible on purpose**: answering
-    ActiveRecord's own `def id` at `story.id` is defensible, and a key written to call it wrong
-    would be a key asserting that the generated declaration is the only right answer — which is
-    the adjudication this whole scale exists to refuse.
+    `outside` is the repository's own boundary, and it is **admissible on purpose**: answering
+    ActiveRecord's `def id` at `story.id` is defensible. Calling it wrong would assert that the
+    generated declaration is the only right answer, which is the adjudication this scale exists to
+    refuse.
     """
     path = path_of(target)
     if path is None:
@@ -434,8 +426,9 @@ summary = line
 
 
 def under(counts):
-    """Per macro, because the scale's whole claim is about *which* Rails words are answered, and
-    a total hides an association family that is answered nowhere behind the columns that are."""
+    """Per macro, because the scale's claim is about *which* Rails words get answered. A total hides
+    an association family answered nowhere behind the columns that are.
+    """
     return [f"{macro:9} {cell['answered']} answered, {cell['admissible']} admissible, "
             f"{cell['wrong']} wrong, of {cell['asked']}"
             for macro, cell in sorted(counts["by-macro"].items(),

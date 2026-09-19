@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """Set up the six benchmark corpora, reproducibly, from `scripts/corpora.toml`.
 
-Every measurement this project has ever published over a real repository was taken against
-whatever those clones happened to contain that day. Nothing recorded which commit, which Ruby,
-or how much of the bundle was installed — so an absolute count could not be compared against one
-taken a week earlier, and a diff between two runs could not separate *ya-lsp changed* from *the
-corpus changed*. That is the gap this script closes: the table is the pin, and `status --json` is
-the manifest a measurement carries beside its numbers.
+**Why:** a count taken over a clone means nothing without the commit, the Ruby and the bundle state
+it was taken against. Without those, a diff between two runs cannot separate *ya-lsp changed* from
+*the corpus changed*. The table is the pin, and `status --json` is the manifest a measurement
+carries beside its numbers.
 
-**Ruby is out of scope and stays out of scope.** This script never installs a Ruby. It resolves
-the version the corpus declares against what asdf already has and, when it is missing, prints the
-`asdf install ruby X` line and stops. `--allow-nearest` accepts another patch of the same
-MAJOR.MINOR and says loudly in the manifest that it did.
+**This script never installs Ruby.** It resolves the corpus' declared version against what asdf has.
+When it is missing, it prints the `asdf install ruby X` line and stops. `--allow-nearest` accepts
+another patch of the same MAJOR.MINOR, and the manifest says so.
 
-**Nothing here is vendored and nothing here may be quoted.** Four of the six corpora are copyleft
-and one has a proprietary subdirectory; the licence header in `corpora.toml` is the argument, and
-the rule that follows from it is that no corpus source text is ever committed into this
-repository.
+**Nothing here is vendored, and nothing may be quoted.** Four of the six corpora are copyleft and
+one has a proprietary subdirectory (the licence header in `corpora.toml` has the details). So no
+corpus source text is ever committed into this repository.
 
 Steps, each idempotent and each runnable alone:
 
@@ -29,12 +25,11 @@ Steps, each idempotent and each runnable alone:
     status       what is actually on disk, as a table or as the manifest
     setup        all of the above, in that order
 
-**Ask git about `<dir>/.git` and never about `git -C <dir>`'s answer.** The corpora live under
-`tmp/`, inside this repository, and git searches *upwards*: `git -C tmp/x rev-parse --git-dir` in
-an empty `tmp/x` succeeds and answers about **ya-lsp**. The obvious spelling of "is this a
-repository yet?" therefore skips the `init`, adds a remote to ya-lsp, fetches a corpus into
-ya-lsp's object store and runs `checkout --detach` on the working tree being developed in.
-`canary.md` records that this was written the wrong way once.
+**Test for `<dir>/.git` directly, never with `git -C <dir>`.** The corpora live under `tmp/`, inside
+this repository, and git searches *upwards*: in an empty `tmp/x`, `git -C tmp/x rev-parse --git-dir`
+succeeds and answers about **ya-lsp**. That spelling of "is this a repository yet?" skips the
+`init`, adds a remote to ya-lsp, fetches a corpus into ya-lsp's object store, and runs
+`checkout --detach` over the working tree being developed in.
 """
 
 import argparse
@@ -51,9 +46,9 @@ ROOT = Path(__file__).resolve().parent.parent
 TABLE = ROOT / "scripts" / "corpora.toml"
 ASDF_RUBY = Path.home() / ".asdf" / "installs" / "ruby"
 
-# What setting a corpus up writes into a pinned clone. `status` measures dirtiness against this
-# list rather than against nothing, because every one of these files is *supposed* to be there
-# and a check that calls the corpus dirty for them is a check nobody reads.
+# What corpus setup writes into a pinned clone. `status` measures dirtiness against this list,
+# because each of these files is *supposed* to be there, and a check that calls the corpus dirty for
+# them is a check nobody reads.
 WRITTEN = (
     ".tool-versions",
     ".solargraph.yml",
@@ -64,11 +59,11 @@ WRITTEN = (
     ".solargraph/",
 )
 
-# `.rubocop.yml` lists `rubocop-rails` under `plugins:` and the Gemfile never declares it, so
-# RuboCop's FeatureLoader raises `cannot load such file -- rubocop-rails` *inside* ruby-lsp's
-# `initialized` handler — which is where it starts indexing. The index therefore never runs and
-# the server answers nothing for the rest of its life. solidus went 0/41 -> 29/41 on this one
-# line. `Gemfile-custom` is solidus' own hook (`Gemfile:91`) and is gitignored by solidus.
+# solidus' `.rubocop.yml` lists `rubocop-rails` under `plugins:`, but its Gemfile never declares it.
+# - RuboCop then raises `cannot load such file -- rubocop-rails` *inside* ruby-lsp's `initialized`
+#   handler, which is where indexing starts.
+# - So ruby-lsp never indexes and answers nothing for the rest of its life.
+# `Gemfile-custom` is solidus' own Gemfile hook, and solidus gitignores it.
 GEMFILE_CUSTOM = {
     "solidus": """\
 # Added by ya-lsp's corpus setup (scripts/corpora.py), not by solidus.
@@ -79,21 +74,21 @@ gem "rubocop-rails", require: false
 """
 }
 
-# The gems every corpus needs for the comparison harness to have three servers to talk to.
+# The gems every corpus needs so the comparison harness has three servers to talk to.
+#
 # ruby-lsp composes its own bundle on first start (`.ruby-lsp/Gemfile`) and adds `ruby-lsp-rails`
-# itself once it sees Rails, so that addon is deliberately not listed here.
+# itself once it sees Rails, so that addon is not listed here.
 LSP_GEMS = ("ruby-lsp", "solargraph", "solargraph-rails", "yard")
 
-# The bundle solargraph is measured from, composed on top of the corpus' own Gemfile exactly the
-# way ruby-lsp composes `.ruby-lsp/Gemfile`.
+# The bundle solargraph is measured from, composed on the corpus' own Gemfile the way ruby-lsp
+# composes `.ruby-lsp/Gemfile`.
 #
-# **A gem the corpus already declares is not added again, at any version or none.** Bundler reads
-# a bare `gem "solargraph"` as `solargraph (>= 0)` and refuses it beside forem's own
-# `~> 0.45` — *"You cannot specify the same gem twice with different version requirements"* — at
-# Gemfile *parse* time, before resolution starts. So there is no constraint to negotiate and no
-# floor to ask for: where the corpus declares it, the corpus' version is the only option. That is
-# the same degradation ruby-lsp makes for discourse, which declares `gem "ruby-lsp"` itself and
-# gets no composed bundle at all.
+# **A gem the corpus already declares is never added again, at any version.** Bundler reads a bare
+# `gem "solargraph"` as `solargraph (>= 0)` and refuses it beside forem's own `~> 0.45` at Gemfile
+# *parse* time: *"You cannot specify the same gem twice with different version requirements"*. There
+# is nothing to negotiate, so where the corpus declares it, the corpus' version is the only option.
+# ruby-lsp degrades the same way for discourse, which declares `gem "ruby-lsp"` itself and gets no
+# composed bundle.
 SOLARGRAPH_BUNDLE = ".solargraph-bundle"
 SOLARGRAPH_GEMS = ("solargraph", "solargraph-rails")
 
@@ -202,12 +197,12 @@ class Corpus:
     # -- ruby ------------------------------------------------------------------------------
 
     def resolve_ruby(self, allow_nearest):
-        """The declared version if installed; otherwise a named failure, not a guess.
+        """The declared version if installed; otherwise a named failure, never a guess.
 
         `--allow-nearest` prefers a patch whose bundle *already resolves* over the highest one,
-        because the highest is not usually the one the gems were installed under: mastodon
-        declares 4.0.6, has 4.0.5 and 4.0.1 available, and only 4.0.1 satisfies its Gemfile.
-        Picking by version number alone would report a bundle as broken that is not.
+        because the highest is often not the one the gems were installed under. mastodon, for
+        example, declares 4.0.6, and of the installed 4.0.5 and 4.0.1 only 4.0.1 satisfies its
+        Gemfile. Picking by version number alone would report a working bundle as broken.
         """
         if self._ruby is not None:
             return self._ruby
@@ -353,12 +348,13 @@ def step_lsps(corpus, args):
 
 
 def solargraph_env(corpus):
-    """What makes a command run out of the composed bundle. Relative, so `cwd` must be the corpus."""
+    """What makes a command run out of the composed bundle. Relative, so `cwd` must be the corpus.
+    """
     return {"BUNDLE_GEMFILE": f"{SOLARGRAPH_BUNDLE}/Gemfile"}
 
 
 def solargraph_version(corpus):
-    """The version the composed bundle resolved. Per corpus, and never assume it is the newest."""
+    """The version the composed bundle resolved. Per corpus; never assume it is the newest."""
     lock = corpus.dir / SOLARGRAPH_BUNDLE / "Gemfile.lock"
     if not lock.exists():
         return None
@@ -371,11 +367,8 @@ def solargraph_version(corpus):
 def step_solargraph(corpus, args):
     """The config, then the bundle solargraph is actually measured from.
 
-    Measured on mastodon, 2026-09-10, same Ruby and same corpus commit either side:
-    a globally installed solargraph produced **513 request errors and 7 of 338 hovers**; out of
-    this composed bundle, **0 errors and 427 of 811** — level with definition's 49%, which is what
-    a healthy run looks like. It also ran definition 2.7x faster (p50 1350ms -> 497ms) and so
-    reached 2.4x the plan in the same budget. `corpora.md` has the mechanism.
+    A global solargraph fails most hovers with request errors, while the composed bundle answers
+    them. `corpora.md` has the mechanism (the strscan trap).
     """
     ruby, _ = corpus.resolve_ruby(args.allow_nearest)
     notes = []
@@ -394,16 +387,16 @@ def step_solargraph(corpus, args):
 
     bundle = corpus.dir / SOLARGRAPH_BUNDLE
     bundle.mkdir(exist_ok=True)
-    # Self-ignoring, the way ruby-lsp's `.ruby-lsp/` is, so a pinned clone stays clean without
-    # every corpus needing an entry in its own `.gitignore`.
+    # Self-ignoring, like ruby-lsp's `.ruby-lsp/`, so a pinned clone stays clean without an entry in
+    # each corpus' own `.gitignore`.
     (bundle / ".gitignore").write_text("*\n")
     gemfile = bundle / "Gemfile"
     wanted = solargraph_gemfile(corpus)
     if (gemfile.read_text() if gemfile.exists() else None) != wanted:
         gemfile.write_text(wanted)
     if not (bundle / "Gemfile.lock").exists():
-        # Seed from the corpus' own lock so bundler re-resolves rather than resolving from
-        # nothing, which on a 344-gem application is the difference between seconds and minutes.
+        # Seeded from the corpus' own lock, so bundler re-resolves instead of resolving from
+        # nothing: seconds instead of minutes on a large application.
         corpus_lock = corpus.dir / "Gemfile.lock"
         if corpus_lock.exists():
             (bundle / "Gemfile.lock").write_text(corpus_lock.read_text())
@@ -426,21 +419,21 @@ def step_solargraph(corpus, args):
 def step_docs(corpus, args):
     """Cache solargraph's documentation, then warm ruby-lsp's composed bundle.
 
-    `solargraph gems` with no arguments loads *every* installed gem's RBS in one environment, so a
-    single gem shipping a malformed signature takes the whole corpus down with it. chatwoot has
-    one: `snaky_hash-2.0.5` declares `SnakyHash::VERSION` in both `sig/snaky_hash.rbs` and
-    `sig/snaky_hash/version.rbs`, which rbs 3 tolerated and rbs 4 raises on. That is upstream's
-    bug and there is nothing to fix here, so the fallback caches gem by gem instead and names the
-    ones that refuse. Slower, and only on the path where the fast way already failed.
+    `solargraph gems` with no arguments loads *every* installed gem's RBS into one environment, so
+    one gem with a malformed signature takes the whole corpus down.
+    - chatwoot has one: `snaky_hash` declares `SnakyHash::VERSION` in two files, which rbs 3
+      tolerated and rbs 4 raises on.
+    - That is an upstream bug, so the fallback caches gem by gem and names the gems that refuse. It
+      is slower, and runs only when the fast way failed.
 
-    Neither half is fatal. Both tools are *competitors* in the comparison harness; a corpus whose
-    solargraph cache is short still answers every question ya-lsp is asked, and a setup step that
-    fails the corpus over it would stop work for the wrong reason.
+    **Neither half is fatal.** Both tools are *competitors* in the comparison harness. A corpus with
+    a short solargraph cache still answers everything ya-lsp is asked, so failing setup over it
+    would stop work for the wrong reason.
     """
     ruby, _ = corpus.resolve_ruby(args.allow_nearest)
-    # Through the composed bundle, because solargraph's cache is keyed by its own version as well
-    # as the gem's: caching under the global 0.60.4 and then serving under the bundle's 0.59.2
-    # builds a cache the running server ignores.
+    # Through the composed bundle, because solargraph's cache is keyed by solargraph's own version
+    # as well as the gem's. A cache built under the global version is ignored by a server running
+    # the bundle's.
     sg = ["bundle", "exec", "solargraph"]
     env = solargraph_env(corpus)
     whole = run([*sg, "gems"], cwd=corpus.dir, ruby=ruby, check=False, echo=args.verbose,
@@ -483,11 +476,11 @@ def blame_gem(out):
     return match.group(1) if match else None
 
 
-# Each step, and whether it reaches for a Ruby. **The third column is what CI depends on.** The
-# canary job installs no Ruby at all — deliberately, for a project whose headline is that it
-# needs none — and it clones through this script, so `clone` has to run on a machine with no
-# asdf on PATH. `RUBYLESS` is derived from this column rather than written out again, so a step
-# added here cannot forget to say which kind it is.
+# Each step, and whether it needs a Ruby. **CI depends on the third column.**
+#
+# The canary job installs no Ruby (the project's claim is that it needs none) and clones through
+# this script, so `clone` must run with no asdf on PATH. `RUBYLESS` is derived from this column, so
+# a new step cannot forget to say which kind it is.
 STEPS = [
     ("clone", step_clone, False),           # git fetch and checkout; nothing else
     ("ruby", step_ruby, True),
@@ -496,8 +489,8 @@ STEPS = [
     ("solargraph", step_solargraph, True),
     ("docs", step_docs, True),
 ]
-# Which commands run without asdf. `setup` and `status` are in neither list and stay guarded:
-# `setup` runs every step, and `status` resolves each corpus' Ruby to report on it.
+# Which commands run without asdf. `setup` and `status` stay guarded: `setup` runs every step, and
+# `status` resolves each corpus' Ruby to report on it.
 RUBYLESS = frozenset(name for name, _, needs_ruby in STEPS if not needs_ruby)
 
 
@@ -543,27 +536,27 @@ def observe(corpus, args):
 
 
 def strscan_state(ruby, directory):
-    """Two copies of `strscan` in one process is solargraph's silent hover killer.
+    """Two copies of `strscan` in one process silently break solargraph's hover.
 
-    solargraph renders every hover card with kramdown, and kramdown scans with `StringScanner`.
-    `strscan` is a *C extension*, so loading two builds of it puts two distinct `StringScanner`
-    classes in the process and the type check fails against itself:
+    solargraph renders every hover card with kramdown, which scans with `StringScanner`. `strscan`
+    is a *C extension*, so two loaded builds put two distinct `StringScanner` classes in the
+    process, and the type check fails against itself:
 
         [TypeError] wrong argument type StringScanner (expected StringScanner)
 
-    Every hover raises; `definition` never touches kramdown and answers perfectly. Nothing on
-    screen says why. Measured on lobsters: hover 6/45 against definition 17/45 with 83 request
-    errors, and 23/45 with zero errors once the duplicate was gone.
+    Every hover raises, while `definition` (which never touches kramdown) answers normally. Nothing
+    on screen says why.
 
-    **The general "a default gem is pinned away from the Ruby's default" test is the wrong test**
-    — it fires on five gems in lobsters, which is healthy, and on seventeen in chatwoot. Pure-Ruby
-    default gems double-load harmlessly. What matters is a *C extension* loaded twice, and the
-    cheap observable for that is a second `strscan` installed beside the default one.
+    **Test for a C extension loaded twice, not for "a default gem pinned away from Ruby's
+    default".** That general test fires on healthy corpora; pure-Ruby default gems double-load
+    harmlessly. The cheap observable is a second `strscan` installed beside the default one.
 
-    Two causes, and only one of them is ours to avoid. Installing solargraph into a contained
-    `GEM_HOME` beside the project Ruby's own creates the duplicate — which is why `lsps` installs
-    into the Ruby's own gem home and never sets `GEM_HOME`. The other cause is the project's:
-    a lockfile that pins `strscan` away from the default. That one cannot be fixed from here.
+    Two causes, and only one is ours to avoid:
+    - **Ours:** installing solargraph into a separate `GEM_HOME` beside the project Ruby's own
+      creates the duplicate. So `lsps` installs into the Ruby's own gem home and never sets
+      `GEM_HOME`.
+    - **The project's:** a lockfile that pins `strscan` away from the default. That cannot be fixed
+      from here.
     """
     out = run(["gem", "list", "strscan"], ruby=ruby, check=False)
     if out.returncode != 0:
@@ -582,8 +575,8 @@ def strscan_state(ruby, directory):
         return None
     if not extra:
         return {"default": default, "duplicates": [], "hover": "ok", "cause": None}
-    # Which of the two causes is it? The lock is the discriminator, and it decides whether there
-    # is anything to do: a pinned strscan is the corpus', a stray one is this machine's.
+    # Which cause is it? The lock decides, and it decides whether there is anything to do: a pinned
+    # strscan is the corpus', a stray one is this machine's.
     pinned = None
     for line in (directory / "Gemfile.lock").read_text().splitlines() if (
         directory / "Gemfile.lock"
@@ -602,13 +595,12 @@ def strscan_state(ruby, directory):
 
 
 def ruby_lsp_state(directory):
-    """How ruby-lsp gets into this corpus. Absence of a composed bundle is not absence of setup.
+    """How ruby-lsp gets into this corpus. No composed bundle does not mean no setup.
 
-    ruby-lsp composes `.ruby-lsp/Gemfile` on top of the project's only when the project does not
-    declare ruby-lsp itself. discourse does declare it, so it composes nothing and runs on the
-    project's own resolved version — which is the exact pattern the solargraph composed bundle
-    should copy, and the reason a bare `.ruby-lsp/Gemfile.lock` existence test reads a healthy
-    corpus as an unconfigured one.
+    ruby-lsp composes `.ruby-lsp/Gemfile` only when the project does not declare ruby-lsp itself.
+    discourse declares it, so it composes nothing and runs the project's own resolved version. So a
+    bare "does `.ruby-lsp/Gemfile.lock` exist" test reads a healthy corpus as unconfigured. (The
+    solargraph composed bundle copies this pattern.)
     """
     if (directory / ".ruby-lsp" / "Gemfile.lock").exists():
         return "composed"
@@ -622,7 +614,7 @@ def ruby_lsp_state(directory):
 
 
 def locked_gems(directory):
-    """Every gem name the lock resolves, read as text. Bundler is not needed to answer this."""
+    """Every gem name the lock resolves, read as text. No Bundler needed."""
     lock = directory / "Gemfile.lock"
     if not lock.exists():
         return []
@@ -654,9 +646,9 @@ def print_status(rows):
             f"{row['solargraph_version'] or 'no bundle':<12}"
             f"{row['ruby_lsp']:<10}{dirty}"
         )
-    # A duplicate strscan only reaches solargraph when solargraph runs *outside* the composed
-    # bundle. With the bundle in place the duplicate is still installed and no longer loaded, so
-    # this reports an exposure rather than a fault — and says which it is.
+    # A duplicate strscan reaches solargraph only when solargraph runs *outside* the composed
+    # bundle. With the bundle in place, the duplicate is installed but not loaded, so this reports
+    # an exposure, not a fault, and says which.
     exposed = [
         r for r in rows
         if (r.get("strscan") or {}).get("hover") == "broken" and not r["solargraph_bundle"]
@@ -720,9 +712,8 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="echo the commands run")
     args = parser.parse_args()
 
-    # Only the commands that drive a Ruby need asdf. Guarding the rest fails `clone`, which is a
-    # git fetch — and `make canary-clone` is that command on a runner with no Ruby toolchain at
-    # all. It was written unconditionally once and took CI's canary job down with it.
+    # Only the commands that drive a Ruby need asdf. Guarding the rest would fail `clone`, a plain
+    # git fetch, and `make canary-clone` runs exactly that on a CI runner with no Ruby.
     if args.command not in RUBYLESS and not shutil.which("asdf"):
         print("corpora: asdf is not on PATH; this script drives Ruby through it", file=sys.stderr)
         return 2

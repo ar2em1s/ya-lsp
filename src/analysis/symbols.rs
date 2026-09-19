@@ -1,4 +1,4 @@
-//! `textDocument/documentSymbol` — the outline of one file.
+//! `textDocument/documentSymbol`: the outline of one file.
 
 use std::collections::HashMap;
 
@@ -13,9 +13,9 @@ use super::{locator, position::TextDocument, render};
 
 /// The outline of `uri_id`, nested the way the file is nested.
 ///
-/// rubydex hands back a *flat* list of every definition in the document, each carrying the
-/// `DefinitionId` of the construct it is lexically inside. Rebuilding the tree from those
-/// links is what turns it into an outline.
+/// rubydex returns a *flat* list of every definition in the document, each carrying the
+/// `DefinitionId` of the construct it is lexically inside. Rebuilding the tree from those links is
+/// what makes it an outline.
 #[must_use]
 pub fn document_symbols(
     graph: &Graph,
@@ -34,8 +34,8 @@ pub fn document_symbols(
         .filter(|(_, definition)| is_outline_worthy(graph, definition))
         .collect();
 
-    // rubydex emits definitions in source order already, but nothing in its API promises that,
-    // and the tree assembly below depends on a parent always preceding its children.
+    // rubydex already emits definitions in source order, but its API does not promise it, and the
+    // tree assembly below needs every parent before its children.
     listed.sort_by_key(|(_, definition)| (definition.offset().start(), definition.offset().end()));
 
     let position: HashMap<DefinitionId, usize> = listed
@@ -49,13 +49,12 @@ pub fn document_symbols(
         .map(|(_, definition)| Some(symbol(graph, modifiers, definition, text)))
         .collect();
 
-    // Back to front, so a node is complete — children and all — before it is moved into its
-    // own parent.
+    // Back to front, so a node is complete, children and all, before it moves into its parent.
     let mut roots = Vec::new();
     for index in (0..nodes.len()).rev() {
-        // Each index is visited once and only a *parent* is ever borrowed, never taken, so this
-        // is `Some` for the same reason the arm below is — stated the same way, rather than as
-        // a silent skip that would drop a symbol if it ever stopped being true.
+        // Each index is visited once, and only a *parent* is ever borrowed, never taken, so this is
+        // `Some` for the same reason as the arm below. Stated the same way, not as a silent skip
+        // that would drop a symbol if it ever stopped being true.
         let node = nodes[index]
             .take()
             .expect("each index is taken exactly once");
@@ -75,8 +74,8 @@ pub fn document_symbols(
 
 /// The same outline for a client that never learned about nesting.
 ///
-/// `hierarchicalDocumentSymbolSupport` arrived in LSP 3.10; a client without it expects a flat
-/// list of `SymbolInformation` and will not render — or may not even parse — the nested form.
+/// `hierarchicalDocumentSymbolSupport` arrived in LSP 3.10. A client without it expects a flat list
+/// of `SymbolInformation`, and will not render (or may not even parse) the nested form.
 #[must_use]
 pub fn flatten(symbols: &[DocumentSymbol], uri: &lsp_types::Uri) -> Vec<SymbolInformation> {
     let mut flat = Vec::new();
@@ -111,7 +110,7 @@ fn push_flat(
 
 /// The nearest enclosing construct that is itself in the outline.
 ///
-/// Walking up rather than giving up matters for `class << self`: were singleton classes ever
+/// Walking up instead of giving up matters for `class << self`: if singleton classes were ever
 /// filtered out, their methods would still need to land under the class.
 fn parent_of(
     graph: &Graph,
@@ -119,9 +118,9 @@ fn parent_of(
     position: &HashMap<DefinitionId, usize>,
 ) -> Option<usize> {
     let mut nesting = *definition.lexical_nesting_id();
-    // Bounded rather than `while let`: nothing in rubydex's API promises the nesting chain is
-    // acyclic, and a cycle here would hang the analysis thread, which is indistinguishable
-    // from a dead editor. Real Ruby does not nest anywhere near this deep.
+    // Bounded, not `while let`: rubydex's API does not promise the nesting chain is acyclic, and a
+    // cycle here would hang the analysis thread, which looks exactly like a dead editor. Real Ruby
+    // never nests anywhere near this deep.
     for _ in 0..MAX_NESTING {
         let id = nesting?;
         if let Some(index) = position.get(&id) {
@@ -142,7 +141,7 @@ fn symbol(
     definition: &Definition,
     text: &TextDocument,
 ) -> DocumentSymbol {
-    // `selectionRange` has to sit inside `range` or VS Code throws away the whole outline;
+    // `selectionRange` must sit inside `range`, or VS Code throws away the whole outline.
     // `locator::spans` is the one place that guarantees it.
     let (full, selection) = locator::spans(definition);
 
@@ -166,9 +165,9 @@ fn name_of(graph: &Graph, definition: &Definition) -> String {
         .strings()
         .get(&graph.definition_string_id(definition))
         .map_or_else(String::new, |string| string.as_str().to_owned());
-    // Through `qualified_name` for the anonymous `Class.new`, which rubydex keys by number: a
-    // row in the outline reads the same as the hover card over the line it points at, and both
-    // read as the call the source wrote. It leaves every other name exactly as it found it.
+    // Through `qualified_name` for the anonymous `Class.new`, which rubydex keys by number. An
+    // outline row then reads the same as the hover card over its line, and both read as the call
+    // the source wrote. Every other name is left exactly as it was.
     let raw = render::qualified_name(graph, &raw);
     let name = render::simple_name(&raw);
 
@@ -202,10 +201,10 @@ fn detail_of(
             let parameters = render::parameter_list(graph, method.signatures());
             match method.visibility() {
                 rubydex::model::visibility::Visibility::Public => parameters,
-                // **An outline row is one `def`, so the reread is asked of that `def` and not of
-                // the name.** rubydex records a bare `private` written inside a block against
-                // every `def` below the block, and the word would otherwise be printed beside a
-                // public method in the tree a reader navigates by. See `locator::Modifiers`.
+                // **An outline row is one `def`, so the reread is asked of that `def`, not of the
+                // name.** rubydex records a bare `private` written inside a block against every
+                // `def` below the block, and the word would otherwise be printed beside a public
+                // method in the tree a reader navigates by. See `locator::Modifiers`.
                 rubydex::model::visibility::Visibility::Private
                 | rubydex::model::visibility::Visibility::ModuleFunction
                     if modifiers.escaped(graph, definition) =>
@@ -240,14 +239,14 @@ pub(super) fn kind_of(definition: &Definition) -> SymbolKind {
 
 /// What belongs in an outline.
 ///
-/// The exclusions by kind are all things rubydex records for resolution rather than for reading:
+/// The exclusions by kind are all things rubydex records for resolution, not for reading:
 /// `private :foo` is a visibility *statement*, not a definition of `foo`, and instance and class
 /// variables would list `@name` once per assignment.
 ///
-/// The name is checked because Prism recovers a half-typed `def` into a node whose name span is
-/// the whitespace after the keyword, and a row with nothing written in it is not an outline
-/// entry. Dropping one is safe for the tree: `parent_of` walks past a definition it cannot find,
-/// so anything nested inside reparents outwards rather than disappearing.
+/// The name is checked because Prism recovers a half-typed `def` into a node whose name span is the
+/// whitespace after the keyword, and an empty row is not an outline entry. Dropping one is safe for
+/// the tree: `parent_of` walks past a definition it cannot find, so anything nested inside moves
+/// outwards instead of disappearing.
 fn is_outline_worthy(graph: &Graph, definition: &Definition) -> bool {
     !matches!(
         definition,
@@ -288,7 +287,7 @@ mod tests {
             .iter()
             .map(|symbol| symbol["name"].as_str().unwrap())
             .collect();
-        // `self.build` keeps its receiver, and `private` is a statement rather than a symbol.
+        // `self.build` keeps its receiver, and `private` is a statement, not a symbol.
         assert_eq!(
             members,
             vec!["MAX_AGE", "name", "self.build", "shout", "secret"]
@@ -300,7 +299,7 @@ mod tests {
         assert_eq!(outline[0]["children"][4]["detail"], "private");
         assert_eq!(outline[0]["children"][1]["detail"], "attr_reader");
 
-        // The selection range has to sit inside the range, or clients reject the symbol.
+        // The selection range must sit inside the range, or clients reject the symbol.
         assert_eq!(shout["selectionRange"]["start"]["line"], 14);
         assert_eq!(shout["range"]["start"]["line"], 14);
         assert_eq!(shout["range"]["end"]["line"], 16);
@@ -309,9 +308,9 @@ mod tests {
     #[test]
     fn a_public_method_below_a_block_holding_private_is_not_labelled_private() {
         // rubydex records a bare `private` written inside a block against every `def` below the
-        // *block*, so the outline printed `private` beside a public method — the tree a reader
-        // navigates by, stating the one thing about the method that is not true. The same
-        // reread the jump and the list use decides the word. See `locator::Modifiers`.
+        // *block*, so the outline would print `private` beside a public method: the tree a reader
+        // navigates by, stating the one untrue thing about the method. The reread the jump and the
+        // list use decides the word. See `locator::Modifiers`.
         let mut harness = Harness::new();
         let uri = harness.write(
             "app/models/concerns/has_custom_fields.rb",
@@ -349,9 +348,8 @@ end
 
     /// Every construct the outline spells differently from its bare name.
     ///
-    /// `class << self` has no name of its own, a `Class.new` has none either, a method can
-    /// carry a receiver, and six kinds have a `detail` that is a keyword rather than a
-    /// parameter list. Each was reachable only through a fixture nothing had written.
+    /// `class << self` has no name of its own, nor does a `Class.new`; a method can carry a
+    /// receiver; and six kinds have a `detail` that is a keyword, not a parameter list.
     const SHAPES: &str = "\
 module Outer
   class Widget
@@ -421,8 +419,8 @@ end
             vec![
                 "Outer | 2 | -",
                 "  Widget | 5 | -",
-                // The three `attr_*` kinds are PROPERTY, and their detail is the keyword: there
-                // is no parameter list to show and "width" alone says nothing.
+                // The three `attr_*` kinds are PROPERTY, and their detail is the keyword: there is
+                // no parameter list to show, and "width" alone says nothing.
                 "    width | 7 | attr_writer",
                 "    height | 7 | attr_accessor",
                 "    depth | 7 | attr_reader",
@@ -436,13 +434,13 @@ end
                 "    resize | 6 | -",
                 "    grow | 6 | alias",
                 "    enlarge | 6 | alias",
-                // A method written on a constant receiver keeps it, which is the only thing
-                // telling `def Outer.configure` apart from a top-level `def configure`.
+                // A method written on a constant receiver keeps it: the only thing telling
+                // `def Outer.configure` apart from a top-level `def configure`.
                 "Outer.configure | 6 | -",
-                // A `Class.new` nothing bound to a constant has no name of its own either;
-                // rubydex keys it by document and offset, and the outline was printing that
-                // key. The kind is what tells the two apart at a glance, and the spelling has
-                // to agree with it — rubydex writes both the same, so the declaration decides.
+                // A `Class.new` bound to no constant has no name of its own either. rubydex keys it
+                // by document and offset, and the outline would print that key. The kind tells the
+                // two apart at a glance, and the spelling must agree with it: rubydex writes both
+                // the same, so the declaration decides.
                 "Class.new | 5 | -",
                 "  make | 6 | -",
                 "Module.new | 2 | -",
@@ -453,9 +451,9 @@ end
 
     #[test]
     fn the_outline_lists_definitions_and_not_the_statements_around_them() {
-        // Each of these is something rubydex records as a definition for resolution's sake and
-        // nobody would want in a file's structure: `private :shout` is a visibility statement,
-        // not a second declaration of `shout`, and a variable would appear once per assignment.
+        // Each of these is something rubydex records as a definition for resolution and nobody
+        // wants in a file's structure: `private :shout` is a visibility statement, not a second
+        // declaration of `shout`, and a variable would appear once per assignment.
         let mut harness = Harness::new();
         let source = "\
 $LOG = nil
@@ -496,10 +494,10 @@ end
 
     #[test]
     fn an_outline_names_a_singleton_method_on_a_constant_it_cannot_resolve() {
-        // `def Nowhere.thing` parses and is indexed; the receiver names a constant the graph
-        // never saw. The outline still has to carry a row for it, and the honest name is the
-        // bare method — inventing `Nowhere.thing` from an unresolved reference would put a
-        // name in the picker that leads nowhere.
+        // `def Nowhere.thing` parses and is indexed; the receiver names a constant the graph never
+        // saw. The outline still needs a row for it, and the honest name is the bare method:
+        // inventing `Nowhere.thing` from an unresolved reference would put a name in the picker
+        // that leads nowhere.
         let mut harness = Harness::new();
         let source = "def Nowhere.thing\nend\n";
         let uri = harness.write("app/patch.rb", source);
@@ -523,14 +521,14 @@ end
 
     #[test]
     fn a_half_typed_def_does_not_take_the_outline_down_with_it() {
-        // Reported from a real editor: typing `def` inside a class made VS Code throw
+        // Typing `def` inside a class made VS Code throw
         // `selectionRange must be contained in fullRange` and drop the *entire* outline, so the
         // file's structure vanished mid-keystroke. Prism recovers a bare `def` into a node whose
         // location is the three keyword bytes and whose name location is the whitespace *after*
         // them, so `range` ended where `selectionRange` began.
         //
         // Half-typed code is the normal state of a buffer, not an edge case, so the containment
-        // rule has to hold for whatever the parser recovered.
+        // rule must hold for whatever the parser recovered.
         let mut harness = Harness::new();
         let uri = harness.write("lib/a.rb", "");
         harness.index();
@@ -551,8 +549,8 @@ end
                 "{source:?}: {:?}\n{outline}",
                 uncontained(&outline)
             );
-            // And nothing with no name in it: the recovered node is not a symbol yet, and a
-            // blank row in the outline is the visible half of the same bug.
+            // And nothing without a name: the recovered node is not a symbol yet, and a blank
+            // outline row is the visible half of the same bug.
             for symbol in all_symbols(&outline) {
                 let name = symbol["name"].as_str().unwrap_or_default();
                 assert!(
@@ -562,8 +560,8 @@ end
             }
         }
 
-        // Not vacuous by way of an empty answer: the enclosing class is still outlined while
-        // the method inside it is being typed.
+        // Not vacuous by way of an empty answer: the enclosing class is still outlined while the
+        // method inside it is being typed.
         harness.change(&uri, "class A\n def\n");
         assert_eq!(harness.outline(&uri)[0]["name"], "A");
     }

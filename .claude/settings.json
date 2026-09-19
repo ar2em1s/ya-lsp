@@ -3,7 +3,14 @@
     "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING": "1",
     "MAX_THINKING_TOKENS": "128000"
   },
+  "extraKnownMarketplaces": {
+    "ya-lsp": {
+      "source": { "source": "directory", "path": "." },
+      "autoUpdate": true
+    }
+  },
   "enabledPlugins": {
-    "good-readme@evilmartians": true
+    "good-readme@evilmartians": true,
+    "ya-lsp@ya-lsp": true
   }
 }

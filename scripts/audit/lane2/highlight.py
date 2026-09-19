@@ -1,33 +1,41 @@
-"""Check 1 — `documentHighlight` and `definition` agree about this cursor.
+"""Check 1: `documentHighlight` and `definition` agree about this cursor.
 
-Both requests start from the same offset in the same buffer and `highlight.rs` has already
-decided which of the two halves of the crate speaks for it. So there are two ways they can
-contradict each other, they are different bugs, and they are counted apart:
+Both start from the same offset in the same buffer, and `highlight.rs` has already decided which
+half of the crate speaks for it. They can contradict each other two ways, which are different bugs,
+counted apart:
 
-  `missed`   — `definition` landed in **this** file on a span `documentHighlight` did not light.
-               This is the plan's phrasing of the check, literally: the highlight set is a
-               superset of the same-file definition set.
-  `disagree` — `documentHighlight` answered and **neither `definition` nor `hover`** did, at the
-               same cursor. The empty set is a superset of nothing, so the literal containment
-               above can never catch this — and this, not containment, is the shape the ivar gap
-               actually takes. `highlight.rs`'s own module doc is the statement of it: the scope
-               walk answers at `@foo` and the graph records no reference to one, so `definition`
-               has nothing to look up. One buffer, one already-run walk, opposite answers.
+  `missed`    `definition` landed in **this** file on a span `documentHighlight` did not light.
+              The literal check: the highlight set contains the same-file definition set.
+  `disagree`  `documentHighlight` answered and **neither `definition` nor `hover`** did, at the
+              same cursor. The empty set is contained in anything, so containment can never
+              catch this, and this is the shape the ivar gap takes (`highlight.rs`' module
+              doc): the scope walk answers at `@foo`, the graph records no reference to it, so
+              `definition` has nothing to look up. One buffer, opposite answers.
 
-**`hover` is in that condition to keep a design decision out of the defect count.** Without it
-the check also fires wherever `definition` declines because a generated declaration has no source
-line to point at — `synthesized.rs`'s stated rule, *no mapping means no place, never a guess* —
-while `highlight` lights the name anyway, which it is entitled to do because it matches methods
-by name. Measured on lobsters, that is `where`, `includes`, `find_by!`: 23 firings in 200
-positions, none of them a defect. A cursor where `hover` also says nothing is a different claim
-entirely — not "we know what this is and cannot say where", but "this cursor is on nothing at
-all" — and that is the seam. With the condition, 40 ivar positions on lobsters split 21 silent to
-19 answered, against the 319-of-657 the report measured independently.
+**`hover` is in that condition to keep a design decision out of the defect count.** Without it, the
+check fires wherever `definition` declines because a generated declaration has no source line
+(`synthesized.rs`: *no mapping means no place, never a guess*), while `highlight` lights the name
+anyway, as it may, since it matches methods by name. `where`, `includes` and `find_by!` fire that
+way, and none is a defect. A cursor where `hover` is silent too makes a different claim: not "we
+know what this is and cannot say where", but "this cursor is on nothing". That is the seam.
+
+**A few `disagree` rows are correct refusals of a private method.** Where the name is private
+everywhere it is declared and the written receiver is not `self`, Ruby itself would raise, and both
+refusals are right. They are not subtracted: a text scan for privacy could never catch a regression
+(a server that started *answering* there would just leave the bucket) and could hide one, so it is
+not worth its cost.
 """
+
+import re
 
 from audit.answers import covers
 
 FINDINGS = ("missed", "disagree")
+
+# The receiver written right before the cursor, if any. A `member` is `recv.name` and this reads
+# `recv`; a bare call has none, and `self.name` is the one receiver allowed to reach a private
+# method.
+RECEIVER = re.compile(r"([A-Za-z_@][A-Za-z0-9_]*[?!]?)\s*\.\s*$")
 
 
 def counters():
@@ -61,7 +69,10 @@ summary = line
 
 
 def under(counts):
-    """Which shapes the `disagree` half fell in — the whole finding on `ivar` is this line."""
+    """Which shapes the `disagree` half fell in: for `ivar`, this line is the whole finding."""
+    said = []
     shapes = "  ".join(f"{k} {v}" for k, v in
                        sorted(counts["disagree-shapes"].items(), key=lambda kv: -kv[1]))
-    return [f"by shape  {shapes}"] if shapes else []
+    if shapes:
+        said.append(f"by shape  {shapes}")
+    return said

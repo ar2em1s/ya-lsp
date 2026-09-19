@@ -2,6 +2,16 @@
 
 use std::process::ExitCode;
 
+// Indexing a real application's bundle is thousands of files of short-lived allocation across a
+// thread pool, and it is most of a cold open. Swapping the allocator under it makes that phase
+// markedly faster; `Cargo.toml` says why this is mimalloc rather than the jemalloc rubydex offers.
+//
+// Here, not in `lib.rs`, on purpose: a `#[global_allocator]` binds the whole binary, so in the
+// library it would also bind every test binary and silently move the numbers the suite and the
+// coverage run are read against. The shipped server is what this is for.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 const USAGE: &str = "\
@@ -37,9 +47,9 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             // The binary embeds the `rbs` gem's signatures, whose licence requires its notice to
-            // accompany a binary distribution. A bare binary — attached to a release, rehosted,
-            // installed with `cargo install` — has nothing accompanying it, so it carries the
-            // notice itself. See `ya_lsp::licenses`.
+            // accompany a binary distribution. A bare binary (attached to a release, rehosted,
+            // installed with `cargo install`) has nothing accompanying it, so it carries the notice
+            // itself. See `ya_lsp::licenses`.
             "--licenses" => {
                 println!("{}", ya_lsp::licenses::text());
                 return ExitCode::SUCCESS;
@@ -52,10 +62,10 @@ fn main() -> ExitCode {
     }
 
     // Editors overwhelmingly pass `--stdio`, but some launch the binary bare. stdio is the only
-    // transport, so treat its absence as the default rather than an error.
+    // transport, so its absence is the default, not an error.
     let _ = stdio;
 
-    // The decisions are all in `ya_lsp::logging`; the two lines here are the edge — reading the
+    // The decisions are all in `ya_lsp::logging`; the two lines here are the edge: reading the
     // environment, and the one call that cannot be undone. Anything more in `main` is a line no
     // test reaches.
     let (sinks, reload) = ya_lsp::logging::install(std::env::var("YA_LSP_LOG").ok());

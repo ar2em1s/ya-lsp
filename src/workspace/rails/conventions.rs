@@ -1,76 +1,75 @@
 //! The conventions that are rules about a **path**, and nothing else.
 //!
-//! Being Rails-aware is a surface with no natural edge, which is why every convention in this
-//! directory is bounded. What makes these different is not that they are smaller but that they
-//! are checkable — `app/views/stories/show.html.erb` is rendered by `StoriesController` or by
-//! nothing, and `db/queue_schema.rb` is a schema or it is not. Neither reads a byte of the file
-//! it is asked about.
+//! Rails awareness has no natural edge, so every convention in this directory is bounded. These
+//! differ not by being smaller but by being checkable: `app/views/stories/show.html.erb` is
+//! rendered by `StoriesController` or by nothing, and `db/queue_schema.rb` is a schema or it is
+//! not. None reads a byte of the file it is asked about.
 //!
 //! # What the view convention actually is
 //!
-//! Rails renders `app/views/<path>/<action>.<format>.<handler>` from the controller named by
-//! `<path>`: each segment camelized, joined with `::`, and `Controller` appended to the last.
+//! Rails renders `app/views/<path>/<action>.<format>.<handler>` from the controller `<path>` names:
+//! each segment camelized, joined with `::`, with `Controller` appended to the last.
 //! `stories/show.html.erb` is `StoriesController`; `admin/users/index.html.erb` is
-//! `Admin::UsersController`. The file name says which *action*, and is deliberately not read —
-//! see the `types` module for why the whole class is the unit.
+//! `Admin::UsersController`. The file name gives the *action* and is deliberately not read; the
+//! `types` module explains why the whole class is the unit.
 //!
 //! [`mailer_of`] is the same walk without the suffix, because a mailer's views hang off the
 //! mailer's own name, and [`is_helper`] is Rails' own glob for the modules every template's view
-//! context includes. Both are read by `analysis::views`, and the second is the whole of what a
-//! view context needs from a path: which file *is* a helper, never which helper a template gets.
+//! context includes. `analysis::views` reads both, and the second is all a view context needs from
+//! a path: which file *is* a helper, never which helper a template gets.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use super::inflect::camelize;
 
-/// The directory the convention is anchored on. Rails puts views under `app/views`, and an
-/// engine under `engines/<name>/app/views`, so what is fixed is the segment and not the prefix.
+/// The directory the convention is anchored on. Rails puts views under `app/views`, and an engine
+/// under `engines/<name>/app/views`, so the segment is fixed, not the prefix.
 const VIEWS: &str = "views";
 
 /// The directory Rails globs for helpers, and the one it sits in.
 const HELPERS: &str = "helpers";
 const APP: &str = "app";
 
-/// The three `app/` directories Rails leaves out of the autoload paths, because none of them
-/// holds Ruby to autoload. Everything else under `app/` is a root.
+/// The three `app/` directories Rails leaves out of the autoload paths, because none holds Ruby to
+/// autoload. Everything else under `app/` is a root.
 const NOT_AUTOLOADED: [&str; 3] = ["assets", "javascript", "views"];
 
-/// The one directory name that is a root rather than a namespace.
+/// The one directory name that is a root, not a namespace.
 ///
-/// Rails' own glob is `app/{*,*/concerns}`, so `app/models/concerns/` is an autoload path in its
-/// own right and `app/models/concerns/searchable.rb` is `Searchable` — never `Concerns::Searchable`.
+/// Rails' glob is `app/{*,*/concerns}`, so `app/models/concerns/` is an autoload path of its own
+/// and `app/models/concerns/searchable.rb` is `Searchable`, never `Concerns::Searchable`.
 const CONCERNS: &str = "concerns";
 
 /// The file name Rails' own glob ends in: `app/helpers/**/*_helper.rb`.
 const HELPER: &str = "_helper.rb";
 
+/// What a file Zeitwerk loads is named: the one extension it walks.
+const RUBY: &str = ".rb";
+
 /// The class Rails would render `path` from, as a fully qualified Ruby constant.
 ///
-/// `None` when the path is not a view at all, when it sits directly in `views/` (a template
-/// with no controller directory — `views/index.html.erb` belongs to nothing), or when a segment
-/// cannot spell a Ruby constant. The last case is the only one worth stating: a constant must
-/// begin with `A`–`Z`, so a directory named `123` or `спорт` names no class, and answering
-/// `None` is the difference between "there is no controller" and reaching for one that has a
-/// similar-looking name.
+/// `None` when the path is not a view, when it sits directly in `views/` (`views/index.html.erb`
+/// has no controller directory, so belongs to nothing), or when a segment cannot spell a Ruby
+/// constant. The last case matters: a constant must begin with `A`–`Z`, so a directory named `123`
+/// or `спорт` names no class, and `None` is the difference between "there is no controller" and
+/// reaching for a similar-looking one.
 #[must_use]
 pub fn controller_of(path: &Path) -> Option<String> {
     Some(namespaced(path)? + "Controller")
 }
 
-/// The class a **mailer's** own views are rendered by: the same path rule with no suffix.
+/// The class a **mailer's** own views are rendered by: the same path rule without the suffix.
 ///
-/// `app/views/user_mailer/welcome.html.erb` is `UserMailer`, because `ActionMailer::Base`
-/// derives its view path from the mailer's own name and not from a controller's. The view context needs
-/// it because `AbstractController::Helpers` — and therefore `helper_method` — is in
-/// `ActionMailer::Base` too: 3 of the six corpora's 60 exported names are written in a mailer.
+/// `app/views/user_mailer/welcome.html.erb` is `UserMailer`, because `ActionMailer::Base` derives
+/// its view path from the mailer's own name, not a controller's. The view context needs it because
+/// `AbstractController::Helpers` (and so `helper_method`) is in `ActionMailer::Base` too.
 ///
-/// **The caller must gate this and [`controller_of`] does not have to be gated.** A directory
-/// named `stories` can only produce `StoriesController`, which is a name nothing but a
-/// controller is called; this one produces whatever the directory happens to spell, and
-/// `app/views/shared/` spells `Shared`. `analysis::views` gates it on the classes the
-/// application defines that [`super::is_mailer`] recognises, which is the same superclass table
-/// the mailer and job reader uses.
+/// **The caller must gate this; [`controller_of`] needs no gate.** A directory named `stories` can
+/// only produce `StoriesController`, a name only a controller has; this one produces whatever the
+/// directory spells, and `app/views/shared/` spells `Shared`. `analysis::views` gates it on the
+/// application's classes that [`super::is_mailer`] recognises: the same superclass table the mailer
+/// and job reader uses.
 #[must_use]
 pub fn mailer_of(path: &Path) -> Option<String> {
     namespaced(path)
@@ -78,16 +77,15 @@ pub fn mailer_of(path: &Path) -> Option<String> {
 
 /// Whether `path` is a file Rails puts in every template's view context.
 ///
-/// `ActionController::Base.all_helpers_from_path` globs `**/*_helper.rb` under each
-/// `app/helpers` directory, so **both halves of this are Rails' own** and neither is a
-/// convention this crate chose: a file under `app/helpers` that is not named `*_helper.rb` is
-/// not a default helper at all. Solidus writes seven of them —
-/// `core/app/helpers/spree/core/controller_helpers/auth.rb` — and reaches them by `include`ing
-/// them into its controllers, which is a different mechanism and one `analysis::views` answers
-/// through the ancestor walk rather than through this list.
+/// `ActionController::Base.all_helpers_from_path` globs `**/*_helper.rb` under each `app/helpers`
+/// directory, so **both halves of this are Rails' own**, not a convention this crate chose: a file
+/// under `app/helpers` not named `*_helper.rb` is not a default helper. Solidus has several
+/// (`core/app/helpers/spree/core/controller_helpers/auth.rb`) and reaches them by `include`ing them
+/// into controllers, a different mechanism that `analysis::views` answers through the ancestor
+/// walk, not this list.
 ///
-/// The anchor is a `helpers` segment directly under an `app`, which is what an engine keeps
-/// too. It is doing real work: `spec/helpers/` is a directory every one of the six corpora has.
+/// The anchor is a `helpers` segment directly under an `app`, which engines keep too. It matters:
+/// nearly every project has a `spec/helpers/`.
 #[must_use]
 pub fn is_helper(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -107,19 +105,19 @@ pub fn is_helper(path: &Path) -> bool {
 
 /// Everything between the last `views/` and the file name, camelized and joined.
 ///
-/// The half [`controller_of`] and [`mailer_of`] share, which is all of the path reading: what
-/// separates them is one suffix, and a second copy of this walk is a second copy that would one
-/// day disagree about `app/views/admin/user_sessions/`.
+/// The part [`controller_of`] and [`mailer_of`] share, which is all the path reading: they differ
+/// by one suffix, and a second copy of this walk would one day disagree about
+/// `app/views/admin/user_sessions/`.
 fn namespaced(path: &Path) -> Option<String> {
     let segments: Vec<&str> = path
         .iter()
         .map(|segment| segment.to_str().unwrap_or_default())
         .collect();
-    // The *last* `views`, so that a path that happens to contain the word twice is read the way
-    // Rails reads it: the nearest one to the template is the one the convention hangs off.
+    // The *last* `views`, so a path containing the word twice is read as Rails reads it: the one
+    // nearest the template is what the convention hangs off.
     let views = segments.iter().rposition(|segment| *segment == VIEWS)?;
-    // Everything between `views/` and the file name. The file name is the action, which this
-    // rule does not read.
+    // Everything between `views/` and the file name. The file name is the action, which this rule
+    // does not read.
     let directories = segments.get(views + 1..segments.len().saturating_sub(1))?;
     if directories.is_empty() {
         return None;
@@ -136,66 +134,79 @@ fn namespaced(path: &Path) -> Option<String> {
     Some(name)
 }
 
-/// Every namespace Zeitwerk defines because a **directory** spells it, outermost first.
-///
-/// `class A::B::C` where `A::B` is undefined raises `NameError` in plain Ruby. Rails runs it
-/// because Zeitwerk walks the autoload paths and, for a directory with no matching `.rb` beside
-/// it, **defines a module named after the directory** — an *implicit namespace*. So
-/// `app/services/user/policy/not_already_silenced.rb` needs a `User::Policy` no file writes, and
-/// the directory `app/services/user/policy/` is the whole of what declares it.
-///
-/// Asked of the **file**, and answers the chain of directories between the autoload root and it:
-/// `app/services/chat/thread/policy/message_existence.rb` gives `Chat`, `Chat::Thread` and
-/// `Chat::Thread::Policy`, each with the directory that spells it. Whether any of them is
-/// *already* declared is not this rule's question — a directory beside a `user.rb` conjures
-/// nothing, and the caller, which holds every name the workspace and its bundle declare, is the
-/// only place that can tell.
-///
-/// **Three bounds, and each is Rails' own rather than this crate's.** The anchor is a segment
-/// literally named `app`, which an engine and a discourse plugin keep too. [`NOT_AUTOLOADED`] is
-/// the list Rails leaves out. And a `concerns` directly under a root is a root itself
-/// ([`CONCERNS`]), so nothing named `Concerns` is ever conjured.
-///
-/// What it cannot see is Zeitwerk's acronym table: an application that registers `API` gets
-/// `Api` here. That is `database.yml`'s kind of escape — configuration this crate does not read —
-/// and it costs a namespace that is not declared rather than a wrong one, because the name the
-/// files themselves write will not match it and the caller drops what nothing else confirms.
-#[must_use]
-pub fn autoloaded_namespaces(path: &Path) -> Vec<(PathBuf, String)> {
-    let segments: Vec<&str> = path
-        .iter()
+/// A path as the segments both autoload rules read, with anything unspellable blanked.
+fn segments(path: &Path) -> Vec<&str> {
+    path.iter()
         .map(|segment| segment.to_str().unwrap_or_default())
-        .collect();
-    // The *last* `app`, for [`namespaced`]'s reason: a path holding the word twice hangs off
-    // the one nearest the file.
-    let Some(app) = segments.iter().rposition(|segment| *segment == APP) else {
-        return Vec::new();
-    };
-    let Some(root) = segments.get(app + 1) else {
-        return Vec::new();
-    };
+        .collect()
+}
+
+/// Where a path's namespace directories begin, or `None` if it is under no autoload root.
+///
+/// **The three bounds both autoload rules share, in one place.** The anchor is a segment literally
+/// named `app`, which engines and discourse plugins keep too; [`NOT_AUTOLOADED`] is the list Rails
+/// leaves out; and a `concerns` directly under a root is itself a root ([`CONCERNS`]). A second
+/// copy would one day disagree about `app/models/concerns/`.
+///
+/// The answer indexes the segments *before the file name*, so it is `None` for a path with no file
+/// name after the root: `app/models` and `app/models/concerns` are directories and declare nothing.
+fn autoloaded_from(segments: &[&str]) -> Option<usize> {
+    // The *last* `app`, for [`namespaced`]'s reason: a path containing the word twice hangs off the
+    // one nearest the file.
+    let app = segments.iter().rposition(|segment| *segment == APP)?;
+    let root = segments.get(app + 1)?;
     if NOT_AUTOLOADED.contains(root) {
-        return Vec::new();
+        return None;
     }
-    // Past the root, and past a `concerns` that is a second root. The file name is the last
-    // segment and names a constant rather than a namespace, so it is never walked.
     let mut from = app + 2;
     if segments.get(from) == Some(&CONCERNS) {
         from += 1;
     }
-    let Some(directories) = segments.get(from..segments.len().saturating_sub(1)) else {
+    (from < segments.len()).then_some(from)
+}
+
+/// Every namespace Zeitwerk defines because a **directory** spells it, outermost first.
+///
+/// `class A::B::C` with `A::B` undefined raises `NameError` in plain Ruby. Rails runs it because
+/// Zeitwerk walks the autoload paths and, for a directory with no matching `.rb` beside it,
+/// **defines a module named after the directory**: an *implicit namespace*. So
+/// `app/services/user/policy/not_already_silenced.rb` needs a `User::Policy` no file writes, and
+/// the directory `app/services/user/policy/` is all that declares it.
+///
+/// Asked of the **file**, it answers the chain of directories between the autoload root and the
+/// file: `app/services/chat/thread/policy/message_existence.rb` gives `Chat`, `Chat::Thread` and
+/// `Chat::Thread::Policy`, each with the directory spelling it. Whether any is *already* declared
+/// is not this rule's question: a directory beside a `user.rb` conjures nothing, and only the
+/// caller, which holds every name the workspace and bundle declare, can tell.
+///
+/// **Three bounds, each Rails' own, not this crate's:** the anchor is a segment literally named
+/// `app` (engines and discourse plugins keep it too); [`NOT_AUTOLOADED`] is the list Rails leaves
+/// out; and a `concerns` directly under a root is itself a root ([`CONCERNS`]), so nothing named
+/// `Concerns` is ever conjured.
+///
+/// It cannot see Zeitwerk's acronym table: an application registering `API` gets `Api` here. That
+/// is `database.yml`'s kind of escape (configuration this crate does not read), and it costs an
+/// undeclared namespace, not a wrong one, because the name the files write will not match and the
+/// caller drops what nothing confirms.
+#[must_use]
+pub fn autoloaded_namespaces(path: &Path) -> Vec<(PathBuf, String)> {
+    let segments = segments(path);
+    let Some(from) = autoloaded_from(&segments) else {
         return Vec::new();
     };
+    // Everything between the root and the file name. The file name is the last segment and names a
+    // constant, not a namespace, so it is never walked here.
+    let directories = &segments[from..segments.len() - 1];
 
-    // In bounds because `directories` came back `Some`: the slice above could only be taken
-    // when `from` is at most the index of the file name.
+    // In bounds because [`autoloaded_from`] only answers when `from` is at most the file name's
+    // index.
     let mut here: PathBuf = segments[..from].iter().copied().collect();
     let mut name = String::new();
     let mut conjured = Vec::with_capacity(directories.len());
     for directory in directories {
         here.push(directory);
         // A directory that cannot spell a constant is one Zeitwerk cannot descend either, and
-        // everything below it goes with it — so the chain stops rather than skipping a segment.
+        // everything below goes with it, so the chain stops instead of skipping a segment.
         let Some(camelized) = camelize(directory) else {
             return conjured;
         };
@@ -208,27 +219,95 @@ pub fn autoloaded_namespaces(path: &Path) -> Vec<(PathBuf, String)> {
     conjured
 }
 
+/// The constant Zeitwerk would expect the file at `path` to declare, fully qualified.
+///
+/// [`autoloaded_namespaces`] answers the chain of *directories* between an autoload root and a
+/// file; this is that chain plus the file's own name, the whole constant:
+/// `app/services/chat/thread/policy/message_existence.rb` is
+/// `Chat::Thread::Policy::MessageExistence`, and `app/models/concerns/searchable.rb` is
+/// `Searchable`. `None` for a path under no autoload root, one not named `*.rb`, and any segment
+/// that cannot spell a Ruby constant.
+///
+/// **This is what the path *proposes*, and a caller about to write the answer into somebody's files
+/// must confirm it against the file.** The inflector here is Zeitwerk's default, not Zeitwerk: an
+/// application registering the acronym `API` declares `APIKey` in `api_key.rb`, and this says
+/// `ApiKey`. [`confirmed_spelling`] resolves that for a *namespace*, where any spelling the
+/// directory allows is as good as another, since nothing is written down. It cannot here: a rename
+/// must **spell** the new name, and when a project's own spelling cannot be reproduced, the only
+/// safe answer is not to write.
+#[must_use]
+pub fn autoloaded_constant(path: &Path) -> Option<String> {
+    let segments = segments(path);
+    let from = autoloaded_from(&segments)?;
+    // In bounds because `autoloaded_from` only answers when a file name follows the root.
+    let directories = &segments[from..segments.len() - 1];
+    let own = named_constant(path)?;
+
+    let mut name = String::new();
+    for directory in directories {
+        name.push_str(&camelize(directory)?);
+        name.push_str("::");
+    }
+    name.push_str(&own);
+    Some(name)
+}
+
+/// The constant a file's **own name** spells, with no autoload root required.
+///
+/// The last segment of [`autoloaded_constant`], and worth asking on its own: a file named after the
+/// class it holds has something at stake when it moves, wherever it sits, and one that is not (a
+/// `.rake` task, a spec, an initializer) has nothing, whatever its directory. That separates a move
+/// worth a word from one worth silence.
+#[must_use]
+pub fn named_constant(path: &Path) -> Option<String> {
+    camelize(path.file_name()?.to_str()?.strip_suffix(RUBY)?)
+}
+
+/// Whether two spellings of a constant are the same constant to two different inflectors.
+///
+/// [`confirmed_spelling`]'s comparison (underscores dropped, ASCII case ignored) applied to a whole
+/// name instead of a chain of directories, for the same reason: `APIKey` and `ApiKey` are one class
+/// in an application registering the acronym, and the acronym table is Ruby that only runs.
+///
+/// It is deliberately *not* how a caller decides to write a name. It answers "is this the constant
+/// that file is named after", which separates a file with something at stake in a move from one
+/// without; the exact comparison decides whether ya-lsp may spell the new name.
+#[must_use]
+pub fn same_constant(left: &str, right: &str) -> bool {
+    let mut left = left.split("::");
+    let mut right = right.split("::");
+    loop {
+        let (left, right) = (left.next(), right.next());
+        match (left, right) {
+            (None, None) => return true,
+            (Some(left), Some(right))
+                if left
+                    .replace('_', "")
+                    .eq_ignore_ascii_case(&right.replace('_', "")) => {}
+            _ => return false,
+        }
+    }
+}
+
 /// How the file itself spells the chain a directory proposed, or `None` if it spells another.
 ///
-/// **The path proposes and the file confirms — the spelling as well as the existence.**
-/// [`autoloaded_namespaces`] camelizes each directory, which is Zeitwerk's default inflector and
-/// not Zeitwerk: an application registering `REST` as an acronym autoloads `app/serializers/rest/`
-/// as `REST`, and a chain proposed as `Rest` agrees with nothing that file writes. Six such names
-/// on mastodon — `ActivityPub`, `REST`, `OAuth`, `OStatus`, `RSS` and `SEO` — behind 237 of the
-/// 1,932 openers six corpora write.
+/// **The path proposes and the file confirms: the spelling as well as the existence.**
+/// [`autoloaded_namespaces`] camelizes each directory, which is Zeitwerk's default inflector, not
+/// Zeitwerk: an application registering `REST` as an acronym autoloads `app/serializers/rest/` as
+/// `REST`, and a chain proposed as `Rest` matches nothing that file writes. Real applications
+/// register such acronyms (`ActivityPub`, `REST`, `OAuth`, `OStatus`, `RSS`, `SEO`).
 ///
-/// The acronym table is `config/initializers/inflections.rb`, which is Ruby that only runs. What
-/// is on disk instead is the *answer*: the file writes `REST::AccountSerializer` under a
-/// directory named `rest`, and a segment is the directory's own name whatever case an inflector
-/// put it in. So the match is the directory with its underscores dropped against the segment,
-/// ASCII-case-insensitively — `not_already_silenced` confirms `NotAlreadySilenced` exactly as it
-/// did, and `rest` now confirms `REST` as well as `Rest`.
+/// The acronym table is `config/initializers/inflections.rb`, Ruby that only runs. What is on disk
+/// instead is the *answer*: the file writes `REST::AccountSerializer` under a directory named
+/// `rest`, and a segment is the directory's own name whatever case an inflector gave it. So the
+/// match compares the directory, underscores dropped, against the segment, ignoring ASCII case:
+/// `not_already_silenced` confirms `NotAlreadySilenced`, and `rest` confirms both `REST` and
+/// `Rest`.
 ///
-/// **It cannot conjure a name the directory does not spell**, which is the bound that matters: a
-/// file under `foo/` declaring `Bar::Baz` fails the comparison at the first segment, and one
-/// whose constant has a different number of segments from the chain fails before that. What it
-/// gives up is the ability to say a project's inflector is *wrong* — and this crate never knew
-/// the inflector, so there was nothing to give up.
+/// **It cannot conjure a name the directory does not spell**, the bound that matters: a file under
+/// `foo/` declaring `Bar::Baz` fails at the first segment, and a constant with a different segment
+/// count from the chain fails before that. What it gives up is saying a project's inflector is
+/// *wrong*, and this crate never knew the inflector anyway.
 #[must_use]
 pub fn confirmed_spelling(
     conjured: &[(PathBuf, String)],
@@ -259,18 +338,17 @@ pub fn confirmed_spelling(
 
 /// Whether `path` is a schema `rails db:migrate` writes.
 ///
-/// A path convention, like the view rule above, and checkable the same way — but **not one
-/// file**. Rails has supported more than one database since 6.0, and `schema_dump_path` names
-/// the primary one `db/schema.rb` and every other one `db/<database>_schema.rb`. A new Rails 8
-/// application ships three of the second kind before anyone writes a line of it, for
-/// solid_queue, solid_cache and solid_cable; lobsters has `db/queue_schema.rb`,
-/// `db/cache_schema.rb` and `db/rack_attack_schema.rb` beside its own.
+/// A path convention like the view rule above, checkable the same way, but **not one file**. Rails
+/// has supported multiple databases since 6.0, and `schema_dump_path` names the primary one
+/// `db/schema.rb` and every other `db/<database>_schema.rb`. A new Rails 8 application ships three
+/// of the second kind before anyone writes a line (for solid_queue, solid_cache and solid_cable),
+/// e.g. `db/queue_schema.rb` and `db/cache_schema.rb`.
 ///
-/// The file has to sit **directly** in a directory called `db`, because that is what Rails
-/// joins the name onto. What this cannot see is the two escapes from the convention:
-/// `schema_dump:` in `database.yml` renames the file outright and `ENV["SCHEMA"]` overrides it,
-/// and both are out of reach of a path rule — reading `database.yml` is a new file format and a
-/// new surface. The other half of the same convention is [`is_structure`].
+/// The file must sit **directly** in a directory called `db`, because that is what Rails joins the
+/// name onto. This cannot see the convention's two escapes: `schema_dump:` in `database.yml`
+/// renames the file outright, and `ENV["SCHEMA"]` overrides it; both are out of reach of a path
+/// rule (reading `database.yml` would be a new file format and a new surface). The convention's
+/// other half is [`is_structure`].
 #[must_use]
 pub fn is_schema(path: &Path) -> bool {
     is_dump(path, "schema.rb")
@@ -278,18 +356,17 @@ pub fn is_schema(path: &Path) -> bool {
 
 /// Whether `path` is a schema `rails db:migrate` writes when the format is `:sql`.
 ///
-/// The same rule as [`is_schema`] against the other name, because it is the same method in
-/// Rails: `schema_dump` names the primary database's dump `structure.sql` and every other one
-/// `<database>_structure.sql`, exactly as it names the Ruby one `schema.rb` and
-/// `<database>_schema.rb`. An application has one format or the other, so in practice one of
-/// these two answers for a given `db/` — but nothing enforces that, and a repository that
-/// switched formats and did not delete the old file has both. What happens then is
-/// [`Schema::table_names`]' rule and not this one's: a table two schema sources declare is
-/// declared by neither.
+/// The same rule as [`is_schema`] with the other name, because it is the same method in Rails:
+/// `schema_dump` names the primary database's dump `structure.sql` and every other
+/// `<database>_structure.sql`, exactly as it names the Ruby ones `schema.rb` and
+/// `<database>_schema.rb`. An application uses one format, so in practice only one of these answers
+/// for a given `db/`, but nothing enforces that, and a repository that switched formats without
+/// deleting the old file has both. Then [`Schema::table_names`]' rule applies, not this one's: a
+/// table two schema sources declare is declared by neither.
 ///
-/// **Reading it needs no DDL parser.** A dump's `CREATE TABLE` grammar is shared across the
-/// three databases Rails supports, and what is *not* shared is one keyword.
-/// [`structure`](super::structure) is the reader and names it.
+/// **Reading it needs no DDL parser.** A dump's `CREATE TABLE` grammar is shared across the three
+/// databases Rails supports; what differs is one keyword. [`structure`](super::structure) is the
+/// reader, and names it.
 ///
 /// [`Schema::table_names`]: super::Schema::table_names
 #[must_use]
@@ -299,10 +376,10 @@ pub fn is_structure(path: &Path) -> bool {
 
 /// The half both dump conventions share.
 ///
-/// The file has to sit **directly** in a directory called `db`, because that is the directory
-/// Rails joins the name onto. The secondary form is `_` and then the primary name, which is
-/// deliberately stricter than a bare suffix test: `myschema.rb` is not a dump and
-/// `my_schema.rb` is what Rails would have written for a database called `my`.
+/// The file must sit **directly** in a directory called `db`, the directory Rails joins the name
+/// onto. The secondary form is `_` plus the primary name, deliberately stricter than a bare suffix
+/// test: `myschema.rb` is not a dump, while `my_schema.rb` is what Rails would write for a database
+/// called `my`.
 fn is_dump(path: &Path, primary: &str) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -316,17 +393,15 @@ fn is_dump(path: &Path, primary: &str) -> bool {
 
 /// Whether `path` is a file the router draws.
 ///
-/// Two shapes and both are `config/`-anchored, which is the whole of the rule: `config/routes.rb`
-/// is what `Rails.application.routes.draw` is written in, and `config/routes/<name>.rb` is what
-/// `draw :name` reads — a Rails 6 feature every large application in the corpus uses, and where
-/// **440 of mastodon's 460 helpers** are. An engine keeps both under its own root, so the parent
-/// segment is fixed and the prefix is not: `api/config/routes.rb` and
-/// `plugins/chat/config/routes.rb` are routes files exactly as the application's own is.
+/// Two shapes, both anchored on `config/`, which is the whole rule: `config/routes.rb` holds
+/// `Rails.application.routes.draw`, and `config/routes/<name>.rb` is what `draw :name` reads (a
+/// Rails 6 feature large applications use heavily). An engine keeps both under its own root, so the
+/// parent segment is fixed and the prefix is not: `api/config/routes.rb` and
+/// `plugins/chat/config/routes.rb` are routes files just like the application's.
 ///
-/// The anchor is doing real work rather than tidying. Two files in the corpus are named
-/// `routes.rb`, hold the same DSL, and are **not** an application's routes:
-/// `core/lib/spree/testing_support/dummy_app/routes.rb` is a fixture and lobsters' own
-/// `extras/routes.rb` is not the DSL at all. Neither sits in a `config/`.
+/// The anchor matters. Real files named `routes.rb` exist that are **not** an application's routes:
+/// `core/lib/spree/testing_support/dummy_app/routes.rb` is a fixture, and some applications keep an
+/// `extras/routes.rb` that is not the DSL at all. Neither sits in a `config/`.
 #[must_use]
 pub fn is_routes(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
@@ -350,10 +425,9 @@ mod tests {
 
     /// Every shape of path a routes file can and cannot take.
     ///
-    /// The `config/` anchor is what the two negative rows are about, and both are real files in
-    /// the corpus: solidus keeps a routes fixture at
-    /// `core/lib/spree/testing_support/dummy_app/routes.rb`, and lobsters' `extras/routes.rb` is
-    /// not the DSL at all. A rule keyed on the name alone would read both.
+    /// The two negative rows are about the `config/` anchor, and both are real shapes: a routes
+    /// fixture at `core/lib/spree/testing_support/dummy_app/routes.rb`, and an `extras/routes.rb`
+    /// that is not the DSL. A rule keyed on the name alone would read both.
     #[test]
     fn which_files_the_router_draws() {
         for path in [
@@ -381,9 +455,9 @@ mod tests {
 
     /// Every directory shape the autoloader is asked about, and where the chain stops.
     ///
-    /// A table rather than a test each, because what has to be legible is the **chain**: a file
-    /// three directories down conjures three namespaces and not one, and every empty row is a
-    /// different reason for being empty.
+    /// A table, not a test each, because what must be readable is the **chain**: a file three
+    /// directories down conjures three namespaces, not one, and every empty row is a different
+    /// reason for being empty.
     #[test]
     fn the_namespaces_a_directory_conjures() {
         let rows: [(&str, &[&str]); 11] = [
@@ -404,20 +478,20 @@ mod tests {
             ),
             // A file directly in the root names a top-level constant and conjures nothing.
             ("app/models/user.rb", &[]),
-            // `app/{*,*/concerns}` is Rails' own glob, so `concerns` is a root and never a
-            // namespace — `Searchable`, never `Concerns::Searchable`.
+            // `app/{*,*/concerns}` is Rails' own glob, so `concerns` is a root, never a namespace:
+            // `Searchable`, never `Concerns::Searchable`.
             ("app/models/concerns/searchable.rb", &[]),
             // One level down from a `concerns` root is a namespace again.
             ("app/models/concerns/reports/searchable.rb", &["Reports"]),
             // The three Rails leaves out of the autoload paths.
             ("app/views/stories/show.html.erb", &[]),
             ("app/assets/config/manifest.js", &[]),
-            // No `app` anchor at all: `lib/` is not an autoload path in a Rails application,
-            // and a file there really does need the namespace written down.
+            // No `app` anchor: `lib/` is not an autoload path in a Rails application, and a file
+            // there really must write its namespace down.
             ("lib/reports/story.rb", &[]),
-            // An `app` with nothing after it names no root, and a root with nothing after it
-            // holds no file — neither is a path any walk hands over, and both are the shape a
-            // `..` or a truncated argument would arrive as.
+            // An `app` with nothing after it names no root, and a root with nothing after it holds
+            // no file. No walk hands over either path; both are what a `..` or a truncated argument
+            // would look like.
             ("app", &[]),
             ("app/models", &[]),
         ];
@@ -448,11 +522,10 @@ mod tests {
         );
     }
 
-    /// The file's own spelling is the one taken, and the directory only has to be the word.
+    /// The file's own spelling is taken, and the directory only has to be the word.
     ///
     /// Zeitwerk's default inflector camelizes, and a project that registers an acronym does not.
-    /// Every row here is a real directory and a real constant out of the six corpora except the
-    /// last two, which are what the rule must refuse.
+    /// Every row is a real directory and constant, except the last two, which the rule must refuse.
     #[test]
     fn the_file_spells_the_namespace_and_the_directory_only_has_to_be_the_word() {
         let rows: [(&str, &str, Option<&[&str]>); 8] = [
@@ -462,7 +535,7 @@ mod tests {
                 "User::Policy",
                 Some(&["User", "User::Policy"]),
             ),
-            // An acronym the project registered, which is all six of mastodon's.
+            // An acronym the project registered.
             ("app/serializers/rest/x.rb", "REST", Some(&["REST"])),
             (
                 "app/controllers/activitypub/x.rb",
@@ -479,8 +552,8 @@ mod tests {
             ),
             // A constant that is not the directory at all.
             ("app/services/reports/x.rb", "Invoices", None),
-            // The right words, one segment too few — a file that opens a shallower namespace
-            // than its path, which Zeitwerk would not have loaded from there.
+            // The right words, one segment too few: a file opening a shallower namespace than its
+            // path, which Zeitwerk would not have loaded from there.
             ("app/services/chat/thread/x.rb", "Chat", None),
         ];
         for (path, declared, expected) in rows {
@@ -498,11 +571,94 @@ mod tests {
         }
     }
 
+    /// Every shape of path a file move reads a constant from, side by side.
+    ///
+    /// A table, not a test each, because what must be readable is where the rule stops: five rows
+    /// are `None`, each for a different reason.
+    #[test]
+    fn a_path_names_the_class_zeitwerk_would_look_for_in_it() {
+        let rows: &[(&str, Option<&str>)] = &[
+            ("app/models/order.rb", Some("Order")),
+            ("app/models/user_session.rb", Some("UserSession")),
+            // Every directory between the root and the file, and the file itself last.
+            (
+                "app/services/chat/thread/policy/message_existence.rb",
+                Some("Chat::Thread::Policy::MessageExistence"),
+            ),
+            // `concerns` directly under a root is its own root, so nothing is named `Concerns`:
+            // Rails' glob is `app/{*,*/concerns}`.
+            ("app/models/concerns/searchable.rb", Some("Searchable")),
+            // A `concerns` that is *not* directly under a root is an ordinary directory.
+            (
+                "app/models/shop/concerns/priced.rb",
+                Some("Shop::Concerns::Priced"),
+            ),
+            // The anchor is a segment literally named `app`, which an engine keeps.
+            ("engines/billing/app/models/invoice.rb", Some("Invoice")),
+            // The three directories under `app/` Rails leaves out of the autoload paths.
+            ("app/views/stories/show.rb", None),
+            ("app/assets/config/manifest.rb", None),
+            // No `app` segment at all.
+            ("lib/order.rb", None),
+            ("config/routes.rb", None),
+            // Not Ruby, so Zeitwerk never looks at it.
+            ("app/views/stories/show.html.erb", None),
+            // A directory that cannot spell a constant is one Zeitwerk cannot descend.
+            ("app/services/123/thing.rb", None),
+        ];
+        for (path, expected) in rows {
+            assert_eq!(
+                autoloaded_constant(&PathBuf::from(path)).as_deref(),
+                *expected,
+                "{path}"
+            );
+        }
+    }
+
+    /// The file's own name, which is the half asked wherever the file sits.
+    #[test]
+    fn a_file_name_names_a_class_whether_or_not_anything_autoloads_it() {
+        assert_eq!(
+            named_constant(&PathBuf::from("lib/order.rb")).as_deref(),
+            Some("Order")
+        );
+        assert_eq!(
+            named_constant(&PathBuf::from("spec/models/order_spec.rb")).as_deref(),
+            Some("OrderSpec")
+        );
+        // Nothing to camelize, and nothing Ruby would read as a constant if there were.
+        assert_eq!(named_constant(&PathBuf::from("app/models/123.rb")), None);
+        assert_eq!(named_constant(&PathBuf::from("Rakefile")), None);
+        assert_eq!(named_constant(&PathBuf::from("app/models/")), None);
+    }
+
+    /// Two inflectors, one class — and where that stops being true.
+    #[test]
+    fn one_class_spelled_two_ways_is_one_class_and_two_classes_are_not() {
+        // The acronym table is `config/initializers/inflections.rb`, Ruby that only runs, so the
+        // same class is written both ways in different projects.
+        assert!(same_constant("APIKey", "ApiKey"));
+        assert!(same_constant(
+            "REST::AccountSerializer",
+            "Rest::AccountSerializer"
+        ));
+        assert!(same_constant("Order", "Order"));
+        // An underscore belongs to the file name, never the constant, so it is dropped on both
+        // sides, not one.
+        assert!(same_constant("Api_Key", "ApiKey"));
+
+        assert!(!same_constant("Order", "Purchase"));
+        // A different number of segments is a different name before any spelling is compared.
+        assert!(!same_constant("Shop::Order", "Order"));
+        assert!(!same_constant("Order", "Shop::Order"));
+        // Same letters, different words.
+        assert!(!same_constant("OrderItem", "Order"));
+    }
+
     /// The directory a confirmed name carries is still the directory, whatever the spelling.
     ///
-    /// The re-spelling replaces the *name* and may not touch the path beside it: that path is
-    /// what `autoloaded_declarations` used to key the generated document and what
-    /// `Context::autoloaded` still sorts by.
+    /// The re-spelling replaces the *name* and must not touch the path beside it:
+    /// `Context::autoloaded` sorts by that path.
     #[test]
     fn a_re_spelled_name_keeps_the_directory_it_came_with() {
         let proposed = autoloaded_namespaces(&PathBuf::from("/src/app/serializers/rest/tag.rb"));
@@ -515,10 +671,10 @@ mod tests {
         );
     }
 
-    /// A directory that cannot spell a constant stops the chain, and takes what is under it.
+    /// A directory that cannot spell a constant stops the chain and takes what is below it.
     ///
-    /// Zeitwerk cannot descend into `123/` either, so answering `Reports` for the directory
-    /// above it and nothing for the one below is the honest shape — not a chain with a hole.
+    /// Zeitwerk cannot descend into `123/` either, so answering `Reports` for the directory above
+    /// and nothing below is the honest shape, not a chain with a hole.
     #[test]
     fn a_directory_that_names_no_constant_ends_the_chain() {
         let conjured: Vec<String> =
@@ -531,8 +687,8 @@ mod tests {
 
     /// Every shape of path the convention is asked about, side by side.
     ///
-    /// A table rather than a test each, because what has to be legible is *where the convention
-    /// stops*: three of these rows are `None`, and each one is a different reason.
+    /// A table, not a test each, because what must be readable is *where the convention stops*:
+    /// three rows are `None`, each for a different reason.
     #[test]
     fn the_controller_a_path_names() {
         let rows = [
@@ -578,12 +734,12 @@ mod tests {
         assert_eq!(answers, expected);
     }
 
-    /// The same walk without the suffix, and the row that says why the caller has to gate it.
+    /// The same walk without the suffix, and the row showing why the caller must gate it.
     ///
-    /// `app/views/shared/_header.html.erb` names `Shared`, which is a perfectly good answer to
-    /// "what constant does this directory spell" and no answer at all to "what renders this".
-    /// [`controller_of`] cannot produce that shape and this one can, which is the whole reason
-    /// the two are separate functions rather than one with a flag.
+    /// `app/views/shared/_header.html.erb` names `Shared`: a fine answer to "what constant does
+    /// this directory spell" and no answer at all to "what renders this". [`controller_of`] cannot
+    /// produce that shape and this one can, which is why they are two functions, not one with a
+    /// flag.
     #[test]
     fn the_mailer_a_path_names() {
         let rows = [
@@ -592,8 +748,8 @@ mod tests {
                 "app/views/admin/report_mailer/daily.text.erb",
                 Some("Admin::ReportMailer"),
             ),
-            // Not gated here, deliberately: a directory that names nothing in particular still
-            // spells a constant, and `analysis::views` is what asks whether it is a mailer.
+            // Not gated here, on purpose: a directory naming nothing in particular still spells a
+            // constant, and `analysis::views` asks whether it is a mailer.
             ("app/views/shared/_header.html.erb", Some("Shared")),
             ("app/views/index.html.erb", None),
             ("app/models/story.rb", None),
@@ -610,12 +766,11 @@ mod tests {
         assert_eq!(answers, expected);
     }
 
-    /// Rails' own glob, both halves of it.
+    /// Rails' own glob, both halves.
     ///
-    /// The `_helper.rb` half is what keeps solidus'
-    /// `core/app/helpers/spree/core/controller_helpers/auth.rb` off the list — it really is not
-    /// in any view context by default — and the `app/helpers` half is what keeps `spec/helpers`
-    /// off it. Each of the four false rows fails exactly one of the two.
+    /// The `_helper.rb` half keeps `core/app/helpers/spree/core/controller_helpers/auth.rb` off the
+    /// list (it really is in no view context by default), and the `app/helpers` half keeps
+    /// `spec/helpers` off. Each of the four false rows fails exactly one of the two.
     #[test]
     fn the_files_rails_puts_in_every_view_context() {
         let rows = [
@@ -652,8 +807,8 @@ mod tests {
 
     #[test]
     fn a_leading_underscore_is_not_a_segment_of_its_own() {
-        // `split('_')` on `_stories` yields an empty part first, and an empty part must not eat
-        // the `?` out of `chars().next()` and answer `None` for a directory Rails accepts.
+        // `split('_')` on `_stories` yields an empty first part, which must not eat the `?` from
+        // `chars().next()` and answer `None` for a directory Rails accepts.
         assert_eq!(
             controller_of(&PathBuf::from("app/views/_stories/show.html.erb")),
             Some("StoriesController".to_owned())
@@ -676,12 +831,12 @@ mod tests {
         );
     }
 
-    /// Which files Rails would have dumped a schema into, and which it would not.
+    /// Which files Rails would have dumped a schema into, and which not.
     ///
-    /// A table, because what has to be legible is that there is **more than one** — Rails names
-    /// the primary database's dump `db/schema.rb` and every other one `db/<database>_schema.rb`,
-    /// and a new Rails 8 application ships three of the second kind. Three rows are `false` and
-    /// each is a different reason.
+    /// A table, because what must be readable is that there is **more than one**: Rails names the
+    /// primary database's dump `db/schema.rb` and every other `db/<database>_schema.rb`, and a new
+    /// Rails 8 application ships three of the second kind. Three rows are `false`, each for a
+    /// different reason.
     #[test]
     fn the_files_rails_dumps_a_schema_into() {
         let rows = [
@@ -707,14 +862,13 @@ mod tests {
         assert_eq!(answers, rows.to_vec());
     }
 
-    /// The same table against the other format, which is the same method in Rails.
+    /// The same table for the other format, which is the same method in Rails.
     ///
-    /// `schema_dump` names the primary database's dump and every other one the same way for
-    /// both formats, so the two predicates are one rule with two names — and the rows that are
-    /// `false` are the ones worth having: `structure.sql` is a name a repository puts on things
-    /// that are not a Rails dump, so the `db/` anchor is doing the work here that it does
-    /// there. The last row is the reason the secondary form is `_` and then the name rather
-    /// than a bare suffix.
+    /// `schema_dump` names the primary database's dump and every other one the same way in both
+    /// formats, so the two predicates are one rule with two names. The `false` rows are the
+    /// valuable ones: repositories put the name `structure.sql` on things that are not Rails dumps,
+    /// so the `db/` anchor does the same work here as there. The last row is why the secondary form
+    /// is `_` plus the name, not a bare suffix.
     #[test]
     fn the_files_rails_dumps_a_structure_into() {
         let rows = [
@@ -735,8 +889,8 @@ mod tests {
             .map(|(path, _)| (*path, is_structure(&PathBuf::from(path))))
             .collect();
         assert_eq!(answers, rows.to_vec());
-        // And neither predicate ever answers for the other's file, which is what lets the two
-        // sources be one list from `schema_declarations` down.
+        // And neither predicate ever answers for the other's file, which lets the two sources be
+        // one list from `schema_declarations` on.
         for path in ["db/schema.rb", "db/animals_schema.rb"] {
             assert!(!is_structure(&PathBuf::from(path)), "{path}");
         }
@@ -747,9 +901,9 @@ mod tests {
 
     #[test]
     fn a_templates_instance_variable_is_typed_by_the_controller_its_path_names() {
-        // The view↔renderer convention, end to end. A template has no enclosing class, so
-        // the instance-variable machinery has nothing in the file to walk — the assignment is in another file that the template
-        // never names, and what connects the two is a path.
+        // The view↔renderer convention, end to end. A template has no enclosing class, so the
+        // instance-variable machinery has nothing in the file to walk: the assignment is in another
+        // file the template never names, and only a path connects them.
         let mut harness = Harness::new();
         let view = rails_app(&harness);
         harness.index();
@@ -757,8 +911,8 @@ mod tests {
         let source = "<h1><%= @story.title %></h1>\n";
         let markdown = card(&mut harness, &view, source, "title");
         assert!(markdown.contains("Story#title"), "{markdown}");
-        // The provenance, which is what makes a convention shippable: the class and the line,
-        // both in a file the card is not drawn over.
+        // The provenance, which is what makes a convention shippable: the class and the line, both
+        // in a file the card is not drawn over.
         assert!(
             markdown.contains(
                 "Type taken from `StoriesController`, line 3 — the controller Rails renders \
@@ -766,16 +920,16 @@ mod tests {
             ),
             "{markdown}"
         );
-        // And it is a derived answer rather than a guessed one, which the same card has to say
-        // by *not* saying the other thing.
+        // And it is a derived answer, not a guess, which the card shows by *not* saying the other
+        // thing.
         assert!(
             !markdown.contains("guessed from the name"),
             "a convention that names a file is not a guess: {markdown}"
         );
 
-        // The same rung asked about the variable itself rather than about a call on it. A
-        // template has no assignment of its own to walk to, so `@story` used to answer nothing
-        // at all — and the convention that types `@story.title` is the one that types this.
+        // The same rung, asked about the variable itself instead of a call on it. A template has no
+        // assignment of its own to walk to, so the convention that types `@story.title` must also
+        // type this.
         let bare = card(&mut harness, &view, source, "@story");
         assert!(bare.contains("class Story"), "{bare}");
         assert!(
@@ -783,8 +937,8 @@ mod tests {
             "{bare}"
         );
 
-        // A variable the controller never assigns is not this controller's to answer for, and
-        // the convention says so by finding no assignment rather than by finding a wrong one.
+        // A variable the controller never assigns is not this controller's to answer for, and the
+        // convention says so by finding no assignment, not a wrong one.
         let missing = "<%= @missing.title %>\n";
         let other = harness.write("app/views/stories/edit.html.erb", missing);
         harness.index();
@@ -802,9 +956,9 @@ mod tests {
 
     #[test]
     fn a_namespaced_view_reaches_the_namespaced_controller_or_nothing() {
-        // `app/views/admin/stories/` is `Admin::StoriesController`, and the failure that
-        // matters is not missing it — it is reaching the *top-level* `StoriesController`
-        // instead, which is a different controller assigning a different variable.
+        // `app/views/admin/stories/` is `Admin::StoriesController`, and the failure that matters is
+        // not missing it but reaching the *top-level* `StoriesController` instead: a different
+        // controller assigning a different variable.
         let mut harness = Harness::new();
         harness.write("app/models/story.rb", STORY);
         harness.write(
@@ -833,10 +987,10 @@ mod tests {
 
     #[test]
     fn a_template_whose_controller_does_not_exist_reaches_for_no_other_one() {
-        // The convention is the name and nothing like it. `app/views/comments/` names
-        // `CommentsController`, which this application does not have — and the one it does have
-        // assigns exactly the variable the template reads, so a lookup that fell back to
-        // "something similar" would produce a confident, wrong, checkable-looking answer.
+        // The convention is the exact name, nothing like it. `app/views/comments/` names
+        // `CommentsController`, which this application lacks, and the controller it does have
+        // assigns exactly the variable the template reads, so falling back to "something similar"
+        // would produce a confident, wrong, checkable-looking answer.
         let mut harness = Harness::new();
         harness.write("app/models/story.rb", STORY);
         harness.write("app/controllers/stories_controller.rb", CONTROLLER);
@@ -849,8 +1003,8 @@ mod tests {
             !markdown.contains("StoriesController"),
             "no controller means no controller: {markdown}"
         );
-        // What answers instead is the rung below, wearing its label. The two are separable and
-        // this is where that shows: same file, same variable, a different tier.
+        // The rung below answers instead, wearing its own label. This shows the two are separable:
+        // same file, same variable, a different tier.
         assert!(
             markdown.contains("Type guessed from the name `@story` alone"),
             "{markdown}"
@@ -859,10 +1013,9 @@ mod tests {
 
     #[test]
     fn a_controller_edited_but_not_saved_types_the_template_it_renders() {
-        // The reason the controller's text is read through the buffer accessor rather than
-        // straight off disk. rubydex re-indexes an open buffer on every keystroke, so the graph
-        // is already ahead of the file; reading the assignment from disk would make the one
-        // answer that crosses a file boundary the one answer that lags behind it.
+        // Why the controller's text is read through the buffer accessor instead of straight from
+        // disk: an open buffer is newer than the file on disk, so reading the assignment from disk
+        // would make the one answer that crosses a file boundary lag behind what the user sees.
         let mut harness = Harness::new();
         harness.write("app/models/story.rb", STORY);
         harness.write(
@@ -890,10 +1043,10 @@ mod tests {
 
     #[test]
     fn a_controller_the_graph_holds_and_the_disk_does_not_answers_nothing() {
-        // The graph and the filesystem can disagree for as long as it takes a change to reach
-        // the walk, and this rung is the one place a request reads a file the cursor is not in.
-        // A controller deleted since the index was built has to answer nothing rather than
-        // panic or produce a stale type off a path that no longer resolves.
+        // The graph and the filesystem can disagree until a change reaches the walk, and this rung
+        // is the one place a request reads a file the cursor is not in. A controller deleted since
+        // the index was built must answer nothing, not panic or produce a stale type from a path
+        // that no longer resolves.
         let mut harness = Harness::new();
         let view = rails_app(&harness);
         harness.index();
@@ -908,8 +1061,7 @@ mod tests {
         let source = "<h1><%= @story.title %></h1>\n";
         let markdown = card(&mut harness, &view, source, "title");
         assert!(!markdown.contains("StoriesController"), "{markdown}");
-        // The rung below still answers, which is what makes this a missing file rather than a
-        // broken request.
+        // The rung below still answers, which makes this a missing file, not a broken request.
         assert!(
             markdown.contains("Type guessed from the name `@story` alone"),
             "{markdown}"
@@ -918,9 +1070,9 @@ mod tests {
 
     #[test]
     fn a_definition_jumps_to_the_same_place_the_card_names() {
-        // Both new rungs go through `resolve_typed`, which hover and go-to-definition share
-        // for one reason: a card and a jump that disagreed about what
-        // `@story.` is would be worse than either being absent.
+        // Both new rungs go through `resolve_typed`, which hover and go-to-definition share for one
+        // reason: a card and a jump disagreeing about what `@story.` is would be worse than either
+        // being absent.
         let mut harness = Harness::new();
         let view = rails_app(&harness);
         harness.index();

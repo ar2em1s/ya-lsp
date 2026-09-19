@@ -30,21 +30,19 @@ jobs:
       - run: cargo test
 
       # Through the Makefile, like the notices and coverage steps below: which rustdoc lints are
-      # denied is configuration, and a second copy written out here could deny a different set
-      # from the one `make ci` denies locally, with nothing to say the two had diverged.
+      # denied is configuration, and a second copy here could deny a different set from the one
+      # `make ci` denies locally, with nothing to say the two had diverged.
       - name: no doc link points at nothing
         run: make docs-check
 
-      # `THIRD-PARTY-NOTICES.txt` is committed rather than generated at build time, so that
-      # `cargo build` and `cargo install` need no extra tool. The trade is that it can go stale,
-      # and a stale notice is one that silently omits a dependency somebody added — so it is
-      # regenerated here and the result has to match byte for byte. `about.toml` lists the
-      # licences that may appear; an unlisted one fails this step rather than shipping.
+      # `THIRD-PARTY-NOTICES.txt` is committed, not generated at build time, so `cargo build` and
+      # `cargo install` need no extra tool. The trade: it can go stale, and a stale notice
+      # silently omits a dependency somebody added. So it is regenerated here and must match byte
+      # for byte. `about.toml` lists the licences that may appear; an unlisted one fails this step
+      # instead of shipping.
       #
-      # Through the Makefile, like the coverage step below. The tool's version and the
-      # generate-and-diff were both written out here as a second copy, so `make notices` locally
-      # and this step could run different versions of cargo-about over the same tree and neither
-      # would say so — a difference in the generated file is the *only* signal either one has.
+      # Through the Makefile, so `make notices` locally and this step run the same cargo-about
+      # version: a difference in the generated file is the *only* signal either one has.
       - name: the third-party notices are current
         run: |
           make setup-notices
@@ -53,9 +51,9 @@ jobs:
             exit 1
           }
 
-      # Two copies of the Prism C library link twice and fail with duplicate symbols, and the
-      # version constraint that prevents it lives in Cargo.toml where nothing enforces it. The
-      # same goes for `line-index`, which rubydex and ya-lsp both use to index the same text.
+      # Two copies of the Prism C library fail to link with duplicate symbols, and the version
+      # constraint that prevents it lives in Cargo.toml, where nothing enforces it. The same goes
+      # for `line-index`, which rubydex and ya-lsp both use to index the same text.
       - name: one copy of each shared native dependency
         run: |
           for crate in ruby-prism-sys line-index; do
@@ -68,11 +66,11 @@ jobs:
             fi
           done
 
-      # Last, because installing nightly makes it the default toolchain and every step above is
-      # meant to run on the pinned stable one. Nothing in the crate is nightly-only on an
-      # ordinary build: `#[coverage(off)]` sits behind `cfg(coverage_nightly)`, which
-      # cargo-llvm-cov sets itself. The bars, and the version of the tool, live in the Makefile
-      # so that a local `make coverage` and this step cannot disagree about either.
+      # Last, because installing nightly makes it the default toolchain, and every step above
+      # must run on the pinned stable one. Nothing in the crate is nightly-only on an ordinary
+      # build: `#[coverage(off)]` sits behind `cfg(coverage_nightly)`, which cargo-llvm-cov sets
+      # itself. The bars and the tool's version live in the Makefile, so a local `make coverage`
+      # and this step cannot disagree about either.
       - name: coverage
         run: |
           make setup-coverage
@@ -94,8 +92,8 @@ jobs:
           cache: yarn
           cache-dependency-path: editors/vscode/yarn.lock
 
-      # The extension's contract test talks to a real server. Without one it skips, which would
-      # make this job pass while proving nothing.
+      # The extension's contract test talks to a real server. Without one it skips, and this job
+      # would pass while proving nothing.
       - run: cargo build --release
       - run: |
           mkdir -p editors/vscode/server
@@ -115,22 +113,21 @@ jobs:
         run: |
           unzip -l /tmp/ya-lsp.vsix | grep -q 'extension/dist/extension.js'
           # The mode bits, not just the path. A zip that loses the executable bit installs
-          # cleanly and then fails to spawn for every user, and nothing before this notices.
+          # cleanly, then fails to spawn for every user, and nothing before this notices.
           unzip -Z /tmp/ya-lsp.vsix 'extension/server/*' | grep -qE '^-rwx' \
             || { echo "::error::the server in the VSIX is not executable"; exit 1; }
 
       # The bundled binary embeds the `rbs` gem's signatures, and the 2-clause BSD licence
-      # requires its notice to appear in the materials accompanying a *binary* distribution.
-      # The VSIX is the only binary ya-lsp ships, so these files are that material. Both are
-      # staged from the repository root at package time rather than committed here, so they can
-      # go missing without anything in the extension's own tree changing — which is how the
-      # notice was briefly absent once already.
+      # requires its notice in the materials accompanying a *binary* distribution. In a VSIX,
+      # these files are that material. Both are staged from the repository root at package time,
+      # not committed under the extension, so they can go missing without anything in the
+      # extension's own tree changing.
       - name: the VSIX carries the third-party notices
         run: |
           unzip -p /tmp/ya-lsp.vsix extension/NOTICE.txt > /tmp/vsix-notice.txt
           # The three things BSD-2-Clause names: the copyright notice, the conditions, and the
-          # disclaimer. `cargo about` cannot supply the first of them — neither rbs crate ships
-          # a licence file to harvest — so this is the only copy in the VSIX.
+          # disclaimer. `cargo about` cannot supply the first (neither rbs crate ships a licence
+          # file to harvest), so this is the only copy in the VSIX.
           for phrase in "Soutaro Matsumoto" "Redistributions in binary form" \
                         "THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS"; do
             grep -qF "$phrase" /tmp/vsix-notice.txt \
@@ -138,8 +135,8 @@ jobs:
           done
           unzip -p /tmp/ya-lsp.vsix extension/THIRD-PARTY-NOTICES.txt | grep -qF "ruby-rbs-sys" \
             || { echo "::error::the VSIX is missing the crate notices"; exit 1; }
-          # LICENSE.txt is MIT and nothing else: appending to it is what a licence detector
-          # fails to recognise, and it is why NOTICE.txt exists as a separate file.
+          # LICENSE.txt is MIT and nothing else: a licence detector fails to recognise an
+          # appended one, which is why NOTICE.txt is a separate file.
           unzip -p /tmp/ya-lsp.vsix extension/LICENSE.txt > /tmp/vsix-licence.txt
           grep -qF "The MIT License (MIT)" /tmp/vsix-licence.txt \
             || { echo "::error::the VSIX has no MIT licence"; exit 1; }
@@ -148,20 +145,17 @@ jobs:
             exit 1
           fi
 
-  # The first job in this project's history that opens a **real application**. Every performance
-  # number in three plans came from a driver run by hand against a Rails app that is not public,
-  # so none of them was reproducible by anyone else and none had ever run unattended.
+  # The one job that opens a **real application**, unattended and reproducible by anyone.
   #
-  # What it covers: own-code discovery (594 files, 118 of them ERB templates), parsing (zero
-  # `parse-error` across a Rails app targeting Ruby 4.0.0, under the pinned ruby-prism), the
-  # diagnostics that reach a user — including that a template publishes none — and a generous
-  # ceiling on the cold index. It is a canary, not a benchmark — see `scripts/canary.py`.
+  # What it covers: own-code discovery (Ruby files and ERB templates), parsing (no `parse-error`
+  # across the app under the pinned ruby-prism), the diagnostics that reach a user (including
+  # that a template publishes none), and a generous ceiling on the cold index. It is a canary,
+  # not a benchmark: see `scripts/canary.py`.
   #
-  # **It does not cover gems.** Nothing runs `bundle install` here: lobsters' bundle needs Ruby
-  # 4.0.0 and a hand-built `sqlite3`, which is a large amount of CI for a project whose headline
-  # is that it needs no Ruby at all. The run finds no gems and asserts nothing about them, and
-  # the gem numbers stay manual. A green tick here is not
-  # evidence that gem indexing works.
+  # **It does not cover gems.** Nothing runs `bundle install` here: lobsters' bundle needs a
+  # recent Ruby and a hand-built `sqlite3`, a lot of CI for a project whose headline is that it
+  # needs no Ruby at all. The run finds no gems and asserts nothing about them, so a green tick
+  # here is not evidence that gem indexing works.
   #
   # lobsters is BSD-3-Clause, (c) 2012-2019 Joshua Stein. It is cloned at test time and never
   # vendored, so no artifact this project ships contains any of it and no notice is owed. Copy a
@@ -177,9 +171,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # `make canary` builds the server, fetches the pinned commit and runs the driver with the
-      # numbers from the Makefile, so this step and a local run cannot disagree about any of them.
-      # The release build is not shared with the `extension` job — rust-cache keys per job — and
-      # that is the trade: one more optimized build, for two jobs that run in parallel and neither
-      # of which fails because the other one did. A debug build would be no cheaper to fix, since
-      # the index ceiling means nothing at debug speed.
+      # Makefile's numbers, so this step and a local run cannot disagree about any of them.
+      # The release build is not shared with the `extension` job (rust-cache keys per job). That
+      # is the trade: one more optimized build, for two jobs that run in parallel and never fail
+      # because the other did. A debug build is no alternative: the index ceiling means nothing at
+      # debug speed.
       - run: make canary

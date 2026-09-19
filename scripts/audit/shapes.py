@@ -1,8 +1,7 @@
 """Which *kind* of cursor a position is, and every candidate one file holds.
 
-Stratifying by this as well as by directory is the second of the two strata the sample is drawn
-on, and it exists because a benchmark that asks only `receiver.member` measures only the part of
-a server that answers that shape.
+This is the second of the sample's two strata (directory is the first). A benchmark that asks only
+`receiver.member` measures only the part of a server that answers that shape.
 """
 
 import re
@@ -23,6 +22,31 @@ MACROS = ("belongs_to", "has_many", "has_one", "has_and_belongs_to_many",
           "after_action", "skip_before_action", "around_action", "enum", "attribute")
 SYMBOL = re.compile(r"(?<![.:@$\w])(?:" + "|".join(MACROS) + r")\s+:([a-z_][A-Za-z0-9_]*[?!]?)")
 
+# ------------------------------------------------------------------------------ declarations
+#
+# The cursors `DEF_SITE` and `DEFINING` **exclude** from the draw, drawn here on purpose and apart.
+# - Excluding them is right for the six shapes above: at a `def`'s own name, `definition` would ask
+#   where its own answer is, and `sample.positions` measures navigation.
+# - But `prepareRename`, `prepareTypeHierarchy`, `prepareCallHierarchy` and `implementation` are
+#   only ever sent at exactly those cursors.
+# So they are a stratum of their own, under their own counters, and no counter from the six shapes
+# moves.
+
+# **An operator `def` is not drawn, and the alternation keeps it from being drawn wrongly.** With
+# one optional `self\.` group, `def self./(other)` matches by capturing `self`: a cursor on the
+# receiver keyword, asking four requests about nothing.
+# - The first arm takes a named singleton method.
+# - The second takes a plain one, and refuses any name a dot follows.
+# Neither can spell `/`, `==` or `[]`, so those are out of the stratum: a handful of cursors lost,
+# against a class of cursor that is not one.
+DECLARED = (
+    ("method", re.compile(
+        r"(?:^|[^\w.:])def\s+(?:self\s*\.\s*([A-Za-z_][A-Za-z0-9_]*[?!=]?)"
+        r"|([A-Za-z_][A-Za-z0-9_]*[?!=]?)(?![A-Za-z0-9_?!=])(?!\s*\.))")),
+    ("type", re.compile(
+        r"(?:^|[^\w.:])(?:class|module)\s+([A-Z][A-Za-z0-9_]*(?:::[A-Z][A-Za-z0-9_]*)*)")),
+)
+
 KEYWORDS = {
     "if", "unless", "while", "until", "for", "in", "do", "end", "then", "else", "elsif",
     "case", "when", "begin", "rescue", "ensure", "raise", "return", "yield", "super", "self",
@@ -40,10 +64,10 @@ PATTERNS = (("member", MEMBER), ("constant", CONSTANT), ("call", CALL),
 def find(text, is_erb=False, not_routes=frozenset()):
     """Every candidate position in one file, as {shape: [(line, column, offset, word)]}.
 
-    `not_routes` is `routes.non_helpers`' answer for this corpus: names ending `_path`/`_url`
-    that the corpus itself writes down and Rails therefore did not generate. Without it the
-    `route` shape is a suffix match, and a suffix match samples columns (`normalized_url`),
-    plain methods (`avatar_url`) and SQL aliases — one real helper in fifty-two on lobsters.
+    `not_routes` is `routes.non_helpers`' answer for this corpus: `_path`/`_url` names the corpus
+    writes itself, which Rails therefore did not generate. Without it the `route` shape is a suffix
+    match, and samples columns (`normalized_url`), plain methods (`avatar_url`) and SQL aliases far
+    more often than real helpers.
     """
     regions = ruby_regions(text, is_erb)
     hidden = masked(text)
@@ -58,38 +82,32 @@ def find(text, is_erb=False, not_routes=frozenset()):
             start, word = found.start(1), found.group(1)
             if not inside(start):
                 continue
-            # **The dot is where a `member` comes from, and it was never checked.** `MEMBER`'s
-            # `\s*` matches a newline and the pattern runs on the raw text, so a comment ending
-            # in a full stop reached across the line break and drew the next line's first word.
-            # Measured: 44 positions over five corpora — `def` 16, `class` 15, `module` 8 and
-            # four more — each of them asking `definition` where a Ruby keyword is defined.
-            # `found.start()` is the dot itself, the lookbehind being zero-width. A dot that ends
-            # a line of real code is a line continuation and stays drawn.
+            # **A `member` needs its dot in code.** `MEMBER`'s `\s*` matches a newline and the
+            # pattern runs on raw text, so a comment ending in a full stop would reach across the
+            # line break and draw the next line's first word (`def`, `class`, `module`), asking
+            # `definition` where a keyword is defined. `found.start()` is the dot itself (the
+            # lookbehind is zero-width). A dot ending a line of real code is a line continuation and
+            # stays drawn.
             if shape == "member" and not inside(found.start()):
                 continue
             if shape == "call" and word in KEYWORDS:
                 continue
             if shape == "route" and word in not_routes:
                 continue
-            # **A qualified constant is two questions, and the match only ever asked one.**
-            # `CONSTANT` captures `Api::V1::Statuses::BaseController` whole and the cursor goes
-            # at the start of the match — which is `Api`, the namespace. Measured: 48 positions
-            # over five corpora sat on a namespace, and a column walk on lobsters showed
-            # col 29-31 of `class Mod::MailsController < Mod::ModController` resolve `Mod` with
-            # no place (correct — nothing declares `module Mod`, it is implicit from the
-            # directory) while col 34 resolves `class Mod::ModController` to its file. So the
-            # class in a qualified constant was never a cursor at all. Both are drawn now: the
-            # namespace is a real interaction and the leaf is where the answer lives.
+            # **A qualified constant is two questions.** `CONSTANT` captures
+            # `Admin::UsersController` whole, and the cursor goes at the start of the match: the
+            # namespace, `Admin`. The two halves answer differently: `Admin` may resolve to no place
+            # (a namespace implied by the directory, with no `module Admin` anywhere), while the
+            # leaf resolves to its file. Both are drawn: the namespace is a real interaction, and
+            # the leaf is where the answer lives.
             here = [(start, word)]
             if shape == "constant" and "::" in word:
                 leaf = word.rsplit("::", 1)[-1]
                 here.append((start + len(word) - len(leaf), leaf))
-            # A definition site is not a position a developer navigates *from*, and the
-            # `member` shape reached one the `call` shape was already excluding: `def self.foo`
-            # is a `.foo` by `MEMBER`'s reading, because the character before the dot is `f` and
-            # not another dot. 44 of 4,929 drawn positions were `def self.` names, and every one
-            # of them asked `definition` where its own answer is. `DEF_SITE` covers both
-            # spellings, so the exclusion is now the same rule for every shape.
+            # A definition site is not a position a developer navigates *from*. `MEMBER` reads
+            # `def self.foo` as `.foo` (the character before the dot is `f`, not another dot), and
+            # such a cursor asks `definition` where its own answer is. `DEF_SITE` covers both
+            # spellings, so the exclusion is one rule for every shape.
             if DEF_SITE.search(text[max(0, start - 24):start]):
                 continue
             if shape == "constant" and DEFINING.search(text[max(0, start - 12):start]):
@@ -97,17 +115,18 @@ def find(text, is_erb=False, not_routes=frozenset()):
             for at, name in here:
                 line, column = at_offset(starts, at)
                 out[shape].append((line, column, at, name))
-    # **One cursor is one question, whichever shapes match it.** A route helper is also a bare
-    # call, and `. foo(` — a dot, a space, a name, a paren — is a `member` to one pattern and a
-    # `call` to the other, because `CALL`'s lookbehind only refuses a dot it is standing on. Drawn
-    # twice, that cursor is asked twice, counted twice by every lane-2 check, and named by a
-    # single `audit.site` — so lane 3 subtracting one finding would strike both off. Measured:
-    # 2 of 4,633 drawn positions over five corpora, both `call`/`member`.
+    # **One cursor is one question, whichever shapes match it.** A route helper is also a bare call,
+    # and `. foo(` (a dot, a space, a name, a paren) is a `member` to one pattern and a `call` to
+    # the other, because `CALL`'s lookbehind only refuses a dot directly before it. Drawn twice,
+    # that cursor is asked twice, counted twice by every lane-2 check, and named by one
+    # `audit.site`, so lane 3 subtracting one finding would strike both.
     #
-    # `KEEP` is that decision as one order, most specific first, rather than one pairwise rule
-    # per collision: a sigil or a macro keyword names the shape outright, a leading dot names a
-    # receiver, a `_path` suffix is a suffix plus `routes.non_helpers`, and a trailing paren is
-    # the weakest evidence any of these patterns reads.
+    # `KEEP` settles every collision with one order, most specific first, instead of a rule per
+    # pair:
+    # - a sigil or a macro keyword names the shape outright;
+    # - a leading dot names a receiver;
+    # - a `_path` suffix is a suffix plus `routes.non_helpers`;
+    # - a trailing paren is the weakest evidence any pattern reads.
     KEEP = ("ivar", "symbol", "constant", "member", "route", "call")
     taken = set()
     for name in KEEP:
@@ -119,4 +138,32 @@ def find(text, is_erb=False, not_routes=frozenset()):
             taken.add(offset)
             kept.append(candidate)
         out[name] = kept
+    return out
+
+
+def declared(text, is_erb=False):
+    """Every `def`, `class` and `module` name in one file, as [(kind, line, column, offset, word)].
+
+    The mirror of `find` for the declaration stratum: same masking, same regions, same reason (a
+    name inside a string, a comment or a heredoc is not a cursor anyone uses). A qualified
+    `class Foo::Bar` is drawn at the **leaf**, where the declaration is. The `constant` shape
+    already draws the namespace half; drawing it here too would ask two strata one question.
+    """
+    regions = ruby_regions(text, is_erb)
+    hidden = masked(text)
+    starts = line_starts(text)
+    out = []
+    for kind, pattern in DECLARED:
+        for found in pattern.finditer(text):
+            # Whichever arm of the alternation matched; a pattern with one group has one.
+            group = next(n for n in range(1, (found.re.groups or 1) + 1) if found.group(n))
+            at, word = found.start(group), found.group(group)
+            if not any(lo <= at < hi for lo, hi in regions) or hidden[at]:
+                continue
+            if "::" in word:
+                leaf = word.rsplit("::", 1)[-1]
+                at, word = at + len(word) - len(leaf), leaf
+            line, column = at_offset(starts, at)
+            out.append((kind, line, column, at, word))
+    out.sort(key=lambda row: row[3])
     return out

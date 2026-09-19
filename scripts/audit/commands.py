@@ -1,4 +1,4 @@
-"""What each subcommand does. One function per verb, and none of them knows what a check is."""
+"""What each subcommand does: one function per verb, and none of them knows what a check is."""
 
 import os
 import sys
@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 
-from audit import baseline, lane1, lane2, lane3, places, report
+from audit import baseline, declarations, lane1, lane2, lane3, latency, places, report
 from audit.answers import card_of, locations, path_of, tier
 from audit.client import ask_all, ask_rebased, start, uri
 from audit.config import (BUDGET_SECONDS, PLACES_CAP, QUEUE_WEIGHT, check_clean,
@@ -15,16 +15,16 @@ from audit.lane1.completion import CONTEXT, IN_FLIGHT, rank_of, setter
 from audit.lane3 import ledger
 from audit.ruby import EXAMPLES, check, keeps_place, line_key
 from audit.sample import positions
+from audit.sample import declarations as declaration_sites
 from audit.shapes import SHARES
 
 
 def cmd_sample(args):
     """Draw the sample and print it. Writes nothing, starts no server, asks nothing.
 
-    The mix is printed beside `SHARES`' stated targets rather than on its own, because the only
-    thing worth checking here is whether the draw came out as the design says — a `member` column
-    at 57% against a stated 45% is the sample quietly re-confirming the positions an existing key
-    already covers, and it is invisible in a list of counts.
+    The mix prints beside `SHARES`' stated targets, because the question here is whether the draw
+    came out as designed. A `member` column at 57% against a stated 45% means the sample is
+    re-confirming positions a key already covers, and a bare list of counts hides that.
     """
     total, walked, lost = {}, 0, []
     for corpus in sweepable(args.only):
@@ -61,10 +61,11 @@ def cmd_sample(args):
               f"against {100.0 * share:5.1f}% stated")
     if not args.check:
         return
-    # **The two invariants on the mask, which is the part of the draw that has been wrong most.**
-    # `audit.md` records the six bugs; these are what each one would have caught. A file whose
-    # last top-level `end` is masked is a file the scan lost its place in, which is the only way
-    # this scanner fails catastrophically — and it fails silently, by drawing nothing.
+    # **Two invariants on the mask, the part of the draw most often wrong:**
+    # - every worked example in `EXAMPLES` masks as written;
+    # - every file keeps its place: its last top-level `end` stays unmasked.
+    # Losing its place is the scanner's one catastrophic failure, and it is silent: the file draws
+    # nothing.
     print()
     wrong = check()
     print(f"{'mask':10} {len(EXAMPLES) - len(wrong)} of {len(EXAMPLES)} worked examples right; "
@@ -76,12 +77,13 @@ def cmd_sample(args):
 
 
 def cmd_cost(args):
-    """What one position costs, and therefore what `BUDGET_SECONDS` buys.
+    """What one position costs, and so what `BUDGET_SECONDS` buys.
 
-    Two numbers, and they are separated because they scale differently: **startup** is paid once
-    per corpus however large the draw is, and **per position** is what the draw is sized against.
-    Quoting a single average over a short run hides the first inside the second and sizes the
-    draw too small.
+    Two numbers, because they scale differently:
+    - **startup** is paid once per corpus, whatever the draw's size;
+    - **per position** is what the draw is sized against.
+    One average over a short run hides startup inside the per-position cost and sizes the draw too
+    small.
     """
     server = args.server
     if not os.path.exists(server):
@@ -111,10 +113,14 @@ def cmd_cost(args):
     if not asked:
         return
     each = asking / asked
-    # Lane 2 asks three requests per position and then a second pass over two of them, so the
-    # per-position cost the draw must be sized against is not the one measured here with two.
-    # The factor is stated rather than measured because it is a property of `lane2.METHODS` and
-    # `ask_rebased`, not of the machine.
+    # Lane 2 asks three requests per position, then a second pass over two of them, so the draw is
+    # sized against a multiple of the two-request cost measured here. The factor is stated, not
+    # measured: it is a property of `lane2.METHODS` and `ask_rebased`, not of the machine.
+    #
+    # **A check's own request is not in that factor.** A count is a multiplier only while requests
+    # cost about the same, and `references` answers thousands of places where `hover` answers one
+    # card. Each such request declares its share of the draw on its `client.Post`, and the loop
+    # below prints it beside the factor.
     left = BUDGET_SECONDS - startup
     print()
     print(f"{'all':10} {startup:5.1f}s of startup, {1000 * each:5.1f} ms per position at "
@@ -123,25 +129,40 @@ def cmd_cost(args):
           f"{int(left / each):6} positions at two requests")
     print(f"{'':10} lane 2 asks five, so size against {int(left / (each * 2.5)):6} — and the "
           f"draw is sub-linear in --per-file, so raise it and re-run `sample`")
+    for post in lane2.METHODS:
+        # **Read off `METHODS`, never named here.** A check that sends its own request is one file
+        # plus one name in `CHECKS`. Naming it here too would be a second place to change, and the
+        # one that goes stale.
+        if isinstance(post, str) or (post.stride == 1 and post.shapes is None):
+            continue
+        where = "/".join(sorted(post.shapes)) if post.shapes else "every"
+        print(f"{'':10} {post.method.split('/')[-1]:10} is posted at "
+              f"{'' if post.stride == 1 else f'1 in {post.stride} '}{where} cursors on top of "
+              f"that, and is seconds rather than a multiple of this number — it answers places "
+              f"where a hover answers a card")
 
 
 METHOD_COMPLETION = "textDocument/completion"
+# How many distinct `window/showMessage` lines a corpus prints before the rest are only counted.
+#
+# Five is enough: the ones that matter (a half-installed bundle, a subsystem dead at startup) arrive
+# before the first request and are never cut. See `cmd_score`.
+WARNINGS_SHOWN = 5
 MAX_PREFIX = 6
-# The rows a person would actually read, which is the question a *display* ceiling answers and a
-# candidate ceiling does not. Fixed here rather than read from the server, because the point of
-# the band table is to compare one run against another run of a differently built binary, and a
-# reporting constant that moved with the thing under test would compare nothing.
+# The rows a person actually reads: the question a *display* ceiling answers and a candidate ceiling
+# does not.
+#
+# Fixed here, not read from the server. The band table compares runs of differently built binaries,
+# and a reporting constant that moved with the binary would compare nothing.
 DISPLAY = 128
 
 
 def _middle(values):
     """Median and p90 of a list of ints, or `(0, 0)` for an empty one.
 
-    A median here where the `completion` key keeps everything an int on purpose: that key's
-    counters are summed across corpora and diffed against a committed baseline, and neither
-    operation means anything on a median. Nothing here is recorded or diffed — this is a probe a
-    person runs to set a constant — so the statistic that answers the question is the one to
-    print.
+    The `completion` key keeps only ints, because its counters are summed across corpora and diffed
+    against a baseline, and neither means anything on a median. This probe records and diffs
+    nothing, so it prints the statistic that answers its question.
     """
     if not values:
         return 0, 0
@@ -152,23 +173,24 @@ def _middle(values):
 def cmd_prefix(args):
     """What the **untyped** completion list costs and buys at each prefix length.
 
-    `MAX_UNTYPED_COMPLETION_ITEMS` is the line above which a receiver with no type is answered
-    with no rows at all, and **no standing measurement can see whether it is in the right place**.
-    Every cursor anything here asks at is at a word's *start*, where the candidate set is the
-    project's entire name universe and any bound in the plausible range declines identically.
-    The value only bites mid-word, and nothing asks mid-word. This does.
+    `MAX_UNTYPED_CANDIDATES` is the size above which a receiver with no type gets no rows, and
+    `MAX_UNTYPED_COMPLETION_ITEMS` caps the rows sent below it. **No standing measurement can see
+    whether either is in the right place.** Every other cursor is at a word's *start*, where the
+    candidates are the project's whole name universe and any plausible bound declines. The bounds
+    only bite mid-word, and only this probe asks mid-word.
 
-    **It follows one cursor across seven prefixes, and classifies it at the first.** At `k = 0` a
-    receiver the graph can type answers with its own members and one it cannot is declined, so the
-    empty answer at `k = 0` *is* the classification — no card has to be read and no tier guessed.
-    Only those cursors are followed outwards, because the bound touches no others.
+    **It classifies each cursor at `k = 0`, then follows it across seven prefixes.**
+    - At `k = 0` a typed receiver answers with its members, and an untyped one is declined.
+    - So an empty answer at `k = 0` *is* the classification: no card read, no tier guessed.
+    - Only those cursors are followed, because the bound touches no others.
 
-    **What it can and cannot see, said plainly.** A list that comes back is under the bound, so
-    its size is exact and the histogram below the line is real. A declined one is censored at the
-    bound: it says *more than* the ceiling and never how much more. That is enough to answer
-    *should this be smaller* — if answered lists cluster far below the line, a smaller bound is
-    free — and not enough to answer *should it be larger*, which needs a second binary built with
-    the constant raised, the way the 512 cap was measured.
+    **What it can and cannot see:**
+    - A list that comes back is under the bound, so its size is exact.
+    - A declined list is censored: it says *more than* the ceiling, never how much more.
+    - So it can answer *should this be smaller*: if answered lists sit far below the line, a smaller
+      bound is free.
+    - It cannot answer *should it be larger*. That needs a second binary built with the constant
+      raised.
     """
     server = args.server
     if not os.path.exists(server):
@@ -211,9 +233,9 @@ def cmd_prefix(args):
         for index, _, _, _, word in posed:
             first = replies.get((index, 0))
             items = first.get("items") if isinstance(first, dict) else first
-            # The classification, and the whole reason it is taken here: at an empty prefix a
-            # typed receiver answers with its members and an untyped one is over the bound by
-            # every corpus' universe, so an empty answer names the path this probe is about.
+            # The classification, and the reason it is taken here: at an empty prefix a typed
+            # receiver answers with its members and an untyped one is over the bound in every
+            # corpus, so an empty answer marks the path this probe is about.
             if items:
                 continue
             untyped += 1
@@ -262,10 +284,10 @@ def _print_prefix(counts):
         offered = f"{row['answered']:6} {100.0 * row['answered'] / row['asked']:3.0f}%"
         print(f"{'':10}   {step:5} {row['asked']:6} {offered:>8} {row['declined']:9} "
               f"{median:7} {p90:6} {row['present']:8} {rank:6} {rank90:6}")
-    # **Fixed powers of two, not the ceiling in force.** Run against a binary whose bound is
-    # raised, this is the shape the censoring hides: how far over the shipped line a declined
-    # list actually sits, and therefore what a larger ceiling would convert into a real list.
-    # Reporting buckets have to be the same in both runs or the two cannot be laid side by side.
+    # **Fixed powers of two, not the ceiling in force.** Run against a binary with a raised bound,
+    # this shows what the censoring hides: how far over the shipped line a declined list sits, and
+    # so what a larger ceiling would turn into a real list. The buckets must match across runs, or
+    # the two cannot sit side by side.
     pooled = [size for row in counts.values() for size in row["sizes"]]
     if pooled:
         edges, seen = (128, 256, 512, 1024), []
@@ -273,11 +295,11 @@ def _print_prefix(counts):
             seen.append(f"<={edge} {sum(1 for size in pooled if size <= edge)}")
         seen.append(f">1024 {sum(1 for size in pooled if size > 1024)}")
         print(f"{'':10}   sizes  " + "   ".join(seen))
-    # **What an admission ceiling above a display ceiling would actually cost.** A list in the
-    # band `(low, high]` is one a bound of `high` admits and a bound of `low` declines; the word
-    # is still reachable in it only if the ranking put it in the first `low` rows. Printed per
-    # band because the answer is not the same at every size, and it is the whole question when a
-    # *display* cap sits under an *admission* cap.
+    # **What an admission ceiling above a display ceiling would cost.**
+    # - A list in the band `(low, high]` is one a bound of `high` admits and a bound of `low`
+    #   declines.
+    # - The word is still reachable only if the ranking put it in the first `low` rows.
+    # Printed per band, because the answer differs by size.
     pairs = [pair for row in counts.values() for pair in row["pairs"]]
     if pairs:
         for low, high in ((0, 128), (128, 256), (256, 512), (512, 1024), (1024, 1 << 30)):
@@ -291,41 +313,37 @@ def _print_prefix(counts):
 
 
 def cmd_rank(args):
-    """Where the member sits in a **typed** list, and therefore where `MAX_COMPLETION_ITEMS` goes.
+    """Where the member sits in a **typed** list, and so where `MAX_COMPLETION_ITEMS` goes.
 
-    `cmd_prefix` is the same question asked of the other path. There the receiver has no type, the
-    list is a guess, and the bound decides whether to answer at all; here the receiver *is* typed,
-    the list is one this server believes in, and the bound decides only how much of it to send.
+    `cmd_prefix` asks the same question of the other path:
+    - there the receiver is untyped, the list is a guess, and the bound decides whether to answer at
+      all;
+    - here the receiver is typed, the list is trusted, and the bound decides only how much to send.
 
-    **The classification is the same one and is taken the same way.** A list that comes back at
-    `k = 0` is a typed receiver's own members; an empty one is the untyped decline. No card is
-    read and no tier is guessed. Only typed cursors are followed outwards.
+    **It classifies the same way.** A list at `k = 0` is a typed receiver's own members; an empty
+    one is the untyped decline. Only typed cursors are followed.
 
-    **It follows the cursor through the word for the reason the other probe does**, and here that
-    is the whole question rather than a refinement of it: at `k = 0` nothing has been typed, so
-    `tier` is 1 and `length` is 0 for every row and the only live terms are where a name lives.
-    A band of one owner's members is then in alphabetical order, and a *display* ceiling under it
-    is only honest if the word comes back as soon as the word is being typed — which is what the
-    table below measures and what `isIncomplete` is for.
+    **Following the cursor through the word is the whole question here.** At `k = 0` nothing is
+    typed, so every row has `tier` 1 and `length` 0, and the only live term is where a name lives.
+    One owner's band is then alphabetical, and a *display* ceiling under it is honest only if the
+    word comes back as soon as it is being typed. The table below measures that; `isIncomplete` is
+    what makes it work.
 
-    **What it can see.** Every rank it reports is exact, because the whole list came back — up to
-    the ceiling in force. A word ranked *past* that ceiling arrives here as `absent`,
-    indistinguishable from one the list never held, so this answers *should the ceiling be lower*
-    on its own and *is it low enough to be losing answers* only against a second binary built with
-    it raised. That is the asymmetry `cmd_prefix` states for the other bound, for the same reason.
+    **What it can see.** Every rank is exact, up to the ceiling in force. A word ranked *past* the
+    ceiling arrives as `absent`, the same as one the list never held. So on its own this answers
+    *should the ceiling be lower*; *is it losing answers* needs a second binary built with the
+    ceiling raised. `cmd_prefix` has the same asymmetry.
 
-    **`same-owner` is the diagnosis beside the count.** For each present word it counts how many
-    of the rows above it are owned by the same class — read off the `detail` line, which is the
-    owner rubydex attributed the member to. A rank that is almost entirely same-owner rows is the
-    alphabet inside one band, which no ordering of the bands can improve; a rank made of other
-    owners' rows is a band that sorted above the one holding the answer, which is a ranking
-    question.
+    **`same-owner` is the diagnosis beside the count.** For each present word it counts the rows
+    above it owned by the same class, read off the `detail` line.
+    - Mostly same-owner rows: the alphabet inside one band, which no band order can fix.
+    - Mostly other owners' rows: a band sorted above the right one, which is a ranking question.
     """
     server = args.server
     if not os.path.exists(server):
         sys.exit(f"no server at {server}; `make release` first")
-    # The table below is in fixed columns, so the deepest prefix it can hold is a constant and a
-    # larger `--steps` is clamped to it rather than raising on the first reply it files.
+    # The table has fixed columns, so the deepest prefix it holds is a constant. A larger `--steps`
+    # is clamped to it instead of raising on the first reply.
     steps = max(0, min(args.steps, RANK_PREFIX))
     totals = _rank_counts()
     for corpus in sweepable(args.only):
@@ -365,7 +383,7 @@ def cmd_rank(args):
             first = replies.get((index, 0))
             rows = first.get("items") if isinstance(first, dict) else first
             # An empty list at an empty prefix is the untyped decline, which is `cmd_prefix`'s
-            # subject entirely. Everything else is a receiver this server typed.
+            # subject. Everything else is a receiver this server typed.
             if not rows:
                 continue
             counts["typed"] += 1
@@ -418,16 +436,16 @@ def cmd_rank(args):
 
 
 # How far into the word to follow a typed cursor. Three characters is where `cmd_prefix` found the
-# other bound's population starts existing, so the two tables cover the same keystrokes.
+# other bound starts to matter, so both tables cover the same keystrokes.
 RANK_PREFIX = 3
-# The rows a reader of a typed list would plausibly reach, widening. The last is the ceiling in
-# force when this was written, and the table is in fixed edges for `cmd_prefix`'s reason: a
-# reporting constant that moved with the thing under test would compare nothing.
+# The rows a reader of a typed list could plausibly reach, widening. The last is the typed ceiling
+# (`MAX_COMPLETION_ITEMS`). Fixed edges, for `cmd_prefix`'s reason: a reporting constant that moved
+# with the binary would compare nothing.
 RANK_EDGES = (1, 10, 50, 128, 256, 512)
 
 
 def _owner(item):
-    """The class the `detail` line attributes this member to — `User#shout` -> `User`."""
+    """The class the `detail` line attributes this member to: `User#shout` -> `User`."""
     detail = item.get("detail")
     if not isinstance(detail, str):
         return ""
@@ -470,14 +488,13 @@ def _print_rank(counts):
         share = 100.0 * counts["same"] / counts["above"]
         print(f"{'':10}   owner  {counts['same']} of {counts['above']} rows above an answer are "
               f"its own owner's ({share:.0f}%)")
-    # **What a lower display ceiling costs at each keystroke.** A word past the ceiling is not
-    # sent, and `isIncomplete` is what brings it back: the row that matters is not `chars 0` but
-    # the first one where something has been typed, because that is the request the client makes
-    # the moment the ceiling bites.
-    # `rank1` and `top10` are repeated per step rather than only for the whole run, because a
-    # ranking key is not one ordering but one per prefix length: `tier` is constant while nothing
-    # has been typed and does all the work the moment something has. A key judged on the `chars 0`
-    # bands alone is judged on the request the user spends the least time looking at.
+    # **What a lower display ceiling costs at each keystroke.** A word past the ceiling is not sent,
+    # and `isIncomplete` brings it back. So the row that matters is the first one where something
+    # has been typed, not `chars 0`: that is the request the client makes once the ceiling bites.
+    #
+    # `rank1` and `top10` are printed per step, not only for the whole run. `tier` is constant while
+    # nothing is typed and does all the work once something is, so a ranking key judged on `chars 0`
+    # alone is judged on the request a user looks at least.
     print(f"{'':10}   {'chars':>5} {'asked':>6} {'present':>8} {'rank1':>6} {'top10':>6} "
           f"{'median':>7} {'p90':>6} {'>128':>6} {'>256':>6}")
     for step, row in sorted(counts["steps"].items()):
@@ -492,12 +509,61 @@ def _print_rank(counts):
               f"{step_median:7} {step_p90:6} {over:6} {over256:6}")
 
 
+def cmd_latency(args):
+    """Per-request latency over the drawn cursors, twice, with the spread between the two runs.
+
+    - `cmd_cost` reports a throughput (a pipelined batch divided by a count), which sizes the draw.
+    - This reports the wait: one request in flight, nothing edited, the empty count beside every
+      median, and the second run's disagreement printed underneath.
+    `latency` holds the reasoning and the tables; this is the loop over corpora and runs.
+    """
+    server = args.server
+    if not os.path.exists(server):
+        sys.exit(f"no server at {server}; `make release` first")
+    print(latency.manifest(server, args))
+    runs = []
+    for ordinal in range(max(1, args.runs)):
+        print(f"\n--- run {ordinal + 1} of {max(1, args.runs)}")
+        taken = []
+        for corpus in sweepable(args.only):
+            drift = check_clean(corpus)
+            if drift:
+                print(f"{corpus.name:10} SKIPPED  {drift}")
+                continue
+            drawn = latency.cursors(corpus, args)
+            if not drawn:
+                shape = getattr(args, "shape", "member")
+                print(f"{corpus.name:10} SKIPPED  no {shape} positions drawn")
+                continue
+            result = latency.sweep(server, corpus, drawn)
+            taken.append((corpus.name, result))
+            print(latency.report(f"{corpus.name} {corpus.sha[:7]}", result, args.trace))
+        # A run over a different set of corpora cannot sit beside the one before it. The noise table
+        # pairs runs by index, so one corpus skipped in the second run would pair every row below it
+        # with another corpus.
+        if runs and [name for name, _ in taken] != [name for name, _ in runs[0]]:
+            print("\nruns swept different corpora; no spread to report")
+            return
+        runs.append(taken)
+    if not runs or not runs[0]:
+        return
+    if len(runs) < 2:
+        print("\none run, so nothing to say about the noise between two")
+        return
+    for method in latency.METHODS:
+        print()
+        print(latency.noise(runs, method))
+    print(f"\n{'':2}Asked at an unedited buffer: this is the per-request wait, not the keystroke "
+          f"one.\n{'':2}A deferred completion answers over the last settled graph through a "
+          f"Rebase, which\n{'':2}`concurrency.md` measures and this pass does not.")
+
+
 def measure(corpus, args, held):
     """One corpus, end to end. Returns `(drawn, answers, counts, findings, residue)`.
 
-    The one pipeline both `score` and `adjudicate` run, because two copies of an ordering this
-    particular — lane 1's asking keys before `ask_rebased`, lane 3 after everything — is two
-    copies that drift. The server is stopped before this returns.
+    `score` and `adjudicate` both run this one pipeline, because two copies of an ordering this
+    delicate would drift: lane 1's asking keys before `ask_rebased`, lane 3 after everything. The
+    server is stopped before this returns.
     """
     drawn = positions(corpus, args.seed, args.per_file)
     if getattr(args, "n", 0):
@@ -507,54 +573,59 @@ def measure(corpus, args, held):
     client, _, why = start(args.server, corpus)
     if why != "quiet":
         print(f"{corpus.name:10} WARNING  did not settle: {why}")
-    # One set of open documents for the whole server, because a second `didOpen` for a document
-    # the client already holds is not a legal message and lane 1's Rails key reaches the same
-    # model files the sample does.
+    # One set of open documents for the whole server. A second `didOpen` for a document the client
+    # already holds is illegal, and lane 1's Rails key reaches the same model files the sample does.
     opened = set()
     answers = ask_all(client, corpus, drawn, methods=lane2.METHODS, opened=opened)
-    # **Before the rebase pass, and that is an ordering constraint rather than a preference.**
-    # Lane 1's asking keys draw their own cursors out of the corpus text; `ask_rebased` then
-    # inserts a line at the top of every sampled document, and a model file the sample also
-    # reached would answer one line off for all of them.
+    # The checks that need a conversation, not one post per position: a request per file, or a
+    # second hop carrying the first reply. They run here, not in `lane2.run`, because `run` reads a
+    # transcript and by then the server is stopped.
+    lane2.asked(client, corpus, drawn, answers, opened)
+    # **Before the rebase pass: an ordering constraint, not a preference.** Lane 1's asking keys
+    # draw their own cursors from the corpus text. `ask_rebased` then inserts a line at the top of
+    # every sampled document, so a model file the sample also reached would answer one line off.
     keys, graded = ({}, [])
     if not args.no_key:
         keys, graded = lane1.asked(corpus, client, args.seed, opened, drawn, answers)
-    # **Before the rebase pass and after lane 1, for the rebase pass's own reason**: it asks
-    # about places in whatever documents the answers named, and `ask_rebased` then inserts a line
-    # at the top of every sampled document — a place in one of those would be asked one line off.
+    # **After lane 1 and before the rebase pass**, for the same reason: it asks about places in the
+    # documents the answers named, and after `ask_rebased` inserts its line, a place in one of those
+    # would be one line off.
     described, skipped = places.offered(answers, drawn, args.places_cap)
     place_counts = places.counters(places.ask(client, described), skipped)
+    # The declaration-site stratum: drawn from the files the sample already reached, and counted
+    # under its own counters. Here for the same reason as the two steps above: the rebase pass is
+    # about to insert a line into each of those documents.
+    stratum = declaration_sites(corpus, args.seed, args.per_file, drawn)
+    declared = declarations.count(
+        corpus, stratum, declarations.ask(client, corpus, stratum, opened), graded)
     rebased, shifted = (None, None)
     if not args.eager_only:
         rebased, shifted = ask_rebased(client, corpus, drawn, answers)
     client.stop()
     counts, findings = lane2.run(corpus, drawn, answers, rebased, shifted, place_counts)
+    counts["declarations"] = declared
     findings += graded
-    # The rest of lane 1 reads the replies lane 2 already collected, so it runs after the server
-    # is stopped — which is the property worth keeping rather than an accident of ordering: a key
-    # that reads a transcript can be re-run against one.
+    # The rest of lane 1 reads the replies lane 2 collected, so it runs after the server stops. Keep
+    # it that way: a key that reads a transcript can be re-run against one.
     if not args.no_key:
         read, graded = lane1.graded(corpus, drawn, answers)
         counts["keys"] = dict(keys, **read)
         findings += graded
-    # Lane 3 last, because "a position no rule decides" is defined by what the other two lanes
-    # just did: it subtracts every position a key graded and every position a check raised a
-    # finding at, and what is left is the residue it reports the size of.
+    # Lane 3 runs last, because its residue is what the other two lanes left: every position no key
+    # graded and no check raised a finding at.
     counts, findings, residue = lane3.run(corpus, drawn, answers, counts, findings, held)
     counts["warnings"] = client.warnings
     return drawn, answers, counts, findings, residue
 
 
 def queues(corpora, jobs):
-    """`corpora` split into `jobs` queues, each of which one thread sweeps serially.
+    """`corpora` split into `jobs` queues, each swept serially by one thread.
 
-    Longest-processing-time first: the heaviest corpus starts first and every next one joins the
-    queue with the least work in it. That is the standard schedule for this shape and it needs no
-    tuning — what it needs is a `QUEUE_WEIGHT` that is a duration rather than a size proxy, which
-    is why `cmd_score` prints every queue's real seconds.
-
-    Parallel by **corpus** and never inside one: a corpus is one server answering one pipeline in
-    order, and two threads asking one server would interleave two draws through one graph.
+    - **Longest processing time first:** the heaviest corpus starts first, and each next one joins
+      the lightest queue. It needs no tuning, only a `QUEUE_WEIGHT` in real seconds, which is why
+      `cmd_score` prints every queue's seconds.
+    - **Parallel by corpus, never inside one.** A corpus is one server answering one pipeline in
+      order; two threads on one server would interleave two draws through one graph.
     """
     lanes = [[] for _ in range(max(1, min(jobs, len(corpora))))]
     load = [0] * len(lanes)
@@ -568,9 +639,10 @@ def queues(corpora, jobs):
 def sweep(corpus, args, held):
     """One corpus, from the clean check to its counters. Returns what `cmd_score` prints.
 
-    Every server the audit starts is its own process with its own graph, so two of these at once
-    share nothing but the log — `O_APPEND` with the pid on every line, the same two properties two
-    editor windows on one project rely on — and `held`, which lane 3 only reads.
+    Each server is its own process with its own graph, so two sweeps at once share only:
+    - the log, which is safe because of `O_APPEND` and a pid on every line (what two editor windows
+      on one project rely on);
+    - `held`, which lane 3 only reads.
     """
     drift = check_clean(corpus)
     if drift:
@@ -584,7 +656,7 @@ def sweep(corpus, args, held):
 
 
 def _sweep_queue(lane, args, held, done, seconds, name):
-    """One queue's corpora, in order. All a worker prints is that one of them landed."""
+    """One queue's corpora, in order. A worker prints only that a corpus landed."""
     began = time.time()
     for corpus in lane:
         done[corpus.name] = sweep(corpus, args, held)
@@ -595,15 +667,14 @@ def _sweep_queue(lane, args, held, done, seconds, name):
 
 
 def cmd_score(args):
-    """Ask, then run both lanes over the answers. Prints and writes nothing to disk.
+    """Ask, then run both lanes over the answers. Prints; writes nothing to disk.
 
-    The identifier under the cursor and the path it landed in do reach the terminal, because a
-    finding nobody can go and look at is not a finding — what the licence rule governs is what
-    gets **committed**, and that is the ledger, which carries the sha256 of a line and never the
-    line.
+    The identifier under the cursor and its target path do reach the terminal: a finding nobody can
+    go and look at is not a finding. The licence rule governs what is **committed**, and the ledger
+    carries a line's sha256, never the line.
 
-    `--record` is the exception to "writes nothing": it saves this run in the shape `audit report`
-    diffs, and that file holds no word either.
+    `--record` is the one exception: it saves this run in the shape `audit report` diffs, and that
+    file holds no word either.
     """
     server = args.server
     if not os.path.exists(server):
@@ -611,8 +682,8 @@ def cmd_score(args):
     summed, keyed, pending = {}, {}, {}
     record = {"version": baseline.VERSION}
     held = ledger.load(Path(args.ledger))
-    # One run, one log. The server never truncates, for a reason that is about editors rather
-    # than about sweeps; here there is nothing to keep and ~25 MB a run to lose.
+    # One run, one log. The server never truncates, for reasons about editors; a sweep has nothing
+    # to keep and a lot of log to lose.
     log = fresh_log()
     if log:
         print(f"logging every request to {log}")
@@ -622,18 +693,16 @@ def cmd_score(args):
     done, seconds = {}, {}
     if jobs == 1:
         for corpus in corpora:
-            # Said before the work and not after it: `sweep` walks the corpus, starts a server,
-            # waits out its cold index and then asks every position, which on the largest of the
-            # six is a little over a minute of one process printing nothing. The line is replaced
-            # by nothing — the result block follows it — because a sweep is read as it runs and a
-            # log is read afterwards, and a name in flight is what the first reader needs.
+            # Printed before the work: on the largest corpus, `sweep` is over a minute of one
+            # process printing nothing. Nothing replaces the line; the result block follows it. A
+            # sweep is read as it runs, and a name in flight is what that reader needs.
             print(f"{corpus.name:10} sweeping...")
             done[corpus.name] = sweep(corpus, args, held)
     else:
-        # **Parallel by corpus, and the reports are still printed in the table's order.** A worker
-        # prints one line when a corpus lands, because interleaved result blocks from six servers
-        # are unreadable; everything else waits for the join, so `--jobs` changes the order the
-        # work happens in and not one character of what is reported.
+        # **Parallel by corpus, but reports print in the table's order.** Interleaved result blocks
+        # from six servers are unreadable, so a worker prints one line when a corpus lands and
+        # everything else waits for the join. `--jobs` changes when the work happens, never a
+        # character of the report.
         lanes = queues(corpora, jobs)
         for at, lane in enumerate(lanes, 1):
             print(f"queue {at:<5} {', '.join(c.name for c in lane)}")
@@ -653,15 +722,25 @@ def cmd_score(args):
         pending[corpus.name] = ledger.pending(corpus, result["residue"])
         record[corpus.name] = baseline.of(corpus, args, counts, findings)
         report.report(corpus, counts, findings, result["elapsed"], args.show)
-        for warning in counts.get("warnings") or ():
+        # **Capped, which keeps the list worth reading.**
+        # - `window/showMessage` is collected because a server saying only part of the bundle is
+        #   installed invalidates every absolute taken from it.
+        # - Some messages are about **one request** instead (`messages.md` lists the exception), and
+        #   a sweep asks thousands. Check 10 posts `prepareRename` at every constant, and each
+        #   refusal names its constant.
+        # - The startup messages arrive first and are never the ones cut.
+        said = counts.get("warnings") or ()
+        for warning in said[:WARNINGS_SHOWN]:
             print(f"{'':10}   warning: {warning}")
+        if len(said) > WARNINGS_SHOWN:
+            print(f"{'':10}   warning: ... and {len(said) - WARNINGS_SHOWN} more")
         for name, value in counts.items():
             if isinstance(value, int):
                 summed[name] = summed.get(name, 0) + value
-        # A counter kept as a dict of counts rather than as one number is skipped by the loop
-        # above, so anything the totals line prints has to be merged by name here. Lane 3's two
-        # breakdowns, and the first-place measurement beside `tiers`.
-        for name in ("verdicts", "residue-shapes", "first-place", "def-places"):
+        # A counter kept as a dict of counts is skipped by the loop above, so the totals line merges
+        # these by name: lane 3's two breakdowns, and the first-place measurement beside `tiers`.
+        for name in ("verdicts", "residue-shapes", "first-place", "def-places",
+                     "declarations"):
             running = summed.setdefault(name, {})
             for what, value in counts.get(name, {}).items():
                 running[what] = running.get(what, 0) + value
@@ -672,12 +751,17 @@ def cmd_score(args):
                     running[verdict] = running.get(verdict, 0) + value
     if not summed:
         return
-    report.totals(summed, keyed, summed["positions"], time.time() - clock, BUDGET_SECONDS)
-    # **Two numbers once the queues run at once, because the budget is a serial one.**
-    # `BUDGET_SECONDS` was derived from what one position costs one server, so the wall clock in
-    # the line above stops being comparable with it the moment two servers answer together. The
-    # summed figure is the one `audit cost` sized the draw against; the per-queue seconds are what
-    # to rebalance `QUEUE_WEIGHT` from.
+    # **Only a serial sweep of every corpus is held against the budget.** `BUDGET_SECONDS` was
+    # derived from one server answering alone.
+    # - A run over `--only` one corpus is a fraction of the draw.
+    # - A parallel run is a wall clock several servers shared.
+    # Neither is the same kind of number, so `totals` gets `None` and names no budget.
+    whole = jobs == 1 and len(corpora) == len(sweepable())
+    report.totals(summed, keyed, summed["positions"], time.time() - clock,
+                  BUDGET_SECONDS if whole else None)
+    # **The summed figure is not the serial one either.** It adds up every queue's seconds, which
+    # grows with the queue count because the servers contend. It is for rebalancing `QUEUE_WEIGHT`,
+    # next to the per-queue seconds. `audit cost` takes no `--jobs` for the same reason.
     if seconds:
         summed_seconds = sum(r.get("elapsed", 0.0) for r in done.values())
         print(f"{'':10} {len(seconds)} queues   "
@@ -685,13 +769,13 @@ def cmd_score(args):
               + f"   summed {summed_seconds:.1f}s")
     if getattr(args, "record", None):
         # The one thing `score` may write, and only when asked. It holds integers, a git SHA and
-        # each finding's `audit.site` — no word and no `detail` — because `audit report` diffs it
-        # against a file that is committed. See `baseline`.
+        # each finding's `audit.site`, never a word or a `detail`, because `audit report` diffs it
+        # against a committed file. See `baseline`.
         where = baseline.save(record, Path(args.record))
         print(f"{'':10} recorded {len(record) - 1} corpora to {where}")
     if args.pending:
-        # Written only when asked. The residue is thousands of rows nobody has adjudicated, and
-        # a run that merged them into the ledger unasked would commit them and call them one.
+        # Written only when asked. The residue is thousands of unadjudicated rows, and merging them
+        # into the ledger unasked would commit them as if judged.
         where = ledger.save(dict(ledger.load(), **pending), Path(args.pending))
         rows = sum(len(c["positions"]) for c in pending.values())
         print(f"{'':10} wrote {rows} unadjudicated rows to {where}")
@@ -700,8 +784,8 @@ def cmd_score(args):
 def cmd_ledger(args):
     """What is in `audit/ledger.json`, and whether it still applies.
 
-    Reads the corpora but starts no server and asks nothing: every question here is about the
-    ledger against the source, which is the same pair of facts lane 3 uses at scoring time.
+    Reads the corpora, but starts no server and asks nothing. Every question here is the ledger
+    against the source, the same pair lane 3 uses when scoring.
     """
     held = ledger.load(Path(args.path))
     total = 0
@@ -748,22 +832,23 @@ def cmd_ledger(args):
 
 # ------------------------------------------------------------------------------- adjudicate
 #
-# Lane 3's residue is 3,826 positions and a person cannot judge one of them from a path and a
-# byte offset. What a verdict actually needs is the three things a reviewer would go and look
-# up: the line the cursor is on, what the cursor is on in it, and what ya-lsp said there. This
-# prints exactly those, in batches small enough to finish, and writes the batch back as rows
-# with the verdict left empty.
+# Nobody can judge a residue position from a path and an offset. A verdict needs what a reviewer
+# would look up:
+# - the line the cursor is on;
+# - what the cursor is on;
+# - what ya-lsp said there.
+# This prints those, in batches small enough to finish, and writes the batch back as rows with an
+# empty verdict.
 #
-# **The identifier and the source line reach the terminal and never the file.** That is the same
-# seam every other finding in this package sits on: the licence rule governs what gets committed,
-# and `ledger.save` keeps only its own field list — so no amount of reviewing here can put a
-# corpus line into `audit/ledger.json`.
+# **The identifier and the source line reach the terminal, never the file.** The licence rule
+# governs what is committed, and `ledger.save` keeps only its own field list, so no review here can
+# put a corpus line into `audit/ledger.json`.
 
 CARD_SKIP = ("```", "---", "")
 
 
 def card_lines(card, keep=2):
-    """The first `keep` lines of a hover card that say something. Fences and rules are not."""
+    """The first `keep` lines of a hover card that say something. Fences and rules do not."""
     if not card:
         return []
     out = []
@@ -786,7 +871,7 @@ def _snippet(lines, at, context, column=None, word=None, indent="    "):
 
 
 def _shorten(corpus, target):
-    """A target path as something short enough to read: relative here, gem-and-file elsewhere."""
+    """A target path short enough to read: relative here, gem-and-file elsewhere."""
     path = path_of(target)
     if path is None:
         return target, None
@@ -799,10 +884,10 @@ def _shorten(corpus, target):
 def present(corpus, drawn, answers, batch, context=1, targets=2):
     """Print one batch of residue positions for review, numbered.
 
-    **The target's own source is printed too**, because the question a verdict answers is "did it
-    land on the right thing" and a path with a line number does not answer it — a reviewer would
-    open the file, so this opens it. Reading is unrestricted for every corpus and for every gem;
-    it is copying *out* that the licence rule forbids, and nothing here reaches the ledger.
+    **The target's source is printed too.** A verdict answers "did it land on the right thing", and
+    a path with a line number does not: a reviewer would open the file, so this opens it. Reading
+    any corpus or gem is fine; the licence rule forbids copying *out*, and nothing here reaches the
+    ledger.
     """
     source = {}
 
@@ -819,9 +904,8 @@ def present(corpus, drawn, answers, batch, context=1, targets=2):
         _, _, _, _, column, _, word = drawn[index]
         card = card_of(answers.get((index, "textDocument/hover")))
         found = locations(answers.get((index, "textDocument/definition")))
-        # The ledger key, printed because the batch file is **sorted** and the number above is
-        # therefore not an index into it. Recording a verdict by position-in-batch put one on
-        # the wrong row before this line existed.
+        # The ledger key. The batch file is **sorted**, so the number above is not an index into it;
+        # recording a verdict by position in the batch puts it on the wrong row.
         print(f"[{number}] {shape} `{word}`   {path}:{line + 1}"
               f"   [{ledger.key(path, drawn[index][5])}]")
         print()
@@ -853,8 +937,8 @@ def present(corpus, drawn, answers, batch, context=1, targets=2):
 def cmd_adjudicate(args):
     """Present a batch of lane 3's residue for a person to judge, and write the blank rows.
 
-    Runs the whole pipeline, because residue is *defined* by what the other lanes decided — a
-    batch drawn without them would offer positions a key already graded.
+    Runs the whole pipeline, because residue is *defined* by what the other lanes decided. A batch
+    drawn without them would offer positions a key already graded.
     """
     if not os.path.exists(args.server):
         sys.exit(f"no server at {args.server}; `make release` first")
@@ -884,17 +968,15 @@ def cmd_adjudicate(args):
 
 
 def cmd_report(args):
-    """This run against the last committed one. Reads two files, starts no server, opens no corpus.
+    """This run against the last committed one. Reads two files; starts no server, opens no corpus.
 
-    **A report is a comparison of two recordings, and that is worth more than saving a sweep.** It
-    means the diff can be re-read, re-cut by corpus and re-run in CI from an artifact, months after
-    the machine that produced it went away — the same property lane 1's `graded` keys have, for the
-    same reason. `audit score --record PATH` produces the recording.
+    **A report compares two recordings**, so the diff can be re-read, cut by corpus, and re-run in
+    CI from an artifact long after the sweep. Lane 1's `graded` keys have the same property for the
+    same reason. `audit score --record PATH` makes the recording.
 
-    `--save` writes the run in as the new baseline, and it **merges** rather than replaces: a run
-    over one corpus must not silently drop the other four's numbers from a committed file. Which
-    corpora were carried over unchanged is printed, because a carried-over row is a number nobody
-    measured today and a reader has to be told which ones those are.
+    `--save` writes the run as the new baseline, and it **merges**: a run over one corpus must not
+    drop the other corpora's numbers from a committed file. It prints which corpora were carried
+    over, because a carried-over row is a number nobody measured today.
     """
     now = baseline.load(Path(args.record))
     if len(now) <= 1:

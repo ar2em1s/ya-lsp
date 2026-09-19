@@ -1,48 +1,47 @@
 //! What ya-lsp removes from an RBS document before it reaches the index.
 //!
-//! One thing, and for one reason. rbs's `interface _Foo … end` declares a *structural* type — a
-//! shape a value can satisfy, never a namespace a method can be called on. rubydex does not model
-//! them: `visit_interface_node`'s default walks straight into the members and rubydex overrides
-//! it nowhere, so the members are filed on whatever lexical scope encloses the block and the
+//! One thing, for one reason. rbs's `interface _Foo … end` declares a *structural* type: a shape a
+//! value can satisfy, never a namespace a method can be called on. rubydex does not model them:
+//! `visit_interface_node`'s default walks straight into the members, and rubydex overrides it
+//! nowhere, so the members are filed on whatever lexical scope encloses the block, and the
 //! interface itself never enters the graph. `workspace/symbol "_Range"` finds nothing.
 //!
-//! What is left is orphaned methods with no way to tell them apart from real ones, in a scope
-//! that is usually `Object` — every receiver's ancestor. Ruby's own signatures hold enough
-//! `interface` blocks to put a band of invented rows between a class's own methods and
-//! `Kernel`'s: `"hi".begin`, `"hi".exclude_end?`, `4.each_entry`, none of which exist.
+//! What is left is orphaned methods, indistinguishable from real ones, in a scope that is usually
+//! `Object`: every receiver's ancestor. Ruby's own signatures hold enough `interface` blocks to put
+//! a band of invented rows between a class's own methods and `Kernel`'s: `"hi".begin`,
+//! `"hi".exclude_end?`, `4.each_entry`, none of which exist.
 //!
 //! # Why the text is edited rather than the answers filtered
 //!
-//! Dropping these where completion builds its list is the obvious fix and an incomplete one: the
-//! same declarations are `workspace/symbol` results and goto-definition targets — for `rand` the
-//! *first* target offered is `interface _Rand` in `core/array.rbs`. A filter would have to be
+//! Dropping these where completion builds its list is the obvious fix, and an incomplete one: the
+//! same declarations are `workspace/symbol` results and goto-definition targets (for `rand` the
+//! *first* target offered is `interface _Rand` in `core/array.rbs`). A filter would have to be
 //! repeated in three modules and remembered in a fourth.
 //!
-//! Removing the text is one rule in one place — **ya-lsp does not index RBS interfaces** — and
-//! costs nothing per request. Every byte of the block is replaced with a space except its
-//! newlines, so every offset and every line number in the rest of the file is exactly what it was
-//! and everything else still resolves, hovers and navigates.
+//! Removing the text is one rule in one place (**ya-lsp does not index RBS interfaces**) and costs
+//! nothing per request. Every byte of the block becomes a space except its newlines, so every
+//! offset and line number in the rest of the file is unchanged, and everything else still resolves,
+//! hovers and navigates.
 //!
-//! Nothing is lost by it. RBS reaches an interface's methods through `include _Foo`, and rbs's own
-//! core and stdlib contain no such include — nor could rubydex resolve one, having no declaration
-//! to resolve it to.
+//! Nothing is lost. RBS reaches an interface's methods through `include _Foo`, and rbs's own core
+//! and stdlib contain no such include; nor could rubydex resolve one, having no declaration to
+//! resolve it to.
 
 use ruby_rbs::node::{InterfaceNode, Node, Visit, parse};
 
 /// `source` with every `interface … end` blanked out, or `None` when there is nothing to do.
 ///
-/// `None` rather than an unchanged copy so the caller can keep the parallel path: most signature
-/// files declare no interface, and those should reach rubydex as a plain path to read on a worker
-/// thread.
+/// `None`, not an unchanged copy, so the caller can keep the parallel path: most signature files
+/// declare no interface, and those should reach rubydex as a plain path, read on a worker thread.
 #[must_use]
 pub fn without_interfaces(source: &str) -> Option<String> {
-    // The parser costs more than a substring scan, and the scan says no for four files in five.
-    // It cannot say a false no: `interface` is the keyword, so a block cannot exist without it.
+    // The parser costs more than a substring scan, and the scan says no for most files. It cannot
+    // say a false no: `interface` is the keyword, so a block cannot exist without it.
     if !source.contains("interface") {
         return None;
     }
-    // A signature rbs itself cannot parse is one rubydex will not index either. Leaving it alone
-    // is what the caller does with every other file it cannot improve.
+    // A signature rbs itself cannot parse is one rubydex will not index either. Leaving it alone is
+    // what the caller does with every other file it cannot improve.
     let signature = parse(source).ok()?;
 
     let mut spans = Spans(Vec::new());
@@ -52,13 +51,13 @@ pub fn without_interfaces(source: &str) -> Option<String> {
     }
     let edited = blank(source, &spans.0)?;
 
-    // The guard, and it is not paranoia. A block's `%a{…}` annotations sit *outside* the span
-    // its node reports, so blanking the block alone leaves them with nothing to annotate and rbs
-    // refuses the file with "cannot start a declaration". rubydex then indexes none of it and
-    // `[].` offers seven methods instead of a hundred and fifty, silently.
+    // The guard, and not paranoia. A block's `%a{…}` annotations sit *outside* the span its node
+    // reports, so blanking the block alone leaves them annotating nothing, and rbs refuses the file
+    // with "cannot start a declaration". rubydex then indexes none of it, and `[].` silently offers
+    // a handful of methods instead of the full list.
     //
-    // Editing a file that a parser has to read afterwards is only safe if the parser agrees, so
-    // it is asked. A file this cannot improve keeps its interfaces, which is where it started.
+    // Editing a file a parser must read afterwards is only safe if the parser agrees, so it is
+    // asked. A file this cannot improve keeps its interfaces, which is where it started.
     if parse(&edited).is_err() {
         return None;
     }
@@ -78,10 +77,9 @@ impl Visit for Spans {
             return;
         };
 
-        // An annotation is written before the keyword and is *not* inside the node's own span,
-        // so taking the span alone leaves `%a{deprecated: …}` attached to nothing and the file
-        // stops parsing. The comment above a block needs no such care: `#` lines are legal
-        // anywhere.
+        // An annotation is written before the keyword and is *not* inside the node's own span, so
+        // taking the span alone leaves `%a{deprecated: …}` attached to nothing, and the file stops
+        // parsing. A comment above a block needs no such care: `#` lines are legal anywhere.
         for annotation in node.annotations().iter() {
             if let Node::Annotation(annotation) = annotation
                 && let Ok(begins) = usize::try_from(annotation.location().start())
@@ -91,16 +89,16 @@ impl Visit for Spans {
         }
 
         self.0.push((start, end));
-        // Deliberately not recursing. Nothing inside is wanted, and RBS does not allow a class or
-        // a module in there for the walk to have missed.
+        // Deliberately not recursing. Nothing inside is wanted, and RBS allows no class or module
+        // in there for the walk to miss.
     }
 }
 
 /// Replace every byte of each span with a space, keeping the newlines.
 ///
-/// Bytes rather than characters: a multi-byte character inside a span becomes that many spaces,
-/// so the length is identical and every later offset in the file still lands where it did. Keeping
-/// the newlines is what holds the line numbers.
+/// Bytes, not characters: a multi-byte character inside a span becomes that many spaces, so the
+/// length is identical and every later offset still lands where it did. The newlines hold the line
+/// numbers.
 fn blank(source: &str, spans: &[(usize, usize)]) -> Option<String> {
     let mut bytes = source.as_bytes().to_vec();
     for (start, end) in spans {
@@ -111,8 +109,8 @@ fn blank(source: &str, spans: &[(usize, usize)]) -> Option<String> {
             }
         }
     }
-    // Whole characters were replaced by ASCII, so this holds; it is checked rather than asserted
-    // because a wrong answer here would be a corrupted signature file rather than a panic.
+    // Whole characters were replaced by ASCII, so this holds. It is checked, not asserted, because
+    // a wrong answer here would be a corrupted signature file, not a panic.
     String::from_utf8(bytes).ok()
 }
 
@@ -147,9 +145,8 @@ end
     #[test]
     fn both_a_nested_and_a_top_level_interface_go() {
         // Both shapes appear in one real file: `core/array.rbs` declares `_Rand` inside
-        // `class Array` and again at the top level, so the members land on `Array` and on
-        // `Object` respectively. A rule that only looked at the top level would leave
-        // `Array#rand` behind.
+        // `class Array` and again at the top level, so the members land on `Array` and on `Object`.
+        // A rule that only looked at the top level would leave `Array#rand` behind.
         let stripped = without_interfaces(NESTED).expect("two interfaces");
         assert!(!stripped.contains("def rand"), "{stripped}");
         assert!(!stripped.contains("def read"), "{stripped}");
@@ -159,8 +156,8 @@ end
 
     #[test]
     fn every_offset_and_line_survives() {
-        // The whole point: the file is edited in place, so what is left has to sit exactly where
-        // it sat. Anything else moves the definitions rubydex records for the rest of the file.
+        // The whole point: the file is edited in place, so what is left must sit exactly where it
+        // sat. Anything else moves the definitions rubydex records for the rest of the file.
         let stripped = without_interfaces(NESTED).expect("two interfaces");
         assert_eq!(stripped.len(), NESTED.len());
         assert_eq!(stripped.lines().count(), NESTED.lines().count());
@@ -206,17 +203,17 @@ end
 
     #[test]
     fn what_comes_out_is_something_rbs_still_reads() {
-        // The property the whole approach rests on, asserted directly rather than inferred from
-        // the two tests above.
+        // The property the whole approach rests on, asserted directly, not inferred from the two
+        // tests above.
         let stripped = without_interfaces(NESTED).expect("two interfaces");
         assert!(ruby_rbs::node::parse(&stripped).is_ok(), "{stripped}");
     }
 
     #[test]
     fn a_signature_file_that_cannot_be_read_is_skipped_rather_than_indexed_raw() {
-        // A signature root is walked and then read, and a file can go between the two. The
-        // fallback is to leave it to `index_files`, which is the same answer as for a file
-        // with no interfaces in it.
+        // A signature root is walked and then read, and a file can vanish between the two. The
+        // fallback is to leave it to `index_files`: the same answer as for a file with no
+        // interfaces.
         let mut harness = Harness::new();
         let absent = harness.root.path().join("gone.rbs");
         assert!(!harness.analysis.index_edited_signature(&absent));
@@ -226,20 +223,20 @@ end
         assert!(
             !harness
                 .analysis
-                .index_edited_signature(&ruby.to_path().expect("a path"))
+                .index_edited_signature(&ruby.to_file_path().expect("a path"))
         );
     }
 
     #[test]
     fn an_rbs_interface_never_reaches_the_graph() {
         // The end of the path `analysis::signatures` starts: the unit tests there check the text
-        // that comes out, and this checks that rubydex agreed to read it and that nothing from
-        // inside the block survived indexing.
+        // that comes out, and this checks that rubydex agreed to read it and nothing from inside
+        // the block survived indexing.
         //
-        // A signature root of its own rather than the vendored one, so the fixture owns exactly
-        // what is in it: `_Reader` at the top level lands its member on `Object`, and `_Rand`
-        // inside `class Bag` lands its member on `Bag` — both shapes appear in one real file,
-        // `core/array.rbs`, and a rule that only looked at the top level would miss the second.
+        // A signature root of its own, not the vendored one, so the fixture owns exactly what is in
+        // it. `_Reader` at the top level lands its member on `Object`, and `_Rand` inside
+        // `class Bag` lands its member on `Bag`. `core/array.rbs` has both shapes, and a rule that
+        // only looked at the top level would miss the second.
         let dir = tempfile::tempdir().expect("tempdir");
         let core = dir.path().join("sig/core");
         std::fs::create_dir_all(&core).unwrap();
@@ -275,8 +272,8 @@ end
         harness.index();
         harness.index_gems();
 
-        // The signatures did get indexed — without this the rest of the test passes vacuously,
-        // and an edited file rbs refuses to parse is exactly how it would come to.
+        // The signatures did get indexed. Without this the rest of the test passes vacuously, which
+        // is exactly what an edited file rbs refuses to parse would cause.
         assert!(
             harness.has("Bag#keep()"),
             "the signature root was not indexed"
@@ -294,14 +291,13 @@ end
 
     #[test]
     fn a_projects_own_signatures_are_edited_the_same_way() {
-        // The second of the two routes an `.rbs` file takes into the graph, and the one that was
-        // missed the first time. These files arrive through `index_workspace` rather than through
-        // the background signature index; filtered one way and not the other, `Object#slurp` came
-        // back and was offered on every receiver in the project.
+        // The second of the two routes an `.rbs` file takes into the graph. These files arrive
+        // through `index_workspace`, not the background signature index; filtered one way and not
+        // the other, `Object#slurp` would be offered on every receiver in the project.
         //
-        // **No `index.include` here, and that is half of what this test pins.** With a
-        // `**/*.rb` default a project's own `sig/` reaches nothing at all unless the project
-        // widens the glob itself — the feature exists and is invisible.
+        // **No `index.include` here, and that is half of what this test pins:** the default must
+        // reach a project's own `sig/`. With only `**/*.rb`, the feature would exist and be
+        // invisible unless the project widened the glob itself.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("sig")).unwrap();
         std::fs::write(

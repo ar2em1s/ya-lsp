@@ -7,119 +7,68 @@ paths:
   - "src/workspace/mod.rs"
 ---
 
-# Gems and bundle discovery
+# Gems, bundle discovery and the workspace walk
 
-- **Gem discovery reads `gems::Env`, never `std::env` directly.** That is the only reason the layout
-  fixtures can run against a temp directory instead of whatever Ruby the machine has.
-  `Workspace::load_with_env` is the seam.
-- **The version-file walk's ceiling is `Env::home`, and `None` means "do not walk".**
-  `ruby_version::resolve` reads `.ruby-version` then `.tool-versions` from the workspace root
-  upwards, stopping *after* `$HOME` or at `/`. A fixture whose ceiling is not an ancestor of its
-  workspace walks out of its own temp directory and reads whatever `/tmp` and `/` hold. Put a
-  fixture's workspace *inside* its fixture home.
-- **Nearest directory first, kind second.** `.ruby-version` outranks `.tool-versions` only *within*
-  one directory; across the chain the nearer file wins whichever kind it is, and the whole chain
-  outranks `RUBY VERSION` in the lockfile — that records what the last person to run bundler used,
-  and the question is which interpreter will run this code. `gems::roots` and `gems::discover`
-  resolve independently and must pass the same ceiling, or `rbs::discover` searches one Ruby's tree
-  while the gem index searches another's.
-- **The ABI directory is globbed, never computed.** Ruby 4.0.1 installs into `lib/ruby/gems/4.0.0/`.
-  `abi_of` exists only to *prefer* a globbed directory.
-- **Gem roots are deduplicated by canonical path but stored as spelled.** Storing the canonical form
-  breaks a vendored bundle on any machine whose workspace root reaches disk through a symlink (every
-  macOS temp directory): its files get a different URI spelling from everything else, forking a
-  second document per file.
-- **Diagnostics are filtered by URI prefix, and the workspace prefix alone is not enough.** A
-  vendored bundle is inside the workspace root by construction, so `is_own_code` also excludes the
-  gem roots, the RBS root and Ruby's own library. Without it, opening a Rails app publishes hundreds
-  of unfixable squiggles.
-- **Background gem chunks set `dirty` but must not arm `resolve_at`.** Arming it per chunk pushes the
-  user's own diagnostics out for the whole index. Conversely, `serve` must check `dirty`, not
-  `resolve_at`, or requests answer against an unresolved graph during the index.
-- **`GEM_FILES_PER_STEP` is measured, not chosen.** Its cost is the resolve the *next request* runs
-  over what the step added, and that cost rises sharply once the step grows past its current value.
-  Re-measure it by hand against a real bundle before changing it.
-- **`require_paths` comes from `specifications/<full name>.gemspec`**, RubyGems' serialised gemspec,
-  a plain array literal. Git and path sources have no such file — only the project's own
-  arbitrary-Ruby `.gemspec` — so they fall back to `lib`. Absolute entries are native-extension stubs
-  and are skipped, the same rule rubydex's Ruby-side `graph.rb` applies.
-- **Unresolved gems are counted per name, not per spec.** A lockfile resolved for seven platforms
-  lists `nokogiri` seven times, and six of those directories will never exist here.
-- **`signature_paths` is a second list answering a second question, and must never merge into
-  `load_paths`.** `load_paths` is what `require "..."` resolves against; `sig/` is on no load path,
-  so a `sig/` leaking in would make go-to-definition on a `require` land on a signature rather than
-  the code. The gem walk consumes both lists; require resolution consumes one.
-- **RBS adoption in a real bundle is a few per cent, and reading `sig/` is worth it because of what
-  it costs.** Only a handful of a real bundle's gems ship `sig/` at all, and most of the methods
-  that buys come from two gems no application chains through. No gem ships `.rbs` under a `lib/` require
-  path. The walk is one `is_dir` per gem and the indexing is inside the noise of the background pass.
-  Do not repeat "a growing number of gems ship RBS" as if it were measured — measure it.
-- **`engine_paths` is a *third* list, for `signature_paths`' reason and with sharper teeth.** A Rails
-  engine ships models, mailers, jobs and controllers under `app/` and declares
-  `require_paths = ["lib"]` all the same — checked in the serialised gemspecs of `activestorage`,
-  `actionmailbox`, `devise`, `solid_queue`, `turbo-rails`, `activeadmin`. So `app/` has to be walked
-  and must **not** become a load path: a gem can ship `lib/thing.rb` *and* `app/thing.rb`, and an
-  `app/` on the load path would silently change what `require "thing"` means. Walked after the
-  signatures, before the load paths, inside `[gems] max_files`.
-- **`ENGINE_DIRS` is two entries, and `config/` earns its place with one file and no constant.**
-  Across every gem installed for one Ruby there are **barely a handful of `.rb` files** under any
-  `config/` — `routes.rb` and `importmap.rb` — and **none defines a class or module**, so it contributes
-  nothing to the constants gate 1 exists for. It is walked because an engine's `config/routes.rb` may
-  name the *host application's* helpers. Both entries are on the engine list rather than the load
-  path, so `require "thing"` cannot start meaning `config/thing.rb`.
-- **Which helpers those are is `rails::Whose`, and the split is nearly even.** Of the gems shipping
-  a routes file, **some draw into the application's set** — activestorage, actionmailbox,
-  turbo-rails, solid_queue — and **the rest draw into their own**: blazer, pghero,
-  mission_control-jobs, whose helpers are reached as `blazer.queries_path` after a `mount`. The
-  discriminator is receiver **and** file location, not receiver alone, because an engine monorepo
-  writes `Engine.routes.draw` in its own routes file for its own routes. Checked against
-  `ActionDispatch::Routing::RouteSet` with a real set bound to `Rails.application.routes`: **every
-  helper named, none invented, none missed** — and Rails agrees the own-set engines give the host
-  nothing.
-- **Demand for it is one call site in the whole corpus** (a `rails_direct_uploads_url` in a request
-  spec). It is a correctness feature, not a coverage one: the routes reader was one parameter away,
-  and the alternative was a reader that could not say why it declined.
-- **What gate 1 buys, measured as a floor rather than an estimate.** Over four applications,
-  constant references **gain a `textDocument/definition` and none loses one**, every one landing in a
-  gem's `app/`; `ActiveStorage::Blob` is the largest single group. One position gains a *second*
-  place rather than a first: `ActionView::Helpers::FormHelper` is reopened by actiontext's
-  `app/helpers/`, which is true and was invisible. The corpora's bundles are only partly installed,
-  so the real gain is larger; the engines themselves were installed on purpose.
-- **The walk costs a couple of per cent.** `app/` and `config/` hold a small fraction of what
-  `lib/` does across every gem installed for one Ruby, so adding them barely moves the indexing
-  queue. `source_files` takes `.rb` and `.rbs` only, so an engine's `app/javascript` is excluded
-  without a rule.
-- **`.gem_rbs_collection/` is inside the workspace root, so it must be a foreign prefix.** Same shape
-  as a vendored bundle and the same failure: without it, every squiggle in somebody else's curated
-  signatures is published as the user's own. It is also *hidden*, so the workspace walk prunes it at
-  the directory — it reaches the graph only as a signature path on the background pass. The path from
-  `rbs_collection.yaml` is not honoured: that is YAML, and this crate has no parser for it.
-- **One non-Ruby file this workspace reads, and one predicate for it.** `index.include` is a list of
-  the shapes *Ruby* is written in, so `Workspace::indexes` answers no to a `db/structure.sql` however
-  the user spells the list — which would make reading a SQL dump impossible rather than configurable.
-  `Workspace::admits` is `indexes` minus that half: the same compiled globs and the same
-  `ignore::WalkBuilder`, so `index.exclude`, `.gitignore` and the hidden-file rule still apply and a
-  project excluding `db/` gets no dump read. Deliberately narrow — one caller, one file type — rather
-  than a general "read anything" door. `core-invariants.md` holds it to the same strictly-wider
-  property the other two share.
+## Must: discovery
 
-- **`[index] load_paths` indexes, and the path it names is resolved once.** It documented itself as
-  "extra roots to index" for four releases and indexed nothing — it reached `require` resolution and
-  the prefix order and stopped — so a monorepo that named its shared tree got a `require` resolving
-  to a document the graph did not hold. Two spellings failed on top of that, both silently, because
-  `is_dir` was the only check and `is_dir` follows everything: `../shared` kept its `..` into every
-  prefix comparison, and the graph writes no URI with a `..` in it; a `shared` that is a **symlink**
-  out of the tree was never walked, since `discover` sets `follow_links(false)`. `resolve_load_path`
-  canonicalizes both, and then spells the result back under the root's own prefix when it is inside
-  the root — `canonicalize` resolves the root's symlinks too, and a workspace routinely reaches disk
-  through one, so a canonicalized `lib` under a root spelled `/tmp/...` comes back `/private/tmp/...`
-  and stops being a prefix of any document the walk indexed.
-- **Inside the root and outside it are indexed by different things, and the split is the rule.**
-  `Workspace::external_load_paths` is the second list. A load path inside the root is already the
-  walk's — walking it again is every file twice, so every class declared twice. One outside is
-  reached by nothing else, so `Analysis::collect_external_load_paths` takes it as `.rb` and `.rbs`
-  (the globs are written relative to the root and cannot describe a tree outside it), inside
-  `index.max_files`, and `register_documents` asks the client to claim it, because no selector
-  reaches outside its own folder. **Known limit**: a file opened through a *different* spelling than
-  the one indexed — a symlinked tree browsed through the link rather than through its target — forks
-  a second document, since `DocUri` canonicalizes encoding and not symlinks.
+1. **Read `gems::Env`, never `std::env`.** `Workspace::load_with_env` is the seam that lets fixtures
+   run against a temp directory.
+2. **Stop the version-file walk at `Env::home`; `None` means don't walk.** Put a fixture's workspace
+   *inside* its fixture home, or the walk escapes into `/tmp` and `/`.
+3. **The nearest directory wins, then the file kind.** `.ruby-version` beats `.tool-versions` only
+   within one directory. The whole chain beats the lockfile's `RUBY VERSION`. `gems::roots` and
+   `gems::discover` must pass the same ceiling.
+4. **Glob the ABI directory; never compute it.** Ruby 4.0.1 installs into `4.0.0/`. `abi_of` only
+   ranks the globbed results.
+5. **Dedupe gem roots by canonical path, but store them as spelled.** Storing the canonical form
+   forks a second document per file behind a symlink (every macOS temp directory).
+
+## Three path lists per gem, never merged
+
+| List | Holds | Used for |
+|---|---|---|
+| `load_paths` | `require_paths`, from `specifications/<name>.gemspec` (git and path sources fall back to `lib`; absolute entries are skipped) | `require` resolution and indexing |
+| `signature_paths` | `sig/` | indexing only. On a load path, a `require` would jump to RBS |
+| `engine_paths` | `ENGINE_DIRS`: `app/` and `config/` | indexing only. On a load path, `require "thing"` could change meaning |
+
+- **`config/` is walked for `routes.rb`.** `rails::Whose` decides whether an engine's routes draw
+  into the host's helpers (activestorage) or into the engine's own (`blazer.queries_path`). It uses
+  the receiver *and* the file location.
+- **`source_files` takes `.rb` and `.rbs` only.**
+- **Count unresolved gems per name, not per platform spec.**
+
+## Background indexing
+
+- **Gem chunks set `dirty` but never arm `resolve_at`.** Arming it per chunk delays the user's own
+  diagnostics for the whole index. `serve` checks `dirty`.
+- **`GEM_FILES_PER_STEP` is a measured value.** Re-measure against a real bundle before changing it.
+
+## The workspace walk
+
+1. **Read no ignore files at all.** `walker` switches off every `ignore` source explicitly;
+   `index.exclude` does the whole job.
+2. **Prune excluded trees at the directory** (`pruning_walker`, `filter_entry`).
+3. **Every predicate respects pruning** (`prunes_an_ancestor`), so the watcher and the index cannot
+   disagree about a file inside a pruned tree.
+4. **`index.include` and `index.exclude` replace the defaults; they don't extend them.** That is
+   deliberate: the README prints both defaults in full. There is no negation (`!keep.rb`).
+5. **Exactly one non-Ruby file is read: `db/structure.sql`**, through `Workspace::admits` (`indexes`
+   minus the Ruby-shape half, with the same excludes). Keep it that narrow (`core-invariants.md`).
+
+## Your own code vs someone else's
+
+- **`is_own_code` excludes gem roots, the RBS root and Ruby's library**, even when they sit inside
+  the workspace, as a vendored bundle does. Otherwise a Rails app gets hundreds of squiggles it
+  cannot fix.
+- **`.gem_rbs_collection/` is a foreign prefix.** It is hidden, so it is reached only as a signature
+  path. The path given in `rbs_collection.yaml` is not read, because there is no YAML parser.
+
+## `[index] load_paths`
+
+- **`resolve_load_path` canonicalizes a load path** (`..`, symlinks), then re-spells it under the
+  root's own prefix when it is inside the root.
+- **A load path inside the root belongs to the normal walk.** One outside the root goes to
+  `Workspace::external_load_paths` → `Analysis::collect_external_load_paths`, which takes `.rb` and
+  `.rbs` within `index.max_files`. `register_documents` asks the client to claim it.
+- **Known limit:** opening a file through a different symlink spelling forks a second document.
+  `DocUri` normalises encoding, not symlinks.

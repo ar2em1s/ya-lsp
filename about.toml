@@ -1,24 +1,35 @@
-# Which licences may appear in the dependency graph. An unlisted one fails generation rather
-# than landing quietly in a shipped notice, which is the point of the list: it turns "we picked
-# up a new dependency" into a decision somebody makes.
+# Which licences may appear in the dependency graph. An unlisted one fails generation instead of
+# landing quietly in a shipped notice: the list turns "we picked up a new dependency" into a
+# decision somebody makes.
+#
 # Order matters: for a crate offered under several licences, the first entry here that satisfies
-# its expression is the one elected — and the one whose text gets reproduced. MIT leads because
-# almost the whole tree is `MIT OR Apache-2.0`, and MIT is shorter and asks less of us.
+# its expression is elected, and its text is the one reproduced. MIT leads because almost the
+# whole tree is `MIT OR Apache-2.0`, and MIT is shorter and asks less of us.
 accepted = [
     "MIT",
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
+    "CC0-1.0",
     "ISC",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
 ]
 
-# Every platform a release is built for, so one generated notice is correct for all six. The
-# Windows-only and Unix-only crates differ, and a notice generated on one machine must not be
-# missing the licences that ship on another.
+# CC0-1.0 is here for one crate, `notify`: the one entry on this list that was a decision, not a
+# formality.
+# - What it means: a public-domain dedication with no attribution and no copyleft, so it sits
+#   inside an MIT binary without conditions.
+# - What is wrong with it: section 4(a) expressly does *not* waive the author's patent rights,
+#   which is why OSI never approved it and Fedora stopped accepting it for code in 2022.
+# - Why it is accepted: the risk is low and shared (rust-analyzer and watchexec ship the same
+#   crate), and the alternative is no file watching for every client that cannot register one.
+
+# Every platform a release is built for, so one generated notice is correct for all of them.
+# Windows-only and Unix-only crates differ, and a notice generated on one machine must not miss
+# the licences that ship on another.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -32,14 +43,14 @@ targets = [
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 
-# rubydex publishes no licence file of its own — only `license = "MIT"` in its manifest — so
-# `cargo about` files it under the unfilled SPDX template and **Shopify is named nowhere in any
-# shipped artifact**, which is exactly the gap `NOTICE.txt` closes for rbs. A git checkout carries
-# the whole repository, so the root `LICENSE.txt` is there to harvest; the `../../` escapes the
-# package directory, which means an upstream move of the crate inside its repository breaks this
-# *silently* and `make notices-check`'s byte diff is what catches it. That is an argument for the
-# check rather than against the clarification. Against a crates.io source it fails open — a
-# warning and the template, at exit 0 — so it costs nothing if the pin ever goes back.
+# rubydex's crate has no licence file of its own (only `license = "MIT"` in its manifest), so
+# `cargo about` would file it under the unfilled SPDX template, and **Shopify would be named
+# nowhere in any shipped artifact**: the gap `NOTICE.txt` closes for rbs.
+# - A git checkout carries the whole repository, so the root `LICENSE.txt` is there to harvest.
+# - `../../` escapes the package directory, so if upstream moves the crate inside its repository
+#   this breaks *silently*; `make notices-check`'s byte diff is what catches it.
+# - Against a crates.io source it fails open (a warning and the template, at exit 0), so it
+#   costs nothing if the pin ever goes back to a release.
 [rubydex.clarify]
 license = "MIT"
 

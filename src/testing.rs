@@ -18,17 +18,16 @@ thread_local! {
 
 /// A subscriber that is off for every thread that has not asked to capture.
 ///
-/// The shape matters and took a wrong turn first. `tracing` caches an `Interest` per callsite
-/// **globally**: the first test to reach a `tracing::info!` with no subscriber installed pins it
-/// at `Interest::never()`, and a later `with_default` on another thread never re-evaluates it —
-/// so the capture came back empty in the full suite while passing when run alone.
+/// The shape matters. `tracing` caches an `Interest` per callsite **globally**: the first test to
+/// reach a `tracing::info!` with no subscriber installed pins it at `Interest::never()`, and a
+/// later `with_default` on another thread never re-evaluates it. The capture would then come back
+/// empty in the full suite while passing when run alone.
 ///
-/// Answering `Interest::sometimes` is what fixes it: the callsite is re-asked per event, so a
-/// thread with a sink captures and a thread without one does not. That second half is not an
-/// optimisation, it is the honest part. Enabling the level process-wide would execute every
-/// `info!` argument in the crate and mark ~30 lines covered that nothing asserts — which is the
-/// gaming `coverage.md` forbids. Here a `tracing::` line is covered exactly when some
-/// test asked to read it.
+/// Answering `Interest::sometimes` fixes it: the callsite is re-asked per event, so a thread with a
+/// sink captures and a thread without one does not. That second half is not an optimisation; it is
+/// the honest part. Enabling the level process-wide would execute every `info!` argument in the
+/// crate and mark lines covered that nothing asserts, the gaming `coverage.md` forbids. Here a
+/// `tracing::` line is covered exactly when some test asked to read it.
 struct Capture;
 
 impl tracing::Subscriber for Capture {
@@ -82,11 +81,11 @@ impl Visit for Recorder<'_> {
     }
 }
 
-/// Run `body` with every event at `level` or above captured, and hand back what was logged.
+/// Run `body` with every event at `level` or above captured, and return what was logged.
 ///
-/// The log **is** an interface. When a user asks why they have no completions, stderr is the
-/// only thing that answers: which rbs was used, how many gems resolved, which `ya-lsp.toml` was
-/// read. Those lines are as much a product as a hover card, and this is what asserts them.
+/// The log **is** an interface. When a user asks why they have no completions, stderr is the only
+/// thing that answers: which rbs was used, how many gems resolved, which `ya-lsp.toml` was read.
+/// Those lines are as much a product as a hover card, and this is what asserts them.
 pub fn captured_logs<T>(level: Level, body: impl FnOnce() -> T) -> (T, String) {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {

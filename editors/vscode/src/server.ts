@@ -1,8 +1,8 @@
 /**
  * Which `ya-lsp` binary to run.
  *
- * No `vscode` import, for the same reason as `config.ts`: this is the part most likely to be
- * wrong on a platform nobody tested on, so it has to be testable without one.
+ * No `vscode` import, for `config.ts`' reason: this is the part most likely to break on a platform
+ * nobody tested, so it must be testable without an editor.
  */
 
 import * as path from 'node:path';
@@ -35,9 +35,9 @@ export function bundledPath(extensionPath: string, platform: NodeJS.Platform): s
 /**
  * The configured binary if there is one, otherwise the bundled one.
  *
- * A configured path that does not exist is an error rather than a silent fall back to the
- * bundle: someone who set the path is developing against a specific build, and running a
- * different one instead would produce results they would spend a long time not understanding.
+ * A configured path that does not exist is an error, never a silent fallback to the bundle: whoever
+ * set it is developing against a specific build, and running a different one would give results
+ * they would spend a long time not understanding.
  */
 export function resolveServer(lookup: Lookup): Resolved {
   const configured = lookup.configured.trim();
@@ -68,11 +68,11 @@ export function resolveServer(lookup: Lookup): Resolved {
 }
 
 /**
- * `~` and `${workspaceFolder}`, the two substitutions people expect a path setting to make.
+ * `~` and `${workspaceFolder}`: the two substitutions people expect a path setting to make.
  *
- * VS Code performs neither: `${workspaceFolder}` is resolved for launch configurations and task
- * definitions, not for settings, and a `~` reaches the process verbatim. Both are what somebody
- * types first, so both are handled here rather than left as a mystery.
+ * VS Code does neither: it resolves `${workspaceFolder}` in launch configurations and tasks, not
+ * settings, and passes `~` through verbatim. Both are what people type first, so both are handled
+ * here.
  */
 function expand(value: string, lookup: Lookup): string {
   let expanded = value;

@@ -1,8 +1,8 @@
 /**
- * VS Code settings, translated into what the server actually reads.
+ * VS Code settings, translated into what the server reads.
  *
- * No `vscode` import: everything here is a pure function of values the caller looked up, which
- * is the only way any of it can be tested without an extension host.
+ * No `vscode` import: everything here is a pure function of values the caller looked up, which is
+ * the only way to test it without an extension host.
  */
 
 /** The server's `PartialConfig`. Field names are its wire format, not VS Code's. */
@@ -18,7 +18,6 @@ export interface ServerOptions {
     exclude?: string[];
     load_paths?: string[];
     max_files?: number;
-    respect_gitignore?: boolean;
   };
   gems?: {
     enabled?: boolean;
@@ -44,11 +43,10 @@ export interface ServerOptions {
 /**
  * A source of *explicitly set* settings.
  *
- * "Explicitly set" is the whole point. `WorkspaceConfiguration.get` folds the default from
- * package.json in with the user's choice and returns one value, so a setting nobody touched is
- * indistinguishable from one deliberately set to the same value. Sending those defaults would
- * make package.json a second source of truth for every default in the Rust config, to be kept in
- * sync forever. Omitting what nobody set leaves exactly one.
+ * "Explicitly set" is the point. `WorkspaceConfiguration.get` merges package.json's default with
+ * the user's choice, so an untouched setting looks the same as one set to the default value.
+ * Sending those defaults would make package.json a second source of truth for every default in the
+ * Rust config, kept in sync forever. Sending only what the user set leaves one source.
  */
 export interface Settings {
   /** The user's value for `ya-lsp.<key>`, or `undefined` if they never set one. */
@@ -58,11 +56,10 @@ export interface Settings {
 /**
  * A list setting, or `undefined` unless the user set one whose shape this file can vouch for.
  *
- * There is deliberately no empty-value case here, unlike `gems.rubyVersion` and `rbs.path`:
- * `""` is how those two spell "work it out yourself", but `[]` is a value — no excludes, no
- * extra load paths, no extra gem roots. `index.include = []` is the one that indexes nothing,
- * and the server already says so out loud; dropping it here would turn a reported mistake into
- * a setting that silently does nothing.
+ * **No empty-value case here**, unlike `gems.rubyVersion` and `rbs.path`. For those two, `""` means
+ * "work it out yourself"; here `[]` is a value: no excludes, no extra load paths, no extra gem
+ * roots. `index.include = []` indexes nothing, and the server says so out loud; dropping it here
+ * would turn a reported mistake into a setting that silently does nothing.
  */
 function strings(settings: Settings, key: string): string[] | undefined {
   const value = settings.explicit<unknown>(key);
@@ -72,11 +69,10 @@ function strings(settings: Settings, key: string): string[] | undefined {
 }
 
 /**
- * The `initializationOptions` for a workspace folder, or `undefined` when there is nothing to
- * say.
+ * The `initializationOptions` for a workspace folder, or `undefined` when there is nothing to say.
  *
- * Sending `undefined` is meaningfully different from sending `{}`: the server layers this under
- * `ya-lsp.toml`, and a layer that says nothing lets its own defaults through.
+ * `undefined` differs from `{}`: the server layers this under `ya-lsp.toml`, and a layer that says
+ * nothing lets the server's defaults through.
  */
 export function serverOptions(settings: Settings): ServerOptions | undefined {
   const options: ServerOptions = {};
@@ -98,19 +94,14 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
   if (typeof maxFiles === 'number') {
     index.max_files = maxFiles;
   }
-  const respectGitignore = settings.explicit<boolean>('index.respectGitignore');
-  if (typeof respectGitignore === 'boolean') {
-    index.respect_gitignore = respectGitignore;
-  }
   if (Object.keys(index).length > 0) {
     options.index = index;
   }
 
-  // `logLevel` is the one setting whose editor name does not map onto its TOML name: it shipped
-  // as `ya-lsp.logLevel` when it was an environment variable, and a rename would cost a
-  // deprecation, a migration and a window where both keys are read. So the key stays and the
-  // value now travels in the layer like every other setting — which is what took it off
-  // `RESTART_REQUIRED`, because a level the server is *told* can change while it runs.
+  // `logLevel` is the one setting whose editor name does not map onto its TOML name. It shipped as
+  // `ya-lsp.logLevel`, and a rename would cost a deprecation, a migration, and a window where both
+  // keys are read. So the key stays, and the value travels in the layer like every other setting. A
+  // level the server is *told* can change while it runs, so it needs no restart.
   const log: NonNullable<ServerOptions['log']> = {};
   const level = settings.explicit<string>('logLevel');
   if (typeof level === 'string' && level.trim() !== '') {
@@ -120,9 +111,9 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
   if (typeof logFile === 'boolean') {
     log.file = logFile;
   }
-  // Unlike `gems.rubyVersion` and `rbs.path`, an empty string here is not "work it out
-  // yourself" — there is no discovery to fall back on — so it is dropped as the mistake it is
-  // rather than sent as a path called "".
+  // Unlike `gems.rubyVersion` and `rbs.path`, an empty string here is not "work it out yourself"
+  // (there is no discovery to fall back on), so it is dropped as the mistake it is, not sent as a
+  // path called "".
   const logFilePath = settings.explicit<string>('log.filePath');
   if (typeof logFilePath === 'string' && logFilePath.trim() !== '') {
     log.file_path = logFilePath.trim();
@@ -144,8 +135,8 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
   if (typeof defaultGems === 'boolean') {
     gems.default_gems = defaultGems;
   }
-  // An empty string is the "auto-detect" default written out, not a Ruby version. Sending it
-  // would make the server look for gems belonging to a Ruby called "".
+  // An empty string is the "auto-detect" default written out, not a Ruby version. Sending it would
+  // make the server look for gems of a Ruby called "".
   const rubyVersion = settings.explicit<string>('gems.rubyVersion');
   if (typeof rubyVersion === 'string' && rubyVersion.trim() !== '') {
     gems.ruby_version = rubyVersion.trim();
@@ -167,8 +158,8 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
   if (typeof rbsStdlib === 'boolean') {
     rbs.stdlib = rbsStdlib;
   }
-  // As with `gems.rubyVersion`: the empty string is the "find one yourself" default written
-  // out, and sending it would point the server at a directory called "".
+  // As with `gems.rubyVersion`: the empty string is the "find one yourself" default written out,
+  // and sending it would point the server at a directory called "".
   const rbsPath = settings.explicit<string>('rbs.path');
   if (typeof rbsPath === 'string' && rbsPath.trim() !== '') {
     rbs.path = rbsPath.trim();
@@ -177,8 +168,8 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
     options.rbs = rbs;
   }
 
-  // `enabled` is a word rather than a boolean and the server takes both, so it is sent as
-  // written: the drop-down offers `auto`, which has no boolean spelling at all.
+  // `enabled` is a word, not a boolean, and the server takes both, so it is sent as written: the
+  // drop-down offers `auto`, which has no boolean spelling.
   const rails: NonNullable<ServerOptions['rails']> = {};
   const railsEnabled = settings.explicit<string>('rails.enabled');
   if (typeof railsEnabled === 'string' && railsEnabled.trim() !== '') {
@@ -194,11 +185,10 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
     options.rails = rails;
   }
 
-  // **An empty list is a value here and is sent as one**, unlike `gems.rubyVersion` and
-  // `rbs.path` where `""` spells "work it out yourself". `trees.test = []` turns the suite
-  // fence off and `trees.migration = []` turns the migration fence off; both are things a
-  // project may legitimately mean, and dropping them would turn a deliberate setting into one
-  // that silently does nothing.
+  // **An empty list is a value here, and is sent as one** (unlike `""` for `gems.rubyVersion` and
+  // `rbs.path`). `trees.test = []` turns the suite fence off, and `trees.migration = []` the
+  // migration fence. A project may mean either, and dropping them would turn a deliberate setting
+  // into one that silently does nothing.
   const trees: NonNullable<ServerOptions['trees']> = {};
   const testTrees = strings(settings, 'trees.test');
   if (testTrees) {
@@ -269,13 +259,10 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
 /**
  * The environment the server process is started with.
  *
- * **`YA_LSP_LOG` is deliberately not set from `ya-lsp.logLevel` any more.** The level used to be
- * read once by `EnvFilter::try_from_env`, before the server had a client to be configured by,
- * which is why changing it restarted the process; it is a setting in the layer now and the
- * server re-points its own log when it arrives. What the variable is left to mean is what
- * somebody debugging from a terminal typed, and the server treats it as outranking both the
- * setting and `ya-lsp.toml` — so passing the setting through here as well would take that away
- * from the one person it exists for.
+ * **`YA_LSP_LOG` is never set from `ya-lsp.logLevel`.** The level is a setting in the layer, and
+ * the server re-points its own log when it arrives. The variable is for somebody debugging from a
+ * terminal, and the server lets it outrank both the setting and `ya-lsp.toml`; setting it here
+ * would take that away from the one person it exists for.
  *
  * The shell's own environment is passed on untouched.
  */
@@ -286,8 +273,7 @@ export function serverEnvironment(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 /**
  * Settings whose value only reaches the server through a fresh process.
  *
- * `logLevel` was on this list for as long as it was an environment variable. It is one entry
- * and not a pair on purpose: a list of one still has to be a list, because `serverPath` is
- * genuinely one of these and the next setting like it should land beside it.
+ * A list of one on purpose: `serverPath` is one of these, and the next setting like it belongs
+ * beside it.
  */
 export const RESTART_REQUIRED = ['ya-lsp.serverPath'];

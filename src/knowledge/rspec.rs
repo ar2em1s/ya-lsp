@@ -1,23 +1,20 @@
 //! RSpec, as the proof that the seam is real.
 //!
-//! **This declares one thing and ships nothing**, and both halves are deliberate. What is being
-//! proved is that a body of knowledge can be added without editing core, so the test is how many
-//! files outside this one it takes: **none**. Before the registry it took six — the `List` enum,
-//! the `WANTS` table, the feature gate, the `Context`, the `Contribution` and the pass's own
-//! ordering. A shipping RSpec module is its own item, written after this one made it cheap.
+//! **This declares one thing and ships nothing**, both deliberately. What it proves is that a body
+//! of knowledge can be added without editing core, so the test is how many files outside this one
+//! it takes: **none**. A shipping RSpec module is separate work, made cheap by this one.
 //!
 //! It is the right prover because it is shaped **unlike** Rails in the two ways that matter.
 //!
 //! **Its documents live in a tree `environment.rs` fences**, and that already works: the fence's
-//! target list is read of the *cursor* as well, and the cursor list is wider — a cursor inside
-//! `spec/` sees `spec/` — so `let(:user)` answering inside a spec is legal without this touching
-//! the fence at all.
+//! target list is read of the *cursor* too, and the cursor list is wider (a cursor inside `spec/`
+//! sees `spec/`), so `let(:user)` answering inside a spec is legal without touching the fence.
 //!
 //! **Its declarations have no named owner.** `RSpec.describe Foo do` is an anonymous subclass, so
-//! `let(:user)` has no class to hang off. That is an **RBS bound and not a Rails one** — RBS
-//! cannot declare on an anonymous class either — and the crate already has the answer: a relation
-//! class is a name this pass mints, and so is a `Struct`'s unspellable namespace. This mints one
-//! per file, which is enough to prove the shape; a shipping module would mint one per `describe`.
+//! `let(:user)` has no class to hang off. That is an **RBS bound, not a Rails one** (RBS cannot
+//! declare on an anonymous class either), and the crate already has the answer: a relation class is
+//! a name this pass mints, and so is a `Struct`'s unspellable namespace. This mints one per file,
+//! enough to prove the shape; a shipping module would mint one per `describe`.
 
 use std::collections::BTreeSet;
 
@@ -37,8 +34,8 @@ static WANTS: [Wants; 1] = [Wants {
     path: Some("_spec.rb"),
     tags: false,
     inherits: false,
-    // a gem's own specs are about a project that is not this one, which is `is_own_code`'s
-    // sentence read straight
+    // a gem's own specs are about a project that is not this one: `is_own_code`'s sentence, read
+    // straight
     engines: false,
     gems: false,
     reads_only: false,
@@ -68,16 +65,16 @@ impl super::Knowledge for RSpec {
 
     /// Every `let(:name)` in the file, as an instance method on the group the file mints.
     ///
-    /// A scan rather than a parse, because what is being proved is the seam and not the reader —
-    /// and because the reader a shipping module would need is a Prism walk of nested `describe`
-    /// blocks, which is that item's work rather than this one's.
+    /// A scan, not a parse, because what is proved is the seam, not the reader. The reader a
+    /// shipping module needs is a Prism walk of nested `describe` blocks, which is that work, not
+    /// this.
     fn declare(&mut self, declaring: &Declaring<'_>, into: &mut Declared) -> Counted {
         let mut named = 0;
         for uri in declaring
             .context
             .documents(GROUPS)
             .iter()
-            .filter_map(|uri| DocUri::from_uri_str(uri))
+            .filter_map(|uri| DocUri::from_graph_uri(uri))
         {
             let Some(source) = (declaring.text)(&uri) else {
                 continue;
@@ -105,7 +102,7 @@ impl super::Knowledge for RSpec {
 
 /// The name this file's example group is minted under.
 ///
-/// A name nothing else can write, for the reason a relation class is: the group is an anonymous
+/// A name nothing else can write, for the relation class's reason: the group is an anonymous
 /// subclass, so any name is invented, and one that could collide with a constant somebody wrote
 /// would take their class off the map.
 fn group(uri: &DocUri) -> String {
@@ -138,12 +135,52 @@ fn lets(source: &str) -> Vec<String> {
         else {
             continue;
         };
-        let Some(name) = rest.split(')').next() else {
+        // **The closing paren must be there.** `split(')').next()` answers `Some` for every input,
+        // so an unterminated `let(:name` would declare a member off a line that is not Ruby.
+        // `split_once` asks the question the scan means.
+        let Some((name, _)) = rest.split_once(')') else {
             continue;
         };
+        // `let()` names nothing, and a group writing one `let` twice declares one member: the
+        // second is the one that runs, and either way there is one name.
         if !name.is_empty() && seen.insert(name.to_owned()) {
             found.push(name.to_owned());
         }
     }
     found
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_let_the_scan_reads_and_the_four_lines_it_refuses() {
+        let read = lets(
+            "\
+RSpec.describe Story do
+  let(:story) { Story.new }
+  let!(:author) { User.new }
+    let(:story) { Story.other }
+  let(:) { nil }
+  let(:unterminated
+  letter(:not_a_let) { 1 }
+  it \"works\" do
+  end
+end
+",
+        );
+        // In order and once each: the indented re-`let` is the same name, `let(:)` names nothing,
+        // `let(:unterminated` never closes, and `letter(` is a different call that starts the same
+        // way.
+        assert_eq!(read, vec!["story".to_owned(), "author".to_owned()]);
+    }
+
+    #[test]
+    fn the_group_a_file_mints_is_named_after_the_file() {
+        let uri = DocUri::from_path(std::path::Path::new("/app/spec/models/story_spec.rb"))
+            .expect("a file uri");
+        assert_eq!(group(&uri), "RSpecExampleGroup::StorySpec");
+    }
 }

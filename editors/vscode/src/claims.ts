@@ -1,24 +1,20 @@
 /**
- * Which one of several servers answers about a file, when several are running.
+ * Which of several running servers answers about a file.
  *
- * Two questions, and they arrive from opposite directions. [`Claims`] decides a file that **no**
- * workspace folder holds — a gem, Ruby's own library — which two bundles can resolve to alike.
- * [`claimedByNestedFolder`] decides a file that **two** folders hold, because VS Code lets one
- * workspace folder contain another and a selector cannot subtract the inner one. Both end in the
- * same place: two providers over one document, and the user reading the same card twice.
+ * Two questions, arriving from opposite directions. Both end the same way if unanswered: two
+ * providers over one document, and the user reading every card twice.
+ * - [`Claims`] decides a file **no** workspace folder holds (a gem, Ruby's own library). The server
+ *   registers the roots it has answers about, because only it knows where they are, and two folders
+ *   on one Ruby register the same roots.
+ * - [`claimedByNestedFolder`] decides a file **two** folders hold: VS Code lets one folder contain
+ *   another, and a selector cannot subtract the inner one.
  *
- * No `vscode` import, for `config.ts`'s reason and one more. The server registers the roots it has
- * answers about — a gem's source, Ruby's own library, the RBS beside them — because it is the only
- * side that knows where they are. In a multi-root workspace every folder's server registers *its*
- * roots, and two folders on one Ruby resolve to the same ones: without this, two providers answer
- * one hover and the user reads the same card twice, which is the failure the narrow per-folder
- * selector was protecting against arriving from the other direction.
+ * **Only the extension can decide this**, because only it sees every client at once. Deciding needs
+ * no knowledge of gems, only of which strings were already handed out. First asker wins, so the
+ * answer is stable while that client runs, and there is nothing to arbitrate when two bundles
+ * really differ: a root only one of them resolved to is claimed by that one.
  *
- * **The extension is the only place that can decide this**, because it is the only place that sees
- * every client at once — and deciding it needs no knowledge of gems at all, only of which strings
- * have already been handed out. First asker wins, so the answer is stable for as long as that
- * client is running and there is nothing to arbitrate when two bundles genuinely differ: a root
- * only one of them resolved to is claimed by that one.
+ * No `vscode` import, for `config.ts`' reason: it keeps this testable without an extension host.
  */
 
 /** LSP 3.18's relative pattern: the only narrowing shape `vscode-languageclient` understands. */
@@ -44,9 +40,9 @@ export interface Registration {
 /**
  * The prefix the server makes its document registrations under.
  *
- * Fixed on both sides, and the reason it has to be: the file watcher's registration arrives on the
- * same channel and carries no document selector, so it must be forwarded exactly as sent.
- * Recognising *these* by name is what keeps this module from touching anything else.
+ * Fixed on both sides, because the file watcher's registration arrives on the same channel with no
+ * document selector and must be forwarded exactly as sent. Recognising *these* by name keeps this
+ * module from touching anything else.
  */
 export const DOCUMENTS_ID_PREFIX = 'ya-lsp-documents/';
 
@@ -60,11 +56,12 @@ export class Claims {
   /**
    * Narrow one batch of registrations to the roots no other client already holds.
    *
-   * Registrations the server did not make under [`DOCUMENTS_ID_PREFIX`] pass through untouched, and
-   * so does one carrying no selector — the client falls back to its own for those, which is the
-   * behaviour the watcher's registration needs. A registration whose selector is emptied is
-   * **dropped rather than forwarded empty**: an empty array is not nullish, so the client would
-   * keep it, match nothing with it, and hold a provider that can never answer.
+   * - A registration not made under [`DOCUMENTS_ID_PREFIX`] passes through untouched, and so does
+   *   one with no selector: the client falls back to its own selector, which the watcher's
+   *   registration needs.
+   * - A registration whose selector is emptied is **dropped, not forwarded empty**: an empty array
+   *   is not nullish, so the client would keep it, match nothing, and hold a provider that can
+   *   never answer.
    */
   narrow(
     client: string,
@@ -86,12 +83,12 @@ export class Claims {
         if (base === undefined) {
           return true;
         }
-        // A root that lies inside *another* workspace folder is that folder's client's, by its
-        // selector, and no arbitration here can change that — taking it would put two providers
-        // over the file again from the registration side. The server drops the roots inside its
-        // own root before sending, which is the only half it can see; this is the other half, and
-        // only the extension has it. A vendored bundle in a sibling folder reaches this, and so
-        // does a shared tree a second folder put on `[index] load_paths`.
+        // A root inside *another* workspace folder belongs to that folder's client, by its
+        // selector; taking it here would put two providers over the file again, from the
+        // registration side. The server drops roots inside its own root before sending, the only
+        // half it can see; this is the other half, and only the extension has it. A vendored bundle
+        // in a sibling folder reaches this, and so does a shared tree another folder put on
+        // `index.load_paths`.
         const holder = innermostFolder(folders, base);
         if (holder !== undefined && holder !== client) {
           return false;
@@ -115,13 +112,13 @@ export class Claims {
   }
 
   /**
-   * Give up everything a client held, and say which other clients now have a reason to ask again.
+   * Give up everything a client held, and return which other clients now have a reason to ask
+   * again.
    *
-   * A selector cannot be changed after construction, so a client that lost a root the first time
-   * cannot pick it up later without being rebuilt — and a root nobody owns is a gem file that
-   * answers nothing, which is the silence this whole mechanism exists to end. The caller decides
-   * whether a rebuild is right: a client stopping on its way to being restarted anyway will claim
-   * its own roots back a moment later.
+   * A selector is fixed at construction, so a client that lost a root cannot pick it up without
+   * being rebuilt, and a root nobody owns is a gem file that answers nothing: the silence this
+   * mechanism exists to end. The caller decides whether to rebuild: a client being restarted anyway
+   * claims its own roots back a moment later.
    */
   release(client: string): string[] {
     const released = new Set<string>();
@@ -146,35 +143,31 @@ export class Claims {
 /**
  * Whether a document inside this client's folder is really a nested folder's to answer.
  *
- * VS Code lets one workspace folder contain another — a monorepo listing `/repo` for the code
- * beside the apps and `/repo/backend` for an application with its own `Gemfile.lock` — and
- * `getWorkspaceFolder` resolves a file in the inner one to the **innermost** folder. A document
- * selector cannot say that. LSP's glob syntax has `*`, `**`, `?`, `{}` and `[]` and no way to
- * subtract a path, so "under `/repo` but not under `/repo/backend`" is unsayable, and the outer
- * folder's client claims the inner folder's files along with its own. Both clients then match,
- * `languages.match` scores both, and every request is answered twice: a hover card printed twice,
- * a completion list with every item doubled, one set of squiggles on top of another.
+ * **The problem.** VS Code lets one workspace folder contain another, like a monorepo listing
+ * `/repo` for shared code and `/repo/backend` for an app with its own `Gemfile.lock`.
+ * `getWorkspaceFolder` resolves a file in the inner one to the **innermost** folder, but a document
+ * selector cannot: LSP globs have `*`, `**`, `?`, `{}` and `[]` and no way to subtract a path. So
+ * the outer client claims the inner folder's files too, both clients match, and every request is
+ * answered twice: doubled hover cards, doubled completion items, stacked squiggles.
  *
- * `index.exclude` does not reach it. The outer server indexes an opened buffer whatever its walk
- * collected, so it answers about a file it was told to ignore — which is why the narrowing has to
- * happen on this side, at the point the request would be sent.
+ * **`index.exclude` does not help.** The outer server indexes an opened buffer whatever its walk
+ * collected, so the narrowing must happen here, where the request would be sent.
  *
- * Only a **descendant** folder wins. A sibling's files are already refused by the selector, and a
- * document under no other folder stays this client's however deep it sits — the outer folder is
- * still the only one that holds `/repo/shared`.
+ * **Only a descendant folder wins.** A sibling's files are already refused by the selector, and a
+ * document under no other folder stays this client's however deep it sits (the outer folder alone
+ * holds `/repo/shared`).
  *
- * Prefix comparison on the editor's own URI spelling, which is what [`Claims`] already assumes of
- * `baseUri`: both strings are `Uri.toString()` from the same process, so they cannot disagree
- * about encoding the way a client's URI and rubydex's can.
+ * **Prefix comparison on the editor's own URI spelling**, which [`Claims`] already assumes of
+ * `baseUri`: both strings are `Uri.toString()` from one process, so they cannot disagree about
+ * encoding the way a client's URI and rubydex's can.
  */
 export function claimedByNestedFolder(
   folder: string,
   folders: readonly string[],
   document: string
 ): boolean {
-  // Not this client's folder at all, so there is nothing here to give away. A root the server
-  // registered — a gem, Ruby's own library — arrives looking exactly like this, and `Claims` is
-  // what decides those.
+  // Not this client's folder at all, so there is nothing to give away. A root the server registered
+  // (a gem, Ruby's own library) arrives looking exactly like this, and `Claims` decides those.
   if (!within(folder, document)) {
     return false;
   }
@@ -185,11 +178,9 @@ export function claimedByNestedFolder(
 /**
  * The workspace folder that holds `path`, or `undefined` when none does.
  *
- * **Innermost wins**, which is what `getWorkspaceFolder` answers and therefore the only answer
- * that agrees with the editor. Longest match rather than first: folders arrive in the order the
- * `.code-workspace` lists them, which says nothing about which contains which, and taking the
- * first would hand a nested folder's files to whichever of the two happened to be written down
- * first.
+ * **Innermost wins**, which is what `getWorkspaceFolder` answers, so it agrees with the editor.
+ * Longest match, not first: folders arrive in `.code-workspace` order, which says nothing about
+ * containment, and first match would give a nested folder's files to whichever was listed first.
  */
 function innermostFolder(folders: readonly string[], path: string): string | undefined {
   let held: string | undefined;
@@ -205,7 +196,7 @@ function innermostFolder(folders: readonly string[], path: string): string | und
  * Whether `path` is `base` or sits under it.
  *
  * The trailing slash is trimmed because a folder URI may carry one and a document URI never does,
- * and because `/repo` must not be read as a prefix of `/repository`.
+ * and so that `/repo` is not read as a prefix of `/repository`.
  */
 function within(base: string, path: string): boolean {
   const prefix = base.replace(/\/+$/, '');

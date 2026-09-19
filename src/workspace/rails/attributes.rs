@@ -1,13 +1,15 @@
-//! `attribute`, and the cast type that is the only evidence the call is Rails' at all.
+//! `attribute`, and the two kinds of evidence that the call is Rails' at all.
 //!
-//! One name and one member, declared **only** where the second positional argument is a symbol
-//! naming one of [`super::COLUMN_TYPES`] — the ten a migration writes, which is the registry
-//! Rails looks a cast type up in.
+//! Each call names one member (and its writer). What is declared depends on the second positional
+//! argument:
+//! - **a symbol naming one of [`super::COLUMN_TYPES`]** (the ten a migration writes, the registry
+//!   Rails looks a cast type up in): the member, typed, on any host;
+//! - **anything else, or nothing**: the member as `untyped`, and only on a host the project treats
+//!   as a model (a model class or a module), and only where no column already holds the name.
 //!
 //! # `attribute` in a class body is not evidence that a method exists
 //!
-//! Three gems spell a macro `attribute`, and **only Rails' defines a method** — which is why this
-//! reader is the narrowest in the directory:
+//! Three gems spell a macro `attribute`, and **only Rails' defines a method**:
 //!
 //! | who | what `attribute :name` does | second positional |
 //! | --- | --- | --- |
@@ -15,36 +17,32 @@
 //! | `active_model_serializers` | stores an `Attribute` in `_attributes_data` | an options hash |
 //! | `jsonapi-serializer` | `alias_method :attribute, :attributes`, stores a `Scalar` | *another name* |
 //!
-//! Both serializer gems read the value off the record they are serializing, so a serializer
-//! answers `respond_to?` **false** for every name its own macro wrote — unless its author also
-//! wrote a `def` of that name, which is a definition rubydex already has. Declaring a member for
-//! those calls would be declaring a method that does not exist, and they are the large majority.
+//! Both serializer gems read the value off the record they serialize, so a serializer answers
+//! `respond_to?` **false** for every name its own macro wrote (unless its author also wrote a
+//! `def`, which rubydex already has). Declaring a member for those calls would declare a method
+//! that does not exist, and serializers write most `attribute` calls.
 //!
-//! The cast type separates them by *syntax* rather than by a guess about the class.
-//! `attribute :thing, :string` cannot be either serializer's call: `active_model_serializers`
-//! would `fetch` on a `Symbol` and raise, and `jsonapi-serializer` would read `:string` as a
-//! second attribute name. That is also why a type symbol ya-lsp cannot map is declined —
-//! `attribute :name, :tag_line` **is** that gem's list form.
-//!
-//! The cost is a handful of real Rails attributes that name an unmapped type or no type at all,
-//! and it is the direction every reader here picks: **the untyped half is worth less than
-//! nothing**, because it is the shape both serializers write.
+//! Two pieces of evidence separate them:
+//! 1. **The cast type, by syntax.** `attribute :thing, :string` cannot be either serializer's call:
+//!    `active_model_serializers` would `fetch` on a `Symbol` and raise, and `jsonapi-serializer`
+//!    would read `:string` as a second attribute name. That is also why a type symbol ya-lsp cannot
+//!    map carries no type: `attribute :name, :tag_line` **is** that gem's list form.
+//! 2. **The host, when there is no cast type.** Without a cast type the syntax is the serializers'
+//!    too, so the question moves to the class: the same admit list `has_many` uses.
 //!
 //! # What Rails says about the precedence
 //!
-//! `activerecord/lib/active_record/attributes.rb` documents the macro in two sentences that
-//! settle it:
+//! `activerecord/lib/active_record/attributes.rb` settles it in two sentences:
 //!
 //! > Defines an attribute with a type on this model. **It will override the type of existing
 //! > attributes if needed.** … If this parameter is not passed, **the previously defined type
 //! > (if any) will be used**.
 //!
-//! So a written cast type *re-types its column*, exactly as an `enum` does — the attribute wins
-//! and the column defers, not the other way round. The mechanism is the `enum`'s:
+//! So a written cast type *re-types its column*, exactly as an `enum` does: the attribute wins and
+//! the column defers. The mechanism is the `enum`'s:
 //! [`Model::retyped_columns`](super::Model::retyped_columns) tells the schema which columns to
-//! withdraw, and no rank moves. The second sentence is why a call with no cast type costs so
-//! little by declaring nothing: deferring to the column is what Rails does, and it is what
-//! declining does.
+//! withdraw, and no rank moves. The second sentence is why an untyped call over an existing column
+//! declares nothing: deferring to the column is what Rails does.
 
 use ruby_prism::{CallNode, Node};
 
@@ -55,7 +53,7 @@ use crate::generated::{Declared, Facts, Owner, Source};
 /// The cast type a call wrote, where this crate has a class for it.
 #[derive(Debug)]
 pub(super) struct Cast {
-    /// As written — `integer` — for the provenance line.
+    /// As written (`integer`), for the provenance line.
     written: String,
     /// The class it names: `Integer`.
     returns: &'static str,
@@ -66,12 +64,12 @@ pub(super) struct Cast {
 pub(super) struct Attribute {
     /// The member's name: `count`.
     name: String,
-    /// The cast type as written — `integer` — for the provenance line, where one was written.
+    /// The cast type, where one was written and this crate has a class for it.
     ///
-    /// `None` is a call with no second positional argument, or one this crate has no class for.
-    /// It says the **member** and nothing about the type, which is the same inversion `delegate`
-    /// makes: what is declined is the type and never the name, because
-    /// `ActiveModel::AttributeMethods` defines the pair whatever the cast is.
+    /// `None` is a call with no second positional argument, or one this crate has no class for. It
+    /// says the **member** and nothing about the type: the same inversion `delegate` makes. The
+    /// type is declined, never the name, because `ActiveModel::AttributeMethods` defines the pair
+    /// whatever the cast is.
     cast: Option<Cast>,
     /// The whole `attribute ...` header, and the member's own name inside it.
     at: (u32, u32),
@@ -80,9 +78,9 @@ pub(super) struct Attribute {
 
 /// Read one `attribute` call, or decline it.
 ///
-/// Every `None` here is the same rule read from a different side: a call this cannot take a
-/// **name** out of names a member it could not spell, and a call this cannot take a **cast type**
-/// out of is not evidence that Rails' macro was the one written.
+/// `None` means no **name** could be taken out of the call: a member this could not spell. A
+/// missing or unmappable cast type is not a decline here; it is `cast: None`, and
+/// [`Attribute::declare`] decides what that is worth.
 pub(super) fn read(source: &str, node: &CallNode<'_>) -> Option<Attribute> {
     let at = header(node)?;
     let mut arguments = node.arguments()?.arguments().iter();
@@ -98,10 +96,10 @@ pub(super) fn read(source: &str, node: &CallNode<'_>) -> Option<Attribute> {
 /// The cast type a call's second positional argument names, when it names one.
 ///
 /// **A symbol and nothing else.** Rails' `resolve_type_name` looks a `Symbol` up in the type
-/// registry and uses anything else *as* the type object, so a string is not a spelling of a cast
-/// type the way it is a spelling of a table name — and `attribute :thing, Types::Money.new` is a
-/// type only Ruby that runs can resolve. The keyword hash of `attribute :thing, default: 1`
-/// arrives here too and is not a symbol either.
+/// registry and uses anything else *as* the type object. So a string is not a spelling of a cast
+/// type (as it is of a table name), and `attribute :thing, Types::Money.new` is a type only running
+/// Ruby can resolve. The keyword hash of `attribute :thing, default: 1` arrives here too, and is
+/// not a symbol either.
 fn cast(source: &str, node: Option<Node<'_>>) -> Option<Cast> {
     let (written, _) = node
         .filter(|node| node.as_symbol_node().is_some())
@@ -118,39 +116,35 @@ impl Attribute {
 
     /// The column this call re-types, where it re-types one.
     ///
-    /// Only a written cast type does. `attributes.rb` says a call without one uses "the
-    /// previously defined type (if any)", which is the column — so an untyped call withdraws
-    /// nothing and `retyped_columns` is unchanged by it.
+    /// Only a written cast type does. `attributes.rb` says a call without one uses "the previously
+    /// defined type (if any)", which is the column, so an untyped call withdraws nothing.
     pub(super) fn retypes(&self) -> Option<&str> {
         self.cast.as_ref().map(|_| self.name.as_str())
     }
 
     /// Say the member.
     ///
-    /// The type is **optional whatever the column said**, and the reason is the one
+    /// A typed call is optional **whatever the column said**, for the reason
     /// [`Enum::declare`](super::enums::Enum::declare) gives for the same `?`: nothing in an
-    /// `attribute` call says the value is present — an ActiveModel attribute is `nil` until it is
-    /// assigned, and a `default:` can still be assigned `nil` — so over-admitting `nil` is the
-    /// direction that is never wrong. It also bounds what withdrawing a column can cost:
-    /// `Integer?` is a strictly weaker claim than the `Integer` a `null: false` column made, so
-    /// re-typing can never turn a right answer into a wrong one.
-    /// The host gate, and it is the one thing an untyped call needs that a typed one does not.
+    /// `attribute` call says the value is present (an ActiveModel attribute is `nil` until
+    /// assigned, and a `default:` can still be assigned `nil`), so over-admitting `nil` is never
+    /// wrong. It also bounds what withdrawing a column can cost: `Integer?` is strictly weaker than
+    /// the `Integer` a `null: false` column claimed, so re-typing never turns a right answer into a
+    /// wrong one.
     ///
-    /// A cast type is a **shape** neither serializer gem's macro can produce — 0 of 26 such
-    /// calls in five corpora are on a serializer, because `active_model_serializers` would
-    /// `fetch` on a `Symbol` and raise and `jsonapi-serializer` would read `:string` as an
-    /// attribute called `string`. Without one there is no shape left, so the question moves to
-    /// the **host**, which is the same admit list `has_many` uses: a `module`, or a class the
-    /// project treats as a model.
+    /// `admitted` is the host gate, which only an untyped call needs. A cast type is a **shape**
+    /// neither serializer gem's macro can produce. Without one there is no shape left, so the
+    /// caller decides by the **host** (a `module`, or a class the project treats as a model) and by
+    /// whether a column already holds the name.
     pub(super) fn declare(&self, facts: &mut Facts, file: &str, owner: &Owner, admitted: bool) {
         let Some(cast) = self.cast.as_ref() else {
             if !admitted {
                 return;
             }
-            // The name and never the type, which is `delegate`'s inversion arriving at a second
-            // reader: `ActiveModel::AttributeMethods` defines the pair whatever the cast is, and
-            // `Types::harvest` **drops** `untyped` — so the member exists for resolution and
-            // nothing at all is claimed about what it holds.
+            // The name, never the type: `delegate`'s inversion again.
+            // `ActiveModel::AttributeMethods` defines the pair whatever the cast is, and
+            // `Types::harvest` **drops** `untyped`, so the member exists for resolution and nothing
+            // is claimed about what it holds.
             for (name, parameters, returns) in [
                 (self.name.clone(), "()", "untyped"),
                 (format!("{}=", self.name), "(untyped)", "void"),
@@ -224,8 +218,8 @@ mod tests {
             .rbs
     }
 
-    /// A class the project does **not** treat as a model — a serializer, which is 142 of the
-    /// corpus' 173 `attribute` calls.
+    /// A class the project does **not** treat as a model: a serializer, where most `attribute`
+    /// calls are.
     fn rbs(body: &str) -> String {
         declarations(&format!("class Story < ApplicationRecord\n{body}end\n"))
     }
@@ -253,8 +247,8 @@ end
         );
     }
 
-    /// All ten of [`COLUMN_TYPES`], because the registry a cast type is looked up in is the one a
-    /// migration writes into and a divergence between the two would be silent.
+    /// All ten of [`COLUMN_TYPES`], because a cast type is looked up in the registry a migration
+    /// writes into, and a divergence between the two would be silent.
     #[test]
     fn every_column_type_is_a_cast_type() {
         for (kind, ruby) in super::COLUMN_TYPES {
@@ -267,12 +261,13 @@ end
     }
 
     /// The serializer gems in one test, on a host that is not a model.
+    /// - A type object and a bare `default:` are `active_model_serializers`' options hash and
+    ///   Rails' own untyped form: the same syntax.
+    /// - A second symbol that is not a cast type is `jsonapi-serializer`'s list form.
+    /// - A string is not a spelling of a cast type at all.
     ///
-    /// A type object and a bare `default:` are `active_model_serializers`' options hash and
-    /// Rails' own untyped form, which are the same syntax; a second symbol that is not a cast
-    /// type is `jsonapi-serializer`'s list form; and a string is not a spelling of a cast type
-    /// at all. None of them says anything about the **type**, and on a serializer — which is
-    /// where 142 of the corpus' 173 calls are — none of them says anything at all.
+    /// None of them says anything about the **type**, and on a serializer none of them says
+    /// anything at all.
     #[test]
     fn a_call_that_does_not_name_a_cast_type_declares_nothing_on_a_serializer() {
         for call in [
@@ -291,9 +286,9 @@ end
 
     /// On a host that really is Rails', the same calls declare the **member**.
     ///
-    /// What is declined is the type and never the name. `ActiveModel::AttributeMethods` defines the pair whatever the cast
-    /// is, and `Types::harvest` drops `untyped`, so the member exists for resolution and nothing
-    /// at all is claimed about what it holds.
+    /// The type is declined, never the name. `ActiveModel::AttributeMethods` defines the pair
+    /// whatever the cast is, and `Types::harvest` drops `untyped`, so the member exists for
+    /// resolution and nothing is claimed about what it holds.
     #[test]
     fn a_call_that_names_no_cast_type_still_names_a_member_on_a_model() {
         for call in [
@@ -312,17 +307,16 @@ end
                 "{call}"
             );
         }
-        // And a name it cannot read is still no member, which is the half the host test does
-        // not change.
+        // And a name it cannot read is still no member: the half the host test does not change.
         assert_eq!(on_a_model("  attribute(*names)\n"), "");
     }
 
     /// The column wins, and it wins from **another document**.
     ///
-    /// `attributes.rb` says a call with no cast type uses "the previously defined type (if
-    /// any)", which is the column — so the untyped member would be a strictly worse answer, and
-    /// the two are in the model's generated document and the schema's, where two `def note:`
-    /// lines are a silent overload set and the type is whichever was harvested last.
+    /// `attributes.rb` says a call with no cast type uses "the previously defined type (if any)",
+    /// which is the column, so the untyped member would be strictly worse. The two would sit in the
+    /// model's generated document and the schema's, where two `def note:` lines are a silent
+    /// overload set typed by whichever was harvested last.
     #[test]
     fn an_untyped_attribute_declines_to_a_column_of_the_same_name() {
         let columns: BTreeSet<(String, String)> = [("Story".to_owned(), "note".to_owned())]
@@ -352,11 +346,11 @@ end
         }
     }
 
-    /// A concern owns an `attribute` on the same terms a class does, which a `scope` does not.
+    /// A concern owns an `attribute` on the same terms a class does, unlike a `scope`.
     ///
-    /// A concern's rule read the other way: the member is one type whoever includes the module —
-    /// `attribute :rate_limit, :boolean` is a `bool?` in every includer — where `scope :expired`
-    /// is a different relation for each of them and is declined.
+    /// The member is one type whoever includes the module (`attribute :rate_limit, :boolean` is a
+    /// `bool?` in every includer), whereas `scope :expired` is a different relation for each
+    /// includer and is declined.
     #[test]
     fn a_concern_declares_its_attributes_on_the_module() {
         let rbs = declarations(
@@ -366,10 +360,10 @@ end
         assert!(rbs.contains("def rate_limit: () -> bool?"), "{rbs}");
     }
 
-    /// Which columns the schema is told to withdraw, and a module is not asked at all.
+    /// Which columns the schema is told to withdraw; a module is not asked at all.
     ///
-    /// A concern claims no table, and the classes whose columns its `attribute` really does
-    /// re-type are its includers, which this pass cannot see.
+    /// A concern claims no table. The classes whose columns its `attribute` really re-types are its
+    /// includers, which this pass cannot see.
     #[test]
     fn a_module_withdraws_no_column() {
         let model = read_model(
@@ -384,14 +378,13 @@ end
 
     /// `attribute`'s precedence, which Rails documents and which is easy to get backwards.
     ///
-    /// `attributes.rb` says a cast type "will override the type of existing attributes if
-    /// needed" and that a call with no cast type keeps "the previously defined type" — so the
-    /// two halves of this test are the two halves of that sentence. `price` is re-typed and the
-    /// schema withdraws its column, which has to produce **one** `Story#price` and a chain that
-    /// reaches the cast type rather than the storage. `note` names no type, so nothing is
-    /// declared for it at all and the column is exactly where it was — which is both what Rails
-    /// does and what the serializer gems require, since a call with no cast type is the shape
-    /// their macros also have.
+    /// `attributes.rb` says a cast type "will override the type of existing attributes if needed",
+    /// and a call with no cast type keeps "the previously defined type". The two halves of this
+    /// test are the two halves of that sentence.
+    /// - `price` is re-typed and the schema withdraws its column: **one** `Story#price`, and a
+    ///   chain that reaches the cast type, not the storage.
+    /// - `note` names no type and the column already holds the name, so nothing is declared for it
+    ///   and the column stays exactly where it was.
     #[test]
     fn an_attribute_re_types_the_column_it_overrides_and_defers_where_it_names_no_type() {
         let source = "Story.new.price.upcase\n";
@@ -423,8 +416,8 @@ end
             chained.contains("String#upcase"),
             "the cast type, not the integer it is stored as: {chained}"
         );
-        // The other half: an `attribute` with no cast type declares nothing, so the column is
-        // the only declaration there is and it still types the chain.
+        // The other half: an `attribute` with no cast type over an existing column declares
+        // nothing, so the column is the only declaration and still types the chain.
         assert_eq!(
             harness.declarations_of("Story#note()"),
             1,
@@ -443,9 +436,9 @@ end
     /// The long tail's phase two: an alias takes the type of the column it aliases, across two
     /// generated documents.
     ///
-    /// The second consumer of `Facts::returns`, and the shorter of the two paths — one
-    /// hop where a `delegate` takes two. `title` is declared into `db/schema.rb`'s document and
-    /// the alias into the model's, in the same pass, with nothing resolved and nothing indexed.
+    /// The second consumer of `Facts::returns`, and the shorter path: one hop where a `delegate`
+    /// takes two. `title` is declared into `db/schema.rb`'s document and the alias into the
+    /// model's, in the same pass, with nothing resolved and nothing indexed.
     #[test]
     fn an_alias_attribute_takes_the_type_of_the_column_it_aliases() {
         let source = "Story.new.headline.upcase\n";
@@ -469,12 +462,10 @@ end
 
     /// An `attribute` and a `def` of the same name are two places, and both are the user's own.
     ///
-    /// The one position in 420,249 a tier sweep calls *worse*, pinned here because it is the
-    /// instrument rather than the answer: forem's `ResponseTemplate` writes
-    /// `attribute :user_identifier, :string` and a `def user_identifier` under it, so the card
-    /// gains a second place and `sweep.py`'s `tier` reads any card containing "Defined in " as
-    /// the name-based list. The answer got strictly better — the same declaration, now with the
-    /// line that typed it named beside the line that wrote it.
+    /// `attribute :user_identifier, :string` with a `def user_identifier` under it gives the card a
+    /// second place: the line that typed the member, named beside the line that wrote it. That is
+    /// strictly better, even though a card containing "Defined in " twice can look like a
+    /// name-based list to a sweep that counts places.
     #[test]
     fn an_attribute_beside_a_def_of_the_same_name_is_two_places() {
         let source = "Story.new.nickname\n";

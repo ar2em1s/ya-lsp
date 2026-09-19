@@ -1,6 +1,6 @@
 """Every method name defined by something that is **not** one of the corpora.
 
-Machine state, cached, and the one input to this lane that is not a function of the pins.
+Machine state, cached: the one input to this lane that is not a function of the pins.
 """
 
 import glob
@@ -17,23 +17,23 @@ CACHE = ROOT / "tmp" / "audit-foreign.json"
 def foreign_names():
     """Every method name defined by a gem or by Ruby's own library, on this machine.
 
-    The length-and-underscore heuristic in `neutral.knowable` is not enough on its own, and
-    lobsters says why: `valid?` is six characters with a `?`, and the application really does
-    define `def valid?` exactly once — in `app/models/short_id.rb`. So does ActiveModel, which is
-    the right answer at every call site the sample reached, and a key built on the first fact
-    scores the right answer wrong.
+    `neutral.knowable`'s length-and-underscore heuristic is not enough alone. `valid?` is six
+    characters with a `?`, and lobsters defines `def valid?` exactly once, in
+    `app/models/short_id.rb`. So does ActiveModel, which is the right answer at every call site the
+    sample reaches, so a key built on the first fact scores the right answer wrong.
 
-    The fix is to ask the machine rather than to lengthen the heuristic: a name **anything else**
-    defines is not a name this corpus can be the answer key for. It over-blocks — some gem on
-    the disk defines `find_by_url` and every corpus loses that position — and over-blocking is
-    the safe direction **here**, because in a key it only ever removes a question. It is not
-    safe in a filter on the draw, which is why `routes.non_helpers` does not consult this.
+    **Ask the machine instead of lengthening the heuristic:** a name **anything else** defines is
+    not a name this corpus can be the key for.
+    - It over-blocks: some gem defines `find_by_url`, and every corpus loses that position.
+    - Over-blocking is safe **here**, because in a key it only removes a question. It is not safe in
+      a filter on the draw, so `routes.non_helpers` does not use this.
 
-    **It is machine state, and that is a caveat the report diff has to carry.** The corpora
-    install their bundles into each Ruby's own gem home, which is exactly what this walk reads,
-    so bundling a sixth project changes the key and therefore the denominator. Two runs on
-    different machines are not comparable on this lane; two runs on this one are, as long as the
-    cache is not rebuilt between them. Delete `tmp/audit-foreign.json` to rebuild.
+    **It is machine state, and the report diff must carry that caveat.** The corpora install their
+    bundles into each Ruby's own gem home, which this walk reads, so bundling another project
+    changes the key and the denominator.
+    - Runs on different machines are not comparable on this lane.
+    - Runs on one machine are, as long as the cache is not rebuilt between them. Delete
+      `tmp/audit-foreign.json` to rebuild.
     """
     if CACHE.exists():
         return set(json.loads(CACHE.read_text()))

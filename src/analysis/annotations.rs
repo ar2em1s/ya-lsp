@@ -1,42 +1,43 @@
 //! What a human wrote the type down as: a Sorbet `sig` block, or a YARD `@return` tag.
 //!
-//! The only generator that reads a *claim* rather than a fact. `db/schema.rb` is what the
-//! database is and `belongs_to :user` is what ActiveRecord will do; a `sig` block and a `@return`
-//! tag are what somebody believed when they wrote the line, and nothing checks either unless a
-//! type checker is run. So both are **derived** answers, and the provenance comment says which of
-//! the two it read.
+//! The only generator that reads a *claim*, not a fact. `db/schema.rb` is what the database is, and
+//! `belongs_to :user` is what ActiveRecord will do. A `sig` or a `@return` is what somebody
+//! believed when writing the line, and nothing checks it unless a type checker runs. So both are
+//! **derived** answers, and the provenance comment says which one was read.
 //!
 //! # Why one module reads both
 //!
-//! They are the same shape: find a method, find a type somebody wrote next to it, produce RBS.
-//! Only the syntax differs, and not in a way that reaches the output — a `sig` is a Ruby AST
-//! Prism already parsed, a YARD tag is a comment above a `def`, and both end at
-//! `Declarations::declare`. Splitting them would duplicate the parameter renderer, which is the
-//! half of this module with the real detail in it.
+//! Same shape: find a method, find a type written next to it, produce RBS. Only the syntax differs,
+//! and not in a way that reaches the output:
+//! - a `sig` is a Ruby AST Prism already parsed;
+//! - a YARD tag is a comment above a `def`;
+//! - both end at `Declarations::declare`.
 //!
-//! Sorbet wins where both are present: a `sig` is machine-checked by `srb`, is written in Ruby
-//! the parser validates, and rots loudly when the method changes. A comment rots quietly.
+//! Splitting them would duplicate the parameter renderer, the half of this module with the real
+//! detail.
+//!
+//! Sorbet wins where both are present. A `sig` is machine-checked by `srb`, written in Ruby the
+//! parser validates, and rots loudly when the method changes. A comment rots quietly.
 //!
 //! # Nothing here is a place
 //!
-//! Every declaration this module writes is unmapped, and that is not a shortcut. The method
-//! already exists in the graph — the user's own `def` is indexed, at the offset the editor should
-//! jump to — so what is generated here adds a *type* and nothing else. Recording a span would
-//! point a second definition at the same line and put that location in a go-to-definition list
-//! twice.
+//! Every declaration this module writes is unmapped, on purpose. The user's own `def` is already
+//! indexed at the offset the editor should jump to, so this adds a *type* and nothing else. A span
+//! would point a second definition at the same line and list that location twice in
+//! go-to-definition.
 //!
 //! # What is deliberately not read
 //!
-//! `T.any`, `T.all`, `T.proc`, `T.self_type` and `T.type_parameter` on the Sorbet side; duck
-//! types (`[#read]`), `Hash{Symbol=>String}`, `@!method` and `@!attribute` on the YARD side. Each
-//! either needs a type representation `Types` does not have or names something that is not a
-//! class, and this module's whole safety argument is that a type it cannot spell exactly is a
-//! method it declares nothing about.
+//! - Sorbet: `T.any`, `T.all`, `T.proc`, `T.self_type`, `T.type_parameter`.
+//! - YARD: duck types (`[#read]`), `Hash{Symbol=>String}`, `@!method`, `@!attribute`.
 //!
-//! Positional parameter *names* are dropped too, as a risk trade rather than a limitation: they
-//! buy a nicer signature-help line, and a parameter called `type` or `class` is an RBS keyword
-//! that would take the whole file's declarations down with it. The types and the arity are kept,
-//! which is what `types.rs`' arity partition reads.
+//! Each needs a type representation `Types` lacks, or names something that is not a class. The
+//! safety argument: a type this module cannot spell exactly is a method it declares nothing about.
+//!
+//! Positional parameter *names* are dropped too, as a risk trade. They would buy a nicer
+//! signature-help line, but a parameter called `type` or `class` is an RBS keyword that would take
+//! the whole file's declarations down. Types and arity are kept, which is what `types.rs`' arity
+//! partition reads.
 
 use std::collections::BTreeMap;
 
@@ -44,7 +45,7 @@ use ruby_prism::{CallNode, DefNode, Node, ParametersNode};
 
 use crate::generated::{Declared, Facts, Owner, Source};
 
-/// Sorbet's own namespace. Everything under it is a type constructor rather than a class.
+/// Sorbet's own namespace. Everything under it is a type constructor, not a class.
 const SORBET: &str = "T";
 
 /// The Sorbet generics whose RBS spelling is the same name without the `T::`.
@@ -58,7 +59,7 @@ const YARD_ALIASES: [(&str, &str); 4] = [
     ("false", "bool"),
 ];
 
-/// Which of the two said so. It reaches a hover card, so it is a sentence and not a tag.
+/// Which of the two said so. It reaches a hover card, so it is a sentence, not a tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wrote {
     Sorbet,
@@ -76,8 +77,8 @@ impl Wrote {
 
 /// Read every method in `source` that a `sig` block or a `@return` tag gives a return type.
 ///
-/// `file` is how the source should be spelled to a reader, and goes into every provenance line.
-/// Text in, no graph and no I/O.
+/// `file` is how the source is spelled to a reader, and goes into every provenance line. Text in,
+/// no graph and no I/O.
 #[must_use]
 pub fn read(source: &str, file: &str) -> Facts {
     let parsed = ruby_prism::parse(source.as_bytes());
@@ -101,11 +102,10 @@ struct Reader<'src> {
     file: &'src str,
     /// The class and module bodies open around the cursor, and whether each is a `module`.
     ///
-    /// **The flag is load-bearing.** A `def self.label` in `module Admin` declared as
-    /// `class Admin` says `Admin` is a class, and rubydex holds one declaration of a constant or
-    /// the other — so the module loses whatever else it declares, for the same reason a joined
-    /// `class A::B::C` costs `A::B` its members. [`Owner::ModuleSingleton`] is what it picks
-    /// instead.
+    /// **The flag is load-bearing.** Declaring a `def self.label` in `module Admin` as
+    /// `class Admin` says `Admin` is a class. rubydex holds one kind of declaration per constant,
+    /// so the module would lose whatever else it declares, as a joined `class A::B::C` costs `A::B`
+    /// its members. [`Owner::ModuleSingleton`] is picked instead.
     nesting: Vec<(String, bool)>,
     out: Facts,
 }
@@ -113,13 +113,11 @@ struct Reader<'src> {
 impl Reader<'_> {
     /// One body, and then the class and module bodies written as statements of it.
     ///
-    /// **Statements, not a walk of the whole tree**, and that is a depth bound rather than a
-    /// preference: a generic `Visit` descends into every method body in the file, which on a
-    /// large one is thousands of frames on a thread whose stack is Rust's 2 MiB default —
-    /// measured, as a crash, against a real gem. Recursing on class nesting instead makes the
-    /// depth the depth of `module A; module B; class C`, which no file has more than a handful
-    /// of. It also says exactly what every reader here says: a `class` inside an `if` is not a
-    /// statement of the enclosing body, and neither is a macro inside a block.
+    /// **Statements, not a walk of the whole tree.** This is a depth bound. A generic `Visit`
+    /// descends into every method body, which on a large file means thousands of frames on a thread
+    /// with Rust's default 2 MiB stack: a real crash. Recursing on class nesting keeps the depth to
+    /// `module A; module B; class C`. It also says what every reader here says: a `class` inside an
+    /// `if` is not a statement of the enclosing body, and neither is a macro inside a block.
     fn walk(&mut self, body: Option<Node<'_>>) {
         let Some(statements) = body.and_then(|body| body.as_statements_node()) else {
             return;
@@ -141,10 +139,9 @@ impl Reader<'_> {
 
     /// The annotated methods written as statements of one class body.
     ///
-    /// A `sig` binds to the statement that follows it, which is what Sorbet itself does, and
-    /// anything between the two breaks the binding rather than being skipped over — a `sig`
-    /// followed by a constant assignment is a file this reader does not understand, and
-    /// understanding it wrongly is how a method gets the type of its neighbour.
+    /// A `sig` binds to the statement right after it, as in Sorbet. Anything in between breaks the
+    /// binding instead of being skipped: a `sig` followed by a constant assignment is a file this
+    /// reader does not understand, and misreading it is how a method gets its neighbour's type.
     fn annotated(&mut self, statements: &ruby_prism::StatementsNode<'_>) {
         if self.nesting.is_empty() {
             return;
@@ -164,9 +161,9 @@ impl Reader<'_> {
             }
             sig = None;
         }
-        // Into a local and then merged, rather than straight into `self.out`, because
-        // `self.method` borrows the reader. The order is the same either way: one body's
-        // methods, in the order they are written, before anything nested inside it.
+        // Into a local and then merged, not straight into `self.out`, because `self.method` borrows
+        // the reader. The order is the same: one body's methods, as written, before anything nested
+        // inside.
         self.out.extend(facts);
     }
 
@@ -187,9 +184,9 @@ impl Reader<'_> {
         };
 
         let name = String::from_utf8_lossy(def.name().as_slice()).into_owned();
-        // A `def` whose name is not a plain identifier — `def ==`, `def []=` — is legal RBS to
-        // declare, but not with the parameter list this renders, so the whole surface is kept
-        // to the names an annotation is realistically written above.
+        // A `def` whose name is not a plain identifier (`def ==`, `def []=`) is legal RBS, but not
+        // with the parameter list this renders. So the surface is kept to names an annotation is
+        // realistically written above.
         let stem = name.trim_end_matches(['?', '!', '=']);
         if !stem.starts_with(|first: char| first.is_ascii_lowercase() || first == '_')
             || !stem
@@ -207,7 +204,7 @@ impl Reader<'_> {
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>()
             .join("::");
-        // The innermost body decides, because that is the one this `def` is written in.
+        // The innermost body decides: it is the one this `def` is written in.
         let module = self.nesting.last().is_some_and(|(_, module)| *module);
         into.declare(Declared {
             owner: match (singleton, module) {
@@ -260,9 +257,9 @@ impl Reader<'_> {
     }
 }
 
-/// A `@param` tag split into the parameter it names and the type it gives it.
+/// A `@param` tag split into the parameter it names and the type it gives.
 ///
-/// Both orders YARD allows, and the name is the first word after or before the brackets.
+/// Both orders YARD allows; the name is the first word after or before the brackets.
 fn tagged(rest: &str) -> Option<(&str, &str)> {
     let (name, written) = if rest.starts_with('[') {
         let end = rest.find(']')?;
@@ -275,11 +272,11 @@ fn tagged(rest: &str) -> Option<(&str, &str)> {
 }
 
 impl Reader<'_> {
-    /// The comment block directly above `def`, `#` and leading space stripped.
+    /// The comment block directly above `def`, with `#` and leading space stripped.
     ///
-    /// Read from the text rather than from Prism's comment list, because what is wanted is
-    /// "the lines immediately above this one", which is a fact about layout: a blank line ends
-    /// the block, and a comment separated from the `def` by anything is somebody else's.
+    /// Read from the text, not Prism's comment list, because "the lines right above this one" is a
+    /// fact about layout: a blank line ends the block, and a comment separated from the `def` by
+    /// anything belongs to something else.
     fn comments(&self, def: &DefNode<'_>) -> Vec<String> {
         let at = def.def_keyword_loc().start_offset();
         let start = self.source.get(..at).map_or(0, |before| {
@@ -317,9 +314,9 @@ fn block_body<'pr>(call: &CallNode<'pr>) -> Option<Node<'pr>> {
 
 /// What a `sig` chain says the method returns.
 ///
-/// The chain is read from the outside in — `params(...).returns(String)` is a `returns` call
-/// whose receiver is a `params` call — so a modifier nobody here knows (`abstract`, `overridable`,
-/// `checked(:never)`) is walked past rather than tripped over.
+/// Read from the outside in: `params(...).returns(String)` is a `returns` call whose receiver is a
+/// `params` call. So an unknown modifier (`abstract`, `overridable`, `checked(:never)`) is walked
+/// past, not tripped over.
 fn result(node: &Node<'_>) -> Option<String> {
     let call = node.as_call_node()?;
     match call.name().as_slice() {
@@ -399,18 +396,18 @@ fn sorbet_type(node: &Node<'_>) -> Option<String> {
     }
 }
 
-/// One YARD type list — the text between the brackets, brackets included — as RBS.
+/// One YARD type list (the text between the brackets, brackets included) as RBS.
 ///
-/// `[String, nil]` is the one union worth reading, because it is how YARD spells optional and
-/// it is the majority of the unions written. Any other union is declined: `Types` keys an answer
-/// by one declaration, so `String | Integer` has no representation that is not a lie.
+/// `[String, nil]` is the one union worth reading: it is how YARD spells optional, and most unions
+/// written are that. Any other union is declined: `Types` keys an answer by one declaration, so
+/// `String | Integer` has no honest representation.
 fn yard_type(written: &str) -> Option<String> {
     let inner = written.trim().strip_prefix('[')?;
     let inner = inner.get(..inner.find(']')?)?;
     let mut parts: Vec<&str> = split(inner, ',');
     let nilable = parts.contains(&"nil");
     parts.retain(|part| *part != "nil");
-    // `[true, false]` is YARD's other spelling of a boolean, and the two halves are not classes.
+    // `[true, false]` is YARD's other spelling of a boolean, and neither half is a class.
     if parts.len() == 2
         && parts
             .iter()
@@ -430,19 +427,15 @@ fn yard_class(written: &str) -> Option<String> {
     if let Some((_, rbs)) = YARD_ALIASES.iter().find(|(yard, _)| *yard == written) {
         return Some((*rbs).to_owned());
     }
-    // **`Object` is YARD's way of writing "anything", and this crate already has one.** RBS
-    // spells that `untyped`, and `Types::harvest` drops `untyped` precisely so that a claim
-    // about nothing displaces no rung below it — while `Object` is a real class in the graph, so
-    // believing one answers every chain off it with `Kernel`'s members and takes the name rung
-    // away. Solidus writes `# @return [Object] the source of ths payment` above
-    // `def payment_source`, and
-    // `payment_source.actions` went from a guess at `Spree::PaymentSource` — right — to a
-    // seven-entry list. **Eight occurrences in six corpora**, and not one of them means the
-    // class.
+    // **`Object` is YARD's way of writing "anything", and this crate already has one.** RBS spells
+    // that `untyped`, and `Types::harvest` drops `untyped` so a claim about nothing displaces no
+    // rung below it. `Object` is a real class in the graph: believing it would answer every chain
+    // off it with `Kernel`'s members and remove the name rung. In real code, `@return [Object]`
+    // never means the class.
     if written == "Object" {
         return None;
     }
-    // A duck type names a method, and `Hash{Symbol=>String}` names a shape. Neither is a class.
+    // A duck type names a method and `Hash{Symbol=>String}` names a shape. Neither is a class.
     if written.starts_with('#') || written.contains('{') {
         return None;
     }
@@ -456,7 +449,7 @@ fn yard_class(written: &str) -> Option<String> {
     constant(written)
 }
 
-/// `written` if it is a constant path and nothing else. The gate every spelled type goes past.
+/// `written` if it is a constant path and nothing else. Every spelled type passes this gate.
 fn constant(written: &str) -> Option<String> {
     let path = written.trim().trim_start_matches("::");
     (path.starts_with(|first: char| first.is_ascii_uppercase())
@@ -471,11 +464,10 @@ fn constant(written: &str) -> Option<String> {
 
 /// The RBS parameter list and block, from what the `def` wrote and what the annotation said.
 ///
-/// Arity is the half that has to be exact: an answer is partitioned by how many positional
-/// arguments the *call* wrote, so a signature that claims the wrong arity does not merely
-/// display wrongly — it answers nothing, or answers for a call that was never written. Anything
-/// this cannot render exactly falls back to `(*untyped)`, which is variadic and so applies to
-/// every arity rather than to a wrong one.
+/// Arity must be exact. An answer is partitioned by how many positional arguments the *call* wrote,
+/// so a wrong arity does not merely display wrongly: it answers nothing, or answers for a call
+/// never written. Anything this cannot render exactly falls back to `(*untyped)`, which is variadic
+/// and fits every arity.
 fn signature(parameters: Option<&ParametersNode<'_>>, types: &BTreeMap<String, String>) -> String {
     let Some(parameters) = parameters else {
         return "()".to_owned();
@@ -525,8 +517,8 @@ fn signature(parameters: Option<&ParametersNode<'_>>, types: &BTreeMap<String, S
         ));
     }
     if let Some(keyword_rest) = parameters.keyword_rest() {
-        // `def go(...)` forwards everything, and Prism files the whole of it here — there is no
-        // arity to state, so the honest signature is the variadic one that fits every call.
+        // `def go(...)` forwards everything, and Prism files all of it here. There is no arity to
+        // state, so the honest signature is the variadic one that fits every call.
         if keyword_rest.as_forwarding_parameter_node().is_some() {
             return "(*untyped)".to_owned();
         }
@@ -551,7 +543,7 @@ fn optional(written: &str) -> String {
     format!("{written}?")
 }
 
-/// Split on `separator`, ignoring one nested in `<>` or `{}` — `Hash<Symbol, Array<String>>`.
+/// Split on `separator`, ignoring one nested in `<>` or `{}`, as in `Hash<Symbol, Array<String>>`.
 fn split(written: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
@@ -596,9 +588,8 @@ mod tests {
 
     /// The RBS one snippet declares, with the provenance lines dropped.
     ///
-    /// `modules` is the names the snippet's own file writes `module` for, which is what
-    /// `Facts::render` needs to decide whether a namespace above an owner may be joined onto
-    /// it.
+    /// `modules` names what the snippet's own file writes `module` for. `Facts::render` needs it to
+    /// decide whether a namespace above an owner may be joined onto it.
     fn declared_by(source: &str, modules: &[&str]) -> String {
         read(source, "app/widget.rb")
             .render(&declaring(modules))
@@ -692,7 +683,7 @@ end
             Some("Hash[Symbol, String]")
         );
         assert_eq!(returns("sig { void }").as_deref(), Some("void"));
-        // A modifier this reader does not know is walked past rather than tripped over.
+        // An unknown modifier is walked past, not tripped over.
         assert_eq!(
             returns("sig { abstract.returns(String) }").as_deref(),
             Some("String")
@@ -705,9 +696,8 @@ end
 
     #[test]
     fn what_a_sig_block_declares_nothing_about() {
-        // Every one of these either needs a type representation `Types` does not have, or names
-        // something that is not a class. A method this cannot spell exactly is one it is silent
-        // about.
+        // Each needs a type representation `Types` lacks, or names something that is not a class. A
+        // method this cannot spell exactly is one it stays silent about.
         for annotation in [
             "sig { returns(T.any(String, Integer)) }",
             "sig { returns(T.all(Comparable, Enumerable)) }",
@@ -730,9 +720,9 @@ end
 
     #[test]
     fn a_params_list_this_cannot_read_costs_the_parameter_and_not_the_method() {
-        // A `params` block is decoration on an answer that has already been given: the return
-        // type is what types a chain, and a parameter this cannot spell falls back to `untyped`
-        // rather than taking the method down with it.
+        // A `params` block decorates an answer already given: the return type is what types a
+        // chain. A parameter this cannot spell falls back to `untyped` instead of taking the method
+        // down.
         for annotation in [
             "sig { params.returns(String) }",
             "sig { params(\"x\" => Integer).returns(String) }",
@@ -784,8 +774,8 @@ end
             returns("# @return [Hash<Symbol, Array<String>>]").as_deref(),
             Some("Hash[Symbol, Array[String]]")
         );
-        // The whole block above the `def` is read, and the *last* tag in it wins — YARD's own
-        // rule, and the one that matters when a doc comment restates a tag.
+        // The whole block above the `def` is read, and the *last* tag wins. That is YARD's rule,
+        // and it matters when a doc comment restates a tag.
         assert_eq!(
             returns("# Does a thing.\n  #\n  # @param x [Integer] how many\n  # @return [String]")
                 .as_deref(),
@@ -810,9 +800,9 @@ end
             "# @return",
             "# just prose",
             "",
-            // `Object` is YARD's way of writing "anything", and this crate already has one:
-            // RBS spells it `untyped` and `Types::harvest` drops that so a claim about nothing
-            // displaces no rung below it. `Object` is a real class in the graph and would.
+            // `Object` is YARD's "anything", and this crate already has one: RBS `untyped`, which
+            // `Types::harvest` drops so a claim about nothing displaces no lower rung. `Object` is
+            // a real class in the graph and would displace them.
             "# @return [Object]",
             "# @return [Object, nil]",
         ] {
@@ -822,8 +812,8 @@ end
 
     #[test]
     fn a_comment_that_is_not_directly_above_the_def_is_somebody_elses() {
-        // A blank line ends the block, which is YARD's own rule and the reason this reads the
-        // text rather than Prism's comment list: what is wanted is a fact about layout.
+        // A blank line ends the block. That is YARD's rule, and why this reads the text, not
+        // Prism's comment list: the question is about layout.
         assert_eq!(
             read(
                 "class W\n  # @return [String]\n\n  def go\n  end\nend\n",
@@ -837,9 +827,8 @@ end
 
     #[test]
     fn a_sig_binds_to_the_statement_that_follows_it_and_to_nothing_else() {
-        // What Sorbet itself does. Anything between the two breaks the binding rather than
-        // being skipped over, because understanding it wrongly is how a method gets the type of
-        // its neighbour.
+        // What Sorbet does. Anything in between breaks the binding instead of being skipped,
+        // because misreading it is how a method gets its neighbour's type.
         assert_eq!(
             declared(
                 "class W\n  \
@@ -864,8 +853,8 @@ end
 
     #[test]
     fn every_parameter_shape_ruby_has_and_the_rbs_it_becomes() {
-        // Arity is the half that has to be exact — an answer is partitioned by how many
-        // positional arguments the *call* wrote — so this is pinned shape by shape.
+        // Arity must be exact (an answer is partitioned by the *call's* positional argument count),
+        // so this is pinned shape by shape.
         for (parameters, rendered) in [
             ("", "()"),
             ("()", "()"),
@@ -893,8 +882,8 @@ end
 
     #[test]
     fn a_parameter_that_was_given_a_type_keeps_it() {
-        // Both annotations, and both of YARD's orders. A parameter nobody typed is `untyped`
-        // rather than absent, because dropping it would change the arity.
+        // Both annotations, and both YARD orders. An untyped parameter is `untyped`, not absent:
+        // dropping it would change the arity.
         assert_eq!(
             declared(
                 "class W\n  \
@@ -950,16 +939,15 @@ end
 
     #[test]
     fn a_method_name_this_cannot_spell_in_rbs_is_left_alone() {
-        // Ruby's identifiers are Unicode and RBS's are not, so both halves of the check are
-        // reachable: a name that does not start with an ASCII lower-case letter, and one that
-        // does and then stops being ASCII.
+        // Ruby identifiers are Unicode and RBS identifiers are not, so both halves of the check are
+        // reachable: a name not starting with an ASCII lower-case letter, and one that does and
+        // then stops being ASCII.
         for name in ["==", "[]", "<=>", "+", "Capitalized", "имя", "go_имя"] {
             let source =
                 format!("class W\n  # @return [String]\n  def {name}(other)\n  end\nend\n");
             assert_eq!(declared(&source), String::new(), "{name}");
         }
-        // The three suffixes Ruby allows are fine, and so are the characters an ordinary name
-        // is made of.
+        // The three suffixes Ruby allows are fine, and so are ordinary name characters.
         assert_eq!(
             declared("class W\n  # @return [Boolean]\n  def ok?\n  end\nend\n"),
             "class W\n  def ok?: () -> bool\nend\n"
@@ -972,9 +960,9 @@ end
 
     #[test]
     fn a_module_and_a_nested_class_are_spelled_the_way_rubydex_spells_them() {
-        // `module Admin` and not `class Admin` for the singleton half: a `def self.` written in
-        // a module is `Owner::ModuleSingleton`, and declaring it as a class would say `Admin` is
-        // one — which costs the module whatever else declares on it.
+        // `module Admin`, not `class Admin`, for the singleton half. A `def self.` in a module is
+        // `Owner::ModuleSingleton`; declaring it as a class would say `Admin` is one and cost the
+        // module whatever else is declared on it.
         assert_eq!(
             declared_by(
                 "module Admin\n  \
@@ -990,10 +978,10 @@ end
             "module Admin\n  def self.label: () -> String\nend\n\
              module Admin\nclass Panel\n  def size: () -> Integer\nend\nend\n"
         );
-        // The same member out of a file that writes the namespace into the name instead. Nothing
-        // declares `Admin` at all now, so the name is written out one body per segment — a
-        // joined `class Admin::Panel` would introduce `Admin` itself and cost whatever else
-        // hangs off it. A conjured segment gets `class`, which is what the joined name said.
+        // The same member, from a file that writes the namespace into the name. Here nothing
+        // declares `Admin` at all, so the name is written one body per segment: a joined
+        // `class Admin::Panel` would introduce `Admin` itself and cost whatever else hangs off it.
+        // A conjured segment gets `class`, as the joined name said.
         assert_eq!(
             declared_by(
                 "class Admin::Panel\n  \
@@ -1004,8 +992,8 @@ end
             ),
             "class Admin::Panel\n  def size: () -> Integer\nend\n"
         );
-        // The instance half of the same rule: a `def` in a module body is `Owner::Module`, and
-        // an includer reaches it — which is what a concern is.
+        // The instance half of the same rule: a `def` in a module body is `Owner::Module`, and an
+        // includer reaches it. That is what a concern is.
         assert_eq!(
             declared_by(
                 "module Greetable\n  \
@@ -1024,15 +1012,15 @@ end
         assert!(read("puts 'hello'\n", "app/widget.rb").is_empty());
         assert!(read("class W\nend\n", "app/widget.rb").is_empty());
         assert!(read("class W; end\n", "app/widget.rb").is_empty());
-        // A `def` on the file's first line: the walk back for a comment block has nothing to
-        // walk back over, which is the one way that loop is entered zero times.
+        // A `def` on the file's first line: nothing to walk back over for a comment block, the one
+        // way that loop runs zero times.
         assert!(read("class W; def go; end; end\n", "app/widget.rb").is_empty());
     }
 
     #[test]
     fn a_sig_block_and_a_yard_tag_each_type_a_receiver_and_say_which_they_read() {
-        // Both halves of an annotation. A card says which of the two it read, because a
-        // comment is not a signature and the tiers already have a place to say so.
+        // Both halves of an annotation. A card says which one it read, because a comment is not a
+        // signature and the tiers already have a place to say so.
         let source = "Widget.new.name.upcase\nWidget.new.label.upcase\n";
         let (mut harness, _story, uri) = models_project(source);
         let widget = harness.write(
@@ -1054,16 +1042,16 @@ end
         let yard = card(&mut harness, &uri, source, "label");
         assert!(yard.contains("a YARD `@return` tag"), "{yard}");
 
-        // And both type the chain, which is the only reason to read either.
+        // Both type the chain, which is the only reason to read either.
         let chained = card(&mut harness, &uri, "Widget.new.name.upcase\n", "upcase");
         assert!(chained.contains("String#upcase"), "{chained}");
     }
 
     #[test]
     fn an_annotation_is_not_a_second_place_the_method_is_declared() {
-        // The `def` is already in the graph at the offset an editor should jump to, so what an
-        // annotation adds is a *type* and nothing else. A span here would put the same location
-        // in a go-to-definition list twice.
+        // The `def` is already in the graph at the offset an editor should jump to, so an
+        // annotation adds a *type* and nothing else. A span here would list the same location twice
+        // in go-to-definition.
         let source = "Widget.new.name\n";
         let (mut harness, _story, uri) = models_project(source);
         let widget = harness.write(
@@ -1083,8 +1071,8 @@ end
 
     #[test]
     fn a_sorbet_sig_wins_over_a_yard_tag_that_disagrees_with_it() {
-        // Both are "a human wrote the type down" and one of them is machine-checked. A `sig` is
-        // Ruby the parser validates and `srb` checks; a comment rots quietly.
+        // Both mean "a human wrote the type down", and one is machine-checked: a `sig` is Ruby the
+        // parser validates and `srb` checks. A comment rots quietly.
         let (mut harness, _story, _uri) = models_project("");
         let widget = harness.write(
             "app/models/widget.rb",
@@ -1102,9 +1090,9 @@ end
 
     #[test]
     fn an_annotation_naming_something_that_is_not_a_class_declares_nothing() {
-        // The decline list, as behaviour. A union `Types` cannot key, a duck type that names a
-        // method rather than a class, and a shape — none of them has a spelling this crate can
-        // write exactly, and a method it cannot spell exactly is one it says nothing about.
+        // The decline list, as behaviour: a union `Types` cannot key, a duck type naming a method,
+        // and a shape. None has an exact spelling here, and a method this cannot spell exactly gets
+        // nothing.
         let (mut harness, _story, _uri) = models_project("");
         let widget = harness.write(
             "app/models/widget.rb",
@@ -1130,10 +1118,9 @@ end
 
     #[test]
     fn an_annotated_method_keeps_the_arity_it_was_written_with() {
-        // An answer is partitioned by how many positional arguments the *call* wrote, so a
-        // generated signature that claims the wrong arity does not merely display wrongly — it
-        // answers nothing, or answers for a call nobody made. Every parameter shape Ruby has,
-        // rendered, and then asked the only question that matters about it.
+        // An answer is partitioned by the *call's* positional argument count, so a wrong generated
+        // arity does not merely display wrongly: it answers nothing, or answers for a call nobody
+        // made. Every parameter shape Ruby has, rendered, then asked the one question that matters.
         let source = "Widget.new.go(1, 2, 3, key: 4).upcase\n";
         let (mut harness, _story, uri) = models_project(source);
         let widget = harness.write(

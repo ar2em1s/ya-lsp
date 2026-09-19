@@ -1,38 +1,34 @@
-"""Lane 1's fifth key — **a bare word inside a block written into a class body**.
+"""Lane 1's closures key: **a bare word inside a block written into a class body**.
 
-`rails` draws its own cursors because the macro positions it scores are a shape the sample does
-not target. This is the second such key and the reason is the same one measured: the stratified
-draw holds 848 receiverless calls out of the hundreds of thousands the six corpora write, and the
-shape below has **90** sites in them. A draw that size lands on none of them, which is why defect
-26 was closed on a probe written for the occasion and the sweep for it moved 0 counters.
+This key draws its own cursors, like `rails`, for the same reason: the shape is too rare for the
+stratified draw to land on. A draw of the sample's size reaches none of its sites.
 
-# The shape, and why it is worth a key of its own
+# The shape, and why it gets its own key
 
 `self` inside `rule(:colon) { … }` or `scope :recent, -> { … }` is the class object until whoever
-takes the block re-binds it, and re-binding it is what every DSL that takes a block does. So a
-bare name there may be on the class object and may equally be on an instance, and `locator`'s
-closure rung answers the second — a card reading *Found on an instance of `X`*. Until 2026-09-14
-`completion` at that same byte never left the class object, so the card named a member the list
-beside it did not hold.
+takes the block re-binds it, and every DSL that takes a block does. So a bare name there may be on
+the class object or on an instance. `locator`'s closure rung answers the second, with a card reading
+*Found on an instance of `X`*. `completion` at the same cursor must then offer that instance's
+members too; otherwise the card names a member the list beside it lacks.
 
 # The footnote is the filter, so the scan may be crude
 
-The scan below is a floor and not a census: it reaches a macro call opening a block at two-space
-indentation in a file whose first construct is a `class` or `module`, which is Rubocop's layout
-and not Ruby's grammar. That is deliberate. **What decides whether a candidate counts is the
-server's own sentence** — a card carrying the closure footnote is `locator` stating that the rung
-fired, which by construction means the class object holds no such name. A candidate the scan
-invents costs one pipelined hover and is dropped; a site it misses is not counted and the number
-is honest about being a lower bound.
+The scan is a floor, not a census. It reaches a macro call opening a block at two-space indentation,
+in a file whose first construct is a `class` or `module`: RuboCop's layout, not Ruby's grammar. That
+is deliberate.
+- **The server's own sentence decides whether a candidate counts.** A card carrying the closure
+  footnote is `locator` saying the rung fired, which means the class object holds no such name.
+- A candidate the scan invents costs one pipelined hover and is dropped.
+- A site it misses is not counted, and the number is honest about being a lower bound.
 
-No mask is run over the file, for the same reason: a word inside a string or a comment is a
-candidate the footnote throws away, and `ruby.masked` is a character walk over every byte of every
-`.rb` file in six corpora, which is the one part of this that would cost real time.
+No mask is run, for the same reason: a word in a string or a comment is a candidate the footnote
+throws away, and `ruby.masked` over every `.rb` file in six corpora is the one step here that would
+cost real time.
 
 # The prefix is the word
 
-`lane1.calls` holds the argument: at an empty prefix a bare-word list is the 512-row ceiling on
-every one of these, so a key posed there scores the cap. The cursor goes at the end of the word.
+As `lane1.calls` argues: at an empty prefix, a bare-word list is the 512-row ceiling at every one of
+these cursors, so a key posed there scores the cap. The cursor goes at the end of the word.
 """
 
 import re
@@ -54,17 +50,17 @@ OPENS = re.compile(r"^  ([a-z_][A-Za-z0-9_]*[!?]?)[ (].*?"
                    r"(?:\bdo\b(?: *\|[^|]*\|)? *$|-> *\{|\blambda *\{|\{ *(?:\|[^|]*\| *)?)")
 # The first bare word inside it, deeper than the opener.
 WORD = re.compile(r"^(\s{4,})([a-z_][A-Za-z0-9_]*)")
-# Words that open a construct rather than call one. Over-blocking is safe in a key.
+# Words that open a construct instead of calling one. Over-blocking is safe in a key.
 KEYWORDS = {"end", "if", "unless", "while", "until", "case", "when", "else", "elsif", "begin",
             "rescue", "ensure", "return", "yield", "def", "do", "then", "in", "and", "or",
             "not", "next", "break", "redo", "retry", "super", "self", "nil", "true", "false"}
-# `hover.rs`' closure footnote, quoted rather than matched loosely for `answers.GUESSED`'s
-# reason: a reworded sentence would turn this key off without ever failing it, and `under`
-# below says so out loud when the scan finds candidates and the footnote finds none.
+# `hover.rs`' closure footnote, quoted exactly, for `answers.GUESSED`'s reason: a reworded sentence
+# would turn this key off without failing it. `under` says so when the scan finds candidates and the
+# footnote finds none.
 CLOSURE = "Found on an instance of `"
 # The code fence a card opens with, as `Owner#member` or `Owner.member`.
 NAMES = re.compile(r"^```ruby\n(?:private |protected )?.*?[#.]([A-Za-z0-9_?!]+)")
-# How many rows a list may hold before an absence is the ceiling talking. `MAX_COMPLETION_ITEMS`.
+# How many rows a list may hold before an absence is the ceiling talking: `MAX_COMPLETION_ITEMS`.
 CEILING = 512
 # How deep below the opener to look for the first statement.
 REACH = 12
@@ -75,7 +71,7 @@ def counters():
 
 
 def candidates(corpus):
-    """[(path, line, column, word)] — every cursor the scan reaches, before the server sees one."""
+    """[(path, line, column, word)]: every cursor the scan reaches, before the server sees one."""
     found = []
     for path in sorted(corpus.dir.rglob("*.rb")):
         marked = "/" + str(path.parent.relative_to(corpus.dir)).strip(".") + "/"
@@ -86,7 +82,7 @@ def candidates(corpus):
         except OSError:
             continue
         lines = text.split("\n")
-        # Past the magic comments and the requires: the first construct the file opens.
+        # Past the magic comments and requires: the first construct the file opens.
         head = next((row for row in lines if row.strip() and not row.lstrip().startswith("#")), "")
         if not (head.startswith("class ") or head.startswith("module ")):
             continue
@@ -115,8 +111,8 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
     counts["scanned"] = len(rows)
     if not rows:
         return counts, findings
-    # Two pipelined passes and not one round trip each: `places` reads 31,924 hovers in 5.1 s
-    # this way, and the whole point of a crude scan is that a wasted candidate is cheap.
+    # Two pipelined passes, not one round trip per cursor, as `places` does it. A crude scan only
+    # works if a wasted candidate is cheap.
     cards = {}
     for index, (path, line, column, _) in enumerate(rows):
         client.post((index, "closure-hover"), "textDocument/hover", {
@@ -127,9 +123,8 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
     for key, result in client.drain():
         cards[key] = result
 
-    # Only the cursors the server itself says the rung fired at. The card also has to *name this
-    # word* — a hover that landed on something else is a candidate the scan got wrong, not a
-    # server answering the wrong thing.
+    # Only cursors where the server says the rung fired. The card must also *name this word*: a
+    # hover that landed on something else is the scan's mistake, not the server's.
     fired = []
     for index, (path, line, column, word) in enumerate(rows):
         card = card_of(cards.get((index, "closure-hover")))
@@ -159,11 +154,11 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
         if rank_of(items, word) is not None:
             counts["present"] += 1
             continue
-        # **A full list is the ceiling talking and not the server.** `completion.rs` caps at
-        # `MAX_COMPLETION_ITEMS` after ranking, so a list at exactly that length with
-        # `isIncomplete` has dropped rows and cannot be read as *the name is not a candidate*.
-        # It is counted, because a name a developer cannot reach is still a name they cannot
-        # reach, and it is not reported, because the fix for it is a ranking argument.
+        # **A full list is the ceiling talking, not the server.** `completion.rs` caps at
+        # `MAX_COMPLETION_ITEMS` after ranking, so a list at exactly that length with `isIncomplete`
+        # has dropped rows and cannot mean *the name is not a candidate*.
+        # - Counted: a name a developer cannot reach is still unreachable.
+        # - Not reported: its fix is a ranking argument.
         if len(items) >= CEILING and isinstance(answer, dict) and answer.get("isIncomplete"):
             counts["capped"] += 1
             continue
@@ -175,7 +170,7 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
 
 
 def site_of(corpus, path, line, column):
-    """`audit.site` for a cursor this key drew itself, which is an offset the sample never made."""
+    """`audit.site` for a cursor this key drew itself: an offset the sample never made."""
     text = (corpus.dir / path).read_text(encoding="utf-8", errors="replace")
     rows = text.split("\n")
     return site(path, sum(len(row) + 1 for row in rows[:line]) + column)

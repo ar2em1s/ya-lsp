@@ -1,55 +1,43 @@
-//! `textDocument/completion` — what can be written where the cursor is.
+//! `textDocument/completion`: what can be written where the cursor is.
 //!
-//! [`cursor`] says what *shape* the cursor is in; this says what the graph has to offer there.
-//! The split matters because the shape is pure syntax and the offer is pure semantics, and only
-//! one of them needs a project loaded to test.
+//! [`cursor`] says what *shape* the cursor is in; this says what the graph offers there. The shape
+//! is pure syntax and the offer pure semantics, and only the offer needs a loaded project to test.
 //!
 //! # What is exact and what is a guess
 //!
-//! Three of the four contexts are exact, because in each the receiver is something the graph
-//! resolved: `Foo::`, `Foo.`, `self.`, and a bare word (whose receiver is the enclosing `self`).
-//! rubydex walks the real ancestor chain, applies real visibility — a `private` method is offered
-//! inside the class and not outside it — and for an argument list hands back the called method's
-//! keyword parameters.
+//! 1. **Three contexts are exact**, because the graph resolved the receiver: `Foo::`, `Foo.`,
+//!    `self.`, and a bare word (receiver: the enclosing `self`). rubydex walks the real ancestor
+//!    chain and applies real visibility (a `private` method is offered inside its class, not
+//!    outside), and for an argument list returns the called method's keyword parameters.
+//! 2. **The fourth is `foo.`** where `foo` is a local, an instance variable or another call's
+//!    result. [`types`](super::types) answers what it can. If every rung is empty, one is left: the
+//!    receiver's spelling read as a class name. That list is a real class's members, and
+//!    [`Completion::guess`] says which letters it came from.
+//! 3. **When even that finds nothing**, the list falls back to every method name in the project: a
+//!    different guess, presented as one. Names only, deduplicated, the user's own code first. Still
+//!    better than the editor's word list, which cannot see methods in unopened files.
 //!
-//! The fourth is `foo.` where `foo` is a local, an instance variable, or the result of another
-//! call. [`types`](super::types) answers what it can there, and where every rung comes back empty
-//! one is left: the receiver's own spelling, read as a class name. That list is a real class's
-//! members and is offered as one, with [`Completion::guess`] saying which letters it came from.
-//!
-//! When even that finds nothing, the list falls back to every method name in the project — a
-//! guess of a different kind, presented as one: names only, deduplicated, the user's own code
-//! first. It still beats the editor's word-list, which cannot see a method defined in a file that
-//! is not open.
-//!
-//! **The two guesses are not the same and a row must not conflate them.** `precise` says whether
-//! the rows are one class's members; `guess` says whether that class was inferred from a name. A
-//! guessed receiver is `precise` *and* guessed — a better list than the name-based one and a
-//! worse answer than a resolved type — and the card has to be able to say both.
+//! **The two guesses must not be conflated.** `precise` says the rows are one class's members;
+//! `guess` says that class was inferred from a name. A guessed receiver is `precise` *and* guessed:
+//! a better list than the name-based one, a worse answer than a resolved type, and the card must be
+//! able to say both.
 //!
 //! # When the list is `isIncomplete`
 //!
-//! Completion is filtered here rather than in the client, because the alternative is shipping a
-//! Rails bundle's hundred thousand candidates on the first keystroke. Filtering server-side means
-//! the answer is only correct for the prefix it was asked with, and `isIncomplete` is what tells
-//! the client to ask again rather than narrow what it already has.
+//! Filtering happens here, not in the client, because otherwise the first keystroke would ship a
+//! Rails bundle's hundred thousand candidates. So the answer is only correct for the prefix asked,
+//! and `isIncomplete` tells the client to ask again rather than narrow what it has.
 //!
-//! **It is set when the cap dropped rows, and not on every list.** Dropping a row is the only way
-//! this answer can fail to hold something a longer prefix would reach, because every filter on
-//! the way here is a *subsequence* match — [`tier`], and rubydex's `MatchMode::Fuzzy` under
-//! [`by_name`]. A longer prefix therefore admits a subset of what a shorter one admitted, so an
-//! untruncated list is a superset of what a fresh query would return and the client can narrow it
-//! safely. What the client does not keep is this module's *ranking*: it scores rows against the
-//! longer prefix itself and falls back to `sort_text` only as a tiebreak, which is the right way
-//! round for a list it is holding — that score is the one that knows what has been typed since.
-//!
-//! The distinction is worth drawing because the flag costs a request per keystroke and each
-//! repeats the whole lookup.
-//!
-//! **An empty list stays incomplete**, which is a separate statement rather than the same one
-//! read twice. Every route that answers with no rows does so because there was nothing to say — a
-//! receiver that turned out not to be a namespace, a `::` on something that cannot hold one — and
-//! "the complete answer is nothing" would have the client stop asking as the word grows.
+//! - **Set only when the cap dropped rows.** Every filter here is a *subsequence* match ([`tier`],
+//!   and rubydex's `MatchMode::Fuzzy` under [`by_name`]), so a longer prefix admits a subset of
+//!   what a shorter one did. An untruncated list is therefore a superset of any fresh query, and
+//!   the client can narrow it safely. The client does not keep this module's *ranking*: it
+//!   re-scores rows against the longer prefix and uses `sort_text` only as a tiebreak, which is
+//!   right, since its score knows what was typed since. The flag matters because each re-ask
+//!   repeats the whole lookup.
+//! - **An empty list stays incomplete.** Every empty answer means there was nothing to say (a
+//!   receiver that is not a namespace, a `::` on something that cannot hold one), and "the complete
+//!   answer is nothing" would make the client stop asking as the word grows.
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
@@ -66,10 +54,10 @@ use rubydex::{
 use super::{
     cursor::{self, Context, Receiver},
     environment::{self, Tally},
+    indexed::Placed,
     locator,
     position::Rebase,
     render,
-    synthesized::{self, GENERATED_SCHEME},
     types::{self, Derivation, Scope, Sources, constant_at, object_name, singleton_of},
     views,
 };
@@ -77,14 +65,14 @@ use super::{
 /// One suggestion, before it is dressed up as an LSP item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
-    /// What gets inserted, and what the user reads: `shout`, `Person`, `@name`, `volume:`, `def`.
+    /// What gets inserted and what the user reads: `shout`, `Person`, `@name`, `volume:`, `def`.
     pub label: String,
     /// The full spelling, shown beside the label: `HR::Person#shout`.
     pub detail: Option<String>,
     pub kind: Kind,
-    /// Filled in immediately for keywords, whose documentation is a constant. For everything
-    /// else it is `completionItem/resolve`'s job, so that a list of 300 does not read 300
-    /// comment blocks the user will never look at.
+    /// Filled immediately for keywords, whose documentation is constant. Otherwise it is
+    /// `completionItem/resolve`'s job, so a list of 300 does not read 300 comment blocks nobody
+    /// looks at.
     pub documentation: Option<String>,
     pub deprecated: bool,
     /// The declaration this came from, for `completionItem/resolve` to find again.
@@ -107,123 +95,118 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     pub items: Vec<Item>,
-    /// Whether the cap dropped rows, so the client has to ask again rather than narrow this.
+    /// Whether the cap dropped rows, so the client must ask again instead of narrowing this.
     ///
-    /// Below the cap the list is complete and a client may filter it itself; see the module
-    /// docs for why that is sound. An empty list is always incomplete — it means there was
-    /// nothing to say, not that the answer is nothing.
+    /// Below the cap the list is complete and a client may filter it itself (the module docs
+    /// explain why that is sound). An empty list is always incomplete: it means nothing to say, not
+    /// that the answer is nothing.
     pub incomplete: bool,
     pub start: u32,
     pub end: u32,
-    /// Whether the receiver these were offered for was one ya-lsp could name.
+    /// Whether the receiver these rows were offered for was one ya-lsp could name.
     ///
-    /// A property of the *list* rather than of a row, because it is a property of the receiver
-    /// and every row was offered for the same one. `false` is the name-based fallback: every
-    /// method in the project, matched on its name, and the card for any of them has to say so.
+    /// A property of the *list*, not of a row, because every row was offered for the same receiver.
+    /// `false` is the name-based fallback: every method in the project, matched by name, and each
+    /// card must say so.
     pub precise: bool,
-    /// The receiver's own spelling, when the class these were offered for was guessed from it.
+    /// The receiver's own spelling, when the class was guessed from it.
     ///
-    /// The third tier, on a list rather than on a card: `precise` says the rows are a real
-    /// class's members and this says the class itself was a guess. Both, together, are the only
-    /// way a row can be honest about `@user.` — the methods are `User`'s, and `User` is six
-    /// letters of inference.
+    /// The third tier, on a list: `precise` says the rows are a real class's members, and this says
+    /// the class itself was a guess. Together they make a row honest about `@user.`: the methods
+    /// are `User`'s, and `User` is six letters of inference.
     pub guess: Option<String>,
 }
 
-/// The three ceilings a completion answer is bounded by, which are three different questions.
+/// The three ceilings a completion answer is bounded by, each a different question.
 ///
-/// A struct rather than three adjacent `usize` parameters, because they are transposable and mean
-/// different things. `items` is how much JSON a keystroke may cost, and is reached by a list this
-/// server believes in. The other two both bound a **guess**, and they are split because the
-/// measurement behind them says the ranking is trustworthy where the row count is not:
-/// `untyped_candidates` decides whether the guess is worth making at all, and `untyped` how much
-/// of it is worth reading. A typed receiver never reads either, so nothing is bounded twice.
+/// A struct, not three adjacent `usize` parameters, because they are easy to transpose and mean
+/// different things. `items` is how much JSON a keystroke may cost, for any list this server
+/// believes in. The other two bound a **guess**, split because the ranking is trustworthy where the
+/// row count is not: `untyped_candidates` decides whether to guess at all, and `untyped` how much
+/// of the guess is worth reading. A typed receiver reads neither, so nothing is bounded twice.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// `MAX_COMPLETION_ITEMS`: the response ceiling, applied to every list that is offered.
+    /// `MAX_COMPLETION_ITEMS`: the response ceiling for every offered list.
     pub items: usize,
     /// `MAX_UNTYPED_COMPLETION_ITEMS`: how many rows of the name-based list are sent. See
     /// [`by_name`].
     pub untyped: usize,
-    /// `MAX_UNTYPED_CANDIDATES`: above this many candidates the name-based list is not offered
-    /// at all, however few rows would have been sent.
+    /// `MAX_UNTYPED_CANDIDATES`: above this many candidates the name-based list is not offered at
+    /// all, however few rows would be sent.
     pub untyped_candidates: usize,
 }
 
 /// What can be written at `offset`.
 ///
-/// `None` where nothing can — inside a comment or a literal, or in a document the graph has
-/// never seen.
+/// `None` where nothing can: inside a comment or literal, or in a document the graph has never
+/// seen.
 #[must_use]
-pub fn complete(
+pub(super) fn complete(
     sources: &Sources<'_>,
     uri_id: UriId,
     source: &str,
     offset: u32,
     limits: Limits,
-    own: &HashSet<UriId>,
+    placed: &Placed,
     rebase: &Rebase,
 ) -> Option<Completion> {
     let graph = sources.graph;
     let cursor = cursor::at(source, offset)?;
     let prefix = &source[cursor.start as usize..cursor.end as usize];
 
-    // **The coordinate change, and this is the only place completion needs one.** Everything
-    // above reads `source`, which is the buffer; everything below keys the graph, whose offsets
-    // index the text the indexer was last handed. On a document nobody is typing in the two
-    // are one string and `rebase` is the identity — see `Rebase`.
+    // **The coordinate change, the only one completion needs.** Everything above reads `source`
+    // (the buffer); everything below keys the graph, whose offsets index the text last given to the
+    // indexer. On a document nobody is typing in they are the same string and `rebase` is the
+    // identity (see `Rebase`).
     //
-    // Completion is deferrable precisely because it never hands a graph span back: `Completion::start`/`end` come off the cursor and stay in the buffer's
-    // coordinates. `hover` and `definition` answer with spans that came *out* of the graph and
-    // need `Rebase::span_to_buffer` as well, which is why they are not deferred here.
+    // Completion can be deferred because it never returns a graph span: `Completion::start`/`end`
+    // come from the cursor, in buffer coordinates. `hover` and `definition` return spans *from* the
+    // graph and need `Rebase::span_to_buffer` too, which is why they are not deferred.
     let (lo, hi) = match rebase.to_graph(offset) {
         Some(at) => (at, at),
-        // The cursor is inside what was typed since the index, which is the ordinary case while
-        // typing rather than an edge one. A scope survives it — see `Scope::covering` — and a
-        // receiver lookup may not, which the `rebased` below decides.
+        // The cursor is inside text typed since the index: the ordinary case while typing. A scope
+        // survives it (see `Scope::covering`); a receiver lookup may not, which `rebased` below
+        // decides.
         None => rebase.changed_in_graph(),
     };
-    // `None` where the changed region runs out of a body: the graph can no longer say which
-    // `class` or `def` the caret is in, so the request declines and is retried against a settled
-    // graph rather than answered from the wrong side of `self`.
+    // `None` where the changed region runs out of a body: the graph cannot say which `class` or
+    // `def` the caret is in, so the request declines and is retried against a settled graph instead
+    // of answering from the wrong side of `self`.
     //
-    // Logged rather than counted on a field: how often this fires during real editing is a
-    // property of how somebody edits, so the number worth having is one a probe collects over a
-    // session rather than one the server carries.
+    // Logged, not counted on a field: how often this fires depends on how someone edits, so the
+    // useful number is one a probe collects over a session.
     let Some(scope) = Scope::covering(graph, uri_id, lo, hi) else {
         tracing::debug!("completion declined: the changed region leaves the body the caret is in");
         return None;
     };
-    // A receiver written in text the graph has never held cannot be looked up in it. Refusing
-    // is the whole safety argument: answering anyway offers another class's members, which is a
-    // wrong answer and not a missing one — reproduced as `Alpha.new.` offering `Gamma`'s.
+    // A receiver in text the graph never held cannot be looked up in it. Refusing is the safety
+    // argument: answering anyway would offer another class's members, a wrong answer (seen as
+    // `Alpha.new.` offering `Gamma`'s).
     let Some(context) = cursor.context.rebased(rebase) else {
         tracing::debug!("completion declined: the receiver is inside text the graph has not seen");
         return None;
     };
-    // Pure syntax, and decided before anything is looked up: see `Context::allows_private`.
+    // Pure syntax, decided before any lookup; see `Context::allows_private`.
     let private_ok = context.allows_private();
-    // Empty until a candidate rubydex calls private arrives, and most lists hold none — so the
-    // list that pays for this is the list the repair is about.
+    // Empty until a candidate rubydex calls private arrives, which most lists never have, so only
+    // the lists the repair is about pay for it.
     let modifiers = locator::Modifiers::new(sources.read);
-    // Read off the layout rather than taken as a ninth argument: `Sources` already carries the
-    // one value every surface that fences takes, and the halves of a fence coming apart is the
-    // defect this crate has already had once.
-    let locality = Locality::at(graph, uri_id, own, sources.layout.names);
+    // Read from the layout, not passed as a ninth argument: `Sources` already carries the value
+    // every fencing surface takes, and letting the halves of a fence drift apart is a defect this
+    // crate has had before.
+    let locality = Locality::at(graph, uri_id, placed, sources.layout);
     let mut precise = true;
     let mut guess = None;
     let (items, incomplete) = match receiver_for(sources, uri_id, &context, &scope) {
         Some((receiver, only, derivation)) => {
-            // The tier travels with the list, because it is a property of the *receiver* and
-            // every row was offered for the same one. A guessed receiver still offers a real
-            // class's members — which is a better list than matching every method in the
-            // project by name — and the card on any of them still has to say where the class
-            // came from.
+            // The tier travels with the list: it belongs to the *receiver*, and every row was
+            // offered for the same one. A guessed receiver still offers a real class's members
+            // (better than matching every method by name), and each card must still say where the
+            // class came from.
             guess = derivation.guess;
-            // Collected before the ranking because two of the three are read by it, and
-            // merged after it: see [`Beside`]. `Extended` is built once and read twice,
-            // because its walk answers both questions at once — what a concern extends onto a
-            // class object, and how far out it sits.
+            // Collected before ranking, because the ranking reads two of the three, and merged
+            // after it (see [`Beside`]). `Extended` is built once and read twice: its walk answers
+            // both what a concern extends onto a class object and how far out it sits.
             let beside = Beside {
                 extended: Extended::at(graph, &receiver),
                 view: in_view(sources, uri_id, &cursor.context),
@@ -243,30 +226,23 @@ pub fn complete(
             };
             from_graph(graph, receiver, only, limits.items, &ranking, &beside)
         }
-        // Only one context arrives here with anything worth saying: a `.` on a receiver whose
-        // type is unknown. `foo::` and a receiver that is not a namespace have no honest answer.
+        // Only one context arrives here with anything to say: a `.` on an untyped receiver. `foo::`
+        // and a non-namespace receiver have no honest answer.
         //
-        // **And `sources.guess` decides whether even that one may answer.** The rows below are
-        // the name-based guess wearing a different hat — matched on the word alone, attached to
-        // no class — so `[types] guess_from_names = false` has to reach here or the setting
-        // silences the tier everywhere a card is drawn and nowhere a list is. It gates this arm
-        // only: a typed receiver is not a guess and is left alone.
+        // **And `sources.guess` decides whether even that may answer.** These rows are the
+        // name-based guess in another form (matched on the word alone, attached to no class), so
+        // `[types] guess_from_names = false` must reach here, or the setting would silence the tier
+        // on every card but not in lists. It gates only this arm: a typed receiver is not a guess.
         None => match &cursor.context {
             Context::MethodCall { .. } if sources.guess => {
-                // No receiver means no chain, so `Distance` is silent and `Locality` is the
-                // only nearness this list has. It is not what ranks it, and neither is
-                // anything else below `tier`. Measured over 385 untyped cursors on six
-                // corpora, nineteen orderings of the eight terms behind `tier` — including
-                // every one that deletes a term outright — return the same lists: the word is
-                // at median rank 1 from the third character on, and inside the first 128 rows
-                // for 474 of the 492 lists that came back at all. `tier` is the whole ranking
-                // here because a guess still broad enough for the terms below it to matter is
-                // *declined* by `admitted` rather than ordered — nothing is offered at a bare
-                // `.` at all, and only 30% of cursors are answered at the fourth character.
-                // The twentieth ordering is the one that shows: lifting `Locality` above
-                // `tier` takes the median from 1 to 10. Which is to say the only ranking risk
-                // this arm has is putting nearness in front of what the user typed. See the
-                // note on `Distance::none`.
+                // No receiver means no chain, so `Distance` is silent and `Locality` is the only
+                // nearness, but neither ranks this list: `tier` does. Measured over untyped cursors
+                // on six corpora, reordering the terms behind `tier` (even deleting them) returns
+                // the same lists, with the typed word at median rank 1 from the third character on.
+                // A guess still broad enough for those terms to matter is *declined* by `admitted`
+                // rather than ordered. The one ordering that hurts is lifting `Locality` above
+                // `tier`, so the only risk here is putting nearness before what the user typed. See
+                // `Distance::none`.
                 let ranking = Ranking {
                     prefix,
                     distance: Distance::none(),
@@ -277,8 +253,8 @@ pub fn complete(
                 precise = false;
                 by_name(graph, limits.untyped, limits.untyped_candidates, &ranking)
             }
-            // Nothing to say, which is not the same as an answer that is empty: telling the
-            // client this list is complete would have it stop asking as the word grows.
+            // Nothing to say, which differs from an empty answer: calling this list complete would
+            // make the client stop asking as the word grows.
             _ => (Vec::new(), true),
         },
     };
@@ -297,14 +273,14 @@ pub fn complete(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Only {
     Everything,
-    /// After a `::`, where a method or a keyword would not be legal to write.
+    /// After a `::`, where a method or keyword would not be legal.
     Constants,
 }
 
 /// Turn a classified cursor into the question rubydex answers.
 ///
-/// `None` means there is no exact question to ask: an unknown receiver, or a `::` on something
-/// that is not a namespace.
+/// `None` means no exact question: an unknown receiver, or a `::` on something that is not a
+/// namespace.
 fn receiver_for(
     sources: &Sources<'_>,
     uri_id: UriId,
@@ -313,10 +289,9 @@ fn receiver_for(
 ) -> Option<(CompletionReceiver, Only, Derivation)> {
     let graph = sources.graph;
     match context {
-        // `caller` and not `scope.self_id`, and it is not a choice: rubydex's
-        // `expression_completion` requires a `self` type, so a `None` there collects no methods
-        // and no instance variables at all — the commonest completion there is. The nesting's
-        // own declaration is what has to be passed.
+        // `caller`, not `scope.self_id`, by necessity: rubydex's `expression_completion` needs a
+        // `self` type, and with `None` it collects no methods and no instance variables at all,
+        // which would break the commonest completion. The nesting's own declaration must be passed.
         Context::Expression => Some((
             CompletionReceiver::Expression {
                 self_decl_id: scope.caller(graph),
@@ -326,18 +301,25 @@ fn receiver_for(
             Derivation::default(),
         )),
         Context::Argument { name } => {
-            // Only a receiver rubydex could name gives real keyword arguments. A name-based
-            // guess would put another class's parameters into this call, which is worse than
-            // offering none: the completion would be syntactically valid and wrong.
-            // `Context::Argument` *is* the implicit-receiver case — the cursor is inside a
-            // call's parentheses, not after its operator — so a private callee is reachable here
-            // exactly as `Context::allows_private` says.
+            // Only a receiver rubydex could name gives real keyword arguments. A name-based guess
+            // would put another class's parameters into this call: syntactically valid and wrong,
+            // worse than none.
+            //
+            // `Context::Argument` *is* the implicit-receiver case (the cursor is inside a call's
+            // parentheses, not after an operator), so a private callee is reachable here, as
+            // `Context::allows_private` says.
+            //
+            // The same evidence the jump reads: a keyword argument from a `def` a block filed on
+            // `Object` would be a parameter list the call cannot take. `locator::Blocks` is empty
+            // until a hit lands on a root, so other cursors pay nothing.
+            let blocks = locator::Blocks::new(sources.read);
             let receiver = match locator::precise_call(
                 graph,
                 uri_id,
                 *name,
                 sources.layout,
                 locator::Privacy::Allowed,
+                &blocks,
             ) {
                 Some(method_decl_id) => CompletionReceiver::MethodArgument {
                     self_decl_id: scope.caller(graph),
@@ -353,31 +335,40 @@ fn receiver_for(
         }
         Context::NamespaceAccess { receiver } => {
             let namespace_decl_id = match receiver {
-                Receiver::Constant(offset) => constant_at(graph, uri_id, *offset)?,
-                // `self::CONST` is legal and rare; the nesting is what it means. `caller` is
-                // the singleton in a class or module body, and asking a singleton reaches the
-                // class it is attached to — so this answers the same list `HR::` does, from a
-                // body and from inside a method alike. Pinned by
-                // `every_receiver_that_can_precede_a_double_colon_is_answered`, because the
-                // equivalence is rubydex's and not something this line states.
+                Receiver::Constant(offset) => constant_at(graph, uri_id, *offset, sources.layout)?,
+                // `self::CONST` is legal and rare, and means the nesting. `caller` is the singleton
+                // in a class or module body, and asking a singleton reaches its attached class, so
+                // this answers the same list as `HR::`, from a body or a method.
+                // `every_receiver_that_can_precede_a_double_colon_is_answered` pins it, since the
+                // equivalence is rubydex's.
                 Receiver::SelfObject(_) => scope.caller(graph)?,
-                // `"foo"::Bar`, `Foo.new::Bar` and `foo.bar::Baz` all parse, and mean nothing
-                // anybody writes on purpose. An instance is not a namespace.
+                // `"foo"::Bar`, `Foo.new::Bar` and `foo.bar::Baz` all parse and mean nothing anyone
+                // writes on purpose. An instance is not a namespace.
                 //
-                // `Receiver::Named` joins them: a name is at best an instance, and the two
-                // rungs that read one both answer with a class rather than with a namespace.
+                // `Receiver::Named` joins them: a name is at best an instance, and both rungs that
+                // read one answer with a class, not a namespace.
                 Receiver::Instance(_)
-                | Receiver::Literal(_)
+                | Receiver::Literal { .. }
                 | Receiver::Returned { .. }
                 | Receiver::Yielded { .. }
                 | Receiver::Assigned { .. }
+                | Receiver::Destructured { .. }
                 | Receiver::Spelled { .. }
+                // `super::Bar` parses and means nothing: `super` returns a value, and a value is
+                // not a namespace. `(a || b)::Bar` likewise (a shortcut returns one of its
+                // operands, which are values), and `param::Bar` (a parameter holds whatever the
+                // caller passed).
+                | Receiver::Super { .. }
+                | Receiver::Shortcut { .. }
+                // `!x::Bar` parses too, and `!x` is `true` or `false`: a value, and the least
+                // likely values to be a namespace.
+                | Receiver::Negated(_)
+                | Receiver::Parameter { .. }
                 | Receiver::Named(_) => return None,
-                // `::Foo` asks for the top level, which is `Object` — but rubydex's namespace
-                // walk deliberately stops *before* Object's own members, to keep `String::` from
-                // listing every top-level constant in the project. Asking the same question as
-                // an expression at the top level reaches them, and dropping everything that is
-                // not a constant leaves what `::` can actually be followed by.
+                // `::Foo` asks for the top level, which is `Object`, but rubydex's namespace walk
+                // deliberately stops *before* Object's own members, so `String::` does not list
+                // every top-level constant. Asking the same question as a top-level expression
+                // reaches them, and dropping non-constants leaves what `::` can be followed by.
                 Receiver::TopLevel => {
                     return Some((
                         CompletionReceiver::Expression {
@@ -399,15 +390,17 @@ fn receiver_for(
                 Derivation::default(),
             ))
         }
-        // Every arm of this one lives in `types::method_receiver`, because navigation asks the
-        // same question and the two must not answer it differently: what `person.` is cannot
-        // depend on whether the user pressed a key or hovered.
+        // Every arm lives in `types::method_receiver`, because navigation asks the same question
+        // and the two must agree: what `person.` is cannot depend on whether the user typed or
+        // hovered.
         Context::MethodCall { receiver } => {
             let typed = types::method_receiver(sources, uri_id, receiver, scope)?;
             Some((
                 CompletionReceiver::MethodCall {
                     self_decl_id: scope.caller(graph),
-                    receiver_decl_id: typed.declaration,
+                    // A union offers nothing: no single class can answer a `.`
+                    // (`types::Typed::one`).
+                    receiver_decl_id: typed.one()?,
                 },
                 Only::Everything,
                 typed.derivation,
@@ -418,8 +411,8 @@ fn receiver_for(
 
 /// Everything rubydex offers for a receiver, filtered to the prefix and capped.
 ///
-/// The flag is `Completion::incomplete`: true where the cap dropped rows, and true where there
-/// was nothing to say at all, which is not the same statement as "the answer is empty".
+/// The flag is `Completion::incomplete`: true where the cap dropped rows, and true where there was
+/// nothing to say at all, which differs from "the answer is empty".
 fn from_graph(
     graph: &Graph,
     receiver: CompletionReceiver,
@@ -431,7 +424,7 @@ fn from_graph(
     let candidates = match query::completion_candidates(graph, CompletionContext::new(receiver)) {
         Ok(candidates) => candidates,
         Err(error) => {
-            // A receiver that is not a namespace after all. Nothing to say, and nothing broken.
+            // A receiver that is not a namespace after all. Nothing to say, nothing broken.
             tracing::debug!("no completion candidates: {error}");
             return (Vec::new(), true);
         }
@@ -443,8 +436,8 @@ fn from_graph(
         .enumerate()
         .filter_map(|(sequence, candidate)| rank(graph, candidate, sequence, ranking))
         .collect();
-    // Before the cap and never after it: these rows compete with the graph's own on one key,
-    // and appending past `take_best` would answer with `limit` + however many a concern holds.
+    // Before the cap, never after: these rows compete with the graph's on one key, and appending
+    // after `take_best` would return `limit` plus however many a concern holds.
     if let Some(extended) = &beside.extended {
         ranked.extend(
             extended
@@ -455,32 +448,26 @@ fn from_graph(
                 }),
         );
     }
-    // The view context's rows, added the same way and in the same place for the same
-    // reason: before the cap, so that they compete with the graph's own on one key rather than
-    // being appended past it.
+    // The view context's rows, added the same way and place for the same reason: before the cap,
+    // competing with the graph's own on one key.
     add_view(graph, &mut ranked, ranking, &beside.view);
-    // Last of the three, and the order is only half a statement: a template has no class body
-    // to write a block in, so this and the view context cannot both have rows. What it does
-    // state is the one that matters — the concern edge above has already been merged, so a
-    // name a concern extends onto the class object is held against this the same way a name the
-    // graph's own walk found is.
+    // Last of the three. A template has no class body to write a block in, so this and the view
+    // context never both have rows. What the order does state: the concern edge is already merged,
+    // so a name a concern extends onto the class object is held against this like any name the
+    // graph's own walk found.
     add_closure(graph, &mut ranked, ranking, beside.closure.as_ref());
     let truncated = take_best(&mut ranked, limit);
-    (
-        ranked.into_iter().map(|entry| entry.item).collect(),
-        truncated,
-    )
+    (spelled_out(graph, ranked), truncated)
 }
 
 /// The lists that join the graph's own answer before the cap.
 ///
-/// One value rather than three parameters, because they are one idea. rubydex answers for a
-/// *receiver*; each of these is a name reachable from the cursor that no receiver names — what
-/// a Rails concern extends onto a class object, what Rails puts into a template's view context,
-/// and what a block written straight into a class body may be run against. Resolution can ask
-/// each of them as a second question after the first fails, because it takes one answer;
-/// completion has to **collect**, so they are gathered here and merged into the ranked rows
-/// before `take_best` rather than appended past it.
+/// One value, because they are one idea. rubydex answers for a *receiver*; each of these is a name
+/// reachable from the cursor that no receiver names: what a Rails concern extends onto a class
+/// object, what Rails puts into a template's view context, and what a block written straight into a
+/// class body may run against. Resolution can ask each as a second question, because it takes one
+/// answer. Completion must **collect**, so they are merged into the ranked rows before `take_best`,
+/// not appended after it.
 struct Beside {
     extended: Option<Extended>,
     view: Vec<views::Reached>,
@@ -489,14 +476,13 @@ struct Beside {
 
 /// What a bare word in a **template** can complete to.
 ///
-/// `None` for every other document and for every context with a receiver written in it, which
-/// is [`views::Views::reachable`]'s own gate plus one syntactic test: a template's view context
-/// is what an *implicit* receiver answers, and `person.` in a template is still `person`'s.
+/// `None` for every other document and every context with a written receiver:
+/// [`views::Views::reachable`]'s own gate plus one syntax test, since a template's view context
+/// answers only an *implicit* receiver (`person.` in a template is still `person`'s).
 ///
-/// The walk is [`views`]', shared with [`locator::resolve_typed`] so that a jump and a list
-/// cannot disagree about what a template can call — the same seam the concern edge shares
-/// through [`locator::extended_modules`], and for the same reason: resolution takes the
-/// first answer and completion collects all of them.
+/// The walk is [`views`]', shared with [`locator::resolve_typed`] so a jump and a list cannot
+/// disagree about what a template can call. The concern edge shares [`locator::extended_modules`]
+/// the same way: resolution takes the first answer, completion collects all.
 fn in_view(sources: &Sources<'_>, uri_id: UriId, context: &Context) -> Vec<views::Reached> {
     if !matches!(context, Context::Expression | Context::Argument { .. }) {
         return Vec::new();
@@ -511,12 +497,11 @@ fn in_view(sources: &Sources<'_>, uri_id: UriId, context: &Context) -> Vec<views
 /// Put the view context's rows into the list, taking a name away from `Object` where they share
 /// one.
 ///
-/// **The shadowing is Ruby's rather than a preference.** A helper module is `include`d into the
-/// view class and `Kernel` is at the end of every chain, so an application that writes
-/// `def format` in `ApplicationHelper` really has replaced `Kernel#format` for every template —
-/// and a row that kept the graph's answer would complete the word and then jump to the wrong
-/// one. It costs a pass over the ranked rows and is only paid where a template offered a name
-/// the view context also holds.
+/// **The shadowing is Ruby's, not a preference.** A helper module is `include`d into the view class
+/// and `Kernel` ends every chain, so `def format` in `ApplicationHelper` really replaces
+/// `Kernel#format` for every template. Keeping the graph's row would complete the word and then
+/// jump to the wrong definition. It costs a pass over the ranked rows, paid only where a template
+/// offered a name the view context also holds.
 fn add_view(graph: &Graph, ranked: &mut Vec<Ranked>, ranking: &Ranking, view: &[views::Reached]) {
     if view.is_empty() {
         return;
@@ -541,56 +526,43 @@ fn add_view(graph: &Graph, ranked: &mut Vec<Ranked>, ranking: &Ranking, view: &[
 
 /// The instance side a **block written straight into a class body** can reach.
 ///
-/// # The list beside the rung that answers from two scopes
-///
-/// `locator`'s closure rung is the resolution half of this, and its docs hold the argument: a
-/// bare name in `rule(:colon) { … }` may be on the class object, which is what `self` is until
-/// somebody re-binds it, and may equally be on an instance, because re-binding it is what every
-/// DSL that takes a block does. That rung answers one name. This offers every name that rung
-/// would answer — the same rule read as a list rather than as a lookup, which is the whole of
-/// why it exists: `hover` in one of these blocks named a member the list beside it did not hold.
-///
-/// # The two agree per member, and that is what makes the order safe
-///
-/// `locator` reaches its closure rung only once `resolve_call` has come back imprecise, so the
-/// class object's own answer — including the one a concern extends onto it — always wins.
-/// [`add_closure`] holds that same order by adding a row only where the list does not already
-/// carry the name, which is why it runs after the concern edge and not before it. What `hover`
-/// says of any row offered here is therefore what the row was offered for.
-///
-/// # A class, never a module, and never a receiver somebody wrote
-///
-/// Both refusals are `locator`'s, restated where each is cheapest. A module has no instances for
-/// the claim to be about, and the blocks a module body holds — `included do`, `class_methods do`
-/// — re-bind `self` to the *including* class, which is not reachable from the module at all;
-/// that one is tested here. A receiver written down says what `self` is not — `Foo.` and
-/// `person.` are answered by the receiver, whatever block they are written inside — and that one
-/// is [`cursor::at`](cursor::at)'s, which is why `Cursor::in_a_closure` is `false` on those
-/// cursors rather than true and discarded.
+/// - **The list beside `locator`'s closure rung.** That rung (whose docs hold the argument) answers
+///   one name: a bare name in `rule(:colon) { … }` may be on the class object (`self` until
+///   rebound) or on an instance (what DSLs rebind it to). This offers every name that rung would
+///   answer, so `hover` in such a block never names a member the list lacks.
+/// - **The two agree per member, which makes the order safe.** `locator` reaches its closure rung
+///   only after `resolve_call` came back imprecise, so the class object's own answer (including
+///   concern extensions) always wins. [`add_closure`] keeps that order by adding a row only where
+///   the list lacks the name, which is why it runs after the concern edge.
+/// - **A class, never a module, and never a written receiver.** Both are `locator`'s refusals,
+///   placed where each is cheapest. A module has no instances, and its
+///   `included do`/`class_methods do` blocks rebind `self` to the *including* class; that refusal
+///   is tested here. A written receiver (`Foo.`, `person.`) decides `self` whatever block it is in;
+///   that one is [`cursor::at`](cursor::at)'s, so `Cursor::in_a_closure` is `false` on such
+///   cursors.
 struct InClosure {
-    /// The class the block's `self` may be an instance of.
+    /// The class whose instance the block's `self` may be.
     class: DeclarationId,
-    /// The lexical nesting, which rubydex's expression query wants and this does not read —
-    /// every row is filtered to a method, and the constants it reaches are the ones the class
-    /// object's list already holds from the same nesting.
+    /// The lexical nesting, which rubydex's expression query needs and this does not read: every
+    /// row is filtered to a method, and the constants it reaches are already on the class object's
+    /// list from the same nesting.
     nesting: NameId,
 }
 
 impl InClosure {
     /// `None` wherever either half of the evidence is missing.
     ///
-    /// **The scope and not the receiver**, although the two hold the same declaration: every
-    /// receiver that can reach here was built from `Scope::caller`, and the ones that were not
-    /// — a `.` or a `::` — never reach here at all, because `Cursor::in_a_closure` is `false`
-    /// on any cursor with a receiver written in front of it. Reading the scope is that fact
-    /// stated once rather than a match with two arms nothing can take.
+    /// **The scope, not the receiver**, though they hold the same declaration: every receiver
+    /// reaching here was built from `Scope::caller`, and a `.` or `::` never reaches here
+    /// (`Cursor::in_a_closure` is `false` with a written receiver). Reading the scope states that
+    /// once, instead of a match with two untakeable arms.
     fn at(graph: &Graph, scope: &Scope, in_a_closure: bool) -> Option<Self> {
         if !in_a_closure {
             return None;
         }
-        // "rubydex called this a class object", which is the same test the closure rung makes
-        // of the same declaration — a bare call in a class body is recorded on the singleton,
-        // and one inside a `def` is not, so this is also what keeps a method body out.
+        // "rubydex called this a class object": the closure rung's test on the same declaration. A
+        // bare call in a class body is recorded on the singleton and one inside a `def` is not, so
+        // this also keeps method bodies out.
         let class = locator::attached_class(graph, scope.caller(graph)?)?;
         matches!(
             graph.declarations().get(&class),
@@ -604,30 +576,27 @@ impl InClosure {
 
     /// Every instance member of that class the list does not already hold, ranked.
     ///
-    /// The question asked is the one a receiverless call in an instance method asks — `self` is
-    /// an instance of this class — so rubydex walks the ancestors and a superclass's `def` is
-    /// reached, which is the half the name rung was throwing away. Filtered to methods and
-    /// nothing else: the constants it also collects are the class object's from the same
-    /// nesting and are already on the list, and an instance variable is a different claim
-    /// entirely — `@x` in a class body is the class object's, whatever the block does with
-    /// `self`, because rebinding the receiver does not rebind the file's lexical scope.
-    ///
-    /// **`held` is tested before the row is built**, which is [`Extended::candidates`]' ordering
-    /// and the same reasoning: `last_segment` is a slice and the hash lookup is a hash lookup,
-    /// where [`ranked_declaration`] walks a declaration's definitions to score its locality. On
-    /// a controller's chain most of these names are the class object's already.
-    ///
-    /// Visibility is [`ranked_declaration`]'s as for every other row, and `private_ok` is
-    /// already true here: no receiver was written, so a private method is exactly what may be
-    /// called.
+    /// - **The question is a receiverless call's in an instance method** (`self` is an instance of
+    ///   this class), so rubydex walks the ancestors and reaches a superclass's `def`, the half the
+    ///   name rung was dropping.
+    /// - **Methods only.** The constants it also collects are the class object's from the same
+    ///   nesting, already listed. An instance variable is a different claim: `@x` in a class body
+    ///   is the class object's, whatever the block does, because rebinding the receiver does not
+    ///   rebind the lexical scope.
+    /// - **`held` is tested before the row is built**, as in [`Extended::candidates`]:
+    ///   `last_segment` is a slice and the lookup a hash, while [`ranked_declaration`] walks a
+    ///   declaration's definitions to score locality. On a controller's chain most names are
+    ///   already the class object's.
+    /// - **Visibility is [`ranked_declaration`]'s**, and `private_ok` is already true: no receiver
+    ///   was written, so private methods are exactly what may be called.
     fn rows(&self, graph: &Graph, ranking: &Ranking, held: &HashSet<u64>) -> Vec<Ranked> {
         let receiver = CompletionReceiver::Expression {
             self_decl_id: Some(self.class),
             nesting_name_id: self.nesting,
         };
-        // `unwrap_or_default` where [`from_graph`] logs, because the one error this call
-        // returns is *the receiver is not a namespace* and [`InClosure::at`] has already
-        // looked: the class exists and is a `Namespace::Class`, or this value does not exist.
+        // `unwrap_or_default` where [`from_graph`] logs: the one error here is *the receiver is not
+        // a namespace*, and [`InClosure::at`] already checked that the class exists and is a
+        // `Namespace::Class`.
         let candidates = query::completion_candidates(graph, CompletionContext::new(receiver))
             .unwrap_or_default();
         candidates
@@ -652,11 +621,10 @@ impl InClosure {
 
 /// Put the block's instance rows into the list, keeping every name the class object answered.
 ///
-/// The opposite of [`add_view`]'s shadowing, and deliberately: a helper module really does
-/// replace `Kernel#format` for a template, where a block's `self` is an **inference** about what
-/// somebody's DSL does and the class object is what Ruby will use if the inference is wrong. So
-/// the existing row stands and this fills the gaps around it — which is also the rule that keeps
-/// `hover` and this list saying the same thing about every row in it.
+/// The opposite of [`add_view`]'s shadowing, on purpose. A helper module really replaces
+/// `Kernel#format` in a template, but a block's `self` is an **inference** about a DSL, and the
+/// class object is what Ruby uses if the inference is wrong. So existing rows stand and this fills
+/// gaps, which also keeps `hover` and this list in agreement on every row.
 fn add_closure(
     graph: &Graph,
     ranked: &mut Vec<Ranked>,
@@ -673,51 +641,44 @@ fn add_closure(
     ranked.extend(closure.rows(graph, ranking, &held));
 }
 
-/// The members of a module a class object `extend`s and rubydex did not linearize — the
-/// collecting half of the repair [`locator`] resolves.
+/// The members of a module a class object `extend`s that rubydex did not linearize: the collecting
+/// half of the repair [`locator`] resolves.
 ///
-/// Resolution can ask a second question after the first fails, because it takes one answer;
-/// completion cannot, because it *collects*. So the same walk runs here and the rows join the
-/// list before it is ranked and capped.
+/// Resolution can ask a second question after the first fails, because it takes one answer.
+/// Completion *collects*, so the same walk runs here and its rows join the list before ranking and
+/// the cap.
 ///
-/// The walk itself is [`locator::extended_modules`], shared so that the one shape it is about is
-/// stated once. **It is not the Rails concern edge**, which used to be read here and is now
-/// declared: `workspace/rails/concerns.rs` writes a concern's class methods onto every class that
-/// includes it, so `query::completion_candidates` offers them like any other member of the
-/// receiver.
+/// The walk is [`locator::extended_modules`], shared so its one shape is stated once. **This is not
+/// the Rails concern edge**: `workspace/rails/concerns.rs` declares a concern's class methods onto
+/// every including class, so `query::completion_candidates` offers them like any member.
 struct Extended {
-    /// The singleton the concerns were found from, and the receiver rubydex answered for.
+    /// The singleton the modules were found from, and the receiver rubydex answered for.
     ///
-    /// Kept because it is also the dedup question: a name this already offers must not be
-    /// offered a second time by the edge, and asking it is the same ancestor walk resolution
-    /// makes.
+    /// Kept for deduplication: a name this already offers must not be offered again by the edge,
+    /// and asking is the same ancestor walk resolution makes.
     on: DeclarationId,
     modules: Vec<locator::Extension>,
 }
 
 impl Extended {
-    /// `None` where there is no edge to walk: a receiver that is not a class object — every
-    /// instance method call, and every cursor inside a `def` — or a chain with no concern in it.
+    /// `None` where there is no edge to walk: a receiver that is not a class object (every instance
+    /// call, every cursor inside a `def`), or a chain with no such module.
     fn at(graph: &Graph, receiver: &CompletionReceiver) -> Option<Self> {
         let on = class_object(graph, receiver)?;
         let modules = locator::extended_modules(graph, on);
         (!modules.is_empty()).then_some(Self { on, modules })
     }
 
-    /// Every member the edge adds, nearest concern first.
+    /// Every member the edge adds, nearest module first.
     ///
-    /// Deduplicated the way rubydex's own walk deduplicates and for the same reason: the
-    /// nearest declaration of a name is the one that answers, so a second concern spelling a
-    /// name the first already spelled is not a second row. **And a name the ordinary walk
-    /// already offers is not added at all** — the resolution's own rule, per member rather than
-    /// per request: a class that writes its own `def self.validates` keeps it, and what a
-    /// concern extends is only ever what nothing else answered.
-    ///
-    /// The prefix is tested **before** that question and not after, which is the rule
-    /// [`ranked_declaration`] already holds between `tier` and `reachable`: the ancestor walk
-    /// costs a hundred hash lookups on a Rails model's singleton chain and the prefix test
-    /// costs a string compare, so the cheap filter goes first and a keystroke pays for the
-    /// handful of rows it could actually offer rather than for all 476 of them.
+    /// - **Deduplicated like rubydex's own walk**: the nearest declaration of a name answers, so a
+    ///   second module spelling the same name adds no row.
+    /// - **A name the ordinary walk already offers is not added**, the resolution's rule applied
+    ///   per member: a class writing its own `def self.validates` keeps it, and an extension only
+    ///   ever answers what nothing else did.
+    /// - **The prefix is tested first**, as [`ranked_declaration`] orders `tier` before
+    ///   `reachable`: the ancestor walk costs many hash lookups on a Rails model's singleton chain,
+    ///   a prefix test one string compare, so a keystroke pays only for the rows it could offer.
     fn candidates(&self, graph: &Graph, prefix: &str) -> Vec<DeclarationId> {
         let mut seen: HashSet<StringId> = HashSet::new();
         let mut found = Vec::new();
@@ -726,8 +687,8 @@ impl Extended {
                 continue;
             };
             for (name, member) in extended.members() {
-                // `extend` installs methods and nothing else: a constant nested in a
-                // `ClassMethods` module is not reachable through the singleton at all.
+                // `extend` installs methods only: a constant nested in a `ClassMethods` module is
+                // not reachable through the singleton.
                 let Some(declaration @ Declaration::Method(_)) = graph.declarations().get(member)
                 else {
                     continue;
@@ -749,15 +710,14 @@ impl Extended {
 
 /// The receiver's own declaration, where the receiver is a **class object**.
 ///
-/// The one shape the concern edge applies to, and it is rubydex's answer rather than a
-/// syntactic test: a bare call in a class body and an explicit `Foo.` both arrive here as the
-/// singleton class, and the same call inside an instance `def` arrives as the class — which is
-/// exactly the discriminator the concern edge turns on, reached from the other side.
+/// The one shape the edge applies to, decided by rubydex, not syntax: a bare call in a class body
+/// and an explicit `Foo.` both arrive as the singleton class, while the same call inside an
+/// instance `def` arrives as the class.
 ///
-/// `extended_modules` declines anything that is not a singleton, so this hands over what
-/// the receiver holds rather than testing it twice. `NamespaceAccess` is the one arm that has
-/// to look: `Foo::` names the class and rubydex collects its *singleton's* methods, which is
-/// also why [`Distance::from_receiver`] seeds that chain there.
+/// `extended_modules` declines non-singletons, so this passes the receiver's declaration without
+/// testing it twice. `NamespaceAccess` is the one arm that must look: `Foo::` names the class and
+/// rubydex collects its *singleton's* methods, which is also why [`Distance::from_receiver`] seeds
+/// that chain there.
 fn class_object(graph: &Graph, receiver: &CompletionReceiver) -> Option<DeclarationId> {
     match receiver {
         CompletionReceiver::MethodCall {
@@ -792,30 +752,26 @@ impl Only {
 
 /// How far a namespace sits from the receiver, in steps along the chains rubydex walked.
 ///
-/// This is the ranking's only term for *relevance*, and without it a list that nothing has been
-/// typed into is not ranked at all: `tier` is 1 for every row, `length` is 0 for every row, and
-/// what decides is the label, alphabetically. Measured, `"hello".` opened on `DelegateClass,
-/// Digest, append_as_bytes, ascii_only?, b, begin, …` — two of the first three are not `String`'s
-/// and one of those two is not a method.
-///
-/// Zero is the receiver's own members, one an included module's, and `Object`, `Kernel` and
-/// `BasicObject` come last because they are the end of every chain. That is also the argument for
-/// doing this before anything about `Object` being the drain that everything rubydex cannot
-/// attribute falls into: whatever is misfiled there is already as far away as a name can be.
+/// - **The ranking's only relevance term.** Without it, an empty-prefix list is not ranked: `tier`
+///   and `length` tie for every row, and the alphabet decides. `"hello".` would open on
+///   `DelegateClass, Digest, append_as_bytes, …`, mostly not `String`'s.
+/// - **Zero is the receiver's own members, one an included module's**, and `Object`, `Kernel` and
+///   `BasicObject` come last as the end of every chain. That also means whatever rubydex misfiles
+///   onto `Object` is already as far away as a name can be.
 struct Distance {
     steps: HashMap<DeclarationId, u16>,
 }
 
-/// What an owner that none of the chains reached is worth.
+/// What an owner none of the chains reached is worth.
 ///
-/// Last, and equally last, so the rest of the key still separates them. Every candidate rubydex
-/// collects comes off one of the chains seeded below, so landing here means the graph disagrees
-/// with itself about who owns a name — not a case to give the benefit of the doubt to.
+/// Last, equally, so the rest of the key still separates them. Every collected candidate comes from
+/// one of the chains seeded below, so landing here means the graph disagrees with itself about who
+/// owns a name: no benefit of the doubt.
 const NO_DISTANCE: u16 = u16::MAX;
 
 impl Distance {
-    /// The name-based list has no receiver, so no chain, so nothing to measure. Every row ties
-    /// and the rest of the key decides it, exactly as before.
+    /// The name-based list has no receiver, so no chain and nothing to measure. Every row ties and
+    /// the rest of the key decides.
     fn none() -> Self {
         Self {
             steps: HashMap::new(),
@@ -824,17 +780,15 @@ impl Distance {
 
     /// Seed from the same walks `query::completion_candidates` is about to make.
     ///
-    /// Each walk is numbered from zero rather than end to end, because they are different kinds
-    /// of nearness sharing one scale: a sibling constant in the enclosing module is close to the
-    /// cursor and is on nobody's ancestor chain, and `Foo::` reaches `Foo::Bar` and `Foo.build`
-    /// by two routes that both start at `Foo`. Numbering them end to end would sink every method
-    /// in an expression below every constant, or the reverse.
-    ///
-    /// Ancestor chains are seeded first and the nearest of them wins. The lexical walk only
-    /// fills in what they never reached, because it is a shortcut to the same place and taking
-    /// it would be a lie about a method: `Object` is the last rung of every ancestor chain *and*
-    /// the outermost lexical scope, so letting it be scored as the latter would put `Object`'s
-    /// members — which is everything rubydex could not attribute — one step from the cursor.
+    /// - **Each walk numbers from zero**, not end to end, because they are different kinds of
+    ///   nearness on one scale: a sibling constant in the enclosing module is near the cursor but
+    ///   on no ancestor chain, and `Foo::` reaches `Foo::Bar` and `Foo.build` by two routes both
+    ///   starting at `Foo`. Numbering end to end would sink every method below every constant, or
+    ///   the reverse.
+    /// - **Ancestor chains first, nearest wins; the lexical walk only fills gaps.** `Object` is
+    ///   both the last rung of every ancestor chain and the outermost lexical scope; scored as the
+    ///   latter, its members (everything rubydex could not attribute) would sit one step from the
+    ///   cursor.
     fn from_receiver(
         graph: &Graph,
         receiver: &CompletionReceiver,
@@ -867,10 +821,9 @@ impl Distance {
                 ..
             } => {
                 let nesting = graph.name_id_to_declaration_id(*nesting_name_id).copied();
-                // Methods and instance variables come off `self`'s ancestors; constants off the
-                // lexical nesting, which is a walk outwards through owners and not through
-                // ancestors. Both are seeded, so a class's own methods and the constants sitting
-                // beside it in its module are both near.
+                // Methods and instance variables come from `self`'s ancestors; constants from the
+                // lexical nesting, a walk outwards through owners. Both are seeded, so a class's
+                // own methods and its sibling constants are both near.
                 if let Some(id) = self_decl_id.or(nesting) {
                     distance.chain(graph, id);
                 }
@@ -880,22 +833,21 @@ impl Distance {
                 }
             }
         }
-        // The concern edge, at the step the class that installed it sits at. Before the
-        // lexical walk for the same reason every ancestor chain is: these are members, and
-        // `Object` must not be able to claim them at one step from the cursor.
+        // The extension edge, at the step of the class that installed it. Before the lexical walk,
+        // like every ancestor chain: these are members, and `Object` must not claim them one step
+        // from the cursor.
         if let Some(extended) = extended {
             distance.extended(extended);
         }
-        // The view context's rows, at the step [`views::Reached`] carries — which is the chain Rails
-        // builds `_helpers` from and not one of rubydex's. Before the lexical walk for the
-        // reason the concern edge is: these are members, and `Object` must not be able to claim
-        // them at one step from the cursor.
+        // The view context's rows, at the step [`views::Reached`] carries (the chain Rails builds
+        // `_helpers` from, not one of rubydex's). Before the lexical walk for the same reason as
+        // the extension edge.
         for reached in view {
             if let Some(declaration) = graph.declarations().get(&reached.declaration) {
                 distance.record(*declaration.owner_id(), reached.step as usize);
             }
         }
-        // After every ancestor chain, never before one: see above.
+        // After every ancestor chain, never before one (see above).
         if let Some(id) = lexical {
             distance.lexical(graph, id);
         }
@@ -908,8 +860,8 @@ impl Distance {
             return;
         };
         for (step, ancestor) in namespace.ancestors().iter().enumerate() {
-            // A rung rubydex could not linearize is still a rung: whatever sits past it is
-            // further away whether or not this one can be named.
+            // A rung rubydex could not linearize is still a rung: whatever lies past it is further
+            // away, named or not.
             if let Ancestor::Complete(ancestor_id) = ancestor {
                 self.record(*ancestor_id, step);
             }
@@ -918,16 +870,15 @@ impl Distance {
 
     /// The one seed that is not a walk rubydex is about to make.
     ///
-    /// A concern's `ClassMethods` is on **none** of those chains — that is the whole reason its
-    /// members were missing from the list in the first place — so every one of them would land
-    /// on [`NO_DISTANCE`]: last, equally last, and *behind `Object`'s own methods*, which is
-    /// backwards for the name a model body is most likely to be typing.
+    /// A module a class object `extend`s but rubydex did not linearize is on **none** of those
+    /// chains (why its members were missing), so every member would land on [`NO_DISTANCE`]: last,
+    /// *behind `Object`'s own methods*, which is backwards for what a model body is most likely
+    /// typing.
     ///
-    /// One `record` and not a chain, because [`Extended::candidates`] offers a module's own
-    /// members and never its ancestors': what those ancestors declare is not on this list, and
-    /// numbering them here could only make some *other* row look nearer than it is.
-    /// [`locator::Extends`] carries the step, which counts the classes the receiver's chain
-    /// passes through — where Ruby's own singleton chain puts the module the `extend` landed on.
+    /// One `record`, not a chain, because [`Extended::candidates`] offers a module's own members,
+    /// never its ancestors'; numbering those could only make some *other* row look nearer.
+    /// [`locator::Extension`] carries the step: the number of classes the receiver's chain passes,
+    /// where Ruby's singleton chain puts the module.
     fn extended(&mut self, extended: &Extended) {
         for extends in &extended.modules {
             self.record(extends.module, extends.step);
@@ -936,10 +887,9 @@ impl Distance {
 
     /// Number the lexical nesting outwards: `Billing::Invoice`, then `Billing`, then `Object`.
     ///
-    /// rubydex's own invariant is that `Object` and `BasicObject` are the only declarations that
-    /// own themselves, so self-ownership is what ends the walk. The bound is there because an
-    /// invariant that is checked is not an invariant that is enforced, and rubydex bounds its
-    /// own owner walks the same way.
+    /// rubydex's invariant is that only `Object` and `BasicObject` own themselves, so
+    /// self-ownership ends the walk. The bound is there because a checked invariant is not an
+    /// enforced one, and rubydex bounds its own owner walks the same way.
     fn lexical(&mut self, graph: &Graph, id: DeclarationId) {
         const MAX_NESTING: usize = 64;
 
@@ -957,7 +907,7 @@ impl Distance {
         }
     }
 
-    /// The nearest of the ancestor chains is the one that counts.
+    /// The nearest ancestor chain counts.
     fn record(&mut self, id: DeclarationId, step: usize) {
         let step = Self::bounded(step);
         self.steps
@@ -975,11 +925,11 @@ impl Distance {
         u16::try_from(step).unwrap_or(NO_DISTANCE)
     }
 
-    /// How far the namespace that declares this sits from the receiver.
+    /// How far the namespace declaring this sits from the receiver.
     ///
-    /// `owner_id` is rubydex's own back-pointer to the namespace a member was collected from,
-    /// which is why nothing here parses a name: `Foo::<Foo>#build()` and a top-level constant
-    /// both answer without a special case.
+    /// `owner_id` is rubydex's back-pointer to the namespace a member was collected from, so no
+    /// name is parsed: `Foo::<Foo>#build()` and a top-level constant both answer without special
+    /// cases.
     fn of(&self, declaration: &Declaration) -> u16 {
         self.steps
             .get(declaration.owner_id())
@@ -990,243 +940,302 @@ impl Distance {
 
 /// How near a declaration sits to the cursor itself, counted in directories.
 ///
-/// [`Distance`] measures nearness along a receiver's ancestor chain, and there is no chain when
-/// the receiver is an instance variable or another call's return value. That list is every method
-/// name in the project, and on a Rails app it opened on `account_type, add_row, amount,
-/// attributes, balance` — 512 rows chosen by the alphabet, in 50 ms, telling the user nothing.
-///
-/// So this is the same question asked of what *is* known: not what the receiver is, but where the
-/// cursor is. It ranks the typed list too, where it breaks ties `Distance` leaves — every
-/// top-level constant in a project sits at the same depth on the same chain, and the alphabet was
-/// deciding between them.
-///
-/// **The measure is the path, not the namespace, and that was decided by trying both.** A walk
-/// outwards through the cursor's lexical nesting reads like the more principled answer and works
-/// well on namespaced code — inside `Finance::BankDetails::BankAccounts::Decorator` it found the
-/// sibling service, then the cousins under `Finance::BankDetails`. But a Rails model is
-/// `class Message < ApplicationRecord` at the top level, so its nesting is empty, and half of a
-/// real app got nothing at all. Ruby projects put related code in the same directory whether or
-/// not they nest it, and Zeitwerk makes the directory *be* the namespace, so the path carries
-/// everything the nesting carried and answers for flat code as well.
-struct Locality {
-    /// Every document of the user's own code, and how far its directory sits from the cursor's:
-    /// 0 the file itself, 1 its directory or below, 2 the parent, and so on outwards.
+/// - **Why.** [`Distance`] measures nearness along a receiver's ancestor chain, and an untyped
+///   receiver has no chain. Its list is every method name in the project, which on a Rails app
+///   would otherwise open alphabetically (`account_type, add_row, amount, …`), telling the user
+///   nothing.
+/// - **What it asks instead:** not what the receiver is, but where the cursor is. It also breaks
+///   ties in typed lists that `Distance` leaves (every top-level constant sits at the same chain
+///   depth).
+/// - **The path, not the namespace, by experiment.** A walk out through the lexical nesting works
+///   on namespaced code, but a Rails model is `class Message < ApplicationRecord` at the top level,
+///   with empty nesting, so half an app got nothing. Ruby projects put related code in one
+///   directory whether or not they nest it, and Zeitwerk makes the directory *be* the namespace, so
+///   the path carries everything the nesting did and works for flat code too.
+struct Locality<'a> {
+    /// Every document of the user's own code, and how far its directory is from the cursor's: 0 the
+    /// file itself, 1 its directory or below, 2 the parent, and so on.
     ///
-    /// Gems are absent rather than far. They are already below the user's own code on `group`,
-    /// and scoring six thousand documents nobody asked about is work for no answer.
+    /// - **Gems are absent, not far.** They are already below the user's code on `group`, and
+    ///   scoring thousands of documents nobody asked about is wasted work.
+    /// - **A generated document sits beside the file that implied it, at the same step**, flagged
+    ///   `generated`. It has no path of its own (`synthesized::generated_uri` puts a scheme in
+    ///   front of the source's URI), so the walk would score it as far as possible, and `group`
+    ///   would read that as "not the user's code". A Rails app's most important declarations are
+    ///   all generated, so without this a model's own columns would sit behind every method
+    ///   anywhere on the chain.
+    /// - **The third field is *the application never loads this document***:
+    ///   [`environment::Names::in_a_test_tree`], [`environment::in_a_generator_template`] or
+    ///   [`environment::Names::in_a_migration`]. It lives here because [`Locality::of`] is already
+    ///   the one walk over a declaration's definitions, which runs per definition of every method
+    ///   in the graph, so one lookup there is the budget. See [`Written::loadable`].
+    /// - **The tags read different sets**, [`environment::Trees`]' rule: the test tree from `own`
+    ///   (a gem's `lib/rack/test/` is a published library, so a miss must mean *not a spec*); the
+    ///   template and migration from the whole graph (a tree `rails generate` copies from, or
+    ///   `db:migrate` runs a file of, is the same wherever it ships; pundit's and engines' are
+    ///   common).
+    documents: HashMap<UriId, Where>,
+    /// Which of the two fences is on: the first false where the cursor itself is in a test tree,
+    /// the second false where the cursor itself is outside the project.
     ///
-    /// **A generated document is in here beside the file that implied it, at the same step**,
-    /// carrying `true` for *this step came from a generated document*. It has no path of its own
-    /// — `synthesized::generated_uri` is a scheme in front of the source's URI, deliberately not
-    /// a path — so the walk below would score it as far as a name can be, and `group` reads
-    /// *that* as "not the user's code". The declarations a Rails application cares about most
-    /// are every one of them generated, so without this a model's own columns sit behind every
-    /// method any file in the project declares anywhere on the chain, `Object`'s included.
-    ///
-    /// The third field is *the application never loads this document* —
-    /// [`environment::in_a_test_tree`], [`environment::in_a_generator_template`] or
-    /// [`environment::in_a_migration`] — and it travels here because [`Locality::of`] is already
-    /// the one walk over a declaration's definitions. It is packed into the entry rather than read from `environment::Trees` for
-    /// the same reason the step is: the point of use runs once per definition of every method
-    /// declaration in the graph, and one lookup there is the budget. See [`Written::loadable`].
-    ///
-    /// **The tags are read of different sets**, which is [`environment::Trees`]' rule arriving
-    /// here: the test tree off `own`, because a gem's `lib/rack/test/` is a published library and
-    /// a miss there has to mean *not a spec*; the template and the migration off the whole graph,
-    /// because a tree `rails generate` copies out of — or that `db:migrate` runs one file of — is
-    /// the same thing wherever it ships from, and pundit's and an engine's are the common cases.
-    documents: HashMap<UriId, (u8, bool, bool)>,
-    /// Whether the fence is on at all: false wherever the cursor is itself under a test tree.
-    ///
-    /// A developer editing a spec is exactly who the `def` in the next spec file over is the
-    /// answer for — `environment::fenced_from` is where that is decided, for this and for the
-    /// name rung alike. It is a field rather than a test at the point of use because the
-    /// question is about the *cursor*, which does not change between candidates, and the point
-    /// of use runs once per method declaration in the graph.
-    fenced: bool,
+    /// Someone editing a spec is exactly who the next spec file's `def` answers, and someone
+    /// editing a scratch file beside their project is who its top class answers.
+    /// `environment::fenced_from` decides both, here and for the name rung. A field, not a
+    /// per-candidate test, because it is about the *cursor*, which does not change between
+    /// candidates, and the point of use runs once per method declaration in the graph.
+    fenced: environment::Gates<'a>,
 }
 
-/// What a declaration in none of those documents is worth: nothing, and equally nothing, so the
-/// rest of the key still separates them.
+/// What [`Locality`] knows about one document, as the ranking and the two fences read it.
+///
+/// A struct, not a tuple: the fourth field made the tuple unreadable, and two fields can both be
+/// true (a loose file whose path holds a `spec` segment is in both lists), so an entry holding
+/// whichever loop wrote last would answer one fence wrongly.
+#[derive(Clone, Copy)]
+struct Where {
+    /// How near the document sits to the cursor's own, or [`NO_LOCALITY`].
+    step: u8,
+    /// Whether ya-lsp generated it rather than the user having written it.
+    generated: bool,
+    /// Whether the application never loads it: a test tree, a generator template tree, or a
+    /// migration.
+    unloadable: bool,
+    /// Whether it is outside the project altogether.
+    outside: bool,
+}
+
+/// What a declaration in none of these documents is worth: nothing, equally, so the rest of the key
+/// separates them.
 const NO_LOCALITY: u8 = u8::MAX;
 
-impl Locality {
-    /// Built once per request, from the user's own documents rather than from the whole graph —
-    /// 161 path comparisons on a real Rails app, against 7,000.
-    fn at(graph: &Graph, here: UriId, own: &HashSet<UriId>, names: environment::Names<'_>) -> Self {
-        let mut documents = HashMap::new();
+impl<'a> Locality<'a> {
+    /// Built once per request, from the table [`Placed`] builds once per settle.
+    ///
+    /// - **Everything not about the cursor is already answered**: which documents are the user's
+    ///   own, which trees the app never loads, which documents ya-lsp generated and from what, and
+    ///   each own document's directory. All are properties of the settled graph, so they are
+    ///   computed per settle, not per keystroke (see [`Placed`]).
+    /// - **What is left is the one term a cursor moves**: how many leading segments each directory
+    ///   shares with the cursor's. The cursor's directory is split **once**, here, which is why
+    ///   [`shared_segments`] takes a slice and a `&str`.
+    fn at(graph: &'a Graph, here: UriId, placed: &Placed, layout: environment::Layout<'_>) -> Self {
+        // The sum over-counts documents in two of the four lists: a slightly large reservation
+        // instead of a rehash.
+        let mut documents = HashMap::with_capacity(
+            placed.unloadable().len()
+                + placed.each_own().len()
+                + placed.generated().len()
+                + placed.outside().len(),
+        );
         let here_uri = graph.documents().get(&here).map(|document| document.uri());
-        // The same gate `locator::loadable_from` asks, so the two dropping surfaces cannot
-        // disagree about which cursors are fenced. A cursor in a document the graph has never
-        // held scores nothing and fences nothing: both halves fail in the direction that offers
-        // more rather than fewer.
-        let fenced = environment::fenced_from(here_uri, names);
+        // The same gate `locator::loadable_from` asks, so the two dropping surfaces cannot disagree
+        // about which cursors are fenced. A cursor in a document the graph never held scores and
+        // fences nothing: both halves fail towards offering more.
+        let fenced = environment::fenced_from(here_uri, layout);
         let Some(cursor) = here_uri else {
             return Self { documents, fenced };
         };
-        let cursor = directory_of(cursor);
-        let depth = segments(cursor);
+        let cursor: Vec<&str> = directory_of(cursor).split('/').collect();
 
-        // **The two tags that are read of the whole graph and not of `own`.** A gem's generator
-        // template is unloadable for the same reason the project's is — nobody requires the tree
-        // `rails generate` copies out of — and pundit's is the common case, so `own` cannot be
-        // the set. An engine's `db/migrate/` is the same shape: a tree run one file at a time by
-        // a rake task, wherever it was shipped from. It costs one pass over the documents, which is the pass `own` itself was
-        // built with, and it is the loop below that then decides the step: a template of the
-        // project's own is overwritten there with its real distance and the same flag, because
-        // `insert` is last-writer-wins and `own` comes second.
+        // **The two tags read from the whole graph, not `own`.** A gem's generator template is
+        // unloadable for the same reason the project's is (nobody requires the tree
+        // `rails generate` copies from); pundit's is the common case. An engine's `db/migrate/` is
+        // the same: run one file at a time by a rake task, wherever it ships from. The loop below
+        // then sets the step: a project template is overwritten there with its real distance and
+        // the same flag, since `insert` is last-writer-wins and `own` comes second.
         //
         // An entry at `NO_LOCALITY` changes no ranking: `of` takes a `min` over the entries it
         // finds and falls back to exactly this value when it finds none.
-        //
-        // The generated documents are collected in the same pass and resolved after the loop
-        // below, because what each of them is worth is what its **source** is worth and that is
-        // not known until the source has been given a step. They cannot be computed from a
-        // source's URI any more: one source writes one generated document per body, so the set
-        // is read off the graph and mapped back by the naming rather than guessed at.
-        let mut generated: Vec<(UriId, &str)> = Vec::new();
-        for (id, document) in graph.documents() {
-            let uri = document.uri();
-            if environment::in_a_generator_template(uri) || names.in_a_migration(uri) {
-                documents.insert(*id, (NO_LOCALITY, false, true));
-            }
-            if uri.starts_with(GENERATED_SCHEME) {
-                generated.push((*id, synthesized::source_of(uri)));
-            }
+        for id in placed.unloadable() {
+            documents.insert(
+                *id,
+                Where {
+                    step: NO_LOCALITY,
+                    generated: false,
+                    unloadable: true,
+                    // Read here, not in its own loop, because a loose file with a `spec` segment in
+                    // its path is in both lists, and one entry must carry both answers.
+                    outside: placed.outside().contains(id),
+                },
+            );
         }
 
-        // `filter_map`, the way `of` below reads the same table: `own` is built from the
-        // graph's own documents, so a miss has nothing to be done about it.
-        for (id, document) in own
-            .iter()
-            .filter_map(|id| Some((*id, graph.documents().get(id)?)))
-        {
-            let step = if id == here {
+        // **Every document outside the project: the one list here not about ranking.** A file open
+        // beside the user's work is not near or far: it is not the project's, so its row is dropped
+        // rather than placed. `or_insert`, because the loop above may already have written it.
+        for id in placed.outside() {
+            documents.entry(*id).or_insert(Where {
+                step: NO_LOCALITY,
+                generated: false,
+                unloadable: false,
+                outside: true,
+            });
+        }
+
+        for own in placed.each_own() {
+            let step = if own.id == here {
                 0
             } else {
-                let shared = shared_segments(cursor, directory_of(document.uri()));
-                u8::try_from(depth - shared + 1).unwrap_or(NO_LOCALITY)
+                let shared = shared_segments(&cursor, &own.directory);
+                u8::try_from(cursor.len() - shared + 1).unwrap_or(NO_LOCALITY)
             };
-            // The test flag is the source document's and is carried onto the generated entry
-            // below with it: what `workspace/rails/` writes down for a file under `spec/` is
-            // reachable exactly where that file is.
-            let testing = names.in_a_test_tree(document.uri())
-                || environment::in_a_generator_template(document.uri())
-                || names.in_a_migration(document.uri());
-            documents.insert(id, (step, false, testing));
+            // The test flag is the source document's and is carried onto its generated entry below:
+            // what `workspace/rails/` writes for a file under `spec/` is reachable exactly where
+            // that file is.
+            documents.insert(
+                own.id,
+                Where {
+                    step,
+                    generated: false,
+                    unloadable: own.unloadable,
+                    // The user's own code and documents outside the project are disjoint by
+                    // construction: `is_own` needs the workspace root or an `[index] load_paths`
+                    // prefix, and outside means neither.
+                    outside: false,
+                },
+            );
         }
-        // Every document this pass wrote, at its source's own step and with its source's own
-        // test flag: what `workspace/rails/` writes down for a file under `spec/` is reachable
-        // exactly where that file is. A generated document whose source is in none of the
-        // entries above — a gem's, say — is left out, exactly as it was when this was computed
-        // per own document.
-        for (id, source) in generated {
-            if let Some(&(step, _, testing)) = documents.get(&UriId::from(source)) {
-                documents.insert(id, (step, true, testing));
+
+        // Every document the generator pass wrote, at its source's step and with its source's test
+        // flag. A generated document whose source is in none of the entries above (a gem's) is left
+        // out. One source writes one document per body, so the set is read from the graph and
+        // mapped back by naming, not guessed from a URI.
+        for (id, source) in placed.generated() {
+            if let Some(&source) = documents.get(source) {
+                documents.insert(
+                    *id,
+                    Where {
+                        generated: true,
+                        ..source
+                    },
+                );
             }
+        }
+        // **The cursor's own document is not outside, for this request only.**
+        // `environment::Outward::Alone`'s exception, written into the table instead of asked per
+        // candidate (`of` reads one entry per definition of every method in the graph). Every
+        // *other* outside document keeps its flag, so one unsaved buffer never reads another.
+        if let Some(entry) = fenced
+            .outward
+            .own_document()
+            .and_then(|cursor| documents.get_mut(&UriId::from(cursor)))
+        {
+            entry.outside = false;
         }
         Self { documents, fenced }
     }
 
-    /// The nearest document the declaration was written in, whether ya-lsp wrote it, and
-    /// whether the application loads it at all.
+    /// The nearest document the declaration was written in, whether ya-lsp wrote it, and whether
+    /// the application loads it.
     ///
-    /// The nearest, because a class reopened in two places — a Rails concern, a monkey patch —
-    /// should be scored by the copy the cursor can see, not by whichever definition rubydex
-    /// happened to record first. **One walk for all three**, because this runs over every method
-    /// declaration in the graph on the name-based path: the second is a `bool` already sitting
-    /// in the entry the first reads, and the third is two counters over the same entries.
-    ///
-    /// A tie between a real file and a generated one goes to the real file: `(step, false)`
-    /// sorts before `(step, true)`, which is the ordering the caller then spends. The test flag
-    /// is deliberately **not** in that comparison — it decides whether the row exists, not where
-    /// it sits, so folding it into the key would tiebreak on something already answered.
+    /// - **The nearest**, because a class reopened in two places (a concern, a monkey patch) should
+    ///   be scored by the copy the cursor can see, not whichever rubydex recorded first.
+    /// - **One walk for all three**, because this runs over every method in the graph on the
+    ///   name-based path: the second is a `bool` in the entry the first reads, the third two
+    ///   counters over the same entries.
+    /// - **A tie between a real and a generated file goes to the real one**: `(step, false)` sorts
+    ///   before `(step, true)`. The test flag is **not** in that comparison: it decides whether the
+    ///   row exists, not where it sits.
     fn of(&self, graph: &Graph, declaration: &Declaration) -> Written {
         let mut nearest: Option<(u8, bool)> = None;
         let mut tally = Tally::default();
+        let mut elsewhere = Tally::default();
         for definition in declaration
             .definitions()
             .iter()
             .filter_map(|id| graph.definitions().get(id))
         {
-            // A definition in none of the user's own documents is a gem's, Ruby's own
-            // signatures', or one the walk never scored — far, and loadable. `own` is the only
-            // set that knows where *this project's* test trees are, so a miss here is not
-            // evidence of a spec: a gem with a `test/` directory inside its `lib/` is not this
-            // rule's business.
+            // A definition in none of the user's documents is a gem's, Ruby's signatures', or one
+            // never scored: far, and loadable. Only `own` knows where *this project's* test trees
+            // are, so a miss is not evidence of a spec (a gem with `test/` inside `lib/` is not
+            // this rule's business).
             let entry = self.documents.get(definition.uri_id());
-            if let Some(&(step, generated, _)) = entry {
+            if let Some(&Where {
+                step, generated, ..
+            }) = entry
+            {
                 nearest = Some(nearest.map_or((step, generated), |held| {
                     std::cmp::min(held, (step, generated))
                 }));
             }
-            // Outside the `if`: a definition in none of the user's own documents is still a
-            // definition, and it is the count of them that makes the "any" rule an "any". See
-            // [`Tally::loadable`], which is also where a declaration with no definitions at all
-            // is decided.
-            tally.saw(entry.is_some_and(|&(_, _, in_a_test)| in_a_test));
+            // Outside the `if`: a definition in none of the user's documents still counts, and
+            // counting them is what makes the "any" rule an "any". See [`Tally::loadable`], which
+            // also decides a declaration with no definitions.
+            tally.saw(entry.is_some_and(|entry| entry.unloadable));
+            elsewhere.saw(entry.is_some_and(|entry| entry.outside));
         }
         let (step, generated) = nearest.unwrap_or((NO_LOCALITY, false));
         Written {
             step,
             generated,
-            loadable: !self.fenced || tally.loadable(),
+            loadable: !self.fenced.trees || tally.loadable(),
+            inside: !self.fenced.outward.on() || elsewhere.loadable(),
         }
     }
 }
 
 /// Where a declaration was written, as the ranking and the fence both need it.
 ///
-/// Three answers from [`Locality::of`]'s single walk. Two of them order the list and the third
-/// decides whether the row is on it.
+/// Three answers from [`Locality::of`]'s single walk: two order the list, the third decides whether
+/// the row is on it.
 struct Written {
-    /// How near the nearest of the user's own documents holding it sits to the cursor.
+    /// How near the nearest of the user's documents holding it is to the cursor.
     step: u8,
-    /// Whether that nearest document is one ya-lsp generated rather than one the user wrote.
+    /// Whether that nearest document was generated by ya-lsp rather than written by the user.
     generated: bool,
-    /// Whether **any** definition of it is in code the application loads.
+    /// Whether **any** definition is in code the application loads.
     ///
-    /// *Any*, and one with no definitions at all is loadable: both are [`Tally::loadable`]'s,
-    /// which is the only place either is written down. What this removes is the declaration
-    /// whose *every* definition is under a test tree — a name that cannot be called from where
-    /// the cursor is, which is the same thing `reachable` refuses a private method for.
+    /// *Any*, and a declaration with no definitions counts as loadable: both are decided only in
+    /// [`Tally::loadable`]. This removes a declaration whose *every* definition is in a test tree:
+    /// a name that cannot be called from the cursor, the same reason `reachable` refuses a private
+    /// method.
     ///
-    /// **True for everything when the cursor is in a test tree**, so the term is inert exactly
-    /// where it would be wrong. See [`Locality::fenced`].
+    /// **True for everything when the cursor is in a test tree**, so the term is off exactly where
+    /// it would be wrong. See [`Locality::fenced`].
     loadable: bool,
+    /// Whether **any** definition is inside the project at all.
+    ///
+    /// The second fence, off for a cursor that is itself outside, so a reader in a scratch file
+    /// beside the project is offered that file's own names and nothing else outside.
+    inside: bool,
 }
 
 /// A URI without its last segment. Both sides come from `Url::from_file_path`, so they are
-/// already canonical and comparing them as text is comparing paths.
-fn directory_of(uri: &str) -> &str {
+/// canonical, and comparing text compares paths.
+///
+/// `pub(super)` for `indexed::Placed`, which reads this for every user document when the graph
+/// settles, making it cheap. The rule sits here, beside the cursor half it is compared with.
+pub(super) fn directory_of(uri: &str) -> &str {
     uri.rsplit_once('/').map_or(uri, |(directory, _)| directory)
-}
-
-fn segments(uri: &str) -> usize {
-    uri.split('/').count()
 }
 
 /// How many leading path segments two directories share.
 ///
-/// Segment-wise rather than byte-wise, or `app/model` would count as sharing all of `app/models`.
-fn shared_segments(left: &str, right: &str) -> usize {
-    left.split('/')
-        .zip(right.split('/'))
-        .take_while(|(left, right)| left == right)
+/// Segment-wise, not byte-wise, or `app/model` would share all of `app/models`.
+///
+/// **The argument shapes are the performance choice.** This runs once per own document with the
+/// same cursor each time, so the cursor arrives pre-split; splitting it here would repeat thousands
+/// of times per keystroke. The directory is a `&str` because splitting *it* is the work, and
+/// `Placed` holding the directory makes it the only path work completion does.
+fn shared_segments(cursor: &[&str], directory: &str) -> usize {
+    cursor
+        .iter()
+        .zip(directory.split('/'))
+        .take_while(|(cursor, segment)| **cursor == *segment)
         .count()
 }
 
-/// The namespace a receiver id names, following a constant alias the way rubydex's own walk
-/// does — `Money = Billing::Money` offers what it points at.
+/// The namespace a receiver id names, following a constant alias as rubydex's own walk does:
+/// `Money = Billing::Money` offers what it points at.
 fn namespace_id(graph: &Graph, id: DeclarationId) -> Option<DeclarationId> {
     namespace(graph, id).map(|(id, _)| id)
 }
 
-/// The same, with the declaration it had to look up anyway.
+/// The same, plus the declaration it had to look up anyway.
 ///
-/// `chain` runs this once per ancestor of every candidate's receiver, and looking the id back up
-/// to re-establish what this already proved was a second hash lookup on that path — and a
-/// `Declaration` that was known to be a `Namespace` re-checked as though it might not be.
+/// `chain` calls this once per ancestor of every candidate's receiver, so looking the id up again
+/// would be a second hash lookup on that path, re-checking a `Declaration` already proven to be a
+/// `Namespace`.
 fn namespace(graph: &Graph, id: DeclarationId) -> Option<(DeclarationId, &Namespace)> {
     match graph.declarations().get(&id)? {
         Declaration::Namespace(namespace) => Some((id, namespace)),
@@ -1242,42 +1251,32 @@ fn namespace(graph: &Graph, id: DeclarationId) -> Option<(DeclarationId, &Namesp
 
 /// The degraded list: every method name in the project, for a receiver with no type.
 ///
-/// Deduplicated by name, because `name` is defined by hundreds of classes in a Rails bundle and
-/// hundreds of identical rows is not a completion list. The user's own code wins the duplicate,
-/// so the detail line names a file they can actually go and read.
+/// - **Deduplicated by name**, because `name` is defined by hundreds of classes in a Rails bundle,
+///   and hundreds of identical rows is not a list. The user's own code wins the duplicate, so the
+///   detail line names a file they can read.
+/// - **Deduplicated before sorting, on a hash of the label**: this runs over every method in the
+///   graph per keystroke, and copying each name would be a hundred thousand allocations to discard.
+/// - **Over `admitted` candidates it returns no rows.** A decision, not an absence: the list
+///   returns once typing narrows the candidates below the line. At an empty prefix it never does,
+///   since the candidates are the whole project's names and the typed word ranks in the thousands.
+/// - **Under it, rows are cut to `shown`**, which is honest here but not at an empty prefix: with
+///   nothing typed, `tier` and `length` tie and only `Locality` (a name's directory) ranks, so
+///   truncation would keep arbitrary rows. From three characters both are live, and in every
+///   measured list of up to 512 candidates the typed word sits within the first 128 rows.
 ///
-/// Deduplication happens *before* the sort, and on a hash of the label rather than the label:
-/// this runs over every method declaration in the graph on every keystroke, so a copy of each
-/// name would be a hundred thousand allocations to throw away.
-///
-/// **A guess is refused on its candidate count and truncated on its row count**, which are
-/// `admitted` and `shown`, and the split is measured rather than tidy.
-///
-/// Over `admitted` candidates this answers with **no rows at all**. That is a decision and not an
-/// absence: the list comes back on its own as soon as what has been typed narrows the candidates
-/// under the line. At an empty prefix it never does — the set there is the project's entire name
-/// universe, 26,073 to 45,953 over five corpora, with the word the file actually wrote at rank
-/// 4,070 at the median — which is the case the ceiling exists for.
-///
-/// Under it, the rows are cut to `shown`, and that is honest here where it would not be at an
-/// empty prefix. With nothing typed, `tier` is 1 for every row and `length` is 0, leaving
-/// `Locality` — which directory a name lives in — as the only live term, so a truncation would
-/// keep rows chosen by nothing. From three characters on both are live, and it shows: in every
-/// measured list of up to 512 candidates the word sits inside the first 128 rows, 430 of 430.
-///
-/// `isIncomplete` is true in both cases, and it is what makes the refusal self-correcting — see
-/// the module docs. Saying the empty answer is *complete* would have the client filter it locally
-/// and never ask again, so the list could not reappear inside the word it was declined for.
+/// `isIncomplete` is true in both cases, which makes the refusal self-correcting (see the module
+/// docs): calling the empty answer *complete* would make the client filter locally and never ask
+/// again.
 fn by_name(graph: &Graph, shown: usize, admitted: usize, ranking: &Ranking) -> (Vec<Item>, bool) {
-    // Every method name contains a `#` and no other declaration's does, so this is rubydex's
-    // parallel filter doing the "methods only" pass for free.
+    // Every method name contains a `#` and no other declaration's does, so rubydex's parallel
+    // filter does the "methods only" pass for free.
     let query = format!("#{}", ranking.prefix);
     let mut best: HashMap<u64, Ranked> = HashMap::new();
 
     for id in query::declaration_search(graph, &[&query], &MatchMode::Fuzzy) {
-        // The query leads with `#`, which only a method name contains, so this is rubydex's
-        // parallel filter having already done the "methods only" pass — bound rather than
-        // re-tested, since a second `matches!` over every method in the graph proved nothing.
+        // The query starts with `#`, which only method names contain, so rubydex's parallel filter
+        // has already kept only methods. Bound here, not re-tested: a second `matches!` over every
+        // method in the graph proves nothing.
         let Some(declaration @ Declaration::Method(_)) = graph.declarations().get(&id) else {
             continue;
         };
@@ -1295,64 +1294,63 @@ fn by_name(graph: &Graph, shown: usize, admitted: usize, ranking: &Ranking) -> (
                 slot.insert(entry);
             }
         }
-    }
 
-    // Counted after the dedup, because a duplicate is not a candidate a person could pick and
-    // the ceiling is about what the ranking can be trusted to order. Nothing above this point is
-    // wasted when it fires: the walk is what decides whether the guess is narrow enough to make.
-    if best.len() > admitted {
-        return (Vec::new(), true);
+        // **Counted inside the walk, because the walk is what the ceiling stops.** Counted after
+        // the dedup, because a duplicate is not a candidate anyone could pick. `best` only grows,
+        // so once over the line it cannot come back, and ranking the rest would build a list that
+        // is discarded whole.
+        //
+        // This is the common case. The query is `#` plus what was typed, and at a bare `.` nothing
+        // is typed: a lone `#` fuzzy-matches every method name in the graph (tens of thousands),
+        // and most cursors are still over the line at the fourth character.
+        if best.len() > admitted {
+            return (Vec::new(), true);
+        }
     }
 
     let mut ranked: Vec<Ranked> = best.into_values().collect();
     let truncated = take_best(&mut ranked, shown);
-    (
-        ranked.into_iter().map(|entry| entry.item).collect(),
-        truncated,
-    )
+    (spelled_out(graph, ranked), truncated)
 }
 
-/// Everything the ranking needs that is not the candidate itself.
+/// Everything the ranking needs besides the candidate.
 ///
-/// A struct rather than another parameter each time, because `ranked_declaration` is the one
-/// point both the receiver path and the name-based path pass through: every term the ranking
-/// grows lands here, and the two paths cannot drift apart on one.
+/// A struct, because `ranked_declaration` is the one point both the receiver path and the
+/// name-based path go through: every new ranking term lands here, so the two paths cannot drift
+/// apart.
 struct Ranking<'a> {
     prefix: &'a str,
     distance: Distance,
-    locality: Locality,
-    /// Whether Ruby would let a private method be written at the cursor. Decided from the
-    /// syntax alone by [`cursor::Context::allows_private`].
+    locality: Locality<'a>,
+    /// Whether Ruby allows a private method at the cursor, decided from syntax alone by
+    /// [`cursor::Context::allows_private`].
     private_ok: bool,
     /// The second opinion on rubydex's visibility record, for the one shape it gets wrong.
     ///
-    /// Here for the reason it is in `locator`: a bare `private` written inside a block is
-    /// recorded against every `def` below the block, so an ordinary Rails concern's public
-    /// methods were never offered on any receiver. See [`locator::Modifiers`].
+    /// Here for `locator`'s reason: a bare `private` inside a block is recorded against every `def`
+    /// after the block, so an ordinary Rails concern's public methods would never be offered. See
+    /// [`locator::Modifiers`].
     ///
-    /// **`None` on the name-based path, and that is a bound rather than an oversight.** The
-    /// repair costs a read of the declaring document, memoised per document, and the receiver
-    /// path's candidates are one ancestry's members — tens of documents. [`by_name`] walks every
-    /// method in the graph before it decides whether to answer at all, so the same repair there
-    /// would read thousands of files at a keystroke. Nothing is lost at any one cursor: the two
-    /// paths are alternatives, the name-based one runs only where no receiver resolved, and what
-    /// it produces is the *Guessed* tier — where a list that came back one name short is what
-    /// the tier already warns about, and a **Resolved** card contradicted by its own list is
-    /// what this repair exists to prevent.
+    /// **`None` on the name-based path, as a bound.** The repair reads the declaring document
+    /// (memoised per document), and the receiver path's candidates come from one ancestry, tens of
+    /// documents. [`by_name`] walks every method in the graph before deciding whether to answer, so
+    /// the repair there would read thousands of files per keystroke. Nothing is lost at any cursor:
+    /// the name-based path runs only where no receiver resolved, and produces the *Guessed* tier,
+    /// where a list one name short is exactly what the tier warns about. The repair exists to stop
+    /// a **Resolved** card being contradicted by its own list.
     modifiers: Option<&'a locator::Modifiers<'a>>,
 }
 
 /// The five method names Ruby keeps private however they were declared.
 ///
-/// `rb_add_method` privatises them by name at the point of definition, so a `def initialize` is
-/// private whatever its class did or did not say — and neither rbs nor rubydex records that.
-/// Measured against Ruby 4.0.1: these five and nothing else. `method_missing` and
-/// `singleton_method_added` look like they belong here and do not; they are private on
-/// `BasicObject` because that is how *those* copies were written, which the graph already knows.
-///
-/// Instance methods only. The same code leaves `def self.initialize` public, and `Bar.initialize`
-/// really does call it — which is why [`reachable`] checks who owns the method before applying
-/// this. `Class#initialize` is caught anyway, because it is an instance method of `Class`.
+/// - **`rb_add_method` makes them private by name**, so a `def initialize` is private whatever its
+///   class said, and neither rbs nor rubydex records that. Checked against Ruby 4.0.1: these five,
+///   nothing else. `method_missing` and `singleton_method_added` look like they belong but do not;
+///   they are private on `BasicObject` because those copies were written that way, which the graph
+///   already knows.
+/// - **Instance methods only.** `def self.initialize` stays public, and `Bar.initialize` really
+///   calls it, so [`reachable`] checks the owner first. `Class#initialize` is still caught, as an
+///   instance method of `Class`.
 const ALWAYS_PRIVATE: [&str; 5] = [
     "initialize",
     "initialize_clone",
@@ -1361,19 +1359,19 @@ const ALWAYS_PRIVATE: [&str; 5] = [
     "respond_to_missing?",
 ];
 
-/// Whether Ruby would let this method be called where the cursor is.
+/// Whether Ruby allows this method to be called where the cursor is.
 ///
-/// Everything reaching here has already passed rubydex's visibility filter, which answers a
-/// slightly different question than Ruby asks. Two gaps follow, and they close together:
+/// Everything here already passed rubydex's visibility filter, which answers a slightly different
+/// question. Two gaps, closed together:
 ///
-/// - **rubydex passes a private method whenever the caller's `self` is the same class as the
-///   receiver.** Ruby's exemption is for a receiver *written* `self`, so `Vault.new.secret` was
-///   offered from inside `Vault`, where a real interpreter raises `NoMethodError`.
-/// - **The graph believes rbs about the five names above**, and rbs is not consistent about
-///   them: `Kernel#initialize_copy` is marked private and `String#initialize_copy` public, so
-///   `"hi".` offered `initialize` and `initialize_copy` while `count.` offered only the first.
+/// - **rubydex passes a private method whenever the caller's `self` is the receiver's class.** Ruby
+///   exempts only a receiver *written* `self`, so `Vault.new.secret` would be offered inside
+///   `Vault`, where Ruby raises `NoMethodError`.
+/// - **The graph trusts rbs about the five names above**, and rbs is inconsistent:
+///   `Kernel#initialize_copy` is private but `String#initialize_copy` public, so `"hi".` would
+///   offer both `initialize` and `initialize_copy` while `count.` offers only the first.
 ///
-/// Both are the same question — may this be written *here* — and `private_ok` is the answer.
+/// Both ask whether this may be written *here*, and `private_ok` answers.
 fn reachable(
     graph: &Graph,
     modifiers: Option<&locator::Modifiers<'_>>,
@@ -1386,7 +1384,7 @@ fn reachable(
     }
     if matches!(
         graph.visibility(&id),
-        // rubydex treats `module_function`'s instance copy as private, and so does Ruby.
+        // rubydex treats `module_function`'s instance copy as private, as Ruby does.
         Some(Visibility::Private | Visibility::ModuleFunction)
     ) && modifiers.is_none_or(|modifiers| modifiers.confirm(graph, id))
     {
@@ -1395,7 +1393,7 @@ fn reachable(
     !ALWAYS_PRIVATE.contains(&label) || singleton_owned(graph, declaration)
 }
 
-/// Whether a method hangs off a singleton class, which is how rubydex spells `def self.foo`.
+/// Whether a method hangs off a singleton class: rubydex's spelling of `def self.foo`.
 fn singleton_owned(graph: &Graph, declaration: &Declaration) -> bool {
     matches!(
         graph.declarations().get(declaration.owner_id()),
@@ -1406,93 +1404,81 @@ fn singleton_owned(graph: &Graph, declaration: &Declaration) -> bool {
 struct Ranked {
     group: u8,
     tier: u8,
-    /// Whether the name is spelled as an internal one — `_fork`, `__send`.
+    /// Whether the name is spelled as an internal one: `_fork`, `__send`.
     internal: bool,
     /// How far the namespace declaring this sits from the receiver. See [`Distance`].
     distance: u16,
-    /// Whether ya-lsp wrote the document this was declared in, rather than the user.
+    /// Whether ya-lsp wrote the document this was declared in.
     ///
-    /// **Below `distance` and above `locality`, and it has to be its own term.** *What the class
-    /// was written to do, then what its table says it holds* is a property of the **kind** of
-    /// declaration, not of where it lives: a column is declared in `db/schema.rb` and the method
-    /// beside it in `app/models/story.rb`, so leaving the two to `locality` decides them by which
-    /// of those directories the cursor happens to be nearer — the order holds from `app/` and
-    /// inverts from `db/`, which the test named for it fails without.
-    ///
-    /// **It is here for that invariant and the corpora argue against it.** Over the audit's
-    /// 1,452 typed cursors it moves 18 words out of rank 1 into the top ten, 124 to 106, while
-    /// tightening every band below — median 30 to 29, p90 199 to 192. A developer does reach a
-    /// table's members slightly more often than the `def`s beside them. It is kept because the
-    /// alternative is an order that changes with the cursor's directory.
+    /// - **Its own term, below `distance` and above `locality`.** "What the class was written to
+    ///   do, then what its table holds" is a property of the declaration's **kind**, not its
+    ///   location. A column is declared in `db/schema.rb` and the method beside it in
+    ///   `app/models/story.rb`; leaving them to `locality` would order them by which directory the
+    ///   cursor is nearer, inverting between `app/` and `db/`. The test named for it fails without
+    ///   this.
+    /// - **The corpora mildly disagree**: developers reach a table's members slightly more often
+    ///   than the `def`s beside them. It is kept because the alternative is an order that changes
+    ///   with the cursor's directory.
     generated: bool,
     /// How near the declaration itself sits to the cursor. See [`Locality`].
     locality: u8,
-    /// Where a keyword argument sits in the signature that declares it, and zero for everything
-    /// else.
+    /// Where a keyword argument sits in its declaring signature; zero for everything else.
     ///
-    /// It is only ever a signature's own order. rubydex's emission order looks like it would
-    /// serve every candidate — the ancestor chain is walked outwards, so an earlier row is
-    /// declared nearer — but *within* one namespace that order is a hash map's, and adding a
-    /// member reshuffles it. A completion list that rearranges itself as the file is edited is
-    /// worse than one that is merely alphabetical. [`Distance`] takes the half of the emission
-    /// order that is stable and leaves the half that is not. A signature is a list, so its order
-    /// is real and worth keeping.
+    /// Only a signature's own order. rubydex's emission order looks usable (the ancestor chain is
+    /// walked outwards), but *within* one namespace it is a hash map's order and reshuffles when a
+    /// member is added, and a list that rearranges as the file is edited is worse than
+    /// alphabetical. [`Distance`] takes the stable half of emission order. A signature is a list,
+    /// so its order is real.
     sequence: usize,
-    /// The label's length, or zero when nothing has been typed yet.
+    /// The label's length, or zero when nothing is typed yet.
     ///
-    /// Shortest-first is a good tiebreak among rows that all matched a prefix and a poor one
-    /// among rows that matched nothing in particular: `Foo::` should read alphabetically, not
-    /// shortest-name-first. The zero is what lets the term rank high without cost — it is
-    /// silent at exactly the cursor where it would be wrong, so the terms it sits above keep
-    /// the list they had. See [`order`].
+    /// Shortest-first is a good tiebreak among rows that all matched a prefix, and a poor one among
+    /// rows that matched nothing (`Foo::` should read alphabetically). The zero lets the term rank
+    /// high at no cost: it is silent exactly where it would be wrong, so the terms below keep their
+    /// order. See [`order`].
     length: usize,
+    /// The declaration whose qualified name becomes [`Item::detail`], **spelled after the cap, not
+    /// before**.
+    ///
+    /// The detail line is in no term of [`order`] and is read only by the response builder.
+    /// Spelling it when the row is built would spell it for every candidate the prefix admits
+    /// (every method in the graph, at an empty prefix): two `format!`s and a name walk each, for
+    /// strings all but `limit` of them discard. Measured, that was a large share of the analysis
+    /// thread's CPU during completion.
+    ///
+    /// `None` wherever the detail is a constant the producer already knows: every non-declaration
+    /// row.
+    detail_of: Option<DeclarationId>,
     item: Item,
 }
 
 /// What the user typed first, then how near the name is, then the shorter one.
 ///
-/// **Match quality leads, and for two releases it did not.** `group` — is this the user's code —
-/// sat above `tier`, so a name in the project matching `wh` as a *subsequence* beat `where`
-/// matching it as a *prefix*. Measured over 1,452 typed cursors on six corpora, moving `tier`
-/// to the front takes the words sitting past rank 128 one character into the word from 21 to
-/// **2**, and past 256 from 9 to **0**. Everything below it is a tiebreak among rows the user
-/// has equally asked for.
+/// 1. **Match quality leads.** With `group` (is this the user's code) first, a project name
+///    matching `wh` as a *subsequence* would beat `where` matching it as a *prefix*. Measured,
+///    putting `tier` first nearly eliminates words ranked past 128 one character in. Everything
+///    below is a tiebreak among rows the user asked for equally.
+/// 2. **Names starting with `_` sink**: Ruby's "not meant for you" spelling. Without this, `User.`
+///    opens on `__send`, `_fork` and `_load_from_sql` (underscores sort before letters). Typing `_`
+///    lifts them back.
+/// 3. **`group` has three bands.** Keyword arguments lead, because they are the only suggestions
+///    that are *wrong* to leave out (in `build(` the parameter names are the answer). Then every
+///    declaration, the user's and gems' **together**: `distance` knows a method on the receiver
+///    beats one on `Object` whoever wrote either. Ruby's keywords come last: above declarations,
+///    forty keywords would fill the top ten at a bare cursor. The cost is `end` ranking a few
+///    places lower mid-word, returned once `end` is typed in full (an exact match outranks every
+///    prefix).
+/// 4. **[`Distance`] ranks a list with nothing typed**, where `tier` ties: the nearer owner wins,
+///    and `Object` (end of every chain, drain for everything rubydex could not attribute) is as far
+///    as possible.
+/// 5. **`length` sits above both nearness terms.** It cannot speak at a bare cursor (`sort_length`
+///    is zero there) and is the strongest tiebreak once a character arrives: among rows matching
+///    `ren`, `render` is the answer, not `rendered_format`. Measured, this gets the right word to
+///    rank 1 noticeably more often at one to three characters, and changes nothing at a bare
+///    cursor, which is why the move is free.
 ///
-/// A name beginning with an underscore sinks: Ruby spells "you were not meant to call this" that
-/// way, and without the rule `User.` opens on `__send`, `_fork` and `_load_from_sql` because
-/// underscores sort before letters. Typing one lifts them back — someone who writes `_` means it.
-///
-/// **`group` is three bands, not four, and that is the other half of the same correction.**
-/// Keyword arguments lead because they are the only suggestion that can be *wrong* to leave out:
-/// in `build(` the parameter names are the answer to the question and everything else is
-/// background. Then every declaration, the user's own and a gem's **together** — the distinction
-/// used to be this term's whole job and it belongs to `distance`, which knows that a method on
-/// the receiver beats one on `Object` whoever wrote either. Ruby's keywords come last, measured:
-/// putting them above declarations empties rank 1 and the entire top ten at a bare-word cursor,
-/// 34 and 183 rows to **0**, because forty keywords sit in front of everything before a
-/// character is typed. What that costs is `end` a few ranks mid-word — rank 4 to 10 at `en` — and
-/// it is handed back by the first rule on this list, since `end` typed in full is an exact match
-/// and outranks every prefix: rank 4 to **2**.
-///
-/// [`Distance`] is what ranks a list nothing has been typed into at all, where `tier` is 1 for
-/// every row: the nearer owner wins, and `Object` — the end of every chain and the drain for
-/// everything rubydex could not attribute — is as far as a name can be.
-///
-/// **`length` sits above both nearness terms, and for two releases it sat below them.** It is
-/// the one term on this list that cannot speak at a bare cursor — `sort_length` is zero when
-/// nothing has been typed — and it is the strongest tiebreak the moment a character arrives:
-/// among rows that all matched `ren`, `render` is the answer and `rendered_format` is not.
-/// Asking `generated` and `locality` first let a long name from the nearer file sit above the
-/// short one the user was spelling. Measured over the same 1,452 typed cursors, lifting it two
-/// places takes the right word to rank 1 for 543 -> **586** cursors one character in, 727 ->
-/// **759** at two and 887 -> **919** at three, and into the top ten for 1,096 -> **1,122**,
-/// 1,164 -> **1,169** and 1,154 -> **1,157**. A bare cursor is untouched — 108 and 392, both
-/// unchanged — which is the whole of why the move is free: the term is inert exactly where the
-/// two below it do their work.
-///
-/// [`Locality`] answers the same question as [`Distance`] asked of a different thing. Distance
-/// is the stronger answer and goes first, but it is silent exactly twice: where there is no
-/// receiver to measure a chain from, and among the rows of one chain that tie. Locality speaks
+/// [`Locality`] asks [`Distance`]'s question about a different thing. Distance is stronger and goes
+/// first, but is silent twice: with no receiver, and among one chain's tied rows. Locality speaks
 /// in both.
 fn order(a: &Ranked, b: &Ranked) -> std::cmp::Ordering {
     b.tier
@@ -1507,10 +1493,10 @@ fn order(a: &Ranked, b: &Ranked) -> std::cmp::Ordering {
         .then(a.item.label.cmp(&b.item.label))
 }
 
-/// Keep the `limit` best rows in order, and answer whether any were dropped.
+/// Keep the `limit` best rows in order, and say whether any were dropped.
 ///
-/// The return value is the whole of `Completion::incomplete`: dropping a row is the only way
-/// this list can fail to hold something a longer prefix would reach. See the module docs.
+/// The return value is all of `Completion::incomplete`: dropping a row is the only way this list
+/// can miss something a longer prefix would reach. See the module docs.
 fn take_best(ranked: &mut Vec<Ranked>, limit: usize) -> bool {
     let truncated = ranked.len() > limit;
     if truncated {
@@ -1519,6 +1505,27 @@ fn take_best(ranked: &mut Vec<Ranked>, limit: usize) -> bool {
     }
     ranked.sort_unstable_by(order);
     truncated
+}
+
+/// The rows that survived the cap, each given the detail line only it now needs.
+///
+/// The one place a [`Ranked`] becomes an [`Item`], so the deferral [`Ranked::detail_of`] describes
+/// cannot be half-done. `graph.declarations()` is asked again rather than carrying the name,
+/// because a borrow would thread a lifetime through `rank`, `order` and `take_best` to save one
+/// lookup per *kept* row (at most `limit`), against the tens of thousands of rows no longer
+/// spelled.
+fn spelled_out(graph: &Graph, ranked: Vec<Ranked>) -> Vec<Item> {
+    ranked
+        .into_iter()
+        .map(|entry| {
+            let mut item = entry.item;
+            if let Some(declaration) = entry.detail_of.and_then(|id| graph.declarations().get(&id))
+            {
+                item.detail = Some(render::qualified_name(graph, declaration.name()));
+            }
+            item
+        })
+        .collect()
 }
 
 fn rank(
@@ -1542,13 +1549,14 @@ fn rank(
                 tier,
                 internal: is_internal(prefix, &label),
                 // Neither of these is anywhere in particular, and `group` keeps both out of
-                // any comparison where that would matter: keyword arguments lead the list and
-                // Ruby's keywords are a band of their own.
+                // comparisons where that would matter: keyword arguments lead the list, and Ruby's
+                // keywords are their own band.
                 distance: 0,
                 generated: false,
                 locality: 0,
                 sequence,
                 length: sort_length(prefix, &label),
+                detail_of: None,
                 item: Item {
                     label,
                     detail: Some("keyword argument".to_owned()),
@@ -1568,6 +1576,7 @@ fn rank(
             locality: 0,
             sequence: 0,
             length: sort_length(prefix, keyword.name()),
+            detail_of: None,
             item: Item {
                 label: keyword.name().to_owned(),
                 detail: Some("Ruby keyword".to_owned()),
@@ -1587,39 +1596,47 @@ fn ranked_declaration(
     ranking: &Ranking,
 ) -> Option<Ranked> {
     let prefix = ranking.prefix;
-    // A `Todo` namespace is a placeholder the resolver invented for a parent it never saw, so
-    // it has no definition to jump to and no members to offer.
+    // A `Todo` namespace is a placeholder the resolver invented for a parent it never saw: no
+    // definition to jump to, no members to offer.
     if matches!(declaration, Declaration::Namespace(Namespace::Todo(_))) {
         return None;
     }
     let name = declaration.name();
-    // A singleton class and an anonymous `Class.new` both have names rubydex invented. The
-    // singleton's *methods* are still offered, spelled the way its class calls them.
-    if !render::is_nameable(name) {
+    // A singleton class and an anonymous `Class.new` both have invented names. The singleton's
+    // *methods* are still offered, spelled as its class calls them.
+    //
+    // Take the segment first and test it, because `is_nameable` reads the same segment; asking the
+    // name would walk it twice, over every method declaration in the graph.
+    let label = render::last_segment(name);
+    if !render::segment_is_nameable(label) {
         return None;
     }
-    let label = render::last_segment(name);
-    // After `tier`, deliberately. This runs once per candidate and there can be a hundred
-    // thousand of them, and `reachable` costs a visibility lookup where the prefix test costs a
-    // string compare — so the cheap filter goes first and most rows never reach the expensive
-    // one. `private_ok` short-circuits the whole thing wherever a receiver was not written.
+    // After `tier`, on purpose. This runs per candidate (up to a hundred thousand), and `reachable`
+    // costs a visibility lookup while the prefix test is a string compare, so the cheap filter goes
+    // first. `private_ok` short-circuits wherever no receiver was written.
     let tier = tier(prefix, label)?;
     if !ranking.private_ok && !reachable(graph, ranking.modifiers, id, declaration, label) {
         return None;
     }
 
-    // One walk over the definitions, not three. `Locality` is built from exactly the documents
-    // that are the user's own code, so "is this theirs" is "did any document score at all" —
-    // and this runs over every method declaration in the graph on the name-based path.
+    // One walk over the definitions, not three. `Locality` holds exactly the user's own documents,
+    // so "is this theirs" is "did any document score", and this runs over every method in the graph
+    // on the name-based path.
     let written = ranking.locality.of(graph, declaration);
-    // **A row the application cannot load is not offered, and that is a drop rather than a
-    // rank.** Ruby will not find this name from where the cursor is — the file it is written in
-    // is loaded by RSpec and by nothing else — so offering it is offering a suggestion that
-    // cannot run, which is the judgement `reachable` already makes about a private method.
-    // Sinking it instead would leave it holding a slot under `MAX_COMPLETION_ITEMS` and leave
-    // the name in `by_name`'s candidate count, where it decides whether a guess is offered at
-    // all. See [`Written::loadable`] for why the cursor's own tree turns this off.
+    // **A row the application cannot load is dropped, not ranked lower.** Ruby will not find the
+    // name from the cursor (only RSpec loads its file), so offering it offers a suggestion that
+    // cannot run, the same judgement `reachable` makes for a private method. Sinking it would still
+    // take a slot under `MAX_COMPLETION_ITEMS` and count in `by_name`'s candidate total, which
+    // decides whether a guess is offered at all. See [`Written::loadable`] for why the cursor's own
+    // tree turns this off.
     if !written.loadable {
+        return None;
+    }
+    // **The same drop for the other meaning.** A name whose every definition is outside the project
+    // is not this project's: its file is one the user opened beside their work, which the
+    // application cannot load at all. See [`Written::inside`] for why a scratch file's own cursor
+    // turns this off.
+    if !written.inside {
         return None;
     }
 
@@ -1632,9 +1649,10 @@ fn ranked_declaration(
         locality: written.step,
         sequence: 0,
         length: sort_length(prefix, label),
+        detail_of: Some(id),
         item: Item {
             label: label.to_owned(),
-            detail: Some(render::qualified_name(graph, name)),
+            detail: None,
             kind: kind_of(declaration),
             documentation: None,
             deprecated: false,
@@ -1645,11 +1663,11 @@ fn ranked_declaration(
 
 /// A name nobody reaches by typing its first character: `_internal`, `!`, `<=>`, `[]`, `$0`.
 ///
-/// Punctuation and underscores sort before letters, so without this the first thing a large
-/// project offers after a `.` is `!`, `%`, `&` and `__send`. A sigil does not count as
-/// punctuation — `@name` is a name — so it is stepped over before the test.
+/// Punctuation and underscores sort before letters, so without this a large project offers `!`,
+/// `%`, `&` and `__send` first after a `.`. A sigil is not punctuation (`@name` is a name), so it
+/// is skipped before the test.
 ///
-/// Typing one of these characters lifts them all back: somebody who writes `_` means it.
+/// Typing one of these characters lifts them all back: someone who writes `_` means it.
 fn is_internal(prefix: &str, label: &str) -> bool {
     let Some(first) = significant(label) else {
         return true;
@@ -1660,11 +1678,11 @@ fn is_internal(prefix: &str, label: &str) -> bool {
     significant(prefix).is_none_or(char::is_alphabetic)
 }
 
-/// The leading run of sigil characters: `@`, `@@`, `$`, or nothing at all.
+/// The leading run of sigil characters: `@`, `@@`, `$`, or nothing.
 ///
-/// `$@` is the awkward one and the reason this is a run rather than a first character: every
-/// character in it is a sigil character, so the whole name comes back — which is the right
-/// answer for the only question asked of it, since nothing but a `$` prefix should reach it.
+/// A run, not a first character, because of `$@`: every character in it is a sigil character, so
+/// the whole name comes back, which is right for the only question asked of it (only a `$` prefix
+/// should reach it).
 fn sigils(name: &str) -> &str {
     &name[..name.len() - name.trim_start_matches(['@', '$']).len()]
 }
@@ -1678,23 +1696,20 @@ fn sort_length(prefix: &str, label: &str) -> usize {
     if prefix.is_empty() { 0 } else { label.len() }
 }
 
-/// How well `prefix` matches `label`, or `None` when it does not match at all.
+/// How well `prefix` matches `label`, or `None` if it does not match.
 ///
-/// The floor is a case-insensitive subsequence, which is what editors fuzzy-match with — being
-/// stricter here would drop rows the client would have been happy to show.
+/// The floor is a case-insensitive subsequence, what editors fuzzy-match with: stricter would drop
+/// rows the client would happily show.
 fn tier(prefix: &str, label: &str) -> Option<u8> {
-    // Except for the sigil, which is not a letter to fuzzy-match on. `@foo`, `@@foo` and `$foo`
-    // are three different namespaces in Ruby, and a name in one of them is not a candidate for
-    // a prefix in another — so what the prefix asked for has to be what the label carries.
+    // Except the sigil, which is not a letter to fuzzy-match. `@foo`, `@@foo` and `$foo` are three
+    // Ruby namespaces, and a name in one is not a candidate for a prefix in another, so the label
+    // must carry the prefix's sigil.
     //
-    // `starts_with` rather than equality, because `@` is genuinely on the way to `@@`: someone
-    // who has typed one `@` may be about to type the second, and dropping the class variables
-    // there would be the same mistake in the other direction. It does not run backwards — a
-    // prefix of `@@` admits no `@name`.
-    //
-    // Without this, `@` offers `$@`: the subsequence match below reads the sigil as one more
-    // character, and `$@` contains an `@`. Carried through two releases because it is a row at
-    // the bottom of a list rather than a wrong answer at the top.
+    // - **`starts_with`, not equality**, because `@` is on the way to `@@`: someone who typed one
+    //   `@` may type the second, and dropping class variables there would be the opposite mistake.
+    //   It does not run backwards: a `@@` prefix admits no `@name`.
+    // - **Why it exists:** without it `@` offers `$@`, since the subsequence match reads the sigil
+    //   as a character and `$@` contains an `@`.
     if !sigils(label).starts_with(sigils(prefix)) {
         return None;
     }
@@ -1715,10 +1730,10 @@ fn tier(prefix: &str, label: &str) -> Option<u8> {
 
 /// What icon the editor draws.
 ///
-/// Read off the *declaration*, not a definition: the outline can tell an `attr_reader` from a
-/// `def` because it is looking at one definition, but here there are hundreds of rows on every
-/// keystroke and rubydex files both as methods anyway. Paying a definition lookup per row to
-/// change one icon is not a trade worth making.
+/// Read from the *declaration*, not a definition. The outline can tell an `attr_reader` from a
+/// `def` because it looks at one definition; here there are hundreds of rows per keystroke and
+/// rubydex files both as methods anyway. A definition lookup per row to change one icon is not
+/// worth it.
 fn kind_of(declaration: &Declaration) -> Kind {
     match declaration {
         Declaration::Namespace(Namespace::Module(_)) => Kind::Module,
@@ -1734,8 +1749,8 @@ fn equal_ci(left: &str, right: &str) -> bool {
     left.len() == right.len() && starts_with_ci(left, right)
 }
 
-/// Case-insensitive `starts_with` without allocating a lowercased copy, because this runs once
-/// per candidate and there can be a hundred thousand of them.
+/// Case-insensitive `starts_with` without allocating a lowercase copy: this runs per candidate, up
+/// to a hundred thousand.
 fn starts_with_ci(haystack: &str, needle: &str) -> bool {
     let mut chars = haystack.chars();
     needle
@@ -1772,14 +1787,53 @@ mod tests {
         MAX_COMPLETION_ITEMS, MAX_UNTYPED_CANDIDATES, MAX_UNTYPED_COMPLETION_ITEMS,
     };
 
-    /// An id, uri or name that no graph holds — what a client sends after a config reload
-    /// dropped the graph the list it is looking at was built from.
+    #[test]
+    fn a_cursor_in_a_document_the_graph_has_never_held_fences_nothing() {
+        // **A file written since the last settle**: the one cursor `Locality` can be built for but
+        // not scored from. No document exists under this URI, so there is no directory to measure
+        // from and no path to read a fence from. Both halves fail towards offering *more*: a fence
+        // needs evidence, and a missing document is none. So the project's own names still
+        // complete, unranked by locality and unfenced.
+        let mut harness = Harness::new();
+        harness.write(
+            "app/models/store.rb",
+            "class Store\n  def restock\n  end\nend\n",
+        );
+        harness.index();
+
+        let marked = "class Late\n  def run\n    Store.new.resto~\n  end\nend\n";
+        let position = marked_position(marked);
+        // Written, never opened: `with_text` reads it from disk, and the graph holds nothing under
+        // its URI until the next settle.
+        let late = harness.write("app/models/late.rb", &marked.replace('~', ""));
+
+        let answer = harness.ask(
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": late.as_str() },
+                "position": position,
+            }),
+        );
+        let labels: Vec<&str> = answer["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["label"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(labels.contains(&"restock"), "{labels:?}");
+    }
+
+    /// An id, URI or name no graph holds: what a client sends after a config reload dropped the
+    /// graph its list was built from.
     #[test]
     fn nothing_in_an_empty_graph_is_near_the_cursor_or_encloses_it() {
-        // Every one of these takes an id from outside — the request's uri, the `data` a client
-        // echoes back on `completionItem/resolve` — and rubydex ids are hashes, so "the graph
-        // does not hold this" is a state the server is handed rather than one it creates. The
-        // whole ranking has to degrade to "nothing" rather than to a panic or a wrong answer.
+        // Each of these takes an id from outside (the request's URI, the `data` a client echoes on
+        // `completionItem/resolve`), and rubydex ids are hashes, so "the graph does not hold this"
+        // is a state the server is handed. The ranking must degrade to "nothing", not to a panic or
+        // a wrong answer.
         let graph = Graph::new();
         let missing = UriId::from("file:///nowhere/gone.rb");
 
@@ -1794,16 +1848,16 @@ mod tests {
         let locality = Locality::at(
             &graph,
             missing,
-            &HashSet::new(),
-            environment::Names::default(),
+            &Placed::of(&graph, |_| false, environment::Layout::default()),
+            environment::Layout::default(),
         );
         assert!(
             locality.documents.is_empty(),
             "no cursor document, so nothing to measure nearness against"
         );
 
-        // `Object` is in every real graph — rubydex indexes a built-in one — so this is the
-        // only way to reach a nesting that resolves to no declaration at all.
+        // `Object` is in every real graph (rubydex indexes a built-in one), so this is the only way
+        // to reach a nesting that resolves to no declaration.
         let distance = Distance::from_receiver(
             &graph,
             &CompletionReceiver::Expression {
@@ -1829,25 +1883,25 @@ mod tests {
                 "{label} should sink at an empty prefix"
             );
         }
-        // A sigil is not punctuation — `@name` is a name.
+        // A sigil is not punctuation: `@name` is a name.
         for label in ["@name", "$stdout", "shout", "Person"] {
             assert!(!is_internal("", label), "{label} should not sink");
         }
-        // Typing one of these characters lifts them all back: somebody who writes `_` means it.
+        // Typing one of these characters lifts them all back: someone who writes `_` means it.
         assert!(!is_internal("_", "_internal"));
         assert!(!is_internal("<", "<=>"));
         assert!(
             !is_internal("@_", "@_hidden"),
             "the sigil is stepped over first"
         );
-        // A label with nothing left after the sigils has no first character to judge.
+        // A label with nothing after its sigils has no first character to judge.
         assert!(is_internal("", ""));
         assert!(is_internal("", "@"));
     }
 
     #[test]
     fn a_prefix_matches_as_a_subsequence_case_insensitively() {
-        // What a client filters on between keystrokes, and why every list is `isIncomplete`.
+        // What a client filters on between keystrokes.
         assert!(subsequence_ci("ApplicationRecord", "aprec"));
         assert!(subsequence_ci("shout", "SHOUT"));
         assert!(
@@ -1860,8 +1914,8 @@ mod tests {
 
     #[test]
     fn non_ascii_identifiers_fold_by_unicode_rather_than_by_byte() {
-        // Ruby allows them. ASCII on either side takes the fast path; two non-ASCII characters
-        // need the full lowercase mapping, which is the only route through `eq_ci`'s last line.
+        // Ruby allows them. ASCII on either side takes the fast path; two non-ASCII characters need
+        // full lowercase mapping, the only route to `eq_ci`'s last line.
         assert!(eq_ci('Ä', 'ä'));
         assert!(
             eq_ci('Ä', 'Ä'),
@@ -1876,14 +1930,13 @@ mod tests {
 
     #[test]
     fn a_completion_row_says_which_tier_its_list_came_from() {
-        // The tiers reaching a completion row. A row's card is the same card a hover draws,
-        // and a `completionItem/resolve` that built it with `precise: true` unconditionally
-        // would present every row off the name-based list — every method in the project matched
-        // on its name — as certain.
+        // The tiers reaching a completion row. A row's card is the card a hover draws, so a
+        // `completionItem/resolve` that always built it with `precise: true` would present every
+        // name-based row (every project method matched by name) as certain.
         //
-        // The tier is a property of the *list* rather than of the row: every row was offered
-        // for the same receiver. It travels on `data`, because by the time the client asks to
-        // resolve one, that is all either side still knows about where the list came from.
+        // The tier belongs to the *list*, since every row was offered for the same receiver. It
+        // travels on `data`, because when the client asks to resolve a row, that is all either side
+        // still knows about the list's origin.
         let (mut harness, uri) = with_types("");
 
         let derived = harness.complete(&uri, "\"hi\".upcase.len~");
@@ -1921,8 +1974,8 @@ mod tests {
     #[test]
     fn a_constructors_keyword_arguments_complete_at_the_call() {
         // The redirect goes through `locator::resolve`, which is also where `Context::Argument`
-        // gets the method whose parameters it offers. Before it, `Foo.new(` completed against
-        // `Class#new`'s `(*untyped, **untyped)` — a signature with no keywords in it at all.
+        // gets the method whose parameters it offers. Without it, `Foo.new(` would complete against
+        // `Class#new`'s `(*untyped, **untyped)`, which has no keywords.
         let mut harness = Harness::new();
         harness.write(
             "lib/order.rb",
@@ -1939,10 +1992,10 @@ mod tests {
 
     #[test]
     fn a_constant_that_is_not_a_namespace_offers_nothing_after_its_colons() {
-        // `MAX::` is legal to type and means nothing: an `Integer` has no members to write
-        // there. rubydex resolves the receiver to a declaration all the same, and every step
-        // that follows — the ancestor walk, the member list — has to answer "not a namespace"
-        // rather than assume the id it was handed names one.
+        // `MAX::` is legal to type and means nothing: an `Integer` has no members to write there.
+        // rubydex still resolves the receiver to a declaration, so every later step (the ancestor
+        // walk, the member list) must answer "not a namespace" instead of assuming the id names
+        // one.
         let mut harness = Harness::new();
         let uri = harness.write("app/main.rb", "MAX = 10\n");
         harness.index();
@@ -1953,11 +2006,9 @@ mod tests {
 
     #[test]
     fn a_singleton_method_written_on_a_constant_is_scoped_to_that_class() {
-        // `def Person.build` is the same method as `def self.build` written from outside the
-        // class body, and rubydex records the receiver differently for each. Only the `self`
-        // form had a test, so the constant form's `self` could have been anything at all —
-        // and inside it `self` is `Person`, which is what decides whether the class's own
-        // singleton methods are callable without a receiver.
+        // `def Person.build` is the same method as `def self.build`, written from outside, and
+        // rubydex records the receiver differently for each. Inside it `self` is `Person`, which
+        // decides whether the class's own singleton methods are callable without a receiver.
         let mut harness = Harness::new();
         harness.write(
             "app/person.rb",
@@ -1975,9 +2026,9 @@ mod tests {
 
     #[test]
     fn every_receiver_that_can_precede_a_double_colon_is_answered() {
-        // `::` after something that is not a namespace is legal to type and means nothing, and
-        // each shape reaches a different arm. Left unanswered they are not silence but a
-        // *wrong* list — the fall-through would offer whatever the enclosing scope had.
+        // `::` after a non-namespace is legal to type and means nothing, and each shape reaches a
+        // different arm. Left unanswered, the fall-through would not give silence but a *wrong*
+        // list: whatever the enclosing scope had.
         let mut harness = Harness::new();
         harness.write(
             "app/hr.rb",
@@ -1986,16 +2037,16 @@ mod tests {
         harness.index();
         let uri = harness.write("app/main.rb", "");
 
-        // `self::` is legal and rare: the nesting is what it means, so a module's own
-        // constants are what it can be followed by.
-        // The answer has to be the same one `HR::` gives, from inside the module and from
-        // inside one of its methods alike: `::` asks about a namespace, and the namespace is
-        // the same either way.
+        // `self::` is legal and rare: it means the nesting, so a module's own constants are what
+        // may follow.
+        //
+        // The answer must match `HR::`, from inside the module and from inside one of its methods:
+        // `::` asks about a namespace, which is the same either way.
         let named = harness.suggestions(&uri, "HR::~\n");
         assert_eq!(named, vec!["MAX".to_owned(), "Person".to_owned()]);
         assert_eq!(
-            // Something has to follow the line: `self::` with only an `end` after it is a
-            // *method* call in Prism's recovery, with `::` read as the call operator.
+            // Something must follow the line: `self::` with only an `end` after it is a *method*
+            // call in Prism's recovery, with `::` as the call operator.
             harness.suggestions(&uri, "module HR\n  self::~\n  X = 1\nend\n"),
             named,
             "in a module body, `self` is the module"
@@ -2006,7 +2057,7 @@ mod tests {
             "and inside a method it is still the module that `::` asks about"
         );
 
-        // An instance is not a namespace, and neither is a literal. Both parse.
+        // An instance is not a namespace, nor is a literal. Both parse.
         for marked in ["\"foo\"::~\n", "HR::Person.new::~\n", "whatever::~\n"] {
             let offered = harness.suggestions(&uri, marked);
             assert!(offered.is_empty(), "{marked:?} offered {offered:?}");
@@ -2049,8 +2100,8 @@ end
         harness.index();
         let uri = harness.write("app/main.rb", "");
 
-        // Alphabetical, because nothing has been typed for a length or a match quality to
-        // separate them by.
+        // Alphabetical, because nothing has been typed for length or match quality to separate
+        // them.
         let found = harness.declarations_at(&uri, "HR::~\n");
         assert_eq!(found, vec!["MAX_STAFF", "Manager", "Person"], "{found:?}");
     }
@@ -2063,7 +2114,7 @@ end
         let uri = harness.write("app/main.rb", "");
 
         assert_eq!(harness.declarations_at(&uri, "HR::Pe~\n"), vec!["Person"]);
-        // And the nested one, which is where a bare name lookup would have stopped.
+        // And the nested one, where a bare name lookup would have stopped.
         assert_eq!(
             harness.declarations_at(&uri, "HR::Person::NAME~\n"),
             vec!["NAME_LIMIT"]
@@ -2071,9 +2122,78 @@ end
     }
 
     #[test]
+    fn a_plain_extend_offers_the_module_s_methods_on_the_class_object() {
+        // The extension edge in its **Ruby** spelling, the one this module still walks
+        // (`workspace/rails/concerns.rs` declares Rails' own), so what remains here is a
+        // hand-written `extend SomeModule`. Every refusal in the walk is in this fixture, since
+        // each would otherwise offer a row wrongly:
+        //
+        // - `TOOL_LIMIT` is a constant, and `extend` installs only methods;
+        // - `build` does not match what was typed, and the prefix is tested before the expensive
+        //   ancestor walk;
+        // - `shared_tool` is in *both* modules, and the nearer one answers;
+        // - `tool_up` is a name the class already answers itself, and an extension only answers
+        //   what nothing else did.
+        let mut harness = Harness::new();
+        harness.write(
+            "app/tools.rb",
+            "\
+module Tools
+  TOOL_LIMIT = 10
+
+  def tool_up
+  end
+
+  def shared_tool
+  end
+
+  def build
+  end
+end
+
+module Extras
+  def extra_tool
+  end
+
+  def shared_tool
+  end
+end
+
+class Widget
+  extend Tools
+  extend Extras
+
+  def self.tool_up
+  end
+end
+",
+        );
+        harness.index();
+        let uri = harness.write("app/main.rb", "");
+
+        let found = harness.declarations_at(&uri, "Widget.tool~\n");
+        // Offered through the edge and nothing else.
+        assert!(found.contains(&"extra_tool".to_owned()), "{found:?}");
+        assert!(found.contains(&"shared_tool".to_owned()), "{found:?}");
+        // Offered once, by the class's own `def self.tool_up`, not twice.
+        assert_eq!(
+            found.iter().filter(|name| *name == "tool_up").count(),
+            1,
+            "{found:?}"
+        );
+        assert_eq!(
+            found.iter().filter(|name| *name == "shared_tool").count(),
+            1,
+            "{found:?}"
+        );
+        // A constant in an extended module is not reachable through the singleton.
+        assert!(!found.contains(&"TOOL_LIMIT".to_owned()), "{found:?}");
+    }
+
+    #[test]
     fn a_constant_receiver_offers_singleton_methods_and_not_instance_ones() {
-        // The distinction rubydex models with a synthetic singleton class, and the reason
-        // `Foo.` resolves to `Foo::<Foo>` rather than to `Foo`.
+        // The distinction rubydex models with a synthetic singleton class, and why `Foo.` resolves
+        // to `Foo::<Foo>`, not `Foo`.
         let mut harness = Harness::new();
         harness.write("app/hr.rb", OFFICE);
         harness.index();
@@ -2109,7 +2229,7 @@ end
                 "{expected}: {found:?}"
             );
         }
-        // `build` is a singleton method: not callable on an instance, so not offered.
+        // `build` is a singleton method, not callable on an instance, so not offered.
         assert!(!found.contains(&"build".to_owned()), "{found:?}");
     }
 
@@ -2120,9 +2240,9 @@ end
         harness.index();
         let uri = harness.write("app/main.rb", "");
 
-        // One method per rung, in the order Ruby resolves them: the class, the module it
-        // includes, the class it inherits, and `Object` past all three. Alphabetically this
-        // reads `audit, global_helper, price, save`, which is what shipped.
+        // One method per rung, in Ruby's resolution order: the class, its included module, its
+        // parent class, and `Object` past all three. Alphabetically this would read
+        // `audit, global_helper, price, save`.
         assert_eq!(
             harness.first_rows(&uri, "Store::Item.new.~\n", 10),
             [
@@ -2141,8 +2261,8 @@ end
         harness.index();
         let uri = harness.write("app/main.rb", "");
 
-        // The finding, in the small: alphabetical order puts `global_helper` first, and it is
-        // the one row here that `String` does not declare.
+        // Alphabetical order would put `global_helper` first, the one row `String` does not
+        // declare.
         assert_eq!(
             harness.first_rows(&uri, "\"hi\".~\n", 10),
             ["shout  String#shout", "global_helper  Object#global_helper"]
@@ -2172,14 +2292,13 @@ end
         harness.index();
         let uri = harness.write("app/main.rb", "");
 
-        // A module's `::` is its own contents and stops there. Alphabetical, because nothing has
-        // been typed and a namespace has no ancestor chain to measure — the same seam the
-        // untyped receiver sits on, for the same reason.
+        // A module's `::` is its own contents and stops there. Alphabetical, because nothing is
+        // typed and a namespace has no ancestor chain to measure, the same situation as the untyped
+        // receiver.
         //
-        // What matters more than the order is the last row: there isn't one from `Object`.
-        // rubydex's namespace walk deliberately stops before `Object`'s own members, or `String::`
-        // would list every top-level constant in the project — and `Object` is where everything
-        // it could not attribute ends up.
+        // More important than the order is the missing last row from `Object`: rubydex's namespace
+        // walk deliberately stops before `Object`'s members, or `String::` would list every
+        // top-level constant, and `Object` is where everything unattributed ends up.
         assert_eq!(
             harness.first_rows(&uri, "Store::~\n", 10),
             [
@@ -2190,14 +2309,13 @@ end
             ]
         );
 
-        // A *class* under `::` carries its singleton chain as well, because `Store::Item.build`
-        // may also be written `Store::Item::build`. So the nested constant leads, the class's own
-        // singleton method follows, and `Object` sits at the bottom where distance puts it.
+        // A *class* under `::` also carries its singleton chain, because `Store::Item.build` may be
+        // written `Store::Item::build`. So the nested constant leads, the class's singleton method
+        // follows, and `Object` sits at the bottom where distance puts it.
         //
-        // Which makes the two lists above and below asymmetric: `Store.` offers `global_helper`
-        // and `Store::` does not, though both name the same module object. That is rubydex's
-        // namespace walk rather than a rule stated here, and it is finding B's territory — the
-        // fixture's job is to make the seam visible, not to close it.
+        // That makes the lists above and below asymmetric: `Store.` offers `global_helper` and
+        // `Store::` does not, though both name the same module object. That is rubydex's namespace
+        // walk, not a rule here; the fixture makes the seam visible rather than closing it.
         assert_eq!(
             harness.first_rows(&uri, "Store::Item::~\n", 10),
             [
@@ -2215,10 +2333,10 @@ end
         harness.index();
         let uri = harness.write("app/main.rb", "");
 
-        // One letter is enough to separate them, and it has to be the right way round: `Item`
-        // starts with it, `Auditable` merely contains it (`aud-i-table`, folded). Alphabetically
-        // `Auditable` leads, so this is the one namespace list whose order is a claim rather
-        // than the alphabet — and the row a user typed `I` for is the one they get.
+        // One letter separates them, the right way round: `Item` starts with it, `Auditable` merely
+        // contains it (`aud-i-table`, folded). Alphabetically `Auditable` would lead, so this is
+        // the namespace list whose order is a claim, and the row the user typed `I` for comes
+        // first.
         assert_eq!(
             harness.first_rows(&uri, "Store::I~\n", 10),
             ["Item  Store::Item", "Auditable  Store::Auditable"]
@@ -2231,22 +2349,20 @@ end
         let uri = harness.write("app/store.rb", ANCESTRY);
         harness.index();
 
-        // Two scales meeting on one number. Constants are reached through the lexical nesting
-        // and methods through the ancestor chain, so each walk is counted from the cursor
-        // rather than laid end to end — otherwise every method in the list would sit below
-        // every constant, or the reverse.
+        // Two scales on one number. Constants are reached through the lexical nesting and methods
+        // through the ancestor chain, so each walk counts from the cursor rather than end to end;
+        // otherwise every method would sit below every constant, or the reverse.
         //
-        // `Object` is where they touch: it is the last rung of the ancestor chain *and* the
-        // outermost lexical scope. It has to be scored as the former, which is why `save` on
-        // `Record` outranks `global_helper` here. Score it as the latter and everything rubydex
-        // could not attribute — the whole of finding B — lands one step from the cursor.
+        // `Object` is where they meet: the last rung of the ancestor chain *and* the outermost
+        // lexical scope. It must be scored as the former, which is why `save` on `Record` outranks
+        // `global_helper`. Scored as the latter, everything rubydex could not attribute would land
+        // one step from the cursor.
         assert_eq!(
             harness.first_rows(&uri, &ANCESTRY.replace("      audit\n", "      ~\n"), 12),
             [
                 "LIMIT  Store::Item::LIMIT",
-                // The receiver is implicit here, so Ruby permits both of these and the three
-                // receiver lists above must not carry either. That they do not is what makes
-                // this pair a guard rather than decoration.
+                // The receiver is implicit here, so Ruby permits both, and the three receiver lists
+                // above must not contain either. That they do not is what makes this pair a guard.
                 "initialize  Store::Item#initialize",
                 "price  Store::Item#price",
                 "stash  Store::Item#stash",
@@ -2268,12 +2384,11 @@ end
         let uri = harness.write("app/store.rb", ANCESTRY);
         harness.index();
 
-        // The receiver is implicit and `self` is the *class*, not an instance of it — so this
-        // list is the mirror of the one above. `build` is offered without a receiver, because
-        // that is where `def self.build` can be called from; `initialize`, `price` and `stash`
-        // are gone, because none of the three can be written here at all. The pair is the whole
-        // point of both assertions: the same fixture, the same names, two cursors, and Ruby
-        // permits a different set at each.
+        // The receiver is implicit and `self` is the *class*, not an instance, so this list mirrors
+        // the one above. `build` is offered without a receiver, because that is where
+        // `def self.build` can be called; `initialize`, `price` and `stash` are gone, because none
+        // can be written here. Same fixture, same names, two cursors, and Ruby permits a different
+        // set at each.
         assert_eq!(
             harness.first_rows(
                 &uri,
@@ -2290,9 +2405,8 @@ end
                 "Object  Object",
                 "Store  Store",
                 "String  String",
-                // Last of the declarations, which is where `Object` belongs: everything rubydex
-                // could not attribute lands there, and a class body is one keystroke from being
-                // the list finding B is about.
+                // Last of the declarations, where `Object` belongs: everything rubydex could not
+                // attribute lands there.
                 "global_helper  Object#global_helper",
             ]
         );
@@ -2304,19 +2418,18 @@ end
         let uri = harness.write("app/store.rb", ANCESTRY);
         harness.index();
 
-        // The seam, pinned deliberately. The typed and untyped paths share a ranking
-        // constructor and nothing else: one walks a receiver's ancestor chain, the other is a
-        // flat name search over the graph with no receiver in it at all. There is no distance
-        // where there is no chain, so this list is exactly what it was — which is the case
-        // against leaving it as a list, not an argument that it is fine.
+        // The seam, pinned deliberately. The typed and untyped paths share only a ranking
+        // constructor: one walks a receiver's ancestor chain, the other is a flat name search with
+        // no receiver. No chain means no distance, so this list is exactly what it was, which
+        // argues against leaving it a list, not that it is fine.
         //
-        // Every candidate is in the one file this fixture has, so `Locality` scores them all
-        // alike and says nothing — which is the point. A ranking term that invents an order
-        // where there is no information would be worse than the alphabet, not better.
+        // Every candidate is in this fixture's one file, so `Locality` scores them alike and says
+        // nothing, as it should: a term inventing order from no information would be worse than the
+        // alphabet.
         //
-        // The receiver is written after the last `end` on purpose. Put it inside the method and
-        // Prism's recovery eats that `end` instead, refiling every later top-level class one
-        // level deeper: the answer is the same six names, spelled `Store::String#shout`.
+        // The receiver is written after the last `end` on purpose. Inside the method, Prism's
+        // recovery eats that `end` and nests every later top-level class one level deeper: the same
+        // six names, spelled `Store::String#shout`.
         assert_eq!(
             harness.first_rows(&uri, &format!("{ANCESTRY}@foo.~\n"), 12),
             [
@@ -2338,11 +2451,10 @@ end
         harness.write("lib/far.rb", "class Far\n  def aaa_far\n  end\nend\n");
         harness.index();
 
-        // The two names are spelled to sort the wrong way round on purpose: `aaa_far` is the
-        // alphabetically first method in the whole project and it belongs last, `zzz_near` is
-        // the last and belongs above it. Nothing else here can tell them apart — both are the
-        // user's own code, neither matches a prefix, and there is no receiver to measure a
-        // chain from.
+        // The names are spelled to sort the wrong way on purpose: `aaa_far` is the project's
+        // alphabetically first method and belongs last; `zzz_near` is the last and belongs above
+        // it. Nothing else separates them: both are the user's code, neither matches a prefix, and
+        // there is no receiver chain.
         assert_eq!(
             harness.first_rows(&uri, &format!("{ANCESTRY}@foo.~\n"), 12),
             [
@@ -2358,13 +2470,13 @@ end
         );
     }
 
-    /// A project with a spec tree that declares three names nothing else does, and one the
-    /// application declares too.
+    /// A project with a spec tree declaring three names nothing else does, plus one the application
+    /// declares too.
     ///
-    /// `spec_only_helper` is the shape the corpora are full of: a `def` at the top level of a
-    /// spec file, or inside an `RSpec.describe … do` block, which rubydex files on `Object`
-    /// because a block body is not a namespace. `Object` is the end of every ancestor chain, so
-    /// one of these is on the list for every receiver in the project.
+    /// `spec_only_helper` is the common shape: a `def` at the top level of a spec file, or inside
+    /// an `RSpec.describe … do` block, which rubydex files on `Object` because a block body is not
+    /// a namespace. `Object` ends every ancestor chain, so such a name is on the list for every
+    /// receiver.
     fn a_project_with_a_spec_tree() -> (Harness, DocUri, DocUri) {
         let mut harness = Harness::new();
         let app = harness.write("app/store.rb", ANCESTRY);
@@ -2386,14 +2498,13 @@ end
 
     #[test]
     fn a_name_only_a_spec_declares_is_not_offered_to_the_application() {
-        // Ruby will not find any of these from a model: the file they are written in is loaded
-        // by RSpec and by nothing else. `spec_shared` is the control — the application declares
-        // it too, and a spec reopening a class does not take the class away.
+        // Ruby will not find any of these from a model: only RSpec loads their file. `spec_shared`
+        // is the control: the application declares it too, and a spec reopening a class does not
+        // take the class away.
         //
-        // **Both paths, because they reach a spec by different routes.** A bare word asks
-        // `self`'s ancestors, and every one of these projects ends that chain at an `Object`
-        // the spec tree has written on; an untyped receiver asks [`by_name`], which matches the
-        // whole graph on letters and needs no chain at all.
+        // **Both paths, because they reach a spec differently.** A bare word asks `self`'s
+        // ancestors, which end at an `Object` the spec tree wrote on; an untyped receiver asks
+        // [`by_name`], which matches the whole graph by letters with no chain.
         let (mut harness, app, _) = a_project_with_a_spec_tree();
 
         assert_eq!(
@@ -2408,9 +2519,9 @@ end
 
     #[test]
     fn a_class_only_a_spec_declares_is_not_offered_either() {
-        // The fence is a fact about where a declaration was written, not about what kind it is,
-        // so it reaches the constant list by the same line. A double nobody outside the suite
-        // can construct is not a name to offer in `app/`.
+        // The fence is about where a declaration was written, not its kind, so it reaches the
+        // constant list by the same line. A test double nobody outside the suite can build is not a
+        // name to offer in `app/`.
         let (mut harness, app, _) = a_project_with_a_spec_tree();
 
         let offered = harness.declarations_at(&app, &format!("{ANCESTRY}Spec~\n"));
@@ -2422,16 +2533,16 @@ end
 
     #[test]
     fn the_same_names_are_offered_to_a_cursor_inside_the_test_tree() {
-        // The other half, and the reason this is a fence rather than a filter: a developer
-        // editing a spec is exactly who a helper in the next spec file over is the answer for.
-        // `environment::fenced_from` settles it for the name rung too; the list follows.
+        // The other half, and why this is a fence, not a filter: a developer editing a spec is
+        // exactly who a helper in the next spec file answers. `environment::fenced_from` settles it
+        // for the name rung too.
         let (mut harness, _, spec) = a_project_with_a_spec_tree();
 
         assert_eq!(
             harness.first_rows(&spec, "spec_~\n", 8),
             [
-                // `length` decides between two rows nothing else separates, which is why the
-                // shorter name leads. See `order`.
+                // `length` decides between two rows nothing else separates, so the shorter name
+                // leads. See `order`.
                 "spec_shared  Object#spec_shared",
                 "spec_only_helper  Object#spec_only_helper",
             ]
@@ -2452,21 +2563,23 @@ end
 
     #[test]
     fn a_declaration_with_no_definitions_is_loadable_rather_than_unproven() {
-        // The fence fires on **evidence** — every definition under a test tree — and rubydex's
-        // own built-ins have no definitions at all: `Object` and `Module` are in the graph
-        // without a line of anybody's Ruby behind them. Written as a count rather than as a
-        // running `bool` for exactly this: the first spelling started at *not loadable* and had
-        // nothing to flip it, so a built-in fell out of every list drawn outside a test tree.
+        // The fence fires on **evidence** (every definition under a test tree), and rubydex's
+        // built-ins have no definitions: `Object` and `Module` exist without a line of Ruby behind
+        // them. That is why it is a count, not a running `bool`: a `bool` starting at *not
+        // loadable* with nothing to flip it would drop built-ins from every list outside a test
+        // tree.
         let (harness, app, _) = a_project_with_a_spec_tree();
         let graph = &harness.analysis.graph;
-        let own = harness.analysis.own_documents();
         let locality = Locality::at(
             graph,
             UriId::from(app.as_str()),
-            &own,
-            environment::Names::default(),
+            harness.analysis.placed(),
+            environment::Layout::default(),
         );
-        assert!(locality.fenced, "a cursor in app/ is what the fence is for");
+        assert!(
+            locality.fenced.trees,
+            "a cursor in app/ is what the fence is for"
+        );
 
         let mut undefined = 0;
         for (_, declaration) in graph.declarations().iter() {
@@ -2485,10 +2598,10 @@ end
 
     #[test]
     fn a_gem_is_never_fenced_by_the_test_tree_rule() {
-        // The deny-list reads path segments, and a gem's path is not the project's to reason
-        // about — `rspec-core` and `minitest` live under directories nobody here named. What
-        // keeps them is that `Locality` is built from the *workspace's* documents only, so a
-        // definition it has never scored is loadable rather than suspicious.
+        // The deny-list reads path segments, and a gem's path is not the project's to reason about:
+        // `rspec-core` and `minitest` live under directories nobody here named. They are kept
+        // because `Locality` holds only the *workspace's* documents, so a definition it never
+        // scored is loadable, not suspicious.
         let (dir, _elsewhere, env) = project_with_gem(
             "module Shouty\n  class Horn\n    def spec_from_a_gem\n    end\n  end\nend\n",
         );
@@ -2511,11 +2624,10 @@ end
 
     #[test]
     fn a_migration_s_own_names_are_offered_to_nobody_outside_it() {
-        // The project's own tree, so this is the `own` loop's flag rather than the whole-graph
-        // pass — the two halves of the same tag, and a test written against a gem's engine
-        // would pass without this one. `db/migrate` is on no autoload path: the task loads one
-        // file, by path, and the helper somebody wrote above `def change` is reachable from
-        // that file and nowhere else.
+        // The project's own tree, so this exercises the `own` loop's flag, not the whole-graph pass
+        // (a test on a gem's engine would pass without it). `db/migrate` is on no autoload path:
+        // the task loads one file by path, and a helper above `def change` is reachable from that
+        // file only.
         let mut harness = Harness::new();
         harness.write(
             "db/migrate/20180101000000_backfill_stories.rb",
@@ -2535,17 +2647,16 @@ end
 
     #[test]
     fn a_gem_s_generator_template_is_fenced_and_the_rest_of_the_gem_is_not() {
-        // The other half of the test above, and the one place `own` is the wrong set. A gem's
-        // `lib/rack/test/` is a published library, so a document `Locality` never scored has to
-        // be loadable — but the tree `rails generate` copies **out** of is not a library in a
-        // gem any more than it is in the project, and fabrication's
-        // `.../cucumber_steps/templates/fabrication_steps.rb` puts a top-level `def with_ivars`
-        // on `Object`, which is an ancestor of every receiver in the workspace. So the template
-        // tag is read of the whole graph and the test tag stays read of `own`.
+        // The other half, and the one place `own` is the wrong set. A gem's `lib/rack/test/` is a
+        // published library, so an unscored document must be loadable; but a tree `rails generate`
+        // copies **from** is no more a library in a gem than in the project. fabrication's
+        // `.../cucumber_steps/templates/fabrication_steps.rb` puts a top-level `def with_ivars` on
+        // `Object`, an ancestor of every receiver. So the template tag reads the whole graph, and
+        // the test tag stays on `own`.
         //
-        // **The cursor is bare on purpose**: that is the path `Locality` decides on its own. A
-        // receiver reaches the same name through `locator`, which reads the path directly and
-        // was already fenced, so a test written with one would pass without this.
+        // **The cursor is bare on purpose**: that path is decided by `Locality` alone. A receiver
+        // would reach the name through `locator`, which reads the path directly and was already
+        // fenced, so such a test would pass without this.
         let (dir, _elsewhere, env) = project_with_gem_file(
             "lib/generators/shouty/cucumber_steps/templates/shouty_steps.rb",
             "def shouty_from_a_template\nend\n",
@@ -2564,24 +2675,16 @@ end
         );
     }
 
-    /// A constant that holds an *object* is not a class object.
+    /// A constant holding an *object* is not a class object.
     ///
-    /// Upstream promotes a constant used as a receiver into a `Namespace::Todo` — rubydex's
-    /// spelling for "a namespace I never saw a definition of" — which has a singleton class
-    /// whose ancestors are `Class`, `Module` and `Object`. `ENV: RBS::Unnamed::ENVClass` and
-    /// `URI::RFC2396_PARSER: URI::RFC2396_Parser` are both that shape, and completing against
-    /// the singleton answered `alias_method` and `attr_accessor` for `ENV.` — precisely, wrongly,
-    /// and *instead of* the name-based list, which had been answering. Fifteen lobsters
-    /// positions, fourteen of them `ENV.fetch`.
-    ///
-    /// The fixture is `ENV`'s shape written out, and what it pins is both halves: the members
-    /// of the class the signature says it holds are offered, and the singleton's own are not.
-    ///
-    /// **The first half used to be the name rung and is now the type**, which is the whole of
-    /// what `types::held_by` added: the declaration `HOLDER: Vault::Store` says what the object
-    /// is, so the decoy `unlock` below — which the name rung would have offered beside the real
-    /// one — is gone. The second half is unchanged and is what the `Todo` costs if nobody asks
-    /// the signature.
+    /// - **The bug.** Upstream promotes a constant used as a receiver into a `Namespace::Todo` ("a
+    ///   namespace I never saw defined"), whose singleton's ancestors are `Class`, `Module` and
+    ///   `Object`. `ENV: RBS::Unnamed::ENVClass` and `URI::RFC2396_PARSER: URI::RFC2396_Parser`
+    ///   have that shape, and completing against the singleton offered `alias_method` and
+    ///   `attr_accessor` for `ENV.`, precisely, wrongly, *instead of* the name-based list.
+    /// - **Pinned both ways.** The members of the class the signature says it holds are offered
+    ///   (via `types::held_by`: `HOLDER: Vault::Store` names the object's type, so the decoy
+    ///   `unlock` the name rung would add is gone), and the singleton's own are not.
     #[test]
     fn a_constant_that_holds_an_object_is_not_a_class_object() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2658,12 +2761,12 @@ HOLDER.unlock
         );
     }
 
-    /// The same constant, typed by the Ruby that assigns it rather than by a signature.
+    /// The same constant, typed by the Ruby that assigns it instead of a signature.
     ///
-    /// The sibling of the test above and the reason both exist: no signature will ever declare
-    /// an application's own configuration object, and the line that builds it says the same.
-    /// Completion is the surface where the `Todo` singleton cost the most — an empty list or
-    /// `attr_accessor` — so it is where the second half of the rung is pinned too.
+    /// The sibling of the test above: no signature will ever declare an application's own config
+    /// object, and the line building it says the same thing. Completion is where the `Todo`
+    /// singleton cost most (an empty list or `attr_accessor`), so the rung's second half is pinned
+    /// here too.
     #[test]
     fn a_constant_the_ruby_assigns_is_not_a_class_object_either() {
         let mut harness = Harness::new();
@@ -2713,16 +2816,13 @@ end
 
     #[test]
     fn an_extend_is_read_wherever_it_is_written() {
-        // `extend` is not unread: rubydex indexes it and attaches it to the singleton class
-        // exactly as Ruby does. What
-        // it loses is **one shape** — an `extend` in an `.rbs` whose module name is qualified —
-        // and four probes over one workspace are what isolated it: Ruby resolves `extend Flat`,
-        // `extend Ns::Fmt` and `include Ns::Fmt`; RBS resolves `extend Flat` and
-        // `include Ns::Fmt`; only RBS's `extend Ns::Fmt` does not.
+        // Every spelling of `extend`, qualified or not, Ruby or RBS, indexed together with its
+        // namespace. rubydex links all of these itself, so this holds even without
+        // `locator::extends_written_on`; the repair is for an `extend` indexed *later* (the test
+        // below).
         //
-        // The fixture is `stdlib/securerandom/0/securerandom.rbs` written out, because that is
-        // the call the report made — and 15 of the 22 `extend`s in the vendored signatures are
-        // qualified, so this is the commonest of them rather than the only one.
+        // The fixture is `stdlib/securerandom/0/securerandom.rbs` written out: most `extend`s in
+        // the vendored signatures are qualified, and this is the commonest.
         let dir = tempfile::tempdir().expect("tempdir");
         let signatures = dir.path().join("sig");
         std::fs::create_dir_all(signatures.join("core")).unwrap();
@@ -2745,8 +2845,8 @@ end
         )
         .unwrap();
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
-        // The same edge written in Ruby, which rubydex resolves on its own and must keep doing:
-        // the repair must never be the only thing answering a shape rubydex already handles.
+        // The same edge written in Ruby, which rubydex resolves itself and must keep resolving: the
+        // repair must never be the only answer for a shape rubydex handles.
         harness.write(
             "app/rb.rb",
             "module Ns\n  module Fmt\n    def in_ruby\n    end\n  end\nend\n\n\
@@ -2775,9 +2875,8 @@ end
             );
         }
 
-        // The completion side of the same edge. Resolution takes the first answer and
-        // completion collects them all, so the walk is shared and
-        // the list is asked here as well as the card.
+        // The completion side of the same edge. Resolution takes the first answer and completion
+        // collects all, so the walk is shared, and the list is asked here as well as the card.
         let offered = harness.complete(&uri, "SecureRandom.he~");
         let labels: Vec<&str> = offered["items"]
             .as_array()
@@ -2789,12 +2888,74 @@ end
     }
 
     #[test]
+    fn an_extend_written_after_the_first_resolve_is_still_read() {
+        // The test above indexes everything at once. This one writes the `extend` *after* the graph
+        // settled (an edit, a second file reopening the module, a new signature in `sig/`), as an
+        // agent editing through a shell or a user typing would. rubydex schedules a namespace's
+        // ancestors only when it *creates* the declaration, so only the first case is rubydex's
+        // answer; the other three are `locator::extends_written_on`'s, and each fails without that
+        // repair.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        harness.write(
+            "app/fmt.rb",
+            "module Ns\n  module Fmt\n    def solo_m\n    end\n\n    def twice_m\n    end\n\n    \
+             def reopened_m\n    end\n  end\nend\n",
+        );
+        harness.write(
+            "sig/random.rbs",
+            "module Random\n  module Formatter\n    def hex: (?Integer) -> String\n  end\nend\n",
+        );
+        let solo = harness.write("app/solo.rb", "module Solo\nend\n");
+        harness.write("app/twice_a.rb", "module Twice\n  def a\n  end\nend\n");
+        let twice_b = harness.write("app/twice_b.rb", "module Twice\nend\n");
+        harness.write("app/reopened.rb", "module Reopened\nend\n");
+        harness.write("app/late.rb", "module Late\nend\n");
+        let source = "Solo.solo_m\nTwice.twice_m\nReopened.reopened_m\nLate.hex\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+
+        // A module declared in one file, which that file's edit deletes and re-creates.
+        harness.write("app/solo.rb", "module Solo\n  extend Ns::Fmt\nend\n");
+        // A module declared in two files, so editing one leaves the declaration standing.
+        harness.write("app/twice_b.rb", "module Twice\n  extend Ns::Fmt\nend\n");
+        // A new file reopening a module the graph already holds.
+        let reopening = harness.write(
+            "app/reopening.rb",
+            "module Reopened\n  extend Ns::Fmt\nend\n",
+        );
+        // A new signature reopening one, qualified: `stdlib/securerandom`'s shape.
+        let signature = harness.write(
+            "sig/late.rbs",
+            "module Late\n  extend Random::Formatter\nend\n",
+        );
+        harness.watch(&[&solo, &twice_b, &reopening, &signature]);
+
+        let mut wrong = Vec::new();
+        for (needle, owner) in [
+            ("solo_m", "Ns::Fmt#solo_m"),
+            ("twice_m", "Ns::Fmt#twice_m"),
+            ("reopened_m", "Ns::Fmt#reopened_m"),
+            ("hex", "Random::Formatter#hex"),
+        ] {
+            let found = card(&mut harness, &uri, source, needle);
+            if !found.contains(owner)
+                || found.contains("possible definitions")
+                || found.contains("Matched on the method name alone")
+            {
+                wrong.push(format!("{needle}: {found}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
     fn a_call_on_a_class_object_is_never_offered_an_instance_method_of_an_unrelated_class() {
-        // The fallback filter, and it is the half a user meets first. The name-based list
-        // was every declaration in the graph ending in this name; a class object answers on its
-        // singleton chain, which the search above already walked, so a candidate owned by a
-        // `class` is provably unreachable and one owned by a `module` is exactly what has to
-        // stay — a concern's `ClassMethods` is a module's instance method.
+        // The fallback filter, the half a user meets first. The name-based list was every
+        // declaration ending in this name; a class object answers from its singleton chain, which
+        // the search above already walked, so a candidate owned by a `class` is provably
+        // unreachable, while one owned by a `module` must stay (a `ClassMethods` is a module's
+        // instance method).
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write(
@@ -2818,9 +2979,9 @@ end
         let uri = harness.write("app/models/story.rb", source);
         harness.index();
 
-        // Two of the three candidates survive: a module's instance method, because that is what
-        // an `extend` installs, and another class's **singleton** method, because a class object
-        // is what it would be called on. Only `Widget#spin` is dropped.
+        // Two of three candidates survive: a module's instance method (what `extend` installs), and
+        // another class's **singleton** method (a class object is what it would be called on). Only
+        // `Widget#spin` is dropped.
         let narrowed = card(&mut harness, &uri, source, "spin\n");
         assert!(narrowed.contains("2 possible definitions"), "{narrowed}");
         assert!(narrowed.contains("Gadget.spin"), "{narrowed}");
@@ -2830,8 +2991,8 @@ end
             "an instance method of an unrelated class is not reachable here: {narrowed}"
         );
 
-        // Never emptied. `whirl` is an instance method of a class and nothing else, and a guess
-        // is still the honest answer where the graph holds only those.
+        // Never emptied. `whirl` is only a class's instance method, and where the graph holds only
+        // those, a guess is still the honest answer.
         let kept = card(&mut harness, &uri, source, "whirl");
         assert!(kept.contains("Widget#whirl"), "{kept}");
         assert!(kept.contains("Matched on the method name alone"), "{kept}");
@@ -2839,9 +3000,9 @@ end
 
     #[test]
     fn a_class_body_completes_the_class_methods_of_every_concern_it_includes() {
-        // The same cursor that *resolves* `validates` completes to an empty list without this,
-        // because resolution takes one answer and completion collects: `query::completion_candidates` walks the singleton's
-        // ancestors, the `extend` is on none of them, and nothing was there to be offered.
+        // Without this, the same cursor that *resolves* `validates` would complete to an empty
+        // list: resolution takes one answer and completion collects, `query::completion_candidates`
+        // walks the singleton's ancestors, and the `extend` is on none of them.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write("app/models/application_record.rb", CONCERNS);
@@ -2868,22 +3029,19 @@ end
             );
         }
 
-        // The decline, which is the same gate read from the collecting side: `Plain` has no
-        // nested `ClassMethods`, so nothing of it is extended onto anything — its `helper` is an
-        // instance method of every *record*, and this cursor is a class object. `Odd` is the
-        // other shape and it has nothing observable to assert: its `ClassMethods` is a constant
-        // rather than a module, so it is declined where a module would have been walked, and
-        // the list is what it would be if the constant were not there at all. `ClassMethods`
-        // itself *is* offered, as a constant — Ruby resolves one through the cref's ancestors
-        // and rubydex says so, which has nothing to do with this edge.
+        // The decline, the same gate from the collecting side. `Plain` has no nested
+        // `ClassMethods`, so nothing of it is extended: its `helper` is an instance method of every
+        // *record*, and this cursor is a class object. `Odd`'s `ClassMethods` is a constant, not a
+        // module, so it is declined, and the list is as if the constant were absent. `ClassMethods`
+        // itself *is* offered, as a constant: Ruby resolves it through the cref's ancestors, and
+        // rubydex agrees, unrelated to this edge.
         let body = harness.declarations_at(&uri, "class Story < ApplicationRecord\n  ~\nend\n");
         assert!(!body.contains(&"helper".to_owned()), "{body:?}");
     }
 
-    /// Rails' own idiom, and the one worth measuring before believing: an `include` written
-    /// **inside a `def`** in a `ClassMethods` module is for the class the macro is called on,
-    /// and rubydex records it as a mixin of the enclosing module. `ActiveModel::SecurePassword`
-    /// is where this is really written; the shape is copied exactly.
+    /// Rails' own idiom, worth measuring before believing: an `include` written **inside a `def`**
+    /// in a `ClassMethods` module is for the class the macro is called on, and rubydex records it
+    /// as a mixin of the enclosing module. Copied exactly from `ActiveModel::SecurePassword`.
     const SECURABLE: &str = "\
 module Validatable
   def valid?
@@ -2905,12 +3063,10 @@ end
 
     #[test]
     fn what_a_class_methods_def_includes_is_the_records_and_not_the_class_objects() {
-        // Why the walk takes the module's own members rather than its ancestors'. `extend M`
-        // really does
-        // install `M`'s ancestors' methods, so the ancestor walk is the right reading of Ruby —
-        // and over Rails' five core gems 105 `module ClassMethods` blocks hold 2 mixins written
-        // in the module body against **15 written inside a `def`**, every one of the 15 meaning
-        // the class the macro was called on. `Story.valid?` raises in Ruby.
+        // Why the walk takes the module's own members, not its ancestors'. `extend M` really
+        // installs `M`'s ancestors' methods too, so an ancestor walk reads Ruby right, but in
+        // Rails' core gems most `module ClassMethods` mixins are written inside a `def`, each
+        // meaning the class the macro was called on. `Story.valid?` raises in Ruby.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write("app/models/application_record.rb", SECURABLE);
@@ -2918,16 +3074,16 @@ end
             "app/models/story.rb",
             "class Story < ApplicationRecord\nend\n",
         );
-        // Written rather than opened, because `hover_at` asks about the file the workspace
-        // indexed. It is also asked **before** any completion, which opens a buffer over this
-        // one: two requests about one document are two requests about whatever text it holds
-        // now, and asking them the other way round measures the last thing typed.
+        // Written, not opened, because `hover_at` asks about the indexed file. It is also asked
+        // **before** any completion, which opens a buffer over it: two requests about one document
+        // ask about whatever text it holds now, and reversing them would measure the last thing
+        // typed.
         let source = "Story.valid?\n";
         let uri = harness.write("app/models/probe.rb", source);
         harness.index();
 
-        // Resolution reads the same walk, which is the whole reason the walk is shared: before
-        // this rule `Story.valid?` resolved, precisely, to a method Ruby raises on.
+        // Resolution reads the same walk, which is why it is shared: otherwise `Story.valid?` would
+        // resolve, precisely, to a method Ruby raises on.
         let found = card(&mut harness, &uri, source, "valid?");
         assert!(
             found.contains("Matched on the method name alone"),
@@ -2940,7 +3096,7 @@ end
             "an instance method of a module a macro includes into the record: {offered:?}"
         );
 
-        // The macro itself is the member the module really declares, and it still answers.
+        // The macro itself is a member the module really declares, and it still answers.
         let macros = harness.declarations_at(&uri, "Story.has_secure~\n");
         assert!(
             macros.contains(&"has_secure_password".to_owned()),
@@ -2950,10 +3106,10 @@ end
 
     #[test]
     fn a_class_object_completes_what_a_concern_extends_onto_it_however_it_is_written() {
-        // Three spellings of one receiver, and rubydex answers all three with the singleton —
-        // which is why `class_object` hands over what the receiver already holds rather than
-        // testing the syntax. `Story::validates` is legal Ruby and rare; it is here because
-        // `NamespaceAccess` is the one arm that has to find the singleton for itself.
+        // Three spellings of one receiver, all answered by rubydex with the singleton, which is why
+        // `class_object` passes what the receiver holds instead of testing syntax.
+        // `Story::validates` is legal and rare; it is here because `NamespaceAccess` is the one arm
+        // that must find the singleton itself.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write("app/models/application_record.rb", CONCERNS);
@@ -2962,10 +3118,10 @@ end
             "app/models/story.rb",
             "class Story < ApplicationRecord\nend\n",
         );
-        // A second document, because a buffer is what the cursor is completing *in*: writing
-        // `Story.valid` into `story.rb` replaces the `class Story` that file holds, and the
-        // receiver then resolves to nothing and reaches the name-based list — which offers
-        // `validates` too, and would have passed this test for the wrong reason.
+        // A second document, because a buffer is what the cursor completes *in*: writing
+        // `Story.valid` into `story.rb` would replace its `class Story`, the receiver would resolve
+        // to nothing and reach the name-based list, which offers `validates` too, and the test
+        // would pass for the wrong reason.
         let uri = harness.write("app/models/probe.rb", "");
         harness.index();
 
@@ -2981,37 +3137,25 @@ end
             );
         }
 
-        // That the receiver really was resolved, and not fallen back on: `Plain#helper` is an
-        // instance method of every record and is on no class object's chain, so the name-based
-        // list is the only thing that would offer it here.
+        // Proof the receiver really resolved: `Plain#helper` is an instance method of every record
+        // and on no class object's chain, so only the name-based list would offer it here.
         let precise = harness.declarations_at(&uri, "Story.help~\n");
         assert!(!precise.contains(&"helper".to_owned()), "{precise:?}");
     }
 
-    /// `class_methods do` is the majority spelling of the concern edge, and the walk that reads
-    /// the minority one reads it unchanged.
+    /// What declaring `ClassMethods` does **not** fix, pinned so it is a fact, not an assumption.
     ///
-    /// **Nothing in `locator` moved for this.** The gate has always been the nested `module
-    /// ClassMethods`, and it was right — what was missing is that `ActiveSupport::Concern` builds
-    /// that module from a block, so no file declares it and rubydex, which has no namespace for a
-    /// block body, files the `def`s as *instance* members of the concern instead.
-    /// `workspace/rails/concerns.rs` writes the module down and the existing walk finds it.
-    ///
-    /// The six corpora write this spelling **120** times against 17 files holding the other, so
-    /// the gate was testing for the minority case.
-    /// What the fix does **not** reach, pinned so that it is a fact rather than an assumption.
-    ///
-    /// rubydex has no namespace for a block body, so a `def` inside `class_methods do` is filed on
-    /// the enclosing scope — an *instance* member of the concern — and every including class gets
-    /// it on its instance side through the `include` the user wrote. That is wrong in Ruby:
+    /// `class_methods do` is the common spelling of the concern edge, and
+    /// `workspace/rails/concerns.rs` writes the `ClassMethods` module down so the existing walk
+    /// finds it. But rubydex has no namespace for a block body, so a `def` inside
+    /// `class_methods do` is also filed on the enclosing scope, as an *instance* member of the
+    /// concern, and every including class gets it on its instance side. That is wrong in Ruby:
     /// `ActiveSupport::Concern` `module_eval`s the block on a module it then **extends**, so the
-    /// method is on the class object and nowhere else.
+    /// method is on the class object only.
     ///
-    /// Declaring the `ClassMethods` module adds the right answer; it cannot take the wrong one
-    /// away, because the wrong one is a real definition in the graph and no generated declaration
-    /// overwrites a definition. What a `def` in a block is owned by is rubydex's to record, and
-    /// nothing here can supply it. **The class side does not double up**, which is the thing that
-    /// could have gone wrong here and did not: `Ledger.tally_by` is the generated member alone.
+    /// Declaring the module adds the right answer; it cannot remove the wrong one, which is a real
+    /// graph definition that no generated declaration overwrites. **The class side does not double
+    /// up**, which is what could have gone wrong: `Ledger.tally_by` is the generated member alone.
     #[test]
     fn a_class_methods_def_is_still_on_the_instance_side_where_rubydex_filed_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3040,10 +3184,10 @@ end
         let uri = harness.write("app/models/probe.rb", "");
         harness.index();
 
-        // The **container** is the assertion, not the label: a label alone would pass on the
-        // name rung, where `Tallyable#tally_all` — rubydex's own filing of the same `def` — is
-        // sitting one module away. `Ledger.tally_by` is the class side, which only the fan-out
-        // onto the includer puts there.
+        // The **container** is the assertion, not the label: a label alone would pass on the name
+        // rung, where `Tallyable#tally_all` (rubydex's filing of the same `def`) sits one module
+        // away. `Ledger.tally_by` is the class side, which only the fan-out onto the includer
+        // provides.
         let rows = harness.first_rows(&uri, "Ledger.tally~\n", 8);
         assert_eq!(
             rows,
@@ -3054,10 +3198,9 @@ end
             "both public defs of the block, on the class that includes the concern"
         );
 
-        // The three declines, each a different sentence of Ruby. `named_private` and
-        // `after_private` are the file's own visibility, both spellings. `not_extended` is a
-        // `def self.` — a singleton method of the `ClassMethods` module, which is the thing being
-        // extended rather than a thing extending, so `extend` installs it nowhere.
+        // Three declines, each a different Ruby rule. `named_private` and `after_private` are the
+        // file's own visibility, in both spellings. `not_extended` is a `def self.`: a singleton
+        // method of the `ClassMethods` module itself, which `extend` installs nowhere.
         for declined in ["named_private", "after_private", "not_extended"] {
             let offered = harness.declarations_at(&uri, &format!("Ledger.{declined}~\n"));
             assert!(
@@ -3066,19 +3209,18 @@ end
             );
         }
 
-        // A `class_methods do` written in a **class** raises `NoMethodError` in Ruby —
-        // `class_methods` is defined on `ActiveSupport::Concern`, which is extended onto modules.
-        // `Ledger` writes one and it declares nothing.
+        // `class_methods do` in a **class** raises `NoMethodError` (`class_methods` is defined on
+        // `ActiveSupport::Concern`, which extends modules). `Ledger` writes one, and it declares
+        // nothing.
         let never = harness.declarations_at(&uri, "Ledger.never~\n");
         assert!(!never.contains(&"never_reached".to_owned()), "{never:?}");
     }
 
     /// The member the block declares is a place, and the place is the `def` the user wrote.
     ///
-    /// This is the half a generated declaration usually cannot have: `synthesized.rs` maps one
-    /// back to a real source span only where a generator recorded one, and here the `def` is
-    /// really in the file — so the jump lands on the line itself rather than on a macro that
-    /// implied it.
+    /// A generated declaration usually cannot have this: `synthesized.rs` maps one to a real source
+    /// span only where a generator recorded it. Here the `def` really is in the file, so the jump
+    /// lands on that line, not on a macro that implied it.
     #[test]
     fn a_class_methods_def_is_a_place_and_the_place_is_the_def() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3107,11 +3249,10 @@ end
             "the place is the `def` itself, line {line}: {spelled}"
         );
 
-        // **The line is not what proves it and neither is the file.** rubydex files this same
-        // `def` as `Tallyable#tally_all`, an instance member of the concern, so the name rung
-        // answers the very same line — a jump that looks right for a reason that is wrong.
-        // What the two differ on is the *tier*: the walk resolves the receiver's singleton
-        // chain and the name rung says so in a footnote.
+        // **Neither the line nor the file proves it.** rubydex files this `def` as
+        // `Tallyable#tally_all` too, so the name rung answers the same line: a jump that looks
+        // right for the wrong reason. The *tier* differs: the walk resolves the receiver's
+        // singleton chain, and the name rung says it guessed in a footnote.
         let card = harness.hover_at(&uri, "class Probe\n  Ledger.tally_all\nend\n", "tally_al")
             ["contents"]["value"]
             .as_str()
@@ -3129,12 +3270,11 @@ end
 
     #[test]
     fn one_name_two_concerns_is_one_row_and_a_constant_in_a_class_methods_is_none() {
-        // Two declines the walk owes rubydex's own. A member declared by two concerns is offered
-        // once, by the nearer — `include Countable` is written after `include Recountable`, so
-        // Ruby's linearization puts Countable first and `collect_members`' dedup would have kept
-        // exactly that one. And a **constant** nested in a `ClassMethods` is not a row at all:
-        // `extend` installs methods, and `Countable::ClassMethods::LIMIT` is reachable through
-        // the constant path and never through the singleton.
+        // Two declines the walk inherits from rubydex. A member declared by two concerns is offered
+        // once, by the nearer: `include Countable` comes after `include Recountable`, so Ruby's
+        // linearization puts Countable first, as rubydex's own dedup would. And a **constant**
+        // nested in `ClassMethods` is not a row: `extend` installs methods, and
+        // `Countable::ClassMethods::LIMIT` is reachable only through the constant path.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write("app/models/application_record.rb", CONCERNS);
@@ -3159,19 +3299,17 @@ end
 
     #[test]
     fn a_concerns_class_method_ranks_where_an_included_modules_member_ranks() {
-        // The ranking half. `Distance::from_receiver` seeds only the chains
-        // rubydex is about to walk, and a concern's `ClassMethods` is on none of them — so
-        // every one of its members arrived at `NO_DISTANCE`: last, equally last, and *behind
-        // `Object`'s own methods*, which is backwards for the name a model body is most likely
-        // to be typing. The seed is `locator::Extends::step`, which counts the classes the
-        // chain passes through rather than the ancestors, because the instance chain and the
-        // singleton chain have different lengths.
+        // The ranking half. `Distance::from_receiver` seeds only the chains rubydex is about to
+        // walk, and an extended module is on none of them, so its members would land at
+        // `NO_DISTANCE`: last, *behind `Object`'s own methods*, backwards for what a model body
+        // most likely types. The seed is `locator::Extension::step`, which counts classes the chain
+        // passes, not ancestors, because the instance and singleton chains differ in length.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write("app/models/application_record.rb", CONCERNS);
         harness.write("app/models/concerns/countable.rb", OWN_CONCERN);
-        // An `Object` method matching the same prefix, which every class object answers because
-        // `Object` is the end of every chain. It is the row the concern's has to beat.
+        // An `Object` method matching the same prefix, answered by every class object since
+        // `Object` ends every chain: the row the extended one must beat.
         harness.write(
             "app/lib/patches.rb",
             "class Object\n  def counts_everything\n  end\nend\n",
@@ -3195,9 +3333,9 @@ end
 
     #[test]
     fn a_class_that_writes_its_own_class_method_is_not_offered_a_concerns_as_well() {
-        // The dedup rule, per member rather than per request: what a concern extends is only
-        // ever what the ordinary walk did not answer. Two rows of one name would be the visible
-        // failure; the invisible one is which of them the editor accepts on `tab`.
+        // Dedup per member, not per request: an extension answers only what the ordinary walk did
+        // not. Two rows of one name is the visible failure; the invisible one is which the editor
+        // accepts on `tab`.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write("app/models/application_record.rb", CONCERNS);
@@ -3224,10 +3362,9 @@ end
 
     #[test]
     fn an_instance_of_a_model_is_never_offered_what_a_concern_extends_onto_its_class() {
-        // The discriminator is rubydex's rather than a syntactic test, and this is the other
-        // side of it: inside a `def`, and after `Story.new.`, `self` is a record — so the
-        // concern edge does not apply and `Plain#helper`, which does not apply in a class body,
-        // is exactly what does.
+        // The discriminator is rubydex's, not syntax, and this is its other side: inside a `def`,
+        // and after `Story.new.`, `self` is a record, so the extension edge does not apply and
+        // `Plain#helper` (excluded in a class body) is exactly what does.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write("app/models/application_record.rb", CONCERNS);
@@ -3256,14 +3393,11 @@ end
 
     #[test]
     fn a_column_completes_below_a_method_the_user_wrote_and_above_ruby_s_own() {
-        // The ranking `synthesized.md` says to pin with a real schema in front of it rather
-        // than discover from a bug report: what this class was written to do, then what its
-        // table says it holds, then what every object can do. The order is the same one it
-        // always was; what changed underneath it is why the middle band is in the middle —
-        // `Locality` now scores a generated document by the file that implied it, so the
-        // columns are the user's code sitting one directory further away rather than
-        // somebody else's code altogether. See the test below for the case that separates
-        // the two readings.
+        // The ranking `synthesized.md` says to pin with a real schema: what the class was written
+        // to do, then what its table holds, then what every object can do. `Locality` scores a
+        // generated document by the file that implied it, so the columns are the user's code one
+        // directory further away, not somebody else's code. The test below separates the two
+        // readings.
         let source = "Story.new.\n";
         let (mut harness, _schema, uri) = rails_project(source);
         let model = harness.write(
@@ -3280,22 +3414,17 @@ end
 
     #[test]
     fn what_the_class_was_written_to_do_leads_what_its_table_says_it_holds_from_anywhere() {
-        // **The ordering is a property of the kind of declaration, not of the directory.** A
-        // column is declared in `db/schema.rb` and the method beside it in
-        // `app/models/story.rb`, so leaving the two to `Locality` decides them by which of those
-        // the cursor happens to be nearer — and from a cursor in `db/` that is the schema, which
-        // inverts the order the test above pins. `generated` is the term that makes it hold from
-        // both ends, and this is the only thing that says so. The audit does not say it and
-        // would not: over six corpora and 1,452 typed cursors, deleting the term hands back 18
-        // rank-1 answers at a bare cursor against 3 lost from the top ten there and 1 rank-1
-        // each at two and three characters, so a run scored on rank 1 alone reads its removal
-        // as an improvement. This test is the reason it stays.
+        // **The ordering is a property of the declaration's kind, not its directory.** A column is
+        // declared in `db/schema.rb` and the method beside it in `app/models/story.rb`, so leaving
+        // them to `Locality` orders them by which the cursor is nearer, and from `db/` that inverts
+        // the test above. `generated` makes the order hold from both ends, and only this test says
+        // so: the audit, scored on rank 1, would read removing the term as a slight improvement.
         let (mut harness, _schema, _uri) = rails_project("");
         let model = harness.write(
             "app/models/story.rb",
             "class Story\n  def summary\n  end\nend\n",
         );
-        // Beside the schema and three steps from the model, which is the whole point of it.
+        // Beside the schema and three steps from the model, which is the point.
         let near_the_schema = harness.write("db/probe.rb", "Story.new.\n");
         harness.watch(&[&model, &near_the_schema]);
 
@@ -3309,15 +3438,12 @@ end
 
     #[test]
     fn a_column_outranks_a_method_the_project_patched_onto_object() {
-        // **The case the fixture above cannot separate, and the one the corpora are full of.**
-        // `group` is the first term of the key and it asks one question — is this the user's
-        // code — which was answered by whether `Locality` scored the document at all. A
-        // generated document has no path, so the answer was *no*, and a method the project
-        // patches onto `Object` therefore outranked every column, association and enum of the
-        // receiver's own table: `Object` is the far end of the chain and the patch file is the
-        // user's code, and the first term never let `distance` speak.
-        //
-        // Measured on a real application before the fix: two `Object` patches took ranks 1 and
+        // **The case the fixture above cannot separate, and the corpora's common one.** `group`,
+        // the first key term, asks "is this the user's code", answered by whether `Locality` scored
+        // the document. A generated document has no path, so the answer would be *no*, and a method
+        // the project patches onto `Object` would outrank every column, association and enum of the
+        // receiver's table: `Object` is the far end of the chain but the patch file is user code,
+        // and `distance` never gets to speak. On a real app, two `Object` patches took ranks 1 and
         // 2 of `story.`, above `body`, `score` and `title`.
         let source = "Story.new.\n";
         let (mut harness, _schema, uri) = rails_project(source);
@@ -3349,17 +3475,16 @@ end
         harness.index();
         let uri = harness.write("app/main.rb", "");
 
-        // `rb_add_method` privatises five names at the point of definition, so `def initialize`
-        // is private whatever its class said — and nothing in the graph records that. rbs is not
-        // even consistent about it: `Kernel#initialize_copy` is marked private and
-        // `String#initialize_copy` public, so `"hi".` offered `initialize` and `initialize_copy`
-        // while `count.` offered only the first.
+        // `rb_add_method` makes five names private at definition, so `def initialize` is private
+        // whatever its class said, and the graph does not record it. rbs is inconsistent too:
+        // `Kernel#initialize_copy` is private but `String#initialize_copy` public, so `"hi".` would
+        // offer both while `count.` offers only `initialize`.
         let outside = harness.declarations_at(&uri, "Store::Item.new.~\n");
         assert!(outside.contains(&"price".to_owned()), "{outside:?}");
         assert!(!outside.contains(&"initialize".to_owned()), "{outside:?}");
 
-        // And the guard, so this cannot pass by banning the name outright: Ruby 2.7 onwards
-        // permits a private call on a receiver written `self`, `initialize` included.
+        // The guard, so this cannot pass by banning the name outright: since Ruby 2.7, a private
+        // call on a receiver written `self` is allowed, `initialize` included.
         let inside =
             harness.declarations_at(&item, &ANCESTRY.replace("      audit\n", "      self.~\n"));
         assert!(inside.contains(&"initialize".to_owned()), "{inside:?}");
@@ -3371,9 +3496,9 @@ end
         let item = harness.write("app/store.rb", ANCESTRY);
         harness.index();
 
-        // rubydex passes a private method whenever the caller's `self` is the same *class* as
-        // the receiver. Ruby's exemption is for the receiver being *written* `self`, so this
-        // offered `stash` from inside `Item` where a real interpreter raises `NoMethodError`.
+        // rubydex passes a private method whenever the caller's `self` is the receiver's *class*.
+        // Ruby exempts only a receiver *written* `self`, so this would offer `stash` inside `Item`,
+        // where Ruby raises `NoMethodError`.
         let other = harness.declarations_at(
             &item,
             &ANCESTRY.replace("      audit\n", "      Store::Item.new.~\n"),
@@ -3381,8 +3506,8 @@ end
         assert!(other.contains(&"price".to_owned()), "{other:?}");
         assert!(!other.contains(&"stash".to_owned()), "{other:?}");
 
-        // `::` is a method call too, and Ruby exempts it on the same terms — both halves
-        // checked against a real interpreter rather than assumed.
+        // `::` is a method call too, exempted on the same terms; both checked against a real
+        // interpreter.
         for marked in ["      self.~\n", "      self::~\n"] {
             let found = harness.declarations_at(&item, &ANCESTRY.replace("      audit\n", marked));
             assert!(found.contains(&"stash".to_owned()), "{marked}: {found:?}");
@@ -3391,10 +3516,9 @@ end
 
     #[test]
     fn a_public_method_below_a_block_holding_private_is_still_offered() {
-        // The same wrong record the jump reads — a bare `private` written inside a block, which
-        // rubydex applies to every `def` below the *block* — asked of the list instead. Both
-        // surfaces have to repair it or they disagree about one cursor: a jump that lands on
-        // `upsert_custom_fields` and a list that will not offer the name it landed on. See
+        // The same wrong record the jump reads (a bare `private` inside a block, applied by rubydex
+        // to every `def` after the *block*), asked of the list. Both surfaces must repair it, or a
+        // jump lands on `upsert_custom_fields` while the list will not offer it. See
         // `locator::Modifiers`.
         let concern = "\
 module HasCustomFields
@@ -3415,11 +3539,10 @@ module HasCustomFields
   end
 end
 ";
-        // **The receiver has to type, or this measures the name-based path instead.** Only
-        // `from_graph` carries the repair — `by_name` is the arm that walks the whole graph and
-        // is deliberately left with rubydex's record — so the cursor is written into the file as
-        // indexed rather than replacing it, which is what keeps the rebase able to place
-        // `Category` in the graph's coordinates.
+        // **The receiver must type, or this measures the name-based path.** Only `from_graph`
+        // carries the repair (`by_name` walks the whole graph and deliberately keeps rubydex's
+        // record), so the cursor is written into the indexed file rather than replacing it, which
+        // lets the rebase place `Category` in graph coordinates.
         let source = "\
 class Category
   include HasCustomFields
@@ -3451,9 +3574,9 @@ end
 
     #[test]
     fn visibility_is_the_callers_visibility_not_the_methods() {
-        // Private is free from rubydex, but only if the `self` it is handed is the caller's.
-        // Left unstated it defaults to nothing, every call site becomes an outsider, and a
-        // class stops being able to see its own private methods.
+        // rubydex handles private visibility, but only if it is given the caller's `self`. Left
+        // unset it defaults to nothing, every call site becomes an outsider, and a class cannot see
+        // its own private methods.
         let source = "\
 class Person
   def self.build
@@ -3488,9 +3611,9 @@ end
 
     #[test]
     fn a_singleton_method_body_completes_against_the_singleton() {
-        // Inside `def self.build` the lexical scope is `Person` but `self` is `Person`'s
-        // singleton class, and the two produce different lists. Getting this wrong offers
-        // instance methods that would raise `NoMethodError` if accepted.
+        // Inside `def self.build` the lexical scope is `Person` but `self` is its singleton class,
+        // and the two give different lists. Getting it wrong offers instance methods that raise
+        // `NoMethodError` when accepted.
         let mut harness = Harness::new();
         let uri = harness.write("app/hr.rb", OFFICE);
         harness.index();
@@ -3505,9 +3628,9 @@ end
 
     #[test]
     fn a_class_body_completes_against_the_class_and_not_an_instance_of_it() {
-        // Where the entire Rails DSL lives. `self` in a class body is the class object, so what
-        // can be written there is its *singleton* methods — `validates`, `has_many`, `scope`.
-        // Completing against the instance side offers `valid?` and omits every macro.
+        // Where the whole Rails DSL lives. `self` in a class body is the class object, so what may
+        // be written there is its *singleton* methods: `validates`, `has_many`, `scope`. Completing
+        // against the instance side offers `valid?` and omits every macro.
         const MODEL: &str = "\
 class Base
   def self.validates(*names)
@@ -3531,7 +3654,7 @@ end
         assert!(body.contains(&"validates".to_owned()), "{body:?}");
         assert!(!body.contains(&"valid?".to_owned()), "{body:?}");
 
-        // And an instance method body is the other way round, which is the whole distinction.
+        // An instance method body is the reverse, which is the whole distinction.
         let method = harness.declarations_at(
             &uri,
             &MODEL.replace(
@@ -3545,18 +3668,15 @@ end
 
     #[test]
     fn a_class_new_block_inside_a_def_completes_against_the_class_it_opens() {
-        // Ruby refuses a `class` keyword in a method body, so `Class.new(base) do … end` is the
-        // only way one is ever written there — and rubydex records that block as a class all the
-        // same. It is `class_eval`'d, so `self` inside it is the new class *object*: the same
-        // answer the written class body above gets, and the enclosing `def` says nothing about
-        // it.
+        // Ruby refuses the `class` keyword in a method body, so `Class.new(base) do … end` is the
+        // only way to write one there, and rubydex records the block as a class. It is
+        // `class_eval`'d, so `self` inside is the new class *object*, as in a written class body,
+        // whatever the enclosing `def` says.
         //
-        // `types::self_of` read the innermost `def` unconditionally and answered its instance
-        // side, so the base's instance members were offered and the DSL — which is the whole
-        // reason anybody writes the block — was not. The two bodies nest, so the innermost is
-        // the one that decides. Found on chatwoot 2026-09-14 by lane 1's `calls` key, at a
-        // `define_method` inside one: the list was a single row and it was
-        // `define_singleton_method`, arriving from `Object`.
+        // The two bodies nest, so the innermost decides. Reading the innermost `def`
+        // unconditionally would offer the base's instance members and not the DSL, which is why
+        // anyone writes the block (seen on chatwoot at a `define_method` inside one, where the list
+        // was a single row: `define_singleton_method`, from `Object`).
         const ANONYMOUS: &str = "\
 class Base
   def self.validates(*names)
@@ -3588,8 +3708,8 @@ end
             "and not the instance the enclosing `def` runs on: {body:?}"
         );
 
-        // A `def` written *inside* the block is the other way round again, which is the rule
-        // rather than a second case: the innermost of the two bodies is that method now.
+        // A `def` *inside* the block reverses it again, by the same rule: the innermost body is now
+        // that method.
         let nested = harness.declarations_at(
             &uri,
             &ANONYMOUS.replace(
@@ -3603,10 +3723,10 @@ end
 
     /// A class body, a block written straight into it, and every shape that is not one.
     ///
-    /// `DSL` is the shape the defect was reported as: a macro that takes a block and runs it
-    /// against something other than the class object. The four other cursors are the refusals,
-    /// and each is a different reason — `self` fixed by a `def`, a module with no instances, a
-    /// receiver written down, and an expression with no `self` at all.
+    /// `DSL` is the reported shape: a macro that takes a block and runs it against something other
+    /// than the class object. The other four cursors are refusals, each for a different reason:
+    /// `self` fixed by a `def`, a module with no instances, a written receiver, and an expression
+    /// with no `self` at all.
     const DSL: &str = "\
 class Base
   def self.rule(name)
@@ -3645,9 +3765,9 @@ end
 
     #[test]
     fn a_block_in_a_class_body_offers_the_instance_side_the_class_object_does_not_hold() {
-        // The defect: `hover` inside one of these blocks names a member on an instance — see
-        // `locator`'s closure rung — and `completion` at the same byte never left the class
-        // object, so a card named a method the list beside it did not hold.
+        // The bug: `hover` in such a block names a member on an instance (see `locator`'s closure
+        // rung), while `completion` at the same byte stayed on the class object, so a card named a
+        // method the list lacked.
         let mut harness = Harness::new();
         let uri = harness.write("app/parser.rb", DSL);
         harness.index();
@@ -3656,16 +3776,16 @@ end
             &uri,
             &DSL.replace("  rule(:colon) do\n", "  rule(:colon) do\n    ~\n"),
         );
-        // The instance side, inherited rungs included — which is the half the name rung was
-        // throwing away — and a private one, because no receiver was written.
+        // The instance side, inherited rungs included (the half the name rung dropped), and a
+        // private one, since no receiver was written.
         assert!(offered.contains(&"digits".to_owned()), "{offered:?}");
         assert!(offered.contains(&"go".to_owned()), "{offered:?}");
         assert!(offered.contains(&"secret".to_owned()), "{offered:?}");
-        // The class object's own, which is what `self` still is until the DSL says otherwise.
+        // The class object's own, which is what `self` stays until the DSL says otherwise.
         assert!(offered.contains(&"rule".to_owned()), "{offered:?}");
-        // **Once.** `shared` is on both sides; the class object answers it, so the instance row
-        // is not added — the same order `locator` holds by reaching its closure rung only after
-        // `resolve_call` came back imprecise.
+        // **Once.** `shared` is on both sides; the class object answers it, so no instance row is
+        // added: the order `locator` keeps by reaching its closure rung only after `resolve_call`
+        // came back imprecise.
         assert_eq!(
             offered.iter().filter(|label| *label == "shared").count(),
             1,
@@ -3679,8 +3799,8 @@ end
         let uri = harness.write("app/parser.rb", DSL);
         harness.index();
 
-        // A `def` fixes `self` and a block inside one cannot unfix it, so this is the instance
-        // side because it always was — and the class object's `rule` is *not* on it.
+        // A `def` fixes `self` and a block inside it cannot unfix it, so this is the instance side
+        // as always, and the class object's `rule` is *not* on it.
         let in_a_method = harness.declarations_at(
             &uri,
             &DSL.replace("    [1].each do\n", "    [1].each do\n      ~\n"),
@@ -3691,8 +3811,8 @@ end
         );
         assert!(!in_a_method.contains(&"rule".to_owned()), "{in_a_method:?}");
 
-        // A module has no instances for the claim to be about, and `included do` re-binds
-        // `self` to the *including* class, which is reachable from neither side of this file.
+        // A module has no instances for the claim to be about, and `included do` rebinds `self` to
+        // the *including* class, reachable from neither side of this file.
         let in_a_module = harness.declarations_at(
             &uri,
             &DSL.replace("  included do\n", "  included do\n    ~\n"),
@@ -3706,8 +3826,8 @@ end
             "{in_a_module:?}"
         );
 
-        // A receiver written down says what `self` is not, whatever block it sits in — refused
-        // by `Cursor::in_a_closure`, which is `false` on any cursor with one in front of it.
+        // A written receiver decides `self` whatever block it is in; refused by
+        // `Cursor::in_a_closure`, which is `false` with a written receiver.
         let written = harness.declarations_at(
             &uri,
             &DSL.replace("  rule(:colon) do\n", "  rule(:colon) do\n    Base.~\n"),
@@ -3715,11 +3835,11 @@ end
         assert!(written.contains(&"shared".to_owned()), "{written:?}");
         assert!(!written.contains(&"digits".to_owned()), "{written:?}");
 
-        // `::` asks the top level with no `self` at all, and the list it may hold is constants
-        // only — so an instance method reaching it would be a syntax error offered as a row. It
-        // is refused by the same gate, which is why that gate is written on the context and not
-        // on the receiver: this one arrives as a `CompletionReceiver::Expression` like any bare
-        // word, and only the context still says a `::` was typed.
+        // `::` asks the top level with no `self`, and may be followed only by constants, so an
+        // instance method there would be a syntax error offered as a row. The same gate refuses it,
+        // which is why the gate is on the context, not the receiver: this arrives as a
+        // `CompletionReceiver::Expression` like a bare word, and only the context remembers the
+        // `::`.
         let rooted = harness.declarations_at(
             &uri,
             &DSL.replace("  rule(:colon) do\n", "  rule(:colon) do\n    ::~\n"),
@@ -3730,9 +3850,9 @@ end
 
     #[test]
     fn the_card_in_a_block_and_the_list_beside_it_name_the_same_member() {
-        // The pair the defect is *about*, asked at one byte. Both directions: a name only an
-        // instance has comes back as the instance's on both surfaces, and a name both sides
-        // have comes back as the class object's on both.
+        // The pair the bug is *about*, at one byte, both ways: a name only an instance has comes
+        // back as the instance's on both surfaces, and a name both sides have comes back as the
+        // class object's on both.
         let source = DSL.replace(
             "  rule(:colon) do\n",
             "  rule(:colon) do\n    secret\n    shared\n",
@@ -3764,17 +3884,17 @@ end
         harness.index();
         let uri = harness.write("app/main.rb", "");
 
-        // In the order the signature declares them, not alphabetically: a signature is a list
-        // and its order is information, unlike a namespace's members.
+        // In the signature's order, not alphabetical: a signature is a list and its order is
+        // information, unlike a namespace's members.
         let found = harness.declarations_at(&uri, "HR::Person.build(~)\n");
         assert_eq!(&found[..2], ["name:", "age:"], "{found:?}");
     }
 
     #[test]
     fn keyword_arguments_are_never_guessed_from_a_name() {
-        // `person` is a local, so the call resolves by name alone and could be any `build` in
-        // the project. Offering `name:` there would be a syntactically valid wrong answer, so
-        // the argument list degrades to a plain expression instead.
+        // `person` is a local, so the call resolves by name alone and could be any `build`.
+        // Offering `name:` there would be a syntactically valid wrong answer, so the argument list
+        // degrades to a plain expression.
         let mut harness = Harness::new();
         harness.write("app/hr.rb", OFFICE);
         harness.index();
@@ -3786,8 +3906,8 @@ end
 
     #[test]
     fn a_receiver_with_no_type_falls_back_to_every_method_name() {
-        // The one context ya-lsp cannot answer exactly. It answers with names rather than
-        // nothing, because the editor's own word list cannot see a method in an unopened file.
+        // The one context ya-lsp cannot answer exactly. It answers with names rather than nothing,
+        // because the editor's word list cannot see methods in unopened files.
         let mut harness = Harness::new();
         harness.write("app/hr.rb", OFFICE);
         harness.index();
@@ -3813,8 +3933,8 @@ end
 
     #[test]
     fn the_users_own_code_outranks_a_gems() {
-        // The same call `workspace/symbol` makes, for the same reason: a project has thousands
-        // of declarations and its bundle has a hundred times that.
+        // The same call `workspace/symbol` makes, for the same reason: a project has thousands of
+        // declarations and its bundle a hundred times more.
         let (dir, _gem_home, env) =
             project_with_gem("class Megaphone\n  def blare_loudly\n  end\nend\n");
         let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
@@ -3832,10 +3952,9 @@ end
 
     #[test]
     fn a_leading_scope_operator_offers_the_top_level_and_only_constants() {
-        // rubydex's namespace walk stops before `Object`'s own members, so asking it about
-        // `Object` directly answers with nothing. `::` has to be asked as an expression and
-        // then filtered, and the filter is not cosmetic: a method or a keyword after `::` is
-        // not valid Ruby.
+        // rubydex's namespace walk stops before `Object`'s own members, so asking it about `Object`
+        // directly returns nothing. `::` must be asked as an expression and filtered, and the
+        // filter matters: a method or keyword after `::` is not valid Ruby.
         let mut harness = Harness::new();
         harness.write("app/hr.rb", OFFICE);
         harness.write(
@@ -3860,8 +3979,8 @@ end
 
     #[test]
     fn a_name_meant_to_be_left_alone_sinks() {
-        // Ruby writes "internal" with an underscore, and underscores sort before letters — so
-        // without the rule the first thing a Rails user sees after `Model.` is `__send`.
+        // Ruby spells "internal" with an underscore, which sorts before letters, so without the
+        // rule a Rails user's first row after `Model.` is `__send`.
         let mut harness = Harness::new();
         harness.write(
             "app/thing.rb",
@@ -3874,7 +3993,7 @@ end
             harness.declarations_at(&uri, "Thing.~\n")[..2],
             ["build", "_internal"]
         );
-        // Typing the underscore means it: someone who writes `_` is asking for exactly these.
+        // Typing the underscore means it: someone who writes `_` wants exactly these.
         assert_eq!(
             harness.declarations_at(&uri, "Thing._~\n"),
             vec!["_internal"]
@@ -3883,8 +4002,8 @@ end
 
     #[test]
     fn a_name_rubydex_invented_is_never_offered() {
-        // `Class.new` gets called `<uri>:<offset><anonymous>`, which is not something anyone can
-        // type. Measured in a 17,557-file workspace, `::` answered with a page of them.
+        // `Class.new` gets named `<uri>:<offset><anonymous>`, which nobody can type; in a large
+        // workspace `::` answered with a page of them.
         let mut harness = Harness::new();
         harness.write(
             "app/dyn.rb",
@@ -3896,7 +4015,7 @@ end
         let found = harness.suggestions(&uri, "::~\n");
         assert!(found.contains(&"Named".to_owned()), "{found:?}");
         assert!(found.iter().all(|label| !label.contains('<')), "{found:?}");
-        // And the same names are kept out of the symbol picker, which shares the test.
+        // The same names stay out of the symbol picker, which shares the test.
         assert!(
             harness
                 .symbol_names("anonymous")
@@ -3917,7 +4036,7 @@ end
                 .suggestions(&uri, "de~\n")
                 .contains(&"def".to_owned())
         );
-        // After a `.` a keyword is not a legal thing to write.
+        // After a `.`, a keyword is not legal to write.
         assert!(
             !harness
                 .suggestions(&uri, "HR::Person.de~\n")
@@ -3927,8 +4046,8 @@ end
 
     #[test]
     fn a_comment_is_answered_with_null_and_an_empty_scope_with_a_list() {
-        // Two different "nothing", and the difference is not cosmetic: `null` tells the client
-        // to fall back to its own word list, an empty list tells it not to.
+        // Two different "nothing"s: `null` tells the client to use its own word list, an empty list
+        // tells it not to.
         let mut harness = Harness::new();
         let uri = harness.write("app/main.rb", "");
 
@@ -3941,8 +4060,8 @@ end
 
     #[test]
     fn the_half_typed_word_is_replaced_rather_than_appended_to() {
-        // Without an explicit edit range the client guesses the word boundaries from its own
-        // pattern, and Ruby's `?`, `!` and `@` are exactly where that guess goes wrong.
+        // Without an explicit edit range, the client guesses word boundaries from its own pattern,
+        // and Ruby's `?`, `!` and `@` are exactly where that guess goes wrong.
         let mut harness = Harness::new();
         harness.write(
             "app/hr.rb",
@@ -3966,9 +4085,9 @@ end
 
     #[test]
     fn a_list_the_cap_did_not_touch_is_complete() {
-        // The flag costs the client a whole request per keystroke, so it is set where it is
-        // load-bearing rather than everywhere: only the cap can drop a row that a longer prefix
-        // would have reached, because every filter on the way here is a subsequence match.
+        // The flag costs the client a request per keystroke, so it is set only where it matters:
+        // only the cap can drop a row a longer prefix would reach, because every filter here is a
+        // subsequence match.
         let mut harness = Harness::new();
         harness.write("app/hr.rb", OFFICE);
         harness.index();
@@ -3980,9 +4099,8 @@ end
 
     #[test]
     fn a_list_with_nothing_in_it_is_still_incomplete() {
-        // Not the same statement as the one above read twice. A route that answers with no rows
-        // does so because there was nothing to say, and "the complete answer is nothing" would
-        // have the client stop asking as the word grows.
+        // Not the statement above repeated. A route answering no rows had nothing to say, and "the
+        // complete answer is nothing" would make the client stop asking as the word grows.
         let mut harness = Harness::new();
         harness.write("app/hr.rb", OFFICE);
         harness.index();
@@ -4015,8 +4133,8 @@ end
         );
     }
 
-    /// Enough distinct method names to put the whole-project guess over its admission ceiling,
-    /// plus a family that lands between the two ceilings and one name nothing else matches.
+    /// Enough distinct method names to push the whole-project guess over its admission ceiling,
+    /// plus a family between the two ceilings and one name nothing else matches.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn three_regimes_of_guess() -> String {
         let mut source = String::new();
@@ -4038,20 +4156,20 @@ end
 
     #[test]
     fn a_guess_too_wide_to_read_is_not_offered_at_all() {
-        // The name-based list is what a receiver with no type falls to, and at an empty prefix
-        // it is every method name in the project — 26,073 of them on the smallest corpus swept,
-        // 45,953 on the largest, with the word the file actually wrote at rank 4,070.
+        // An untyped receiver falls to the name-based list, which at an empty prefix is every
+        // method name in the project: tens of thousands, with the typed word ranked in the
+        // thousands.
         //
-        // Two ceilings and not one, because the measurement splits them: over five corpora the
-        // word sits inside the first `MAX_UNTYPED_COMPLETION_ITEMS` rows of every guess holding
-        // up to `MAX_UNTYPED_CANDIDATES` candidates, 430 of 430 — so what cannot be trusted is
-        // the *count*, and what can is the order. Hence: refuse on candidates, cut on rows.
+        // Two ceilings, because the evidence splits them: across the corpora the word is within the
+        // first `MAX_UNTYPED_COMPLETION_ITEMS` rows of every guess with up to
+        // `MAX_UNTYPED_CANDIDATES` candidates. So the *count* cannot be trusted but the order can:
+        // refuse on candidates, cut on rows.
         let mut harness = Harness::new();
         harness.write("app/many.rb", &three_regimes_of_guess());
         harness.index();
         let uri = harness.write("app/main.rb", "");
 
-        // `thing` is a local nothing assigns, so there is no receiver to type and no chain.
+        // `thing` is an unassigned local: no receiver to type, no chain.
         let declined = harness.complete(&uri, "thing.~\n");
         assert_eq!(
             declined["items"].as_array().map(Vec::len),
@@ -4063,8 +4181,8 @@ end
             "and saying it is complete would stop the client asking as the word grows"
         );
 
-        // Between the two ceilings: few enough candidates to believe the ranking, more rows than
-        // anybody reads. The answer is the best of them rather than all of them or none.
+        // Between the ceilings: few enough candidates to trust the ranking, more rows than anyone
+        // reads. The answer is the best of them, not all or none.
         let cut = harness.complete(&uri, "thing.beta~\n");
         assert_eq!(
             cut["items"].as_array().map(Vec::len),
@@ -4073,8 +4191,8 @@ end
         );
         assert_eq!(cut["isIncomplete"], true);
 
-        // And under both, the whole of it: the same receiver, the same absent type, a prefix
-        // narrow enough that what is left is a list a person would read to the end.
+        // Under both, all of it: same receiver, same missing type, a prefix narrow enough that the
+        // rest is a list a person would read to the end.
         let narrowed = harness.complete(&uri, "thing.zebra~\n");
         let labels: Vec<&str> = narrowed["items"]
             .as_array()
@@ -4091,22 +4209,18 @@ end
 
     #[test]
     fn a_declined_guess_and_a_typed_list_are_not_two_lengths_of_the_same_answer() {
-        // `GALLERY`'s treatment for the four answers a `.` can get, in one picture, because the
-        // point of this item is that they are **different kinds of answer** rather than different
-        // lengths of one. Read the right-hand column down:
+        // `GALLERY`'s treatment for the four answers a `.` can get, in one picture: they are
+        // **different kinds of answer**, not different lengths of one. Read the right-hand column:
         //
-        // - `"hi".upca` has a receiver the graph names. Those rows are `String`'s own members and
-        //   the ceiling they are bounded by is the response's.
-        // - `thing.` has no receiver at all, so the candidates are every method name in the
-        //   project attached to no class. Nothing is offered, because at an empty prefix `tier`
-        //   is 1 for every row and `length` is 0 — there is no order to keep the best of.
-        // - `thing.beta` has the same absent receiver, and enough of a word that the ranking can
-        //   be trusted: few enough candidates to admit, more rows than anyone reads, so it is
-        //   cut to what is readable rather than refused or sent whole.
-        // - `thing.zebra` narrows it to one, and the whole of the guess is the answer.
-        //
-        // The second row is what used to be 512 rows of the alphabet, and the third is why this
-        // is a decline and not a refusal.
+        // - **`"hi".upca`** has a receiver the graph names. Its rows are `String`'s own members,
+        //   bounded by the response ceiling.
+        // - **`thing.`** has no receiver, so the candidates are every project method name, attached
+        //   to no class. Nothing is offered: at an empty prefix `tier` and `length` tie, so there
+        //   is no order to keep the best of.
+        // - **`thing.beta`** has the same absent receiver but enough of a word to trust the
+        //   ranking: few enough candidates to admit, more rows than anyone reads, so it is cut to a
+        //   readable length.
+        // - **`thing.zebra`** narrows to one, and the whole guess is the answer.
         let (mut harness, uri) = with_types("");
         harness.write("app/many.rb", &three_regimes_of_guess());
         harness.index();
@@ -4139,16 +4253,14 @@ thing.zebra    1: zebra_stripe"
 
     #[test]
     fn an_exactly_typed_keyword_outranks_a_fuzzy_match_in_the_project() {
-        // **`tier` leads the key, and for two releases `group` did.** A name in the user's own
-        // code outranked everything else before match quality was consulted at all, so a word
-        // typed in full lost to any project name matching it as a *subsequence*. Over 1,452
-        // typed cursors on six corpora, putting `tier` first took the words sitting past rank
-        // 128 one character into the word from 21 to **2**, and past 256 from 9 to **0**.
+        // **`tier` leads the key.** With `group` first, a name in the user's code outranked
+        // everything before match quality was consulted, so a word typed in full lost to any
+        // project name matching it as a *subsequence*. Measured, putting `tier` first nearly
+        // eliminates words ranked past 128 one character in.
         //
-        // It is written on a keyword because `group` still has three bands and this is the one
-        // the harness can reach: `end` is band 2, below every declaration, which is where the
-        // measurement put it — offering keywords first empties rank 1 and the whole top ten at
-        // a bare-word cursor. Typed in full it comes back anyway, and that is this test.
+        // Tested with a keyword, because `group` still has three bands and this is the one the
+        // harness can reach: `end` is in band 2, below every declaration (keywords first would fill
+        // the top ten at a bare cursor). Typed in full it comes back, which is this test.
         let mut harness = Harness::new();
         harness.write(
             "lib/patch.rb",
@@ -4174,12 +4286,12 @@ thing.zebra    1: zebra_stripe"
 
     #[test]
     fn the_name_based_list_is_what_guess_from_names_turns_off() {
-        // `[types] guess_from_names = false` exists so that a user can have only answers this
-        // server can defend. The name-based list is the same guess one request over — matched
-        // on the word alone, belonging to no class — so the setting has to reach it, or it
-        // silences every *card* that says "guessed" and none of the lists built the same way.
+        // `[types] guess_from_names = false` lets a user have only answers this server can defend.
+        // The name-based list is the same guess one request over (matched on the word, owned by no
+        // class), so the setting must reach it too, or it silences every "guessed" *card* but none
+        // of the lists built the same way.
         //
-        // It gates that arm and nothing else: a receiver the graph can name is not a guess.
+        // It gates that arm only: a receiver the graph can name is not a guess.
         let dir = tempfile::tempdir().expect("tempdir");
         let signatures = dir.path().join("sig");
         std::fs::create_dir_all(signatures.join("core")).unwrap();
@@ -4230,7 +4342,7 @@ thing.zebra    1: zebra_stripe"
 
         let found = harness.complete(&uri, "thing = nil\nthing.shou~\n");
         let item = found["items"][0].clone();
-        // The list itself carries no documentation: five hundred rows, one of them read.
+        // The list carries no documentation: five hundred rows, one of them read.
         assert!(item["documentation"].is_null(), "{item}");
 
         let resolved = harness.ask("completionItem/resolve", item);
@@ -4243,12 +4355,10 @@ thing.zebra    1: zebra_stripe"
 
     #[test]
     fn resolving_an_item_the_graph_no_longer_holds_answers_the_item_it_was_given() {
-        // A list is built, the configuration reloads, the graph is dropped and rebuilt, and the
-        // user then arrows down onto a row from the old list. The `data` on that row is a
-        // declaration id nothing answers to any more — which arrives from the client, so it is
-        // handed to the server rather than produced by it, and rubydex ids are hashes with no
-        // way to tell a stale one from a wrong one. The protocol says the item comes back
-        // either way; enriching it is the optional half.
+        // A list is built, the config reloads, the graph is rebuilt, and the user arrows onto a row
+        // from the old list. That row's `data` is a declaration id nothing answers to, coming from
+        // the client, and rubydex ids are hashes, so a stale one looks like a wrong one. The
+        // protocol says the item comes back either way; enriching it is the optional half.
         let mut harness = Harness::new();
         harness.write("app/hr.rb", "class Person\nend\n");
         harness.index();
@@ -4256,7 +4366,7 @@ thing.zebra    1: zebra_stripe"
         for data in [
             // A well-formed row naming a declaration that is gone.
             serde_json::json!({ "declaration": "1234567890123456789", "precise": true }),
-            // And the shapes a client can send that are not rows at all.
+            // And shapes a client can send that are not rows at all.
             serde_json::json!("1234567890123456789"),
             serde_json::json!({ "declaration": "1234567890123456789" }),
             serde_json::Value::Null,
@@ -4274,13 +4384,12 @@ thing.zebra    1: zebra_stripe"
         }
     }
 
-    /// One name in every sigil namespace Ruby has, chosen so each would answer the others'
-    /// prefixes if a sigil were fuzzy-matched like a letter.
+    /// One name in every Ruby sigil namespace, chosen so each would answer the others' prefixes if
+    /// a sigil were fuzzy-matched like a letter.
     ///
-    /// `entry` is in all five names on purpose: it is the substring that makes every list below
-    /// a real question rather than a coincidence of spelling. `$@` is here because it is the
-    /// bug this fixture exists for — a global whose whole name after the sigil *is* an `@`, so
-    /// a subsequence match on `@` reaches it and nothing else in Ruby does.
+    /// `entry` is in all five names so every list below is a real question, not a coincidence of
+    /// spelling. `$@` is the case this fixture exists for: a global whose name after the sigil *is*
+    /// an `@`, so a subsequence match on `@` reaches it and nothing else.
     ///
     /// `CURSOR` is where the cursor goes; `sigils_at` writes the line in.
     const SIGILS: &str = "\
@@ -4304,21 +4413,20 @@ class Ledger
 end
 ";
 
-    /// [`SIGILS`] with `line` written into `#record`'s body, where the `~` marks the cursor.
+    /// [`SIGILS`] with `line` written into `#record`'s body; the `~` marks the cursor.
     ///
-    /// One buffer rather than two, unlike `ANCESTRY`: an instance variable belongs to the
-    /// `self` it was assigned on, so the cursor has to be inside the same class that assigns it.
+    /// One buffer, not two (unlike `ANCESTRY`): an instance variable belongs to the `self` it was
+    /// assigned on, so the cursor must be in the class that assigns it.
     fn sigils_at(line: &str) -> String {
         SIGILS.replace("CURSOR", line)
     }
 
     #[test]
     fn an_instance_variable_prefix_reaches_no_other_namespace() {
-        // The whole list, and what is not in it: no `$@`, which is what shipped through two
-        // releases. Nor `$entry_log`, `ENTRY_LIMIT` or either method — every one of them holds
-        // `entry`, and none of them is something `@` can be the start of.
+        // The whole list, and what is not in it: no `$@`. Nor `$entry_log`, `ENTRY_LIMIT` or either
+        // method: each contains `entry`, and none can start with `@`.
         //
-        // `@@entry_total` *is* here, and belongs here: one `@` is on the way to two.
+        // `@@entry_total` *is* here, rightly: one `@` is on the way to two.
         let mut harness = Harness::new();
         let uri = harness.write("app/ledger.rb", "");
         harness.index();
@@ -4335,9 +4443,9 @@ end
 
     #[test]
     fn a_class_variable_prefix_does_not_reach_back_to_the_instance_variables() {
-        // The other direction, which is the half that must not be symmetric: `@` admits `@@`
-        // because the second character may still be coming, and `@@` admits no `@name` because
-        // nothing can be typed that turns one into the other.
+        // The other direction, which must not be symmetric: `@` admits `@@` because the second
+        // character may be coming, and `@@` admits no `@name` because nothing typed can turn one
+        // into the other.
         let mut harness = Harness::new();
         let uri = harness.write("app/ledger.rb", "");
         harness.index();
@@ -4350,8 +4458,7 @@ end
 
     #[test]
     fn a_global_prefix_is_the_only_thing_that_reaches_a_global() {
-        // And `$@` is a perfectly good answer *here*. The rule is not that it is a bad row, it
-        // is that it belongs to one prefix.
+        // `$@` is a fine answer *here*. It is not a bad row; it belongs to one prefix.
         let mut harness = Harness::new();
         let uri = harness.write("app/ledger.rb", "");
         harness.index();
@@ -4364,15 +4471,14 @@ end
 
     #[test]
     fn a_prefix_with_no_sigil_still_reaches_every_namespace() {
-        // Deliberately unchanged, and pinned so it stays deliberate. Someone who has typed no
-        // sigil has not said which namespace they mean, and a client filters as they keep
-        // typing — so `entr` offers the constant, both instance variables, the class variable
-        // and the global, and accepting one of them writes the sigil in.
+        // Deliberately unchanged, and pinned so it stays deliberate. With no sigil typed, the user
+        // has not chosen a namespace, and the client filters as they type, so `entr` offers the
+        // constant, both instance variables, the class variable and the global; accepting one
+        // writes its sigil in.
         //
-        // What it does not offer is `entry`, the local variable one line above the cursor:
-        // rubydex's graph holds no locals, which is why `scopes.rs` walks Prism itself. That is
-        // a missing feature rather than a wrong answer, and it is written here because a
-        // first-ten list is where an absence is visible at all.
+        // It does not offer `entry`, the local one line above: rubydex's graph holds no locals
+        // (which is why `scopes.rs` walks Prism itself). A missing feature, not a wrong answer,
+        // noted here because a first-ten list is where an absence shows.
         let mut harness = Harness::new();
         let uri = harness.write("app/ledger.rb", "");
         harness.index();
@@ -4391,10 +4497,10 @@ end
 
     #[test]
     fn a_completion_row_says_the_class_it_was_offered_for_was_guessed() {
-        // The tier vocabulary, extended to the guess. A guessed receiver is not the
-        // name-based list — the rows really are one class's members, which is a better list —
-        // so `precise` stays true and a second field carries the doubt. Saying nothing would
-        // present six letters of inference as a resolved type.
+        // The tier vocabulary, extended to the guess. A guessed receiver is not the name-based list
+        // (the rows really are one class's members, a better list), so `precise` stays true and a
+        // second field carries the doubt. Saying nothing would present six letters of inference as
+        // a resolved type.
         let mut harness = Harness::new();
         harness.write(
             "app/models/person.rb",

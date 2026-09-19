@@ -1,29 +1,30 @@
-//! `Gemfile.lock` parsing — no Ruby, no Bundler.
+//! `Gemfile.lock` parsing: no Ruby, no Bundler.
 //!
-//! The lockfile is the only thing that says which gems a project actually uses, and Bundler
-//! reads it with Ruby. We cannot: the whole point of this server is that it runs without a Ruby
-//! runtime. So the format is parsed directly.
+//! The lockfile is the only thing that says which gems a project actually uses, and Bundler reads
+//! it with Ruby. We cannot: this server runs without a Ruby runtime. So the format is parsed
+//! directly.
 //!
-//! The grammar is stable and indentation-significant. Section headers sit at column 0; inside a
-//! source section two spaces mean a key, four mean a spec, six or more mean one of that spec's
-//! dependencies (which we ignore — the lockfile already lists every gem in the graph at four
-//! spaces, so walking the dependency tree would only re-derive what is already flat).
+//! The grammar is stable and indentation-significant:
+//! - section headers sit at column 0;
+//! - inside a source section, two spaces mean a key and four mean a spec;
+//! - six or more mean one of that spec's dependencies, which we ignore: the lockfile already lists
+//!   every gem in the graph at four spaces, so walking the dependency tree would only re-derive
+//!   what is already flat.
 //!
-//! Anything unrecognised is skipped rather than rejected. A newer Bundler adding a section must
-//! not turn into "no gem intelligence at all"; the cost of ignoring it is at worst the gems we
-//! would have missed anyway.
+//! Anything unrecognised is skipped, not rejected. A newer Bundler adding a section must not turn
+//! into "no gems at all"; ignoring it costs at worst the gems we would have missed anyway.
 
 /// Where a locked gem comes from. The three that matter live in three different places on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
-    /// `GEM` — installed under `<gem root>/gems/<full name>`.
+    /// `GEM`: installed under `<gem root>/gems/<full name>`.
     Rubygems,
-    /// `PATH` — a directory, relative to the lockfile itself.
+    /// `PATH`: a directory, relative to the lockfile itself.
     Path,
-    /// `GIT` — checked out under `<gem root>/bundler/gems/<repo>-<revision[..12]>`.
+    /// `GIT`: checked out under `<gem root>/bundler/gems/<repo>-<revision[..12]>`.
     Git,
-    /// `PLUGIN SOURCE` — Bundler's own plugins. Recognised only so their specs are not mistaken
-    /// for project dependencies.
+    /// `PLUGIN SOURCE`: Bundler's own plugins. Recognised only so their specs are not mistaken for
+    /// project dependencies.
     Plugin,
 }
 
@@ -38,7 +39,7 @@ pub struct Spec {
 }
 
 impl Spec {
-    /// The directory name RubyGems gives this gem — `Gem::Specification#full_name`.
+    /// The directory name RubyGems gives this gem: `Gem::Specification#full_name`.
     #[must_use]
     pub fn full_name(&self) -> String {
         match &self.platform {
@@ -51,8 +52,8 @@ impl Spec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub kind: SourceKind,
-    /// The last `remote:` line. `GEM` sections may list several mirrors; only `PATH` and `GIT`
-    /// use this to find files, and those have exactly one.
+    /// The last `remote:` line. `GEM` sections may list several mirrors; only `PATH` and `GIT` use
+    /// this to find files, and those have exactly one.
     pub remote: Option<String>,
     /// `GIT` only: the resolved commit. The checkout directory is named after its first twelve
     /// characters, so a lockfile without one is unusable.
@@ -72,8 +73,8 @@ impl Source {
 
     /// The name of the directory Bundler checks a git source out into.
     ///
-    /// Bundler builds it from the *remote URL's* basename, not the gem name — `git@host:org/foo.git`
-    /// and `https://host/org/foo` both become `foo`, and the revision is truncated to twelve
+    /// Bundler builds it from the *remote URL's* basename, not the gem name (`git@host:org/foo.git`
+    /// and `https://host/org/foo` both become `foo`), and truncates the revision to twelve
     /// characters.
     #[must_use]
     pub fn git_checkout_name(&self) -> Option<String> {
@@ -96,7 +97,7 @@ impl Source {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Lockfile {
-    /// In file order, which is the order Bundler wrote them and the order we search them.
+    /// In file order: the order Bundler wrote them, and the order we search them.
     pub sources: Vec<Source>,
     /// From the `RUBY VERSION` section: the Ruby the lockfile was resolved against.
     pub ruby_version: Option<String>,
@@ -118,16 +119,15 @@ impl Lockfile {
     }
 }
 
-/// Which top-level section the parser is inside, and — for a source — the source being filled in.
+/// Which top-level section the parser is inside, and, for a source, the source being filled in.
 ///
-/// The source lives *in* the variant rather than beside it in an `Option`. Held separately, the
-/// two encoded one state twice: `Section::Source` was true exactly when the option was `Some`,
-/// which the compiler could not know, so the body needed a `let ... else { continue }` for a
-/// case the header match had already made impossible. One variable, and the impossible case
-/// cannot be written down.
+/// The source lives *in* the variant, not beside it in an `Option`. Held separately, the two would
+/// encode one state twice (`Section::Source` exactly when the option is `Some`), which the compiler
+/// cannot know, so the body would need a `let ... else { continue }` for a case the header match
+/// already ruled out. With one variable, the impossible case cannot be written down.
 #[derive(Debug)]
 enum Section {
-    /// `GEM` / `PATH` / `GIT` / `PLUGIN SOURCE` — the only ones that carry specs.
+    /// `GEM` / `PATH` / `GIT` / `PLUGIN SOURCE`: the only ones that carry specs.
     Source(Source),
     RubyVersion,
     BundledWith,
@@ -135,14 +135,14 @@ enum Section {
     Other,
 }
 
-/// The file Bundler writes, which is the only one this module ever reads.
+/// The file Bundler writes, the only one this module ever reads.
 pub const LOCKFILE_NAME: &str = "Gemfile.lock";
 
 /// Whether a lockfile locks `gem`, at any version and from any source.
 ///
-/// Pure text over the parse this module already does, so there is nothing it cannot be asked.
-/// Its one caller is Rails detection, which must not go through `Workspace::gems()`: that
-/// returns early when `gems.enabled` is false and never reads a lockfile at all.
+/// Pure text over the parse this module already does. Its one caller is Rails detection, which must
+/// not go through `Workspace::gems()`: that returns early when `gems.enabled` is false and never
+/// reads a lockfile.
 #[must_use]
 pub fn locks(text: &str, gem: &str) -> bool {
     parse(text).specs().any(|(_, spec)| spec.name == gem)
@@ -204,7 +204,7 @@ pub fn parse(text: &str) -> Lockfile {
                     source.specs.push(spec);
                 }
                 // indent >= 6 is a dependency of the spec above it; every gem it could name is
-                // already listed at indent 4, so there is nothing here we do not have.
+                // already listed at indent 4.
             }
             Section::RubyVersion => {
                 if lockfile.ruby_version.is_none() {
@@ -228,9 +228,9 @@ pub fn parse(text: &str) -> Lockfile {
 
 /// `name (version)` or `name (version-platform)`.
 ///
-/// The version half never contains a hyphen — Bundler spells prereleases `1.0.0.rc1` — so the
-/// first hyphen inside the parentheses always starts the platform. This is the same split
-/// Bundler's own `LockfileParser` makes.
+/// The version half never contains a hyphen (Bundler spells prereleases `1.0.0.rc1`), so the first
+/// hyphen inside the parentheses always starts the platform. Bundler's own `LockfileParser` makes
+/// the same split.
 fn parse_spec(line: &str) -> Option<Spec> {
     // A `!` marks a pinned dependency. It only appears in `DEPENDENCIES`, but stripping it here
     // costs nothing and keeps a hand-edited lockfile from producing a gem named `rails!`.
@@ -239,8 +239,8 @@ fn parse_spec(line: &str) -> Option<Spec> {
     let (name, rest) = line.split_at(open);
     let inside = rest.trim().strip_prefix('(')?.strip_suffix(')')?;
 
-    // No emptiness check on the name: the line was trimmed above, so the `" ("` that `rfind`
-    // found is never at index 0 and never leaves nothing in front of it.
+    // No emptiness check on the name: the line was trimmed above, so the `" ("` that `rfind` found
+    // is never at index 0 and never leaves nothing before it.
     let name = name.trim();
     if inside.is_empty() {
         return None;
@@ -263,9 +263,9 @@ fn parse_spec(line: &str) -> Option<Spec> {
 
 /// `ruby 3.2.1p123` → `3.2.1`.
 ///
-/// The patchlevel suffix is part of the `RUBY VERSION` spelling and is never part of a directory
-/// name, so it has to come off. An engine prefix (`truffleruby`, `jruby`) is dropped with it:
-/// we only use the number to pick a directory.
+/// The patchlevel suffix is part of the `RUBY VERSION` spelling and never part of a directory name,
+/// so it comes off. An engine prefix (`truffleruby`, `jruby`) goes with it: the number is only used
+/// to pick a directory.
 fn parse_ruby_version(line: &str) -> Option<String> {
     let token = line
         .split_whitespace()
@@ -332,10 +332,10 @@ BUNDLED WITH
    2.6.2
 ";
 
-    /// A lockfile nobody would write, made of every shape the parser has to survive.
+    /// A lockfile nobody would write, made of every shape the parser must survive.
     ///
-    /// `parse` never fails — a malformed file yields whatever was still legible — so the only
-    /// way to test that promise is to hand it something malformed and say what "legible" meant.
+    /// `parse` never fails (a malformed file yields whatever was still legible), so the only way to
+    /// test that promise is to hand it something malformed and say what "legible" means.
     const MANGLED: &str = "\
 GEM
 \tremote: https://rubygems.org/
@@ -362,20 +362,22 @@ BUNDLED WITH
     fn a_malformed_lockfile_yields_whatever_was_still_legible() {
         let lockfile = parse(MANGLED);
 
-        // A tab is indentation too, so `\tremote:` is a key of the GEM source rather than a
-        // header that would have closed it.
+        // A tab is indentation too, so `\tremote:` is a key of the GEM source, not a header that
+        // would close it.
         let source = &lockfile.sources[0];
         assert_eq!(source.kind, SourceKind::Rubygems);
         assert_eq!(source.remote.as_deref(), Some("https://rubygems.org/"));
 
-        // Of the five lines under `specs:`, only the first is a spec: `(2.0.0)` has no name,
-        // `nameless ()` no version, `dashed (-linux)` an empty version before the platform, and
-        // `not a spec at all` no parentheses.
+        // Of the five lines under `specs:`, only the first is a spec:
+        // - `(2.0.0)` has no name;
+        // - `nameless ()` has no version;
+        // - `dashed (-linux)` has an empty version before the platform;
+        // - `not a spec at all` has no parentheses.
         let named: Vec<&str> = source.specs.iter().map(|spec| spec.name.as_str()).collect();
         assert_eq!(named, vec!["ok-gem"]);
 
-        // The first line of a single-valued section wins; a second is not an overwrite.
-        // `3.4.1pXY` keeps its suffix because `XY` is not a patchlevel.
+        // The first line of a single-valued section wins; a second is not an overwrite. `3.4.1pXY`
+        // keeps its suffix because `XY` is not a patchlevel.
         assert_eq!(lockfile.ruby_version.as_deref(), Some("3.4.1pXY"));
         assert_eq!(lockfile.bundled_with.as_deref(), Some("2.6.2"));
     }
@@ -400,8 +402,8 @@ BUNDLED WITH
             Some("foo-b8ebc2d49101")
         );
 
-        // An abbreviated revision cannot be truncated to twelve characters, and a remote with
-        // no basename left in it names no directory. Both are `None` rather than a guess.
+        // An abbreviated revision cannot be truncated to twelve characters, and a remote with no
+        // basename left names no directory. Both are `None`, not a guess.
         assert_eq!(full("https://host/org/foo", "b8ebc2d"), None);
         assert_eq!(full("/", sha), None);
 
@@ -466,8 +468,8 @@ BUNDLED WITH
     fn a_git_source_names_its_checkout_the_way_bundler_does() {
         let lockfile = parse(REAL);
         let git = &lockfile.sources[0];
-        // Repository basename plus twelve characters of the revision — verified against a real
-        // `bundler/gems` directory.
+        // Repository basename plus twelve characters of the revision, as in a real `bundler/gems`
+        // directory.
         assert_eq!(
             git.git_checkout_name().as_deref(),
             Some("telegram-bot-b8ebc2d49101")

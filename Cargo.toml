@@ -1,6 +1,6 @@
 [package]
 name = "ya-lsp"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -8,22 +8,26 @@ description = "Yet Another LSP: a standalone Ruby language server that never exe
 repository = "https://github.com/ar2em1s/ya-lsp"
 
 [dependencies]
-# Upstream `main` at ac3bb41 (2026-09-04), which upstream calls 0.2.6 and has never
-# published. Pinned by rev, not by branch: a branch pin would silently take upstream
-# changes, and one of them removed a completion branch whose doc comment still promises it.
+# Upstream `main`, which upstream has never published. Pinned by rev, not by branch: a branch
+# pin would silently take upstream changes.
 rubydex = { git = "https://github.com/Shopify/rubydex", rev = "ac3bb411b571a808fb48533500a105153a7ba710" }
-# MUST stay byte-identical to rubydex's `ruby-prism` requirement, or we link two
-# copies of the Prism C library and get duplicate-symbol errors.
+# MUST stay byte-identical to rubydex's `ruby-prism` requirement, or two copies of the Prism C
+# library link and collide with duplicate-symbol errors.
 ruby-prism = "=1.9.0"
-# rbs's own parser, used to find `interface` blocks in a signature file before it is
-# indexed. Requirement matched to rubydex's rather than pinned exactly, so cargo resolves
-# one copy: `ruby-rbs-sys` links rbs's C library and two copies collide at link time.
+# rbs's own parser, used to find `interface` blocks in a signature file before it is indexed.
+# Requirement matched to rubydex's, not pinned exactly, so cargo resolves one copy:
+# `ruby-rbs-sys` links rbs's C library, and two copies collide at link time.
 ruby-rbs = "0.3"
 # Same version rubydex uses, so cargo unifies to one copy.
 line-index = "=0.1.2"
-# rubydex keys documents by `url::Url::from_file_path(path).to_string()`, so we must
-# spell URIs the exact same way or `didOpen` forks a duplicate document. Same version
-# rubydex uses, so cargo unifies to one copy.
+# The hash rubydex stores on every `Document`: `xxh3_64` of the exact source it was handed.
+# Hashing a buffer with the same function is how `Analysis::graph_holds` asks whether indexing it
+# would change anything, without paying for the parse. Same requirement as rubydex, so cargo
+# unifies to one copy and the two hashes are the same function by construction.
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+# rubydex keys documents by `url::Url::from_file_path(path).to_string()`, so URIs must be spelled
+# the same way, or `didOpen` forks a duplicate document. Same version as rubydex, so cargo
+# unifies to one copy.
 url = "2.5"
 
 lsp-server = "0.10"
@@ -35,27 +39,107 @@ toml = "1.1"
 glob = "0.3"
 ignore = "0.4"
 anyhow = "1.0"
+# The filesystem watcher, for every client that cannot take a `didChangeWatchedFiles`
+# registration: Claude Code, Helix, eglot, Neovim on Linux. The crate rust-analyzer watches with.
+# `CC0-1.0`, which is a licence decision, not a default: see `about.toml`. Default features:
+# `macos_fsevent` is the wanted backend, and the optional `crossbeam-channel` feature stays off,
+# since this crate already depends on that channel directly.
+notify = "8.2"
 tracing = "0.1"
 # stderr only: stdout is the LSP transport and any stray byte corrupts the stream.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# **The allocator: worth more than every codegen flag in this file together.** A cold open is
+# dominated by one phase, indexing the thousands of files in a real application's bundle, which
+# is short-lived allocation across a thread pool and little else. mimalloc makes that phase
+# clearly faster than the system allocator (and faster than jemalloc). The *workspace* index
+# barely moves, which is the tell: this is allocator throughput under a thread pool, not
+# anything about Ruby.
+#
+# **Why not jemalloc.** rubydex has a `jemalloc` feature that installs its own
+# `#[global_allocator]`, so it costs no direct dependency and is what upstream benchmarks under.
+# But it is slower here, and it is `cfg(not(windows))`, so it would leave some of the targets
+# `release.yml` ships on the system allocator; mimalloc builds on all of them. MIT, the same
+# licence as this crate, and a smaller binary than jemalloc.
+#
+# Measured on aarch64-apple-darwin. macOS' libmalloc is the weakest of the three system
+# allocators this ships against, so Linux should gain less and Windows more. rust-analyzer ships
+# mimalloc on Windows and the system allocator elsewhere: the same trade from the other end.
+# The `#[global_allocator]` is in `main.rs`, not `lib.rs`, so it binds the shipped server and not
+# the test binaries.
+mimalloc = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
 # Integration tests spell URIs the way a client would.
 url = "2.5"
-# `analysis::position`'s properties. A generated corpus rather than a hand-written one, and
-# shrinking, because the failure mode there is a buffer that silently stops matching the file
-# the user is typing in — and the input that produces it is a *sequence* of edits, which is not
-# something a fixture can enumerate. Dev-only: `about.toml` ignores dev-dependencies, so it owes
-# no notice in the shipped binary.
+# `analysis::position`'s properties. A generated corpus instead of a hand-written one, with
+# shrinking, because the failure there is a buffer that silently stops matching the file the
+# user is typing in, and the input that produces it is a *sequence* of edits, which no fixture
+# can enumerate. Dev-only: `about.toml` ignores dev-dependencies, so it owes no notice in the
+# shipped binary.
 proptest = "1"
 
-# `coverage_nightly` is set by cargo-llvm-cov when it builds on a nightly compiler, and is what
-# gates `#[coverage(off)]` on the test modules. Declaring it here is what keeps `cargo check` quiet
-# on the pinned stable toolchain, where the cfg is never set.
+# `coverage_nightly` is set by cargo-llvm-cov when it builds on a nightly compiler, and gates
+# `#[coverage(off)]` on the test modules. Declaring it here keeps `cargo check` quiet on the
+# pinned stable toolchain, where the cfg is never set.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
+# **`split-debuginfo = "packed"`.** macOS' dev default is `unpacked`: the DWARF lives inside the
+# `.rcgu.o` files, so the linker cannot discard them and nothing ever collects them. Incremental
+# compilation splits this crate and its `#[cfg(test)]` bodies into thousands of codegen units,
+# and each rebuild writes a fresh object per unit under a new name instead of overwriting, so
+# `target/debug` grows without bound. The entry count is not only disk: `FSEventStreamStart`
+# blocks in a Mach RPC whose cost scales with the directory the calling executable sits in,
+# which makes `server/watcher.rs`' tests take seconds each. `packed` bundles the debug info into
+# a `.dSYM` and leaves no loose objects, so a watcher test measures the watcher.
+#
+# **`debug = "line-tables-only"`: the cheapest line in this file.** Nothing here is debugged by
+# inspecting locals; a failing test needs the file and line a panic names, and line tables carry
+# exactly that. What they leave out is what `dsymutil` spends its time on: incremental rebuilds,
+# cold test builds and `target/debug` all shrink noticeably. The debugger loses variables;
+# `rust-lldb` still stops on the right line.
+[profile.dev]
+split-debuginfo = "packed"
+debug = "line-tables-only"
+
+# **Dependencies optimized, this crate not.** rubydex builds the graph and ruby-prism's C parses
+# every file, so a `#[cfg(test)]` body that indexes real Ruby spends most of its time in somebody
+# else's crate. `cc` takes its `-O` from the profile of the package it builds, so at the dev
+# default the Prism parser is compiled `-O0` too. Overriding the glob and not this package keeps
+# cargo's incremental story intact: our code still compiles at `opt-level = 0`, still rebuilds
+# per edit, and still reports the line a panic came from.
+#
+# The suite runs about twice as fast. What it costs is the cold dependency build, paid on
+# `cargo clean`, a toolchain bump or a CI cache miss, never on an edit.
+#
+# **A faster index exposes tests that assume a watch is armed.** `watcher::watch` returns before
+# anything is armed, on purpose (`concurrency.md`), so an indexed workspace is not yet a watched
+# one. A test that writes a file right after indexing must rewrite a probe until one comes back,
+# as `watcher::tests::armed` does. Removing this line to "fix" such a test fixes the wrong
+# thing.
+[profile.dev.package."*"]
+opt-level = 2
+
+# **Speed first, size second; at `codegen-units = 1` the two stop disagreeing.** On a cold open
+# of a real application, `lto = "thin"` and `codegen-units = 1` each help a little, and fat
+# against thin is a speed difference too small to measure. Fat still gives a smaller binary for
+# a somewhat longer build, and a tag builds each target once. So: fat, for the size, at no cost
+# in speed.
+#
+# **`panic = "abort"` is refused, not skipped.** `catch_unwind` seams contain rubydex panics
+# (`analysis/indexer.rs` per file, `analysis/requests.rs` per request, `analysis/mod.rs` per
+# resolution), and aborting turns each of them from a skipped file into a dead server.
+# `core-invariants.md` is where that belongs; the profile only has to not undo it.
+#
+# Two more that look free and are not:
+# - `strip` would take the symbol names out of the backtrace a user pastes into an issue, to save
+#   a small part of the binary, and size is the secondary target.
+# - `-C target-cpu=native` would be measured on whichever runner GitHub handed the job and
+#   shipped to everyone else. `release.yml` builds x86_64 targets too, and a baseline violation
+#   there is a crash on somebody's machine, not a slow answer.
+#
+# `opt-level` stays at the release default of 3.
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1

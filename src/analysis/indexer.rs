@@ -1,37 +1,34 @@
-//! The bulkhead around rubydex's indexer: a file it cannot handle costs its own answers.
+//! The bulkhead around rubydex's indexer: a file it cannot handle costs only its own answers.
 //!
-//! The pinned rev fixes the panic that prompted this — an unwrapped lexical scope on
-//! `extend self` inside a `Class.new`/`Module.new` block, reachable from a real bundle — but
-//! `create_declaration`'s two unwraps are still upstream, so a version fixes an *instance* of the
-//! hazard and not the hazard. Unbulkheaded it is fatal twice over: on the walk the panicking
-//! worker is joined with `expect("Worker thread panicked")` and takes the analysis thread with
-//! it, and on the buffer route [`rubydex::indexing::index_source`] runs inline, so a few lines
-//! typed into an open file kill a server that was already answering.
+//! rubydex's `create_declaration` still has two unwraps, so a new version fixes an *instance* of
+//! the hazard, not the hazard. Unbulkheaded, a panic is fatal on both routes:
+//! - **the walk:** the panicking worker is joined with `expect("Worker thread panicked")` and takes
+//!   the analysis thread with it;
+//! - **a buffer:** [`rubydex::indexing::index_source`] runs inline, so a few lines typed into an
+//!   open file kill a server that was already answering.
 //!
 //! # Why this is not a `catch_unwind` around [`rubydex::indexing::index_files`]
 //!
 //! Because the failure unit would be the *batch*. rubydex's pool steals work in batches into
-//! per-worker queues, so a worker that dies abandons whatever it had already taken, and its peers
-//! recover the rest only while they are alive themselves. Measured over a large batch with bad
-//! files spread through the order, losses stay at zero until bad files outnumber workers and then
-//! climb steeply — deterministically, with no error, no diagnostic and no log line anywhere. A
-//! wrapper therefore holds for the rare bug that prompted it and fails for the class of bug a
-//! bulkhead exists to bound: an indexer defect on a construct every Rails model writes would kill
-//! every worker in the first milliseconds and drop an unbounded fraction of the workspace
-//! silently.
+//! per-worker queues, so a worker that dies abandons whatever it already took, and its peers
+//! recover the rest only while they are alive themselves. Once bad files outnumber workers, good
+//! files start disappearing, deterministically and with no error, diagnostic or log line. A wrapper
+//! holds for one rare bug and fails for the class of bug a bulkhead exists to bound: an indexer
+//! defect on a construct every Rails model writes would kill every worker in the first milliseconds
+//! and silently drop an unbounded part of the workspace.
 //!
-//! So the pool is ours, the failure unit is the **file**, and the loop below is rubydex's own
-//! shape — workers building local graphs, one serial merge on the calling thread — with the
-//! `catch_unwind` moved inside. It costs no measurable throughput against `index_files`.
+//! So the pool is ours and the failure unit is the **file**. The loop below is rubydex's own shape
+//! (workers building local graphs, one serial merge on the calling thread) with the `catch_unwind`
+//! moved inside, at no measurable cost in throughput.
 //!
 //! # What is contained, and what deliberately is not
 //!
-//! Only [`rubydex::indexing::build_local_graph`], which is where the known panics are. The merge
-//! that follows is not, and that is a decision rather than an oversight: a panic part-way through
-//! `consume_document_changes` leaves the graph in exactly the unknown state
-//! [`super::Analysis::resolve`]'s `rebuild()` exists for, and catching it here would hide it
-//! behind a graph nobody can trust. Containing the build is what makes the recovery *known* — the
-//! graph is itself minus one document, and the document keeps whatever version it had.
+//! Only [`rubydex::indexing::build_local_graph`], where the known panics are. The merge that
+//! follows is not, by decision: a panic part-way through `consume_document_changes` leaves the
+//! graph in exactly the unknown state [`super::Analysis::resolve`]'s `rebuild()` exists for, and
+//! catching it here would hide it behind a graph nobody can trust. Containing the build makes the
+//! recovery *known*: the graph is itself minus one document, and that document keeps whatever
+//! version it had.
 
 use std::{
     panic::{self, AssertUnwindSafe},
@@ -50,9 +47,8 @@ use crate::workspace::DocUri;
 
 /// Which indexer a path's extension asks for.
 ///
-/// 0.2.5 spelled this `LanguageId::from_path`; upstream replaced it with `From<&OsStr>` over
-/// the *extension*, so the `map_or` that turns a path with no extension into Ruby is now the
-/// caller's. One function rather than two spellings, because `index_buffer` asks the same
+/// rubydex decides from the *extension* (`From<&OsStr>`), so turning a path with no extension into
+/// Ruby is the caller's job. One function, not two spellings, because `index_buffer` asks the same
 /// question of a `DocUri`'s path that the walk asks of a `PathBuf`.
 #[must_use]
 pub fn language_of(path: &Path) -> LanguageId {
@@ -63,8 +59,8 @@ pub fn language_of(path: &Path) -> LanguageId {
 pub struct Batch {
     /// The files rubydex itself would have reported: unreadable, or with no URI to file under.
     pub errors: Vec<Errors>,
-    /// The documents whose indexing panicked — not in the graph, and *named* rather than
-    /// silently absent, which is the whole difference between this and a wrapper.
+    /// The documents whose indexing panicked: not in the graph, and *named* rather than silently
+    /// absent, which is the whole difference between this and a wrapper.
     pub skipped: Vec<DocUri>,
 }
 
@@ -80,10 +76,9 @@ enum Built {
 /// Index `paths` into `graph`, losing at most the files that crash the indexer.
 ///
 /// The replacement for [`rubydex::indexing::index_files`]. Paths must be **absolute**:
-/// `Url::from_file_path` fails on a relative one, and a document with no URI is indexed
-/// nowhere at all — see `core-invariants.md`. A relative path is reported here rather than
-/// dropped, which is one thing this loop does that rubydex's also does and the prototype of it
-/// did not.
+/// `Url::from_file_path` fails on a relative one, and a document with no URI is indexed nowhere
+/// (see `core-invariants.md`). A relative path is reported here, not dropped, as rubydex's own loop
+/// does.
 pub fn index_files(graph: &mut Graph, paths: Vec<PathBuf>) -> Batch {
     let mut batch = Batch {
         errors: Vec::new(),
@@ -93,16 +88,15 @@ pub fn index_files(graph: &mut Graph, paths: Vec<PathBuf>) -> Batch {
         return batch;
     }
 
-    // rubydex's own worker count, so the timings above are comparable — bounded by the batch,
-    // because a one-file refresh should not start eleven threads to index it.
+    // rubydex's own worker count, bounded by the batch: a one-file refresh should not start a dozen
+    // threads to index it.
     let workers = thread::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
         .min(paths.len());
 
-    // One file at a time out of a shared queue, and that is the point rather than a detail: a
-    // worker holds exactly the file it is on, so there is nothing for it to abandon. The
-    // `catch_unwind` below means it never dies anyway; this is what keeps that true if it ever
-    // does.
+    // One file at a time from a shared queue, and that is the point, not a detail: a worker holds
+    // exactly the file it is on, so it has nothing to abandon. The `catch_unwind` below means it
+    // never dies anyway; this keeps that true if it ever does.
     let (jobs_tx, jobs_rx) = unbounded::<PathBuf>();
     for path in paths {
         // The receiver is this function's own and outlives every send.
@@ -123,10 +117,10 @@ pub fn index_files(graph: &mut Graph, paths: Vec<PathBuf>) -> Batch {
                 }
             });
         }
-        // Or the merge below waits forever for a sender this thread is still holding.
+        // Or the merge below waits forever for a sender this thread still holds.
         drop(built_tx);
 
-        // Merged as they arrive, overlapping with the workers, exactly as rubydex does it.
+        // Merged as they arrive, overlapping with the workers, exactly as rubydex does.
         for outcome in built_rx {
             match outcome {
                 Built::Indexed(local) => graph.consume_document_changes(*local),
@@ -147,8 +141,8 @@ fn build(path: &Path) -> Built {
             path.display()
         )));
     };
-    // `DocUri` rather than `Url::from_file_path` directly, though they are the same call: a
-    // document key that is spelled anywhere but here is a document forked in two.
+    // `DocUri`, not `Url::from_file_path` directly, although they are the same call: a document key
+    // spelled anywhere but here is a document forked in two.
     let Some(uri) = DocUri::from_path(path) else {
         return Built::Failed(Errors::FileError(format!(
             "Couldn't build URI from path `{}`",
@@ -167,20 +161,20 @@ fn build(path: &Path) -> Built {
         )
     })) {
         Ok(local) => Built::Indexed(Box::new(local)),
-        // The default panic hook has already put rubydex's own file and line on stderr, which
-        // is what a bug report is made of. Silencing it would make a contained panic something
-        // nobody can report — the same reasoning `Analysis::resolve` gives.
+        // The default panic hook has already put rubydex's own file and line on stderr, which is
+        // what a bug report is made of. Silencing it would make a contained panic unreportable: the
+        // reasoning `Analysis::resolve` gives.
         Err(_) => Built::Panicked(uri),
     }
 }
 
 // The counter beside [`CRASHES`], for the one route whose text a test does not write.
 //
-// Six of the seven routes hand the indexer a file or a buffer, so a test can put the sentinel
-// in it. The seventh is `Synthesized::record`, which hands rubydex *RBS this crate generated*
-// — nothing a fixture spells reaches that text — so it is armed rather than written. It runs
-// inline on the calling thread, which is what makes a `thread_local` the right shape: tests
-// running in parallel cannot arm each other's crashes.
+// Every other route hands the indexer a file or a buffer, so a test can put the sentinel in it.
+// This one is `Synthesized::record`, which hands rubydex *RBS this crate generated*, text no
+// fixture spells, so it is armed instead of written. It runs inline on the calling thread, which
+// makes a `thread_local` the right shape: tests running in parallel cannot arm each other's
+// crashes.
 #[cfg(test)]
 thread_local! {
     /// How many of the next inline indexes a test has asked to crash.
@@ -206,14 +200,15 @@ fn crash_if_asked(source: &str) {
 
 /// Index one in-memory document, and say whether it survived.
 ///
-/// The replacement for [`rubydex::indexing::index_source`], which is the same two lines with
-/// the first of them contained. Five call sites run this **inline on the analysis thread** —
-/// the two `.rbs`/template pre-passes, both arms of `index_buffer`, and the generated RBS a
-/// synthesizer records — so this is the half of the bug a user meets while working rather than
-/// while waiting.
+/// The replacement for [`rubydex::indexing::index_source`]: the same two lines, with the first
+/// contained. These call sites run it **inline on the analysis thread**, so this is the half of the
+/// bug a user meets while working, not while waiting:
+/// - the two `.rbs`/template pre-passes;
+/// - both arms of `index_buffer`;
+/// - the generated RBS a synthesizer records.
 ///
-/// A `false` costs the document its *update* and nothing else: the panic is in the build, so
-/// the graph is never entered and whatever version it already held still answers.
+/// A `false` costs the document its *update* and nothing else: the panic is in the build, so the
+/// graph is never entered, and whatever version it already held still answers.
 pub fn index_source(graph: &mut Graph, uri: &str, source: &str, language: &LanguageId) -> bool {
     let built = panic::catch_unwind(AssertUnwindSafe(|| {
         #[cfg(test)]
@@ -229,19 +224,18 @@ pub fn index_source(graph: &mut Graph, uri: &str, source: &str, language: &Langu
     }
 }
 
-/// A file the indexer cannot handle, for the tests that need one — and it is a stand-in.
+/// A file the indexer cannot handle, for the tests that need one. It is a stand-in.
 ///
-/// **No real input provokes a panic at the pinned rev.** A scan of 160,341 files — every Ruby
-/// and RBS file under five installed Rubies, six Rails corpora, four bench gem homes and
-/// `vendor/rbs` — finds none, so there is nothing to write here and the exception
-/// `concurrency.md` grants `RESOLVES_TO_CRASH` and `Task::Panic` covers this module too.
+/// **No known real input provokes a panic at the pinned rev**, so there is nothing real to write
+/// here, and the exception `concurrency.md` grants `RESOLVES_TO_CRASH` and `Task::Panic` covers
+/// this module too.
 ///
-/// **That is not an argument against the bulkhead.** `create_declaration`'s two unwraps are
-/// still upstream, so the class of bug outlives any version that retires one instance of it.
+/// **That is not an argument against the bulkhead.** `create_declaration`'s two unwraps are still
+/// upstream, so the class of bug outlives any version that retires one instance of it.
 ///
-/// A Ruby comment, so a fixture that holds it is still a file that would otherwise index; and
-/// recognised in the *text* rather than through a counter, because [`index_files`] builds on
-/// worker threads and a `thread_local` cannot reach one.
+/// A Ruby comment, so a fixture holding it is still a file that would otherwise index. Recognised
+/// in the *text*, not through a counter, because [`index_files`] builds on worker threads, which a
+/// `thread_local` cannot reach.
 #[cfg(test)]
 pub(super) const CRASHES: &str = "# ya-lsp test: crash the indexer\n";
 
@@ -284,14 +278,12 @@ mod tests {
         );
     }
 
-    /// The measurement that is the whole reason this module exists rather than a `catch_unwind`
-    /// around `rubydex::indexing::index_files`.
+    /// The reason this module exists instead of a `catch_unwind` around
+    /// `rubydex::indexing::index_files`.
     ///
-    /// More bad files than the machine has workers is where a wrapper starts losing good ones —
-    /// 11 bad files cost 4 good ones on the 11-worker machine that measured it, 40 cost 181 —
-    /// silently, with no error and no log line. The bad files are spread through the order
-    /// rather than clustered, because that is what the sweep did and what a real bundle looks
-    /// like.
+    /// With more bad files than the machine has workers, a wrapper starts losing good ones,
+    /// silently, with no error and no log line. The bad files are spread through the order, not
+    /// clustered, because that is what a real bundle looks like.
     #[test]
     fn more_bad_files_than_workers_loses_exactly_those_files() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -334,8 +326,8 @@ mod tests {
     #[test]
     fn a_file_that_cannot_be_read_is_reported_the_way_rubydex_reports_it() {
         let root = tempfile::tempdir().expect("tempdir");
-        // A directory reads as an error on every platform this ships on, and it needs no
-        // permission bit that a CI runner might already hold.
+        // A directory reads as an error on every platform this ships on, and needs no permission
+        // bit a CI runner might already hold.
         let directory = root.path().join("not_a_file");
         std::fs::create_dir(&directory).expect("mkdir");
 
@@ -352,16 +344,14 @@ mod tests {
         );
     }
 
-    /// `core-invariants.md`: `Url::from_file_path` fails on a relative path, and rubydex's own
-    /// loop reports that rather than indexing nothing. The prototype of this one did not, and
-    /// spent a round measuring two no-ops against each other.
+    /// `core-invariants.md`: `Url::from_file_path` fails on a relative path, and rubydex's own loop
+    /// reports that instead of indexing nothing. So does this one.
     #[test]
     fn a_relative_path_is_reported_rather_than_silently_indexing_nothing() {
-        // A path that really reads and really has no URI, which is the only way to reach the
-        // second arm. cargo runs a test binary with the package root as its working directory,
-        // so this is the one relative path that is certain to exist without the test writing
-        // one — and writing one would mean changing the process's directory, which the rest of
-        // the suite is running in.
+        // A path that really reads and really has no URI: the only way to reach the second arm.
+        // cargo runs a test binary with the package root as its working directory, so this is the
+        // one relative path certain to exist without the test writing one. Writing one would mean
+        // changing the process's directory, which the rest of the suite is running in.
         let mut graph = Graph::new();
         let batch = index_files(&mut graph, vec![PathBuf::from("Cargo.toml")]);
 
@@ -375,8 +365,8 @@ mod tests {
     #[test]
     fn an_empty_batch_starts_no_threads_and_reports_nothing() {
         let mut graph = Graph::new();
-        // Not `is_empty`: a fresh graph already holds rubydex's own synthetic `built-in`
-        // document, which is why `DocUri::from_uri_str` rejects that URI in the first place.
+        // Not `is_empty`: a fresh graph already holds rubydex's own synthetic `built-in` document,
+        // which is why `DocUri::from_graph_uri` rejects that URI.
         let before = graph.documents().len();
         let batch = index_files(&mut graph, Vec::new());
         assert!(batch.errors.is_empty());
@@ -384,8 +374,8 @@ mod tests {
         assert_eq!(graph.documents().len(), before);
     }
 
-    /// The inline route, and the property that makes the recovery a *known* state: the panic
-    /// is in the build, so the graph is never entered and the document keeps the version it had.
+    /// The inline route, and the property that makes the recovery a *known* state: the panic is in
+    /// the build, so the graph is never entered and the document keeps the version it had.
     #[test]
     fn a_document_that_crashes_the_indexer_keeps_the_version_it_had() {
         let mut graph = Graph::new();
@@ -404,12 +394,11 @@ mod tests {
         assert!(graph.documents().contains_key(&UriId::from(uri)));
     }
 
-    /// The workspace walk, which is a *worker-thread* panic.
+    /// The workspace walk: a *worker-thread* panic.
     ///
-    /// Driven through `index_workspace` rather than by calling the indexer inline, because the
-    /// two propagate differently: uncaught, this one reaches the analysis thread through
-    /// rubydex's `handle.join().expect("Worker thread panicked")` and an inline call would
-    /// never show that.
+    /// Driven through `index_workspace`, not by calling the indexer inline, because the two
+    /// propagate differently. Uncaught, this one reaches the analysis thread through rubydex's
+    /// `handle.join().expect("Worker thread panicked")`, which an inline call would never show.
     #[test]
     fn a_file_that_crashes_the_indexer_costs_that_file_and_not_the_session() {
         let mut harness = Harness::new();
@@ -433,12 +422,12 @@ mod tests {
         );
     }
 
-    /// The other one: `extend self` inside a `Module.new` block.
+    /// The other shape: `extend self` inside a `Module.new` block.
     ///
-    /// `ruby_indexer.rs:985` unwraps a lexical scope its own guard does not test for, which on
-    /// 0.2.5 ends the analysis thread. What is asserted is not merely that it survives: the panic
-    /// is the top-level face of a *wrong answer*, so the `def` inside the block has to be found
-    /// where it really is.
+    /// rubydex's indexer has unwrapped a lexical scope its own guard does not test for on this
+    /// shape, ending the analysis thread. The assertion is more than survival: the panic is the
+    /// visible face of a *wrong answer*, so the `def` inside the block must be found where it
+    /// really is.
     #[test]
     fn extend_self_in_an_anonymous_module_indexes_like_any_other_file() {
         let mut harness = Harness::new();

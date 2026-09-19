@@ -1,13 +1,13 @@
 """`audit/ledger.json`: the adjudicated residue, and the only file the audit writes.
 
-**It is committed, so the licence rule is load-bearing here and nowhere else in this package.**
-A row carries the sha256 of the line it sits on and never the line — and it does not carry the
-identifier under the cursor either. An identifier is a fragment of the source, `corpora.md`'s rule
-is blanket ("not a line, not a fragment, not as a ledger key"), and the path with the line number
-is enough to go and look. That is the cost the rule imposes and it is the whole cost.
+**It is committed, so the licence rule is load-bearing here.**
+- A row carries the sha256 of its line, never the line.
+- It never carries the identifier under the cursor either: an identifier is a fragment of the
+  source, and `corpora.md`'s rule is blanket ("not a line, not a fragment, not as a ledger key").
+- The path and line number are enough to go and look. That is the rule's whole cost.
 
-The row is written from named fields only. Nothing here ever copies a substring of a corpus file
-into the row, which is what makes the guarantee structural rather than a habit.
+Rows are written from named fields only; nothing here copies a substring of a corpus file into a
+row. That makes the guarantee structural, not a habit.
 
     {
       "version": 1,
@@ -22,20 +22,17 @@ into the row, which is what makes the guarantee structural rather than a habit.
       }
     }
 
-**Matching, and why the hash is a guard rather than the key.** A position is found by
-`path:offset` and the verdict applies only if the recorded hash still matches the line there.
-Three outcomes and they are three different things:
+**Matching: the hash guards; it is not the key.** A position is found by `path:offset`, and its
+verdict applies only while the recorded hash still matches the line there:
 
-    live    the offset is in the ledger and the hash matches — the verdict is reused
-    stale   the offset is in the ledger and the hash does not — the line changed under it, so
-            the verdict is **dropped rather than re-scored**: a stale verdict carried forward
-            reads as a regression that never happened
-    new     the offset is not in the ledger at all — residue, and the only kind that costs a
-            human anything
+    live    in the ledger, and the hash matches: the verdict is reused
+    stale   in the ledger, and the hash does not: the line changed, so the verdict is
+            **dropped, not re-scored**; carried forward, it would read as a regression that
+            never happened
+    new     not in the ledger: residue, and the only kind that costs a person anything
 
-Offsets are stable within a pin, which is why the corpus SHA is recorded per corpus rather than
-folded into every key: a pin bump moves every offset in an edited file, and the SHA on the row's
-own corpus is what tells a reader the ledger predates it.
+Offsets are stable within a pin, so the corpus SHA is recorded once per corpus, not in every key. A
+pin bump moves every offset in an edited file, and the SHA tells a reader the ledger predates it.
 """
 
 import json
@@ -45,19 +42,19 @@ from audit.config import OUT
 
 VERSION = 1
 PATH = OUT / "ledger.json"
-# The three a position can be adjudicated as. `wrong` and `accepted` are both "the answer is not
-# right"; what separates them is whether anyone intends to do something about it, and a ledger
-# that cannot say that is a ledger where every known limitation reads as an open defect.
+# The three verdicts a position can get. `wrong` and `accepted` both mean "the answer is not right";
+# they differ in whether anyone intends to fix it. Without that, every known limitation reads as an
+# open defect.
 VERDICTS = ("correct", "wrong", "accepted")
-# Every field a row may hold. The writer builds rows from this list and nothing else, so no
-# corpus text can reach the file by accident. `why` is human-written and is the one place a
-# person could paste a line in — that is a review question, not something code can check.
+# Every field a row may hold. The writer builds rows from this list only, so no corpus text reaches
+# the file by accident. `why` is written by a person and is the one place someone could paste a line
+# in: a review question, not something code can check.
 FIELDS = ("line", "shape", "hash", "verdict", "why")
 
 
-# A ledger row's key and a finding's site are the same string **by construction** rather than by
-# coincidence: `audit.site` is the one spelling, and lane 3 subtracts findings from the draw by
-# comparing them. Two functions that happened to agree would be two functions that can stop.
+# A ledger row's key and a finding's site are the same string **by construction**: `audit.site` is
+# the one spelling, and lane 3 subtracts findings from the draw by comparing them. Two functions
+# that merely agreed could stop agreeing.
 key = site
 
 
@@ -87,8 +84,8 @@ def verdict(ledger, corpus, path, offset, line_hash):
 def pending(corpus, positions):
     """Unadjudicated rows for `positions`, in the shape a person fills in and commits.
 
-    `verdict` is left empty on purpose rather than defaulted to anything: a row that arrived with
-    a verdict nobody chose is a row the ledger asserts on somebody's behalf.
+    `verdict` is left empty on purpose: a row arriving with a verdict nobody chose would be the
+    ledger asserting on somebody's behalf.
     """
     out = {}
     for _, path, line, offset, shape, line_hash in positions:
@@ -100,9 +97,9 @@ def pending(corpus, positions):
 def save(ledger, path=PATH):
     """Write the ledger, keeping only known fields on every row.
 
-    The field filter is the licence guarantee made structural: whatever else a hand-edited row
-    picked up, only `FIELDS` is written back, so a stray copy of a source line cannot survive a
-    round trip through this function.
+    The field filter makes the licence guarantee structural: whatever a hand-edited row picked up,
+    only `FIELDS` is written back, so a stray source line cannot survive a round trip through this
+    function.
     """
     out = {"version": VERSION}
     for name, held in sorted(ledger.items()):

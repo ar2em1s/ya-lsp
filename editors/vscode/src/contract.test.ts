@@ -2,12 +2,12 @@
  * The settings this extension sends, against the real server.
  *
  * The server deserializes `initializationOptions` with serde's `deny_unknown_fields`, which does
- * not degrade: one misspelled key rejects the *entire* layer, so every other setting silently
- * stops working and the only evidence is one `window/showMessage` nobody reads. A type checker
- * cannot see across that boundary and a Rust test cannot see this side of it, so the contract is
- * checked by talking to the actual binary.
+ * not degrade: one misspelled key rejects the *entire* layer, every other setting silently stops
+ * working, and the only evidence is one `window/showMessage` nobody reads. A type checker cannot
+ * see across that boundary and a Rust test cannot see this side of it, so the contract is checked
+ * against the actual binary.
  *
- * Skipped when there is no binary to talk to, so `npm test` still works on its own.
+ * Skipped when there is no binary, so `npm test` still works on its own.
  */
 
 import assert from 'node:assert/strict';
@@ -39,7 +39,6 @@ const everything: Settings = {
       'index.exclude': ['spec/**/*'],
       'index.loadPaths': ['lib', 'app'],
       'index.maxFiles': 4321,
-      'index.respectGitignore': false,
       'gems.enabled': false,
       'gems.defaultGems': false,
       'gems.rubyVersion': '3.3.0',
@@ -60,9 +59,9 @@ test('the server accepts every setting the extension can send', { skip: !binary 
 });
 
 test('and would have said so about one it could not read', { skip: !binary }, async () => {
-  // The guard on the test above: without it, a change that broke every key would still pass by
-  // producing no complaint about keys the server never saw. `rubyVersion` is the camelCase this
-  // extension would write if nobody had checked.
+  // The guard on the test above: without it, a change that broke every key would pass by producing
+  // no complaint about keys the server never saw. `rubyVersion` is the camelCase this extension
+  // would send if nobody checked.
   const complaints = await initialize({ gems: { rubyVersion: '3.3.0' } });
   assert.equal(complaints.length, 1, 'a camelCase key has to be rejected, not ignored');
   assert.match(complaints[0], /unknown field/);
@@ -71,7 +70,7 @@ test('and would have said so about one it could not read', { skip: !binary }, as
 /** Start the server, hand it `options`, and collect what it says about them. */
 async function initialize(options: unknown): Promise<string[]> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ya-lsp-contract-'));
-  // A workspace with nothing in it is itself worth a warning, and this test is not about that.
+  // An empty workspace earns a warning of its own, and this test is not about that.
   fs.writeFileSync(path.join(root, 'main.rb'), 'class Main\nend\n');
   const server = spawn(binary!, ['--stdio'], { cwd: root });
   const messages: string[] = [];
@@ -90,13 +89,13 @@ async function initialize(options: unknown): Promise<string[]> {
       },
     });
 
-    // The handshake has to be finished, not just answered: the server reports config problems
-    // after `initialize_finish`, which blocks until the client says `initialized`.
+    // The handshake must be finished, not just answered: the server reports config problems after
+    // `initialize_finish`, which waits for the client's `initialized`.
     await reader.until((message) => message.id === 1);
     send(server, { jsonrpc: '2.0', method: 'initialized', params: {} });
     for (const message of await reader.drain(400)) {
-      // Only what the server says about the settings: a machine with no Ruby installed has
-      // other things to report, and none of them are this test's business.
+      // Only what the server says about the settings: a machine with no Ruby has other things to
+      // report, and none are this test's business.
       const text = String(message.params?.message ?? '');
       if (message.method === 'window/showMessage' && text.includes('initializationOptions')) {
         messages.push(text);
@@ -121,7 +120,7 @@ function send(server: ChildProcessWithoutNullStreams, message: unknown): void {
   server.stdin.write(body);
 }
 
-/** The smallest LSP framing reader that can be trusted: length-prefixed, never line-based. */
+/** The smallest trustworthy LSP framing reader: length-prefixed, never line-based. */
 function read(server: ChildProcessWithoutNullStreams) {
   let buffer = Buffer.alloc(0);
   const queue: Incoming[] = [];

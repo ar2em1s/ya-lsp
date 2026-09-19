@@ -3,8 +3,8 @@
 /tmp/**/*
 !/tmp/.keep
 
-# The extension's own build outputs are ignored in editors/vscode/.gitignore; this catches the
-# staged server binary if it is ever copied somewhere else.
+# The extension's build outputs are ignored in editors/vscode/.gitignore; this catches a packaged
+# extension copied anywhere else.
 *.vsix
 
 # scripts/ is Python; importing one for a test leaves this behind

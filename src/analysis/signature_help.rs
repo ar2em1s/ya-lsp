@@ -1,12 +1,12 @@
-//! `textDocument/signatureHelp` — the parameters of the call the cursor is inside.
+//! `textDocument/signatureHelp`: the parameters of the call the cursor is inside.
 //!
-//! Nothing here is resolved: `locator::precise_call` has already found the method and
-//! `render::signature_label` has already spelled it. What this module decides is the two
-//! numbers LSP asks for on top of that — which overload the call fits, and which parameter the
-//! cursor is writing — and it is only ever asked when the callee resolved *exactly*. A
-//! name-based guess would put another class's parameters under the cursor while the user types
-//! into them, which is the same wrong answer keyword-argument completion refuses for the same
-//! reason: it would be syntactically valid.
+//! Nothing here is resolved: `locator::precise_call` already found the method and
+//! `render::signature_label` already spelled it. This module decides the two numbers LSP asks for
+//! on top: which overload the call fits, and which parameter the cursor is writing.
+//!
+//! It is only asked when the callee resolved *exactly*. A name-based guess would put another
+//! class's parameters under the cursor while the user types into them. Keyword-argument completion
+//! refuses the same wrong answer for the same reason: it would look valid.
 
 use lsp_types::{
     Documentation, MarkupContent, MarkupKind, ParameterInformation, ParameterLabel, SignatureHelp,
@@ -20,13 +20,13 @@ use rubydex::model::{
 
 use super::{cursor::Active, locator, render};
 
-/// The signature card for a resolved call, or `None` when the declaration is not a method
-/// anybody wrote parameters for.
+/// The signature card for a resolved call, or `None` when the declaration is not a method anybody
+/// wrote parameters for.
 ///
-/// The declaration is the one the *call* resolves to, which for `Foo.new(` is `Foo#initialize`
-/// — the redirect `locator` makes, and the only reading under which the parameters shown are
-/// the ones the call takes. The label says `Foo#initialize` rather than `Foo.new` for the same
-/// reason hover does: what the user is looking at is the method they are passing arguments to.
+/// The declaration is the one the *call* resolves to, which for `Foo.new(` is `Foo#initialize`: the
+/// redirect `locator` makes, and the only reading under which the parameters shown are the ones the
+/// call takes. The label says `Foo#initialize`, not `Foo.new`, for hover's reason: the user is
+/// looking at the method they are passing arguments to.
 #[must_use]
 pub fn help(
     graph: &Graph,
@@ -41,8 +41,8 @@ pub fn help(
     })?;
 
     let name = render::qualified_name(graph, declaration.name());
-    // The same rule hover uses: the first definition that has anything to say. A reopened class
-    // documents a method in one of its parts and not in all of them.
+    // Hover's rule: the first definition with anything to say. A reopened class documents a method
+    // in one of its parts, not all of them.
     let documentation = definitions
         .iter()
         .find_map(|definition| render::documentation(definition.comments()))
@@ -76,18 +76,18 @@ pub fn help(
         })
         .collect();
 
-    // RBS is the only source of more than one, and it declares them so that one of them fits:
-    // `String#gsub` has three, and which is being written is exactly what the argument count
-    // says. Flattening them into one would be a choice to know less than the signatures do.
+    // Only RBS gives more than one, and it declares them so one fits: `String#gsub` has three, and
+    // the argument count says which is being written. Flattening them into one would mean knowing
+    // less than the signatures do.
     let chosen = overloads
         .iter()
         .position(|signature| accepts(graph, signature, active))
         .unwrap_or(0);
 
     Some(SignatureHelp {
-        // `SignatureInformation::activeParameter` is 3.16 and overrides this one per signature;
-        // a client older than that reads only this, so the chosen overload's answer is repeated
-        // here rather than left for it to infer.
+        // `SignatureInformation::activeParameter` is LSP 3.16 and overrides this one per signature.
+        // An older client reads only this, so the chosen overload's answer is repeated here, not
+        // left for it to infer.
         active_parameter: signatures
             .get(chosen)
             .and_then(|signature| signature.active_parameter),
@@ -98,8 +98,8 @@ pub fn help(
 
 /// Whether a signature has the parameter the cursor is writing.
 ///
-/// The question an overload set is picked by, and nothing else: a call with three arguments is
-/// not being written against the two-argument arm.
+/// The only question an overload set is picked by: a call with three arguments is not being written
+/// against the two-argument arm.
 fn accepts(graph: &Graph, signature: &[Parameter], active: &Active) -> bool {
     match active {
         Active::Nth(nth) => {
@@ -111,9 +111,9 @@ fn accepts(graph: &Graph, signature: &[Parameter], active: &Active) -> bool {
                     )
                 })
         }
-        // An arm that *declares* this keyword, or one with a `**opts` for it to fall into. An
-        // arm that merely takes some other keyword does not: `(a:, b:)` is not the arm being
-        // written when the cursor is inside `c:`.
+        // An arm that *declares* this keyword, or has a `**opts` for it to fall into. An arm that
+        // only takes some other keyword does not count: `(a:, b:)` is not the arm being written
+        // when the cursor is inside `c:`.
         Active::Keyword(name) => {
             keyword(graph, signature, name).is_some() || rest_keyword(signature).is_some()
         }
@@ -128,31 +128,30 @@ fn takes_keywords(signature: &[Parameter]) -> bool {
 
 /// Which parameter of this signature to highlight, as an index into it.
 ///
-/// The ceiling is not decoration, and it is not the end of the list either. **A `*rest` absorbs
-/// every positional argument after it**, so the fourth argument to
-/// `def new(name, age = 18, *nicknames)` is still `*nicknames` rather than something past the
-/// end; counting straight through would walk one parameter further along for every argument
-/// typed. Where there is no splat the last parameter is the ceiling instead, because LSP 3.17
-/// has no way to say that *no* parameter is active — an index outside the list, and an omitted
-/// one, both mean zero — so an answer that has run off the end has to land on the nearest
-/// parameter that is still true rather than fall back to pointing at the first one.
+/// The ceiling matters, and it is not always the end of the list.
+/// - **A `*rest` absorbs every positional argument after it.** The fourth argument to
+///   `def new(name, age = 18, *nicknames)` is still `*nicknames`, not something past the end;
+///   counting straight through would move one parameter further for every argument typed.
+/// - **With no splat, the last parameter is the ceiling.** LSP 3.17 cannot say that *no* parameter
+///   is active (an index outside the list and an omitted one both mean zero), so an answer that ran
+///   off the end must land on the nearest parameter that is still true, not fall back to the first.
 ///
-/// A `Post` parameter — the `c` in `def f(a, *b, c)` — is the one case the ceiling is wrong
-/// about, and it is unknowable rather than unhandled: which argument fills it depends on how
-/// many there turn out to be, which is not decided while the call is still being written.
+/// A `Post` parameter (the `c` in `def f(a, *b, c)`) is the one case the ceiling gets wrong, and it
+/// is unknowable, not unhandled: which argument fills it depends on how many there will be, which
+/// is undecided while the call is being written.
 fn active_parameter(graph: &Graph, signature: &[Parameter], active: &Active) -> Option<u32> {
     let index = match active {
         Active::Nth(nth) => {
             let last = signature.len().checked_sub(1)?;
             (*nth as usize).min(rest_positional(signature).unwrap_or(last))
         }
-        // A keyword is found by name, because keywords are written in any order. One the
-        // method does not declare is what `**opts` is for, and belongs there.
+        // A keyword is found by name, because keywords are written in any order. One the method
+        // does not declare belongs in `**opts`.
         Active::Keyword(name) => keyword(graph, signature, name)
             .or_else(|| rest_keyword(signature))
             .or_else(|| first_keyword(signature))?,
-        // Nothing to look up yet, so the answer is the region rather than the parameter: the
-        // first keyword the method declares, and `**opts` only if it declares none.
+        // Nothing to look up yet, so the answer is the region, not the parameter: the first keyword
+        // the method declares, and `**opts` only if it declares none.
         Active::AnyKeyword => first_keyword(signature).or_else(|| rest_keyword(signature))?,
     };
     u32::try_from(index).ok()
@@ -192,8 +191,8 @@ fn rest_keyword(signature: &[Parameter]) -> Option<usize> {
         .position(|parameter| matches!(parameter, Parameter::RestKeyword(_)))
 }
 
-/// A parameter's name as rubydex interned it. `None` where the string has gone, which is the
-/// same "nothing to match" a name nobody wrote would be.
+/// A parameter's name as rubydex interned it. `None` where the string is gone: the same "nothing to
+/// match" as a name nobody wrote.
 fn spelled<'g>(graph: &'g Graph, parameter: &Parameter) -> Option<&'g str> {
     Some(graph.strings().get(parameter.inner().str())?.as_str())
 }
@@ -205,10 +204,9 @@ mod tests {
 
     /// One class carrying every parameter kind, for the one request that is *about* parameters.
     ///
-    /// `initialize` rather than an ordinary method, so that `Person.new(` — the call a user
-    /// makes far more often than any other — is pinned by the same fixture that pins the
-    /// rendering. `shout` exists to be called on a receiver nothing can type, which is the
-    /// answer that has to be `null`.
+    /// `initialize`, not an ordinary method, so `Person.new(` (by far the most common call) is
+    /// pinned by the same fixture that pins the rendering. `shout` exists to be called on a
+    /// receiver nothing can type, where the answer must be `null`.
     const CALLS: &str = "\
 class Person
   # Make one.
@@ -240,16 +238,15 @@ end
 
     #[test]
     fn a_call_shows_the_method_it_reaches_with_the_argument_being_written_underlined() {
-        // The whole card, drawn: the label, the span under the parameter, and the comment. Two
-        // separate things are pinned by the underline sitting where it does — that `render`
-        // spells each parameter kind the way Ruby writes it, and that the offsets it hands back
-        // land on the piece of the label they were computed for. Asserting the numbers instead
-        // would pass just as happily with the underline three characters to the left.
+        // The whole card, drawn: the label, the span under the parameter, and the comment. The
+        // underline's position pins two things: that `render` spells each parameter kind as Ruby
+        // writes it, and that the offsets it returns land on the piece of the label they were
+        // computed for. Asserting the numbers instead would pass with the underline three
+        // characters to the left.
         //
-        // And `Person.new` is answered with `Person#initialize`. `Class#new` is the exact
-        // answer and a useless one — the parameters the call actually takes are the
-        // constructor's — which is the redirect `locator` already makes for hover and
-        // navigation, reaching signature help through the same door.
+        // And `Person.new` is answered with `Person#initialize`. `Class#new` is exact and useless:
+        // the parameters the call takes are the constructor's. This is the redirect `locator`
+        // already makes for hover and navigation, reaching signature help through the same door.
         let mut harness = Harness::new();
         let uri = harness.write("lib/person.rb", CALLS);
         harness.index();
@@ -292,9 +289,9 @@ end
             " ".repeat(35) + "~~~~~~~~~~",
             "and the third is the splat"
         );
-        // The rule the splat exists for: everything positional after it goes into it, so
-        // counting straight through would walk off the end of a method that cannot be
-        // over-called. This is the fifth argument and it is still `*nicknames`.
+        // The rule the splat exists for: everything positional after it goes into it, so counting
+        // straight through would walk off the end of a method that cannot be over-called. This is
+        // the fifth argument, and it is still `*nicknames`.
         assert_eq!(
             underline(&mut harness, "Person.new(\"ada\", 30, \"a\", \"b\", ~)\n"),
             " ".repeat(35) + "~~~~~~~~~~",
@@ -304,10 +301,9 @@ end
 
     #[test]
     fn a_keyword_argument_is_found_by_name_and_an_unknown_one_lands_in_the_splat() {
-        // Keywords are written in any order, so the count that answers a positional argument
-        // answers the wrong parameter for a keyword the moment anybody reorders two. The name
-        // is the only thing that identifies one — and a name the method does not declare is
-        // what `**extra` is for, which is where it is shown going.
+        // Keywords are written in any order, so the positional count answers the wrong parameter
+        // the moment anybody reorders two. The name is the only thing that identifies one, and a
+        // name the method does not declare goes to `**extra`, as shown.
         let mut harness = Harness::new();
         let uri = harness.write("lib/person.rb", CALLS);
         harness.index();
@@ -336,8 +332,8 @@ end
             " ".repeat(59) + "~~~~~~~",
             "a keyword the method never declared is `**extra`'s"
         );
-        // With no `**opts` to fall into, an undeclared keyword still belongs to the keyword
-        // half of the signature rather than to a positional parameter it cannot be passed as.
+        // With no `**opts` to fall into, an undeclared keyword still belongs to the keyword half of
+        // the signature, not to a positional parameter it cannot be passed as.
         assert_eq!(
             harness.signature_card(&uri, &calling("Person.build(\"ada\", bogus: ~)\n")),
             "Person.build(name, sep:)\n\u{20}                  ~~~~\nBuild one."
@@ -351,9 +347,9 @@ end
 
     #[test]
     fn a_singleton_method_is_named_the_way_it_is_called() {
-        // `Person::<Person>#build()` is rubydex's spelling and nobody's Ruby. Signature help
-        // goes through `render::qualified_name` for the same reason hover and the outline do:
-        // a construct that reads one way in one card and another way in the next is a bug.
+        // `Person::<Person>#build()` is rubydex's spelling and nobody's Ruby. Signature help goes
+        // through `render::qualified_name` for the reason hover and the outline do: a construct
+        // that reads one way in one card and another way in the next is a bug.
         let mut harness = Harness::new();
         let uri = harness.write("lib/person.rb", CALLS);
         harness.index();
@@ -368,9 +364,9 @@ end
 
     #[test]
     fn the_innermost_call_is_the_one_being_written() {
-        // A cursor inside a nested call's parentheses belongs to the inner call, and it costs
-        // nothing here: the walk that finds the enclosing argument list is pre-order, so the
-        // innermost claimant is the last to write itself down.
+        // A cursor inside a nested call's parentheses belongs to the inner call, at no cost: the
+        // walk that finds the enclosing argument list is pre-order, so the innermost claimant
+        // writes itself down last.
         let mut harness = Harness::new();
         let uri = harness.write("lib/person.rb", CALLS);
         harness.index();
@@ -397,20 +393,20 @@ end
 
     #[test]
     fn a_receiver_nothing_can_name_is_answered_with_nothing() {
-        // The rule keyword-argument completion already applies, for the reason the README
-        // states: `person.shout` matches on the name alone, and another class's parameter list
-        // under the cursor while the user types into it is a syntactically valid wrong answer.
-        // Absent beats wrong here — the editor falls back to showing nothing at all.
+        // The rule keyword-argument completion applies, for the reason the README states:
+        // `person.shout` matches on the name alone, and another class's parameter list under the
+        // cursor while the user types into it is a valid-looking wrong answer. Absent beats wrong:
+        // the editor falls back to showing nothing.
         let mut harness = Harness::new();
         let uri = harness.write("lib/person.rb", CALLS);
         harness.index();
 
         for marked in [
             "person = whatever\nperson.shout(~)\n",
-            // The graph names a *constant* receiver and nothing else, so an instance of one is
-            // not a name either — the same line keyword-argument completion has always drawn,
-            // reached through the same `locator::precise_call`. Widening it means typing an
-            // expression, which is deliberately out of scope.
+            // The graph names a *constant* receiver and nothing else, so an instance of one is not
+            // a name either: the line keyword-argument completion draws, reached through the same
+            // `locator::precise_call`. Widening it means typing an expression, which is
+            // deliberately out of scope.
             "person = Person.new(\"ada\")\nperson.shout(~)\n",
             "Person.new(\"ada\").shout(~)\n",
         ] {
@@ -419,8 +415,8 @@ end
                 "{marked:?} has no receiver the graph can name"
             );
         }
-        // The guard, so this cannot pass by never answering anything: the same file, the same
-        // method, through a receiver that is a constant.
+        // The guard, so this cannot pass by never answering: the same file and method, through a
+        // constant receiver.
         assert_eq!(
             harness.signature_card(&uri, &calling("Person.build(~)\n")),
             "Person.build(name, sep:)\n\u{20}            ~~~~\nBuild one."
@@ -429,10 +425,9 @@ end
 
     #[test]
     fn a_keyword_a_method_has_nowhere_to_put_underlines_nothing() {
-        // `locate` takes two positionals and no keywords at all, so there is no parameter a
-        // keyword argument could be. The signature is still worth showing — it is what tells
-        // the user why the call is wrong — and highlighting a positional parameter would be
-        // claiming a keyword can be passed as one.
+        // `locate` takes two positionals and no keywords, so no parameter can be a keyword
+        // argument. The signature is still worth showing (it tells the user why the call is wrong),
+        // but highlighting a positional parameter would claim a keyword can be passed as one.
         let mut harness = Harness::new();
         let uri = harness.write("lib/person.rb", CALLS);
         harness.index();
@@ -451,10 +446,9 @@ end
 
     #[test]
     fn a_reader_with_no_parameters_to_show_is_answered_with_nothing() {
-        // `attr_reader` declares a method rubydex records as an attribute rather than as a
-        // `def`, so it carries no parameter list — and a getter takes no arguments, so there
-        // is nothing a signature card could say about the call. `null` closes the popup, which
-        // is the right thing for a call that should not have parentheses at all.
+        // `attr_reader` declares a method rubydex records as an attribute, not a `def`, so it has
+        // no parameter list, and a getter takes no arguments, so a card has nothing to say. `null`
+        // closes the popup: right for a call that should not have parentheses at all.
         let mut harness = Harness::new();
         let uri = harness.write("lib/person.rb", CALLS);
         harness.index();
@@ -493,11 +487,11 @@ end
 
     #[test]
     fn a_parameter_span_is_counted_the_way_the_client_indexes_the_label() {
-        // The offsets are into a string the client holds as UTF-16, and a Ruby parameter can
-        // be spelled in any script — `def приветствие(имя)` is legal Ruby. Counting bytes
-        // would put the span three times too far along for Cyrillic and twice for an emoji,
-        // and the drawing every other test here asserts on cannot see the difference because
-        // every other fixture is ASCII. So this one asserts the numbers.
+        // The offsets are into a string the client holds as UTF-16, and a Ruby parameter can be
+        // spelled in any script: `def приветствие(имя)` is legal Ruby. Counting bytes would put the
+        // span too far along for any non-ASCII name (Cyrillic is 2 bytes per UTF-16 unit), and the
+        // drawings every other test asserts on cannot see it because every other fixture is ASCII.
+        // So this one asserts the numbers.
         let source = "class Greeter\n  def self.hello(имя, sep)\n  end\nend\n";
         let mut harness = Harness::new();
         let uri = harness.write("lib/greeter.rb", source);
@@ -512,7 +506,7 @@ end
             help["signatures"][0]["label"].as_str(),
             Some("Greeter.hello(имя, sep)")
         );
-        // `Greeter#hello(` is 14 UTF-16 units, `имя` is 3 of them however many bytes it takes.
+        // `Greeter#hello(` is 14 UTF-16 units; `имя` is 3, however many bytes it takes.
         assert_eq!(parameters[0]["label"], serde_json::json!([14, 17]));
         assert_eq!(parameters[1]["label"], serde_json::json!([19, 22]));
         assert_eq!(help["activeParameter"], serde_json::json!(1));
@@ -520,12 +514,12 @@ end
 
     #[test]
     fn every_overload_is_offered_and_the_one_being_written_is_chosen() {
-        // `Signatures::Overloaded` is real — RBS declares three arms for `String#gsub` and 65
-        // in `core/string.rbs` altogether — and LSP has `activeSignature` for exactly this.
-        // Flattening them to the first would be a choice to know less than the signatures do.
+        // `Signatures::Overloaded` is real (RBS declares three arms for `String#gsub`), and LSP has
+        // `activeSignature` for exactly this. Flattening them to the first would mean knowing less
+        // than the signatures do.
         //
-        // The arity-1 arm is written first on purpose: with the shorter arm second, every
-        // cursor position fits the first one and a broken choice would pass.
+        // The arity-1 arm is written first on purpose: with the shorter arm second, every cursor
+        // position fits the first, and a broken choice would pass.
         let (mut harness, uri) = with_signatures("");
         assert_eq!(
             harness.signature_card(&uri, "Coordinate.new(1, ~)\n"),
@@ -534,8 +528,8 @@ end
              \u{20}                        ~\n\
              A point, from a pair or from text."
         );
-        // Nothing written yet, so both arms still fit and the first is the answer — an
-        // argument count cannot tell an arity-1 call from an arity-2 one before there is one.
+        // Nothing written yet, so both arms fit and the first is the answer: an argument count
+        // cannot tell arity 1 from arity 2 before there is an argument.
         assert_eq!(
             harness.signature_card(&uri, "Coordinate.new(~)\n"),
             "Coordinate#initialize(text)\n\
@@ -546,13 +540,13 @@ end
     }
     #[test]
     fn a_private_signature_is_not_drawn_where_the_jump_has_nowhere_to_go() {
-        // **The card and the jump answer one cursor and may not disagree about it.** Both go
-        // through `precise_call`'s rung, so the privacy gate `definition` applies has to reach
-        // here too — otherwise `Vault.secret_value(` draws a parameter list for a call Ruby
-        // raises on, at the loudest moment in the server to be confidently wrong.
+        // **The card and the jump answer one cursor and must not disagree.** Both go through
+        // `precise_call`'s rung, so `definition`'s privacy gate must reach here too. Otherwise
+        // `Vault.secret_value(` draws a parameter list for a call Ruby raises on, the loudest
+        // moment in the server to be confidently wrong.
         //
         // The receiver comes off the `CallNode` this request's own parse already produced, so
-        // nothing is re-parsed to learn it. See `cursor::Call::allows_private`.
+        // nothing is re-parsed. See `cursor::Call::allows_private`.
         let mut harness = Harness::new();
         let source = concat!(
             "class Vault\n",
@@ -610,13 +604,13 @@ end
 
     #[test]
     fn a_signature_only_the_suite_declares_is_not_drawn_over_application_code() {
-        // The same fence `definition` applies to a root answer, at the same cursor. A top-level
-        // `def` in a spec lands on `Object` and so answers for every receiver; drawing its
-        // parameter list under the argument the user is typing is the loudest place in the
-        // server to be confidently wrong, and it would disagree with the jump about one cursor.
+        // The fence `definition` applies to a root answer, at the same cursor. A top-level `def` in
+        // a spec lands on `Object` and so answers for every receiver. Drawing its parameter list
+        // under the argument being typed is the loudest place to be confidently wrong, and it would
+        // disagree with the jump at the same cursor.
         //
-        // `precise_call` has no name rung to fall back to — an exact callee is the whole of its
-        // contract — so the card is simply not drawn.
+        // `precise_call` has no name rung to fall back to (an exact callee is its whole contract),
+        // so the card is simply not drawn.
         let mut harness = Harness::new();
         harness.write(
             "spec/lib/email_cook_spec.rb",
@@ -636,8 +630,8 @@ end
             "null"
         );
 
-        // And the control, from a cursor inside the suite: the gate is off there, so the same
-        // call keeps the same card.
+        // The control, from a cursor inside the suite: the gate is off there, so the same call
+        // keeps its card.
         let spec = harness.write(
             "spec/models/post_spec.rb",
             "describe Post do\n  it \"bakes\" do\n    cook(\"x\")\n  end\nend\n",

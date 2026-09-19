@@ -1,55 +1,40 @@
 # ya-lsp
 
-*Y(et) A(nother) LSP.*
+*Y(et) A(nother) LSP* — a Ruby language server that never runs Ruby.
 
-**A language server for Ruby that never runs Ruby.** It parses your code, reads `Gemfile.lock` and
-the gems on disk, and answers from a graph it builds itself — so go-to-definition, hover, completion
-and 21 more LSP requests work on a machine where the project's Ruby is not installed, the bundle is
-not installed, and nothing has to boot. One Rust binary: no `Gemfile` entry, no runtime dependency,
-no `bundle exec`.
+**Install:** VS Code → [ya-lsp on the Marketplace](https://marketplace.visualstudio.com/items?itemName=ar2em1s.yalsp),
+then open a `.rb` file. Other editors: [Install](#install).
 
-**What makes it different from every other Ruby server: each answer tells you how far to trust it.**
-A Ruby tool that cannot run your code has to guess sometimes, and the usual arrangement is that you
-find out which answers were guesses by being wrong. Here every hover card and completion row is
-labelled *Resolved*, *Derived* or *Guessed* — and the guessing can be switched off entirely.
+## Why use it
 
-- **No Ruby, at all.** Never executes `ruby`, `bundle` or `gem`, and never shells out. A legacy app
-  on a Ruby you may not install, a locked bundle you may not add a gem to, an air-gapped box, a CI
-  container: it is a download and nothing else.
-- **Fast from cold.** A pinned commit of a real Rails application — **606 files** — indexes in
-  **under 50 ms**, re-measured on every CI run against a 500 ms ceiling the build fails at. Its gems
-  are indexed after it, with progress reported to your editor.
-- **Nothing to keep warm.** There is **no cache on disk**, so there is nothing to invalidate, prune,
-  or explain when it goes stale. A `git checkout` or `rails g model` re-indexes what changed.
-- **It reads Rails without running Rails.** Your columns, associations, `enum`s, routes, mailers,
-  jobs and engines all resolve, because the schema and the macros are read as the text they are.
-- **Types come from RBS.** Ruby's own signatures are embedded in the binary; a gem's `sig/`, your
-  project's `sig/` and `.gem_rbs_collection/` are read where they exist, and a Sorbet `sig` or a
-  YARD `@return` is read too.
-
-Hovering `title` in a Rails project, with no Ruby process anywhere:
+1. **No Ruby needed.** It never runs `ruby`, `bundle` or `gem`. It reads your code, `Gemfile.lock`
+   and the gems on disk. It ships as one Rust binary.
+2. **Every answer says how far to trust it.** Hover cards and completion rows are labelled
+   *Resolved*, *Derived* or *Guessed*. Guessing can be switched off.
+3. **Rails without booting Rails.** Columns, associations, `enum`s, routes, mailers and jobs all
+   resolve, because the schema and the macros are read as text.
+4. **Fast, no cache.** A real 612-file Rails app indexes in well under a second, and CI fails the
+   build above 500 ms. Nothing sits on disk to go stale.
+5. **Types from RBS.** Ruby's own signatures are built in. It also reads a gem's `sig/`, your `sig/`,
+   `.gem_rbs_collection/`, Sorbet `sig`s and YARD `@return`.
 
 ```ruby
 story = Story.where(published: true).first
 story.title
-#     ↑ Story#title
-#
+#     ↑ hover: Story#title
 #       From `db/schema.rb`, table `stories`, column `title` (`string`, `null: false`).
 ```
 
-That last line is the part to notice: ya-lsp read `db/schema.rb`, so it knows the column exists, what
-it returns, and that it can never be `nil`.
-
-**What it costs:** no formatting and no RuboCop — both are Ruby.
-[Run RuboCop's own language server alongside](#running-rubocop-alongside); that closes both gaps.
+**Not included:** formatting and RuboCop, because both are Ruby. Run
+[RuboCop's server alongside](#running-rubocop-alongside) to get them.
 
 ---
 
 - [Install](#install)
 - [What you get](#what-you-get)
-- [Every answer is labelled](#every-answer-is-labelled)
-- [Rails, without a Rails process](#rails-without-a-rails-process)
-- [Where it stops](#where-it-stops)
+- [Trust tiers](#trust-tiers)
+- [Rails](#rails)
+- [Limits](#limits)
 - [Running RuboCop alongside](#running-rubocop-alongside)
 - [Configuration](#configuration)
 - [Development](#development)
@@ -58,31 +43,42 @@ it returns, and that it can never be `nil`.
 
 ### VS Code
 
-1. Install **[ya-lsp from the Marketplace](https://marketplace.visualstudio.com/items?itemName=ar2em1s.yalsp)**.
+1. Install [ya-lsp from the Marketplace](https://marketplace.visualstudio.com/items?itemName=ar2em1s.yalsp).
 2. Open a Ruby file.
 
-That is the whole setup. The extension bundles a binary for your platform. `ya-lsp.serverPath` points
-it at a local build instead.
+The extension bundles the binary for your platform. To use a local build, set `ya-lsp.serverPath`.
 
-### Any other LSP client
+### Claude Code
 
-1. Download the archive for your platform from the
-   [latest release](https://github.com/ar2em1s/ya-lsp/releases/latest) — or build it with
-   `cargo build --release`.
-2. Extract it and check it runs:
+1. `/plugin marketplace add ar2em1s/ya-lsp`
+2. `/plugin install ya-lsp@ya-lsp`
+3. Run `/ya-lsp:ya-lsp-setup`. It installs or updates the binary, then asks your project three
+   questions to prove it works. It asks you before downloading or writing anything.
+
+**If another plugin already handles `.rb` files** (usually the official `ruby-lsp`), disable it in
+`/plugin`. Otherwise whichever server loads first wins, and nothing tells you which one it was.
+
+Two gaps come from how Claude Code works, not from ya-lsp:
+
+- `Gemfile` and `Rakefile` get no answers, because the plugin routes by file extension.
+- A jump into a git-ignored directory such as `vendor/bundle` is hidden.
+
+### Any other editor
+
+1. Download your platform's archive from the [latest release](https://github.com/ar2em1s/ya-lsp/releases/latest),
+   or run `cargo build --release`.
+2. Extract it and check that it runs:
 
    ```bash
    tar xzf ya-lsp-aarch64-apple-darwin.tar.gz
    ./ya-lsp-aarch64-apple-darwin/ya-lsp --version
    ```
 
-3. Put `ya-lsp` on your `PATH`, and point your client at `ya-lsp --stdio`.
+3. Put `ya-lsp` on your `PATH` and point your editor at `ya-lsp --stdio`.
 
-Releases are archives rather than bare binaries, because an asset downloaded over HTTP loses its
-executable bit. `SHA256SUMS` covers every asset. `ya-lsp --licenses` prints ya-lsp's own terms, the
-notice for the embedded Ruby signatures, and every linked crate's licence, from inside the binary.
+`SHA256SUMS` in the release covers every asset. `ya-lsp --licenses` prints all licence notices.
 
-**Neovim** (0.11+), in `init.lua`:
+**Neovim 0.11+** (`init.lua`):
 
 ```lua
 vim.lsp.config('ya_lsp', {
@@ -93,7 +89,7 @@ vim.lsp.config('ya_lsp', {
 vim.lsp.enable({ 'ya_lsp' })
 ```
 
-**Helix**, in `languages.toml`:
+**Helix** (`languages.toml`):
 
 ```toml
 [language-server.ya-lsp]
@@ -105,129 +101,99 @@ name = "ruby"
 language-servers = ["ya-lsp"]
 ```
 
-**Zed** runs language servers from extensions and there is no ya-lsp extension for it yet.
+**Zed:** there is no extension for it yet.
 
-### Which Ruby it reads
+### Which Ruby version it reads
 
-From `.ruby-version` or `.tool-versions`, in the project or any directory above it — how rbenv,
-chruby, RVM, asdf and mise all resolve it — falling back to `RUBY VERSION` in `Gemfile.lock`. If
-none of them answer, ya-lsp says so instead of guessing.
+It checks these in order and uses the first that answers:
+
+1. `.ruby-version`
+2. `.tool-versions`
+3. `RUBY VERSION` in `Gemfile.lock`
+
+The first two are searched from the project directory upwards. If none answers, it says so and does
+not guess.
 
 ## What you get
 
-| | |
+| Feature | What it does |
 | --- | --- |
-| **Diagnostics** | Parse errors and Prism warnings, live. Per-rule severity. |
-| **Go to definition** | Constants, methods, the path in `require "..."` — into gems too. |
-| **Document links** | Every `require` path is a link. One that resolves nowhere is not. |
-| **Hover** | Signature and documentation, plus where the type came from. |
-| **Completion** | Ancestor-aware, visibility-aware; keyword arguments and model columns. |
-| **Signature help** | Parameters of the call you are in, current one marked. |
-| **Inlay hints** | Types nothing in the line says. A guessed one is never drawn. |
-| **Find references** | Exact for constants, name-based for methods. Your code only. |
-| **Highlight occurrences** | Same name in the file, reads and writes marked apart. |
-| **Symbols** | The file's outline, and fuzzy search over project, gems, core and stdlib. |
-| **Type hierarchy** | Both directions — every ancestor, and everything below. |
-| **Call hierarchy** | Who calls this, and what it calls. Callers are by name and say so. |
-| **Rename** | Locals, parameters, constants. Refuses what it cannot do exactly. |
-| **Refactorings** | Extract variable/method, toggle block style, declare `attr_`. |
-| **Folding & expand selection** | Out through Ruby's own structure. |
-| **Semantic highlighting** | The one thing a grammar cannot decide: local or call? |
-| **ERB templates** | `app/views/**/*.erb` indexed like any other file. |
-| **Rails awareness** | Schema, model macros, routes, mailers, jobs, engines. |
-| **Gems, core & stdlib** | Every gem in `Gemfile.lock`, from disk, with progress. |
-| **Multi-root** | One server per folder; a folder with no Ruby gets none. |
+| **Diagnostics** | Parse errors and Prism warnings as you type. Severity set per rule. |
+| **Go to definition** | Constants, methods, `require "..."` paths, including inside gems. |
+| **Go to implementation** | The method, then every override below the receiver's class. |
+| **Go to type definition** | The class of the value under the cursor. |
+| **Go to declaration** | The RBS signature of a method. |
+| **Hover** | Signature, docs, and where the type came from. |
+| **Completion** | Knows ancestors and visibility. Completes keyword arguments and model columns. |
+| **Signature help** | The parameters of the current call, with the current one marked. |
+| **Inlay hints** | Types the line does not show. Guesses are never drawn. |
+| **References** | Exact for constants, by name for methods. Searches your code only. |
+| **Highlight** | The same name in the file, with reads and writes marked differently. |
+| **Symbols** | File outline, plus fuzzy search over the project, gems, core and stdlib. |
+| **Type and call hierarchy** | Ancestors and descendants; callers and callees. |
+| **Rename** | Locals, parameters and constants. It refuses anything it cannot do exactly. |
+| **Rename a Rails file** | Move `order.rb` to `purchase.rb` and `Order` becomes `Purchase`. |
+| **Refactorings** | Extract variable or method, toggle block style, declare `attr_`. |
+| **Generated RBS** | Opens what a schema, macro or route declared, as a read-only document. |
+| **Folding, selection, highlighting** | Folding ranges, expand selection, local-vs-call colouring. |
+| **Templates** | `.erb` gets full answers. `.jbuilder`, `.builder` and `.ruby` are read as plain Ruby. |
+| **Unsaved buffers** | An `Untitled-1` set to Ruby gets answers too, including parse errors. |
 
-## Every answer is labelled
+## Trust tiers
 
-Three tiers, and **every hover card and completion row says which one it is**:
-
-| Tier | Source | Example |
+| Tier | Meaning | Example |
 | --- | --- | --- |
-| **Resolved** | The code names the type | `Foo.bar`, `self.bar`, `"x".upcase`, `Foo.new.bar` |
-| **Derived** | A signature, an assignment, or a convention — the card names it | `"x".upcase.strip`, `@title.upcase`, `ENV.fetch`, a `CONFIG = Settings.new`, a view's `@story` |
-| **Guessed** | The receiver's name alone | `@user` → `User`, `first_name` → `FirstName` |
+| **Resolved** | The code names the type | `Foo.bar`, `"x".upcase`, `Foo.new.bar` |
+| **Derived** | A signature, an assignment or a Rails convention says so, and the card names which | `"x".upcase.strip`, `ENV.fetch`, a view's `@story` |
+| **Guessed** | Only the receiver's name matched | `@user` → `User` |
 
-Guessed is the only tier allowed to be wrong, it never displaces the other two, and it is never
-painted into a margin as an inlay hint. Turn it off with `[types] guess_from_names = false`.
+- **Guessed** is the only tier that can be wrong. It never replaces a better answer.
+- A guess is never drawn as an inlay hint. Go to implementation, type definition and declaration
+  also refuse to answer from a guess.
+- To turn guessing off, set `[types] guess_from_names = false`.
 
-Under a receiver ya-lsp tries, in this order: the graph naming the type; a signature or an
-assignment; the class a template's path names, a controller or a mailer; the receiver's own
-spelling; then the name-based list. A rung ships only if it moves calls **up** a tier and moves none
-down.
+## Rails
 
-## Rails, without a Rails process
+Nothing boots. Each item below is read as text:
 
-No `rails runner`, no eager load, no initializers. Every fact below is read as the literal Ruby or
-SQL it is and indexed like any other signature.
+1. **Columns** come from `db/schema.rb` or `db/structure.sql`, for every database. Hover shows the
+   table, the column and whether it can be nil.
+2. **Model macros** such as associations, `enum`, `attribute`, `delegate`, `scope` and about twenty
+   more, including those added through a concern. Each jumps to the line you wrote.
+3. **The query interface.** `Story.first` is a `Story`, `Story.first(3)` is an array, and
+   `Story.where` jumps into activerecord.
+4. **Routes, mailers, jobs and Sidekiq workers.** Route helpers jump to their line in
+   `config/routes.rb`. `perform_later` resolves to the `def` it ends up calling.
+5. **Views and engines.** `@story` in `stories/show.html.erb` gets its type from
+   `StoriesController`. A gem's `app/` is indexed, so `ActiveStorage::Blob` resolves.
 
-- **Your columns.** `db/schema.rb` or `db/structure.sql`, every database and not just the primary,
-  so `story.created_at.` chains and the card names the table, the column and whether it is nullable.
-- **Model macros.** Associations, `enum`, `attribute`, `delegate`, `scope` and a couple of dozen
-  more — `class_attribute`, `has_secure_password`, `store_accessor`, `alias_attribute` and the rest
-  — declare the methods Rails would declare, including the ones a concern's `included do` and
-  `class_methods do` land on every including class. Each jumps to the macro line you wrote.
-- **The query interface**, taken from Rails' own list, so `Story.where(...).first.user.email`
-  resolves end to end. How you wrote the call decides the type: `Story.first` is a `Story`,
-  `Story.first(3)` an array. `Story.where` jumps into activerecord, where it is really declared.
-- **Routes.** Every helper `config/routes.rb` names, hovering with and jumping to the DSL line.
-- **Mailers, jobs and Sidekiq workers.** `UserMailer.welcome(user)`, `perform_later`,
-  `perform_async` — each resolved to the `def` it ends up calling.
-- **Engines in your bundle.** A gem's `app/` is read too, so `ActiveStorage::Blob` resolves.
-- **Templates.** A cursor inside `<% %>` gets the same answers a `.rb` file would; `@story` in
-  `app/views/stories/show.html.erb` is typed from what `StoriesController` assigns, and jumps to the
-  line that assigns it.
-- **Macro symbols.** `before_action :authenticate`, `validates :title`, `belongs_to :user` — the
-  symbol is a member of the class the macro is written in, and resolves like one.
+## Limits
 
-## Where it stops
+1. **Method calls with an unknown receiver are matched by name.** In that case signature help and
+   keyword completion show nothing, instead of guessing.
+2. **References never search gems.** A common name can appear there tens of thousands of times.
+3. **Rename refuses methods and instance variables**, because neither can be found exactly. It also
+   refuses the whole rename if any one site cannot be confirmed.
+4. **A chain stops at an untyped method.** It does not infer types for arbitrary expressions.
+5. **Runtime metaprogramming is invisible**, such as `define_method` or a `Class.new` nothing names.
 
-- **A method call whose receiver cannot be named is matched by name.** Find-references then returns
-  every call spelled that way in your project — the right answer for an unusual name, a scoped text
-  search for `call` or `id`. Signature help and keyword-argument completion stay **silent** there
-  rather than answer from whichever class happened to match.
-- **An untyped receiver is offered a bounded list or none.** With nothing typed after the `.`, the
-  candidate list is every method in the graph, so ya-lsp offers nothing at all; it reappears,
-  capped at 128, once the word is long enough to narrow it.
-- **Find-references never enters gems**, where a common name appears tens of thousands of times.
-  Definition and symbol search do, because a read-only answer is still worth having.
-- **Rename declines rather than degrades.** Methods and instance variables are refused, with the
-  reason on screen, because neither can be found exactly. Nothing is written until every site has
-  been read back: one unconfirmable site declines the whole rename.
-- **Chains through an untyped method end there.** Ruby's own library declares its return types;
-  most applications do not, and inferring the type of every expression is a different project.
-- **Runtime metaprogramming is invisible** — `define_method`, an `include` from a variable, a
-  `Class.new` nothing names.
-- **Not included:** formatting, RuboCop, quick fixes, code lenses, test running, a debugger, a
-  plugin API.
+**Not included:** formatting, RuboCop, quick fixes, code lenses, test running, a debugger, a plugin API.
 
 ## Running RuboCop alongside
 
-ya-lsp reports parse errors and stops, because every cop is Ruby. LSP allows more than one server
-per language, and RuboCop ships one: `rubocop --lsp`, over stdio, from the gem you already lint
-with. **Run both** and you have formatting, offences and per-offence quick fixes as well.
+1. Run `rubocop --lsp` as a second server. Quick fixes need RuboCop **1.89+**.
+2. Turn off the duplicate warning in `ya-lsp.toml`. Otherwise "assigned but unused variable" shows
+   twice:
 
-**Quick fixes need RuboCop 1.89 or newer** — that is the version where its server started
-advertising `codeActionProvider`.
+   ```toml
+   [diagnostics.rules]
+   parse-warning = "off"
+   ```
 
-**Turn off `parse-warning` when you do this.** Prism's warnings and `Lint/UselessAssignment` cover
-the same ground, so "assigned but unused variable" arrives twice. Switch off the rule, not the
-category, so a file that does not parse still gets its squiggle:
+**VS Code:** install the [RuboCop extension](https://marketplace.visualstudio.com/items?itemName=rubocop.vscode-rubocop).
+There is nothing to configure. To stop ya-lsp suggesting it, set `ya-lsp.rubocop.hint`.
 
-```toml
-# ya-lsp.toml
-[diagnostics.rules]
-parse-warning = "off"
-```
-
-**VS Code** — install [RuboCop](https://marketplace.visualstudio.com/items?itemName=rubocop.vscode-rubocop),
-published by the RuboCop team. Nothing to configure: ya-lsp advertises no formatting capability,
-the two extensions own separate diagnostic collections, and the lightbulbs merge because ya-lsp
-advertises only `refactor.extract` and `refactor.rewrite` while RuboCop advertises only `quickfix`.
-ya-lsp offers this once in a project with a `.rubocop.yml` or `rubocop` in `Gemfile.lock`;
-`ya-lsp.rubocop.hint` turns the offer off.
-
-**Neovim** — add a second server beside the first; `nvim-lspconfig` ships the `rubocop` half already:
+**Neovim:**
 
 ```lua
 vim.lsp.config('rubocop', {
@@ -238,7 +204,7 @@ vim.lsp.config('rubocop', {
 vim.lsp.enable({ 'ya_lsp', 'rubocop' })
 ```
 
-**Helix** — add `rubocop` to the same language:
+**Helix:**
 
 ```toml
 [language-server.rubocop]
@@ -250,34 +216,29 @@ name = "ruby"
 language-servers = ["ya-lsp", "rubocop"]
 ```
 
-**Zed** ships `rubocop` and enables it by name:
+**Zed:** `{ "languages": { "Ruby": { "language_servers": ["rubocop", "..."] } } }`
 
-```json
-{ "languages": { "Ruby": { "language_servers": ["rubocop", "..."] } } }
-```
-
-**Any other client** — point one server at `ya-lsp --stdio` and another at `rubocop --lsp`.
-Neither needs telling about the other; they share no state and claim no capability in common.
+The two servers share no state and advertise no overlapping capability.
 
 ## Configuration
 
-A `ya-lsp.toml` at the workspace root overrides whatever the editor sends, so a team can commit one
-setup. Changes take effect without a restart. Defaults:
+Put a `ya-lsp.toml` at the workspace root. It overrides editor settings and applies without a
+restart. These are the defaults:
 
 ```toml
 [index]
-include           = [
-  "**/*.rb", "**/*.erb", "**/*.rbs", "**/*.rake",
-  "**/*.gemspec", "**/Rakefile", "**/Gemfile", "**/config.ru",
+include           = [                     # yours replaces this list; it does not add to it
+  "**/*.rb", "**/*.erb", "**/*.jbuilder", "**/*.builder", "**/*.ruby",
+  "**/*.rbs", "**/*.rake", "**/*.gemspec", "**/*.ru",
+  "**/Rakefile", "**/Gemfile",
 ]
 exclude           = ["vendor/**/*", ".bundle/**/*", "tmp/**/*", "node_modules/**/*"]
 load_paths        = ["lib", "app"]        # extra roots, also used to resolve `require`
 max_files         = 50000
-respect_gitignore = true
 
 [gems]
 enabled      = true
-default_gems = true                       # the ~40 gems shipped inside Ruby itself
+default_gems = true                       # the ~40 gems shipped inside Ruby
 # ruby_version = "3.4.1"                  # unset: read from .ruby-version / .tool-versions
 paths        = []                         # extra gem roots
 max_files    = 300000
@@ -288,14 +249,13 @@ stdlib  = true                            # the ~60 stdlib libraries beyond core
 # path  = "/path/to/rbs"                  # unset: the rbs gem, else the copy in the binary
 
 [log]
-level      = "info"                       # stderr; YA_LSP_LOG outranks it
-file       = false                        # a second copy on disk, for a bug report
+level      = "info"                       # stderr; YA_LSP_LOG overrides it
+file       = false                        # also write a log file, for bug reports
 file_path  = "tmp/ya-lsp.log"             # relative to the workspace root
-file_level = "debug"                      # its own level: every request, in and out
+file_level = "debug"
 
 [rails]
-enabled     = "auto"                      # "auto" | true | false; auto looks for
-                                          # config/application.rb, then railties in Gemfile.lock
+enabled     = "auto"                      # "auto" | true | false
 schema      = true                        # db/schema.rb, db/structure.sql, table_name
 models      = true                        # associations, enum, attribute, delegate, scope, ...
 routes      = true                        # config/routes.rb and its helpers
@@ -308,13 +268,13 @@ test_support   = []                       # adds to the built-in `testing_suppor
 # migration    = ["db/migrat"]            # parent/mark pairs; replaces; [] turns it off
 
 [types]
-guess_from_names = true                   # `@user` is a `User`; always labelled as a guess
+guess_from_names = true                   # `@user` is a `User`, always labelled as a guess
 structs          = true                   # Struct.new and Data.define
-annotations      = true                   # a Sorbet `sig`, a YARD `@return`
+annotations      = true                   # Sorbet `sig`, YARD `@return`
 
 [hints]
-block_parameters = true                   # what a method says it yields
-locals           = true                   # what the call on the right hands back
+block_parameters = true                   # what a method yields
+locals           = true                   # what the call on the right returns
 returns          = true                   # what a signature says a `def` returns
 
 [diagnostics]
@@ -322,49 +282,35 @@ enabled = true
 rules   = {}                              # e.g. { parse-warning = "error" }
 ```
 
-Rules are keyed by the name in a diagnostic's `code`. Only `parse-error` and `parse-warning` are
-statements about your code and are on by default; the rest describe indexer limits.
+What some of these settings do:
 
-`[rails]` is about **answers, not speed**: a project that is not Rails should not be told about
-Rails, and one with an `app/views/` gets a hover citing a controller that does not exist. `[trees]`
-says where this project keeps the trees the server fences on — a `def` written in your test suite
-is offered and jumped to only from inside it. Both lists that *replace* say so in the log when you
-set one; a fenced file is still indexed, so `references`, `rename` and highlight find every use in
-it either way.
-
-**Diagnostics** are Prism's parse errors and warnings. The other rules ship `off` or `hint`,
-because they fire on correct Ruby. ERB templates publish none: a template's Ruby does not parse
-standalone, since `<%= yield %>` is legal in the method it compiles to.
-
-**File watching.** A `git checkout`, `git pull`, rebase or `rails g model` re-indexes exactly the
-files it touched, deletions included, with no restart. Needs a client that accepts a file watcher
-registration; ya-lsp logs when one does not, because being blind looks like being wrong.
-
-VS Code exposes all of these except `gems.max_files`, with the TOML key in each description.
-`ya-lsp.logLevel` is `[log] level` under its shipped name and no longer restarts anything;
-`ya-lsp.serverPath` is the one setting with no TOML twin, and the one that still does — it decides
-which binary is spawned. Commands: **ya-lsp: Restart Server**, **ya-lsp: Show Output**. A committed
-`ya-lsp.toml` wins over all of them.
+- **`[rails]`** controls which answers you get, not speed. `auto` checks for `config/application.rb`,
+  then for `railties` in `Gemfile.lock`.
+- **`[trees]`** marks your test tree. A method defined in the test suite is offered, and jumped to,
+  only from inside that suite.
+- **`[diagnostics]`**: only `parse-error` and `parse-warning` are on by default. ERB templates
+  report no diagnostics.
+- **File watching** needs no setup. `git checkout`, rebases and `rails g` re-index only the files
+  they changed. If your editor cannot watch files, ya-lsp watches them itself. A buffer with
+  unsaved changes always wins over the file on disk.
+- **VS Code** exposes every setting except `gems.max_files`, and each description names its TOML
+  key. `ya-lsp.serverPath` is the one setting that restarts the server. A committed `ya-lsp.toml`
+  wins over VS Code settings.
 
 ## Development
 
-`make` lists every target. `make setup` installs the two pinned cargo subcommands; `make ci` runs
-what CI runs — format, clippy, tests and a coverage gate at three bars. Rust 1.93.1, pinned in
-`.tool-versions`.
+```bash
+make          # list targets
+make setup    # install the pinned toolchain pieces
+make ci       # what CI runs: fmt, clippy, tests, coverage
+make canary   # open a pinned real Rails app and check the counts (needs network)
+make audit    # score answers against six pinned Rails apps (needs the corpora)
+```
 
-`make canary` is the one target needing a network: it fetches a pinned commit of a real,
-open-source Rails application, opens it the way an editor does, and checks that the expected files
-index, that none fails to parse, and that the cold index stays inside a generous ceiling. It is a
-canary, not a benchmark, and does not cover gems. CI runs it as its own job.
-
-`make audit` asks the question a timing run does not: **is the answer right?** It draws a
-stratified sample of real cursors over six pinned Rails applications and scores them in three lanes
-— keys that say *wrong* against the source, checks that say *inconsistent* against the server's own
-other answers, and a residue a person rules on once. It needs the corpora on disk, so it is not in
-`make ci`.
+Rust 1.93.1, pinned in `.tool-versions`.
 
 ## Licence
 
-MIT — see [LICENSE.txt](LICENSE.txt). ya-lsp embeds Ruby's own RBS signatures, which are
-BSD-2-Clause/Ruby; [NOTICE.txt](NOTICE.txt) carries their notice and
-[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) every linked crate's licence.
+MIT: see [LICENSE.txt](LICENSE.txt). The Ruby RBS signatures embedded in the binary are
+BSD-2-Clause/Ruby, and [NOTICE.txt](NOTICE.txt) carries their notice.
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) lists every linked crate's licence.

@@ -1,23 +1,25 @@
 //! What the server tells the client it can do.
 //!
-//! Capabilities are announced per milestone: advertising a feature we do not implement makes
-//! the editor show an empty result instead of falling back to its own heuristics, which is a
-//! worse experience than not advertising at all.
+//! A capability is announced only once it is implemented: advertising a feature we lack makes the
+//! editor show an empty result instead of falling back to its own heuristics, which is worse than
+//! not advertising at all.
 
 use std::path::Path;
 
 use lsp_types::{
     CallHierarchyServerCapability, ClientCapabilities, CodeActionKind, CodeActionOptions,
     CodeActionProviderCapability, CompletionOptions, CompletionOptionsCompletionItem,
-    DidChangeWatchedFilesRegistrationOptions, DocumentLinkOptions, FileSystemWatcher,
-    FoldingRangeProviderCapability, GlobPattern, HoverProviderCapability, InlayHintOptions,
+    DeclarationCapability, DidChangeWatchedFilesRegistrationOptions, DocumentLinkOptions,
+    ExecuteCommandOptions, FileOperationFilter, FileOperationPattern, FileOperationPatternKind,
+    FileOperationRegistrationOptions, FileSystemWatcher, FoldingRangeProviderCapability,
+    GlobPattern, HoverProviderCapability, ImplementationProviderCapability, InlayHintOptions,
     InlayHintServerCapabilities, OneOf, Registration, RelativePattern, RenameOptions, SaveOptions,
     SelectionRangeProviderCapability, SemanticTokenType, SemanticTokensFullOptions,
     SemanticTokensLegend, SemanticTokensOptions, SemanticTokensServerCapabilities,
     ServerCapabilities, SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, WorkDoneProgressOptions,
-    WorkspaceFileOperationsServerCapabilities, WorkspaceFoldersServerCapabilities,
-    WorkspaceServerCapabilities,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
+    WorkDoneProgressOptions, WorkspaceFileOperationsServerCapabilities,
+    WorkspaceFoldersServerCapabilities,
 };
 
 use crate::{
@@ -30,40 +32,109 @@ use crate::{
 
 /// The `capabilities` object exactly as it goes out on the wire.
 ///
-/// `lsp-types` 0.97 — the latest published version — has a field for `callHierarchyProvider` and
-/// none for `typeHierarchyProvider`, so the one capability the crate cannot spell is flattened in
-/// beside the ones it can. A typed struct rather than a `serde_json::Map` insertion: this module
-/// is the wire contract, and the contract is worth being unable to misspell.
+/// `lsp-types` 0.97 (the latest release) has a field for `callHierarchyProvider` but none for
+/// `typeHierarchyProvider` or `workspace.textDocumentContent`, so those two are added here beside
+/// the ones it can spell. A typed struct, not a `serde_json::Map` insertion: this module is the
+/// wire contract, and the contract should be impossible to misspell.
 ///
-/// The alternative was `client/registerCapability`, which the protocol does allow for this one.
-/// It would have made the feature depend on a client that takes dynamic registrations — the same
-/// dependency that leaves the file watcher unavailable in several editors — for no reason beyond
-/// a missing struct field.
+/// The alternative was `client/registerCapability`, which the protocol allows for both. It would
+/// make each feature depend on a client that takes dynamic registrations (the dependency that
+/// leaves the file watcher unavailable in several editors) just to work around a missing struct
+/// field.
+///
+/// **The second cannot be flattened, which is why `workspace` is spelled out here.**
+/// `typeHierarchyProvider` is a top-level key `ServerCapabilities` lacks, so `#[serde(flatten)]`
+/// places it beside the rest with no collision. `textDocumentContent` sits *inside* `workspace`,
+/// which `ServerCapabilities` does have, so a second flattened `workspace` field would write the
+/// key twice, and a duplicated JSON key resolves to whichever one the reader keeps. So the whole
+/// object is built here, from the two halves `lsp-types` can spell and the one it cannot, and
+/// [`server_capabilities`] leaves its own `workspace` field `None` instead of writing a value this
+/// would override.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Advertised {
     #[serde(flatten)]
     standard: ServerCapabilities,
     type_hierarchy_provider: bool,
+    workspace: AdvertisedWorkspace,
+}
+
+/// The `workspace` half of the capabilities, with the field `lsp-types` has no name for.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdvertisedWorkspace {
+    workspace_folders: WorkspaceFoldersServerCapabilities,
+    file_operations: WorkspaceFileOperationsServerCapabilities,
+    text_document_content: TextDocumentContent,
+}
+
+/// Which schemes this server serves documents under.
+///
+/// One: the scheme every declaration ya-lsp wrote itself is filed under. Advertising it is the
+/// whole registration: `workspace/textDocumentContent` needs no `client/registerCapability` and no
+/// extension code, so a client that reads this field gets a read-only view of the RBS a macro
+/// produced, just by asking.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextDocumentContent {
+    schemes: Vec<String>,
 }
 
 #[must_use]
-pub fn advertised(encoding: PositionEncoding) -> Advertised {
+pub fn advertised(encoding: PositionEncoding, root: &Path) -> Advertised {
     Advertised {
-        standard: server_capabilities(encoding),
-        // Nothing is taken away by this one: no editor guesses at a type hierarchy, so
-        // the command simply reports that there are no results until a server answers it.
+        standard: server_capabilities(encoding, root),
+        // Nothing is taken away by this one: no editor guesses at a type hierarchy, so the command
+        // just reports no results until a server answers.
         type_hierarchy_provider: true,
+        workspace: AdvertisedWorkspace {
+            workspace_folders: WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                // Announcing support for the notification without acting on it would be a lie the
+                // client cannot detect.
+                change_notifications: None,
+            },
+            file_operations: WorkspaceFileOperationsServerCapabilities {
+                // One of the six, and the only one with an answer behind it. A move is the one file
+                // operation Zeitwerk gives meaning to: a file's class is named after the file, so
+                // renaming the file without renaming the class raises on the next boot. Creating
+                // and deleting say nothing this server could act on.
+                will_rename: Some(FileOperationRegistrationOptions {
+                    filters: vec![FileOperationFilter {
+                        // Ruby files only. A folder rename arrives as the folder, never as its
+                        // children, so a server that took folders would be asked about a move whose
+                        // contents it cannot see.
+                        scheme: Some("file".to_owned()),
+                        pattern: FileOperationPattern {
+                            glob: "**/*.rb".to_owned(),
+                            matches: Some(FileOperationPatternKind::File),
+                            options: None,
+                        },
+                    }],
+                }),
+                ..WorkspaceFileOperationsServerCapabilities::default()
+            },
+            text_document_content: TextDocumentContent {
+                // The scheme without its colon, which is how a client registers a provider for it;
+                // `GENERATED_SCHEME` has the colon because the rest of the crate uses it as a
+                // prefix on a whole URI.
+                schemes: vec![
+                    crate::analysis::synthesized::GENERATED_SCHEME
+                        .trim_end_matches(':')
+                        .to_owned(),
+                ],
+            },
+        },
     }
 }
 
 #[must_use]
-pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
+pub fn server_capabilities(encoding: PositionEncoding, root: &Path) -> ServerCapabilities {
     ServerCapabilities {
         position_encoding: Some(encoding.to_lsp()),
-        // Incremental. rubydex reparses the whole buffer on every `index_source`, so
-        // this saves transfer rather than parsing — but on a large file, sending the entire
-        // text on every keystroke is transfer the editor pays for at typing speed.
+        // Incremental. rubydex reparses the whole buffer on every `index_source`, so this saves
+        // transfer, not parsing, but on a large file sending the whole text per keystroke is
+        // transfer the editor pays at typing speed.
         text_document_sync: Some(TextDocumentSyncCapability::Options(
             TextDocumentSyncOptions {
                 open_close: Some(true),
@@ -75,31 +146,46 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
                 })),
             },
         )),
-        // Announced only once implemented: a client that is told a server
-        // provides hover will stop showing its own word-based fallback, so advertising early
-        // makes the editor worse, not better.
+        // Announced only once implemented: a client told a server provides hover stops showing its
+        // own word-based fallback, so advertising early makes the editor worse.
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
+        // Announced by the same rule: it answers. Nothing is taken away either: no client has a
+        // fallback for *what overrides this*, so without it the command is just greyed out. It is
+        // also the one goto an agent asks for: Claude Code's `LSP` tool maps `goToImplementation`
+        // onto it and maps nothing onto `declaration` or `typeDefinition`.
+        implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+        // The second of the three gotos, advertised by the same rule and taking nothing away: no
+        // client has a fallback for *what class is this value*, and the editors that send this
+        // request render the answer with their own definition formatter. Claude Code maps nothing
+        // onto it, so it is here for editors, not the agent.
+        type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+        // The third goto, and the only one where *not* advertising leaves the client something:
+        // every editor sending this falls back to `definition` when the server declines, which is
+        // exactly what ya-lsp's own `null` does where it has no signature. So it is advertised for
+        // the narrow population it can answer: a project with a `sig/`, a bundle with
+        // `.gem_rbs_collection`, and Ruby's own library, where `String#split` has a declaration and
+        // no definition anybody can open.
+        declaration_provider: Some(DeclarationCapability::Simple(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
-        // `workspace/symbol` answers with `SymbolInformation`, which carries a full
-        // location — so no `resolveProvider`, and no `workspaceSymbol/resolve`. The lazy shape
-        // exists to avoid reading a file per result; measured here that read is a few
-        // milliseconds for a capped result set, and every client understands the eager one.
+        // `workspace/symbol` answers with `SymbolInformation`, which carries a full location, so no
+        // `resolveProvider` and no `workspaceSymbol/resolve`. The lazy shape exists to avoid
+        // reading a file per result; here that read costs a few milliseconds for a capped result
+        // set, and every client understands the eager shape.
         references_provider: Some(OneOf::Left(true)),
-        // Announced with the rest of them and for the same reason: a client told a
-        // server highlights occurrences stops matching words itself, and a word match — which
-        // lights up the name inside a comment, inside a string, and in an unrelated scope — is
-        // better than nothing at all. ya-lsp answers `null` wherever it does not know, which is
-        // what puts the client's own fallback back in play for exactly those positions.
+        // Announced for the same reason as the rest: a client told a server highlights occurrences
+        // stops matching words itself, and a word match (which lights up the name in comments,
+        // strings and unrelated scopes) is better than nothing. ya-lsp answers `null` wherever it
+        // does not know, which puts the client's own fallback back in play at exactly those
+        // positions.
         document_highlight_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
-        // `.` and `:` are the two characters that change what a completion *means* rather
-        // than just narrowing it, and a client only re-asks mid-word for characters listed
-        // here. `:` covers `Foo::` — LSP trigger characters are single characters, so there is
-        // no way to say `::`, and the request for a lone `:` is classified and answered with
-        // nothing. `@` and `$` are here because a sigil starts a name the client's own word
-        // pattern would not treat as one, so without them instance and global variables are
-        // never asked for at all.
+        // `.` and `:` change what a completion *means* instead of just narrowing it, and a client
+        // only re-asks mid-word for characters listed here. `:` covers `Foo::`: LSP trigger
+        // characters are single characters, so there is no way to say `::`, and a lone `:` is
+        // classified and answered with nothing. `@` and `$` are here because a sigil starts a name
+        // the client's word pattern would not treat as one, so without them instance and global
+        // variables would never be asked for.
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![
                 ".".to_owned(),
@@ -107,93 +193,111 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
                 "@".to_owned(),
                 "$".to_owned(),
             ]),
-            // Documentation is the expensive half of a completion item and the user reads it
-            // for one row out of hundreds, so it is filled in on demand.
+            // Documentation is the expensive half of a completion item, and the user reads it for
+            // one row out of hundreds, so it is filled in on demand.
             resolve_provider: Some(true),
             completion_item: Some(CompletionOptionsCompletionItem {
                 label_details_support: Some(false),
             }),
             ..CompletionOptions::default()
         }),
-        // `(` and `,` are where a Ruby call gains an argument — the second covers the
-        // paren-less form too, since `link_to "x", ` is where the next one goes. `)` only
-        // re-triggers, which is to say it is asked while the popup is already up: the call it
-        // closes has no further arguments, ya-lsp answers `null`, and the popup goes away
-        // rather than standing there describing a call the cursor has left.
+        // `(` and `,` are where a Ruby call gains an argument (the second also covers the
+        // paren-less form: `link_to "x", ` is where the next one goes). `)` only re-triggers, i.e.
+        // it is asked while the popup is already up: the call it closes has no more arguments,
+        // ya-lsp answers `null`, and the popup closes instead of describing a call the cursor has
+        // left.
         signature_help_provider: Some(SignatureHelpOptions {
             trigger_characters: Some(vec!["(".to_owned(), ",".to_owned()]),
             retrigger_characters: Some(vec![")".to_owned()]),
             ..SignatureHelpOptions::default()
         }),
-        // Expand-selection has nothing to take away — in a Ruby file the command does
-        // nothing at all today — so this one is pure addition.
+        // Expand-selection has nothing to take away (in a Ruby file the command otherwise does
+        // nothing), so this is pure addition.
         selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
-        // `prepareProvider` is the half of this that matters: it is what lets ya-lsp
-        // answer "not here" *before* the editor asks the user for a new name, which is the only
-        // point at which declining costs the user nothing. A client that does not support it
-        // sends `textDocument/rename` straight off, so every refusal is reachable from both.
+        // `prepareProvider` is the half that matters: it lets ya-lsp say "not here" *before* the
+        // editor asks for a new name, the only point where declining costs the user nothing. A
+        // client without it sends `textDocument/rename` directly, so every refusal must be
+        // reachable from both.
         rename_provider: Some(OneOf::Right(RenameOptions {
             prepare_provider: Some(true),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
-        // The kinds are listed rather than `Simple(true)` because a client filters on
-        // them *before* it asks: VS Code's Refactor… menu sends `only: ["refactor"]`, and a
-        // server that advertises no kinds is asked nothing. Listing the two that are implemented
-        // and no more is the same rule this module opens with, one level down — an advertised
-        // `quickfix` would put an empty entry under the lightbulb on every diagnostic.
+        // The kinds are listed instead of `Simple(true)` because a client filters on them *before*
+        // asking: VS Code's Refactor… menu sends `only: ["refactor"]`, and a server advertising no
+        // kinds is asked nothing. Listing exactly the two implemented kinds follows this module's
+        // opening rule: an advertised `quickfix` would put an empty entry under the lightbulb on
+        // every diagnostic.
+        //
+        // `CodeActionKind::EMPTY` is the third entry, and it matters: a client reads this list to
+        // decide whether to *ask* at all when it filters a menu, and the one action here that is
+        // neither extraction nor rewrite (the read-only jump into the RBS a macro generated) has no
+        // honest kind in the protocol's hierarchy. Empty is the protocol's kindless action, so
+        // advertising it keeps the lightbulb asking. In return, `requests::code_actions` honours
+        // `only`: a client asking for `quickfix` alone gets an empty list, not four refactorings it
+        // will discard.
         code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
             code_action_kinds: Some(vec![
                 CodeActionKind::REFACTOR_EXTRACT,
                 CodeActionKind::REFACTOR_REWRITE,
+                CodeActionKind::EMPTY,
             ]),
             resolve_provider: None,
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
-        // The one capability here that *removes* a fallback rather than replacing
-        // an absence: a client with a folding provider stops guessing from indentation, and on
-        // well-formatted Ruby that guess is decent. So `analysis::ranges` covers the shapes the
-        // guess gets right as well as the ones it cannot see, and answers `null` — never an
-        // empty array — where it found nothing, which is what hands the guess back.
+        // One command: the door to the one document nothing else in the protocol can open. A
+        // generated declaration lives under a scheme with no file behind it, so no `Location` may
+        // name it and no link may point at it. The action carries the URI as a **command argument**
+        // (never a `Location`, symbol row or diagnostic), and the server answers by asking the
+        // client to show that document. `DocUri::from_graph_uri` still refuses the scheme, so the
+        // backstop `synthesized.md` names is untouched.
+        execute_command_provider: Some(ExecuteCommandOptions {
+            commands: vec![crate::analysis::show_generated_command(root)],
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
+        // The one capability here that *removes* a fallback instead of filling an absence: a client
+        // with a folding provider stops guessing from indentation, and on well-formatted Ruby that
+        // guess is decent. So `analysis::ranges` covers the shapes the guess gets right as well as
+        // those it cannot see, and answers `null` (never an empty array) where it found nothing,
+        // which hands the guess back.
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
-        // `resolveProvider: false`, and it is the only interesting field here: a link's target
-        // is known at the moment the link is made — the graph either has the required file or
-        // it does not — so there is nothing a second round trip could add. Advertising the
-        // resolve step would buy the client a request per link for an answer it already has.
+        // `resolveProvider: false`, the only interesting field here: a link's target is known when
+        // the link is made (the graph has the required file or it does not), so a second round trip
+        // adds nothing. Advertising resolve would cost the client a request per link for an answer
+        // it already has.
         //
-        // Nothing is taken away by this one either. An editor underlines a `require` path in a
-        // Ruby file today only if a grammar guessed at it, and none does.
+        // Nothing is taken away by this one either: an editor underlines a `require` path in Ruby
+        // only if a grammar guessed at it, and none does.
         document_link_provider: Some(DocumentLinkOptions {
             resolve_provider: Some(false),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
-        // A bare `true` rather than the options struct, because the struct's only field is
-        // `workDoneProgress` and this server reports progress for indexing rather than for a
-        // request. The type hierarchy is announced two fields further out — in `Advertised`,
-        // which exists because `lsp-types` 0.97 can spell this capability and not that one.
+        // A bare `true`, not the options struct, because its only field is `workDoneProgress`, and
+        // this server reports progress for indexing, not per request. The type hierarchy is
+        // announced further out, in `Advertised`, which exists because `lsp-types` 0.97 can spell
+        // this capability but not that one.
         call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
-        // `resolveProvider: true`, and it is the opposite decision from the document link's for
-        // the opposite reason. A link's target is known the moment the link is made; a hint's
-        // tooltip is a sentence nobody sees until they point at one, and building it for every
-        // hint on screen would put a paragraph of markdown on the wire per line of the file. The
-        // hints that carry no tooltip at all — the resolved tier, which is most of them — ship
-        // no `data`, so the client never asks about those either.
+        // `resolveProvider: true`: the opposite decision from the document link's, for the opposite
+        // reason. A link's target is known when the link is made; a hint's tooltip is a sentence
+        // nobody sees until they point at one, and building it for every visible hint would put a
+        // paragraph of markdown on the wire per line. Hints with no tooltip ship no `data`, so the
+        // client never asks about those.
         //
-        // Nothing is taken away by this one: no editor draws a Ruby type in the margin today.
+        // Nothing is taken away by this one: no editor draws Ruby types in the margin otherwise.
         inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
             InlayHintOptions {
                 resolve_provider: Some(true),
                 work_done_progress_options: WorkDoneProgressOptions::default(),
             },
         ))),
-        // The legend is the wire contract twice over: a client reads every token's type
-        // as an index into this list, so it must be exactly `tokens::LEGEND` and in exactly its
-        // order — a mismatch recolours every token in every file, consistently, which is the
-        // hardest kind of wrong to see. `the_legend_the_client_is_sent_is_the_one_the_tokens_are
-        // _numbered_against` is what holds the two together.
+        // The legend is the wire contract twice over: a client reads every token's type as an index
+        // into this list, so it must be exactly `tokens::LEGEND`, in exactly its order. A mismatch
+        // recolours every token in every file, consistently, the hardest kind of wrong to see.
+        // `the_v0_4_0_semantic_token_legend_is_the_one_the_tokens_are_numbered_against` holds the
+        // two together.
         //
-        // `full: Bool(true)` and no `delta`, deliberately: a delta is a wire optimisation over
-        // an answer the server would have computed anyway, paid for with a cache of every
-        // response sent per document and an id to invalidate on every edit. See `tokens`.
+        // `full: Bool(true)` and no `delta`, on purpose: a delta is a wire optimisation over an
+        // answer the server computes anyway, paid for with a cache of every response per document
+        // and an id to invalidate on every edit. See `tokens`.
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
                 legend: SemanticTokensLegend {
@@ -208,15 +312,10 @@ pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
                 work_done_progress_options: WorkDoneProgressOptions::default(),
             },
         )),
-        workspace: Some(WorkspaceServerCapabilities {
-            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
-                supported: Some(true),
-                // Announcing support for the notification without
-                // acting on it would be a lie the client cannot detect.
-                change_notifications: None,
-            }),
-            file_operations: Some(WorkspaceFileOperationsServerCapabilities::default()),
-        }),
+        // **Deliberately `None`; everything is in [`Advertised`].** The two halves `lsp-types` can
+        // spell are written there beside the one it cannot, because a second flattened `workspace`
+        // key would collide with this one.
+        workspace: None,
         ..ServerCapabilities::default()
     }
 }
@@ -230,43 +329,38 @@ pub fn server_info() -> serde_json::Value {
     })
 }
 
-/// The schema dumps `index.include` can never name, and the only non-Ruby file this server
-/// reads.
+/// The schema dumps `index.include` can never name, and the only non-Ruby file this server reads.
 ///
-/// `db/*structure.sql` rather than `**/*.sql`, which would sweep up every fixture, seed and
-/// migration in a repository for the sake of one file. The shape mirrors Rails' own
-/// `schema_dump`, which names the primary database's dump `structure.sql` and every other one
-/// `<database>_structure.sql` — the same pair of names `rails::is_structure` matches, and it is
-/// that predicate rather than this glob that has the last word, exactly as `Workspace::indexes`
-/// does for the Ruby patterns.
+/// `db/*structure.sql`, not `**/*.sql`, which would sweep up every fixture, seed and migration for
+/// one file. The shape mirrors Rails' `schema_dump`, which names the primary database's dump
+/// `structure.sql` and every other `<database>_structure.sql`, the same names `rails::is_structure`
+/// matches. That predicate, not this glob, has the last word, as `Workspace::indexes` does for the
+/// Ruby patterns.
 const SCHEMA_DUMP_GLOB: &str = "db/*structure.sql";
 
 /// The id the watcher registration is made under.
 ///
-/// Fixed rather than generated: the protocol identifies a registration by this string, so
-/// anything that later unregisters it has to be able to name the same one.
+/// Fixed, not generated: the protocol identifies a registration by this string, so anything that
+/// later unregisters it must name the same one.
 const WATCHED_FILES_ID: &str = "ya-lsp-watched-files";
 
 /// Ask the client to watch the project's `ya-lsp.toml` and the files it indexes.
 ///
-/// The protocol has no static form for file watching — `initialize` cannot announce it, which is
-/// why this is not in `server_capabilities` — so `client/registerCapability` is the only way to
-/// ask, and `None` here means the client did not say it accepts one. Without it, reload works
-/// only in an editor whose extension supplies a watcher of its own.
+/// The protocol has no static form for file watching (`initialize` cannot announce it), so
+/// `client/registerCapability` is the only way, and `None` here means the client did not say it
+/// accepts one. Without it, reload works only in an editor whose extension brings its own watcher.
 ///
-/// The Ruby patterns are `index.include` itself, so a project that widened it to cover `sig/`
-/// gets its signatures watched too. `index.exclude` has no counterpart here — LSP watchers
-/// cannot say "not this" — so the registration is deliberately the *wider* of the two, and
-/// `Workspace::indexes` narrows it back down on arrival. Watching too much costs notifications
-/// the server drops; watching too little is a file that never refreshes.
+/// The Ruby patterns are `index.include` itself, so a project that widened it to cover `sig/` gets
+/// its signatures watched too. `index.exclude` has no counterpart (LSP watchers cannot say "not
+/// this"), so the registration is deliberately the *wider* of the two, and `Workspace::indexes`
+/// narrows it on arrival. Watching too much costs dropped notifications; watching too little leaves
+/// a file that never refreshes.
 ///
-/// **Two of the patterns are constants and neither is indexed**, which is the shape rather than
-/// an exception. `ya-lsp.toml` is watched and never indexed, and [`SCHEMA_DUMP_GLOB`] is beside
-/// it for the same reason: a `db/structure.sql` is read
-/// by the generator pass, is not Ruby, and must never reach rubydex. Being constants is what
-/// makes them safe here — this registration is made once, at `initialize`, and is never made
-/// again, so anything derived from a configuration the user can reload would be stale for the
-/// life of the process.
+/// **Two patterns are constants, and neither is indexed**, by design. `ya-lsp.toml` is watched and
+/// never indexed, and [`SCHEMA_DUMP_GLOB`] sits beside it for the same reason: a `db/structure.sql`
+/// is read by the generator pass, is not Ruby, and must never reach rubydex. Being constants makes
+/// them safe: this registration is made once, at `initialize`, so anything derived from reloadable
+/// configuration would be stale for the life of the process.
 #[must_use]
 pub fn watched_files(
     root: &Path,
@@ -288,11 +382,10 @@ pub fn watched_files(
             .chain(index.include.iter().map(String::as_str))
             .map(|pattern| FileSystemWatcher {
                 glob_pattern: watch_glob(root, pattern, relative),
-                // All three kinds, which is what omitting `kind` means. A deleted `ya-lsp.toml`
-                // is a configuration change — it means back to the defaults — and so is one
-                // written for the first time in a project that never had one; a deleted `.rb`
-                // is the one case the index cannot reach any other way, since nothing else ever
-                // says a declaration has gone.
+                // All three kinds, which is what omitting `kind` means. A deleted `ya-lsp.toml` is
+                // a configuration change (back to defaults), and so is one written for the first
+                // time; a deleted `.rb` is the one case the index cannot learn any other way, since
+                // nothing else says a declaration has gone.
                 kind: None,
             })
             .collect(),
@@ -300,20 +393,20 @@ pub fn watched_files(
     Some(Registration {
         id: WATCHED_FILES_ID.to_owned(),
         method: "workspace/didChangeWatchedFiles".to_owned(),
-        // Infallible for this shape — every field in it is a string — but the type is a
-        // `Result`, and a registration whose options went missing asks the client to watch
-        // nothing at all. Better no registration than one that silently watches nothing.
+        // Infallible for this shape (every field is a string), but the type is a `Result`, and a
+        // registration whose options went missing would ask the client to watch nothing. Better no
+        // registration than one that silently watches nothing.
         register_options: Some(serde_json::to_value(options).ok()?),
     })
 }
 
 /// One pattern the watcher is registered with, relative to `root`.
 ///
-/// Relative when the client says it takes one (LSP 3.17). The base there is a URI rather than
-/// glob syntax, so a root holding `[`, `{`, `*` or `?` — a directory named `[wip]` is enough —
-/// cannot be read as a pattern. The absolute form has no defence against that: LSP's glob
-/// syntax defines no escape. Its separators are `/` on every platform, Windows included, which
-/// is why the path is not simply handed over as the OS spells it.
+/// Relative when the client supports it (LSP 3.17). Its base is a URI, not glob syntax, so a root
+/// holding `[`, `{`, `*` or `?` (a directory named `[wip]` is enough) cannot be misread as a
+/// pattern. The absolute form has no defence, since LSP's glob syntax defines no escape. Its
+/// separators are `/` on every platform, Windows included, which is why the path is not passed
+/// through as the OS spells it.
 fn watch_glob(root: &Path, pattern: &str, relative_patterns: bool) -> GlobPattern {
     if relative_patterns
         && let Some(base) = DocUri::from_path(root).and_then(|uri| uri.to_lsp().ok())
@@ -336,30 +429,29 @@ pub fn sync_kind(capabilities: &ServerCapabilities) -> Option<TextDocumentSyncKi
 
 /// The language ids a document registration claims.
 ///
-/// The client's own selector names the same two — `package.json` contributes `erb` with the id and
-/// the extensions ruby-lsp uses — and `vscode_manifest.rs` is what holds the two lists together.
-/// A registration naming only `ruby` would leave a Rails engine's templates unclaimed, which is
-/// the same silence this mechanism exists to end.
+/// The client's own selector names the same two (`package.json` contributes `erb` with the id and
+/// extensions ruby-lsp uses), and `vscode_manifest.rs` keeps the two lists in step. A registration
+/// naming only `ruby` would leave a Rails engine's templates unclaimed: the very silence this
+/// mechanism exists to end.
 pub const LANGUAGE_IDS: [&str; 2] = ["ruby", "erb"];
 
 /// The prefix every document registration's id is made under.
 ///
-/// Fixed and recognisable, for the same reason [`WATCHED_FILES_ID`] is fixed and for one more:
-/// an extension driving several servers has to be able to tell *these* registrations from the
-/// watcher's, because what it does about them is the opposite. The watcher's registration is
-/// forwarded untouched; a document registration may have to be narrowed, since two folders on one
-/// Ruby ask for the same gem roots and two servers answering one hover is the thing the narrow
-/// selector was protecting against in the first place.
+/// Fixed and recognisable, for [`WATCHED_FILES_ID`]'s reason and one more: an extension driving
+/// several servers must tell *these* registrations from the watcher's, because it handles them
+/// oppositely. The watcher's is forwarded untouched; a document registration may need narrowing,
+/// since two folders on one Ruby ask for the same gem roots, and two servers answering one hover is
+/// exactly what the narrow selector was protecting against.
 pub const DOCUMENTS_ID_PREFIX: &str = "ya-lsp-documents/";
 
-/// A document capability that can be asked for a second time, over a wider set of files than the
-/// client's own selector named.
+/// A document capability that can be requested again, over more files than the client's own
+/// selector named.
 ///
-/// Three names, never the same word twice: `advertised` is what the *server* capability goes out
-/// under in [`advertised`], `client` is what the *client* capability comes back under in
-/// `textDocument`, and `method` is the one a registration is made with — which for the two
-/// hierarchies is the `prepare` half rather than any of the four requests that follow it, and for
-/// semantic tokens is `textDocument/semanticTokens` rather than the `/full` the server answers.
+/// Three names, never the same word twice: `advertised` is the *server* capability's key in
+/// [`advertised`], `client` is the *client* capability's key under `textDocument`, and `method` is
+/// what a registration is made with. For the two hierarchies that is the `prepare` half, not any of
+/// the four follow-up requests, and for semantic tokens it is `textDocument/semanticTokens`, not
+/// the `/full` the server answers.
 struct Dynamic {
     advertised: &'static str,
     client: &'static str,
@@ -368,16 +460,16 @@ struct Dynamic {
 
 /// Every request method this server answers that a document selector gates.
 ///
-/// **Generated from, and checked against, [`advertised`]** — `every_advertised_document_capability_
-/// can_be_registered_again` is the test, and it is the whole reason this is a table rather than a
-/// hand-written list of registrations: a capability advertised and missing from here would be
-/// claimed for `didOpen` and silent for that one request, which looks like it is working and is
-/// worse than today's file that is silent for everything.
+/// **Generated from, and checked against, [`advertised`]**:
+/// `every_advertised_document_capability_can_be_registered_again` is the test, and the reason this
+/// is a table instead of a hand-written list: a capability advertised but missing here would be
+/// claimed for `didOpen` and silent for that one request, which looks like it works and is worse
+/// than a file that is silent for everything.
 ///
 /// `completionItem/resolve`, `inlayHint/resolve` and the four hierarchy walks are deliberately
-/// absent: the protocol registers each of those through the parent's options, so they arrive with
-/// `resolveProvider` and with the `prepare` entry rather than under a method of their own.
-const DYNAMIC: [Dynamic; 16] = [
+/// absent: the protocol registers each through its parent's options, so they arrive with
+/// `resolveProvider` and the `prepare` entry, not under their own methods.
+const DYNAMIC: [Dynamic; 19] = [
     Dynamic {
         advertised: "hoverProvider",
         client: "hover",
@@ -387,6 +479,21 @@ const DYNAMIC: [Dynamic; 16] = [
         advertised: "definitionProvider",
         client: "definition",
         method: "textDocument/definition",
+    },
+    Dynamic {
+        advertised: "implementationProvider",
+        client: "implementation",
+        method: "textDocument/implementation",
+    },
+    Dynamic {
+        advertised: "typeDefinitionProvider",
+        client: "typeDefinition",
+        method: "textDocument/typeDefinition",
+    },
+    Dynamic {
+        advertised: "declarationProvider",
+        client: "declaration",
+        method: "textDocument/declaration",
     },
     Dynamic {
         advertised: "documentSymbolProvider",
@@ -460,34 +567,36 @@ const DYNAMIC: [Dynamic; 16] = [
     },
 ];
 
-/// The advertised capabilities no document registration carries, each with the reason it is here
-/// rather than in [`DYNAMIC`].
+/// The advertised capabilities no document registration carries, each with its reason for being
+/// here and not in [`DYNAMIC`].
 ///
-/// A list rather than a silence, because the test that walks [`advertised`] has to fail on a
-/// capability nobody has ruled on — and "this one is not a document request" is a ruling.
-/// `cfg(test)` because the test below is the only thing that reads it: it is a ruling, and a
-/// ruling's whole job is to make the walk over [`advertised`] fail on a capability nobody made.
+/// A list, not an omission, because the test walking [`advertised`] must fail on any capability
+/// nobody has ruled on, and "this one is not a document request" is a ruling. `cfg(test)` because
+/// only that test reads it.
 #[cfg(test)]
-const NOT_A_DOCUMENT: [&str; 4] = [
-    // Negotiated once, inside the handshake. A registration cannot change the coordinates the
-    // answers already went out in.
+const NOT_A_DOCUMENT: [&str; 5] = [
+    // Negotiated once, in the handshake. A registration cannot change the coordinates answers
+    // already went out in.
     "positionEncoding",
-    // Four notifications rather than one capability, built by `synchronization` below.
+    // Four notifications, not one capability, built by `synchronization` below.
     "textDocumentSync",
     // A search of the whole graph. The request names no document, so no selector gates it, and it
-    // has been answering inside gems since it shipped.
+    // already answers inside gems.
     "workspaceSymbolProvider",
-    // Workspace folders and file operations. Neither is about a document.
+    // Workspace folders, file operations, and the scheme generated documents are served under. None
+    // is about a document the client owns.
     "workspace",
+    // A command the client runs by name; the request that runs it names no document.
+    "executeCommandProvider",
 ];
 
-/// One registration the client will take, waiting for the files it should cover.
+/// One registration the client will accept, waiting for the files it should cover.
 ///
-/// The selector is deliberately *not* in here. What the server has answers about is the gem roots,
-/// Ruby's own library and the RBS beside them, and none of those is known until the bundle has
-/// been discovered — which happens on the analysis thread, long after the handshake this is
-/// negotiated in. A `Registration` with no selector would fall back to the client's own, which is
-/// the narrow folder, so the half-built value is a separate type that cannot be sent by mistake.
+/// The selector is deliberately *not* here. What the server has answers about is the gem roots,
+/// Ruby's own library and the RBS beside them, none of which is known until the bundle is
+/// discovered, on the analysis thread, long after the handshake. A `Registration` with no selector
+/// would fall back to the client's own (the narrow folder), so the half-built value is a separate
+/// type that cannot be sent by mistake.
 #[derive(Debug, Clone)]
 pub struct Requested {
     method: &'static str,
@@ -496,21 +605,22 @@ pub struct Requested {
 
 /// What this client will accept a second registration of, derived from what the server advertised.
 ///
-/// Empty when the client cannot dynamically register text synchronisation, and that is a
-/// deliberate all-or-nothing: a document the client never sends `didOpen` for cannot be asked
-/// about, so registering the sixteen requests over it would claim files and answer nothing.
+/// Empty when the client cannot dynamically register text synchronisation, deliberately
+/// all-or-nothing: a document the client never sends `didOpen` for cannot be asked about, so
+/// registering the requests over it would claim files and answer nothing.
 ///
 /// Every entry is filtered by the client's *own* `dynamicRegistration` flag for that capability.
-/// Read out of the serialized `textDocument` object rather than through sixteen typed accessor
-/// chains: the flag is spelled identically in every one of them, and the table above is already
-/// the place the two vocabularies are matched up.
+/// Read from the serialized `textDocument` object instead of many typed accessor chains: the flag
+/// is spelled the same in each, and the table above is already where the two vocabularies are
+/// matched.
 #[must_use]
 pub fn dynamic_documents(
     encoding: PositionEncoding,
     capabilities: &ClientCapabilities,
+    root: &Path,
 ) -> Vec<Requested> {
-    // `Null` for a client that said nothing about documents at all, which then answers `Null` to
-    // every lookup below and so declines everything — one path rather than two.
+    // `Null` for a client that said nothing about documents, which answers `Null` to every lookup
+    // below and so declines everything: one path, not two.
     let text_document = capabilities
         .text_document
         .as_ref()
@@ -523,7 +633,12 @@ pub fn dynamic_documents(
         return Vec::new();
     }
 
-    let advertised = serde_json::to_value(advertised(encoding)).unwrap_or(serde_json::Value::Null);
+    // The whole advertised object, not [`server_capabilities`], because one document capability
+    // (`typeHierarchyProvider`) is a field `lsp-types` cannot spell and exists only in
+    // [`Advertised`]. `root` rides along only for that: nothing below reads the `workspace` half
+    // this builds, and a command is not a document.
+    let advertised =
+        serde_json::to_value(advertised(encoding, root)).unwrap_or(serde_json::Value::Null);
     let mut requested: Vec<Requested> = DYNAMIC
         .iter()
         .filter(|entry| dynamic(entry.client))
@@ -531,32 +646,32 @@ pub fn dynamic_documents(
             method: entry.method,
             // The advertised value *is* the registration's options, minus the selector: a
             // `CompletionOptions` and a `CompletionRegistrationOptions` differ by exactly that
-            // field. A capability advertised as a bare `true` carries nothing, so it registers
-            // with nothing, and `every_advertised_document_capability_can_be_registered_again` is
-            // what rules out the third case of a method here that is advertised nowhere.
+            // field. A capability advertised as a bare `true` carries nothing and registers with
+            // nothing; `every_advertised_document_capability_can_be_registered_again` rules out the
+            // third case, a method here advertised nowhere.
             options: match &advertised[entry.advertised] {
                 serde_json::Value::Object(options) => options.clone(),
                 _ => serde_json::Map::new(),
             },
         })
         .collect();
-    // Synchronisation last, and `didOpen` last of all inside it: registering `didOpen` is what
-    // walks the already-open documents and sends one for every file the new selector newly
-    // matches, so every provider above is in place before the client is told the file exists.
+    // Synchronisation last, and `didOpen` last within it: registering `didOpen` makes the client
+    // walk the already-open documents and send one for every file the new selector newly matches,
+    // so every provider above must be in place before the client is told the file exists.
     requested.extend(synchronization(&advertised["textDocumentSync"]));
     requested
 }
 
 /// The four notifications `textDocumentSync` is registered as, in the order they must arrive.
 ///
-/// `syncKind` and `includeText` are carried across from the advertised options rather than
-/// restated: a registration that dropped `syncKind` would leave the client at its own default and
-/// `position::Rebase` would be handed whole-document changes it is not written for.
+/// `syncKind` and `includeText` are copied from the advertised options, not restated: a
+/// registration without `syncKind` would leave the client on its own default, and
+/// `position::Rebase` would get whole-document changes it is not written for.
 fn synchronization(sync: &serde_json::Value) -> Vec<Requested> {
-    // Reads rather than questions: `textDocumentSync` is a constant in `server_capabilities`, so
-    // both fields are always there. `a_registration_carries_the_options_the_handshake_announced` is
-    // what keeps that true — it asserts the values, so a change to the constant's shape fails there
-    // rather than shipping a registration with a null in it.
+    // Reads, not questions: `textDocumentSync` is a constant in `server_capabilities`, so both
+    // fields always exist. `a_registration_carries_the_options_the_handshake_announced` asserts the
+    // values, so a change to the constant's shape fails there instead of shipping a registration
+    // with a null in it.
     let change = serde_json::Map::from_iter([("syncKind".to_owned(), sync["change"].clone())]);
     let save = serde_json::Map::from_iter([(
         "includeText".to_owned(),
@@ -584,10 +699,10 @@ fn synchronization(sync: &serde_json::Value) -> Vec<Requested> {
 
 /// The registrations to send, once it is known which files the server has answers about.
 ///
-/// `prefixes` are directory URIs — the gem roots, Ruby's own library, the RBS root — and the
-/// workspace's own is **not** among them: the client already claimed that with the selector it
-/// was built with, and a second provider over the same file is one server answering a hover
-/// twice. Empty `prefixes` means there is nothing to widen to and nothing is sent.
+/// `prefixes` are directory URIs (the gem roots, Ruby's own library, the RBS root), and the
+/// workspace's own is **not** among them: the client already claimed it with its original selector,
+/// and a second provider over the same file means one server answering a hover twice. Empty
+/// `prefixes` means nothing to widen to, so nothing is sent.
 #[must_use]
 pub fn document_registrations(requested: &[Requested], prefixes: &[String]) -> Vec<Registration> {
     if prefixes.is_empty() {
@@ -601,10 +716,9 @@ pub fn document_registrations(requested: &[Requested], prefixes: &[String]) -> V
                     "scheme": "file",
                     "language": language,
                     // The protocol's own relative pattern, whose `baseUri` is a URI *string*.
-                    // `vscode-languageclient` recognises this shape and nothing else, and what it
-                    // does with anything else is not to ignore the pattern but to drop it — which
-                    // widens the filter to scheme and language alone, claiming every Ruby file
-                    // the editor has open anywhere.
+                    // `vscode-languageclient` recognises only this shape, and it does not ignore
+                    // anything else but drops the pattern, which widens the filter to scheme and
+                    // language alone, claiming every Ruby file the editor has open anywhere.
                     "pattern": { "baseUri": prefix.trim_end_matches('/'), "pattern": "**/*" },
                 })
             })
@@ -630,10 +744,9 @@ pub fn document_registrations(requested: &[Requested], prefixes: &[String]) -> V
 
 /// A client that accepts every dynamic registration this server asks for, for the suite.
 ///
-/// **Built from [`DYNAMIC`] rather than written out.** VS Code's client says yes to all of these,
-/// so this is the realistic shape — and deriving it from the table is what makes a row added there
-/// covered by every test that drives a harness, instead of by one somebody has to remember to
-/// widen.
+/// **Built from [`DYNAMIC`], not written out.** VS Code's client accepts all of these, so this is
+/// the realistic shape, and deriving it from the table means a new row there is covered by every
+/// harness test, without anyone remembering to widen this.
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 #[must_use]
@@ -647,7 +760,7 @@ pub(crate) fn every_dynamic_registration_accepted() -> ClientCapabilities {
         let mut capability = serde_json::json!({ "dynamicRegistration": true });
         if client == "semanticTokens" {
             // The four fields `lsp-types` does not make optional here, because the protocol does
-            // not either: a client that says it takes semantic tokens has to say which ones.
+            // not either: a client that takes semantic tokens must say which.
             capability["requests"] = serde_json::json!({ "full": true });
             capability["tokenTypes"] = serde_json::json!(crate::analysis::tokens::LEGEND);
             capability["tokenModifiers"] = serde_json::json!([]);
@@ -666,12 +779,13 @@ mod tests {
 
     #[test]
     fn the_capability_lsp_types_cannot_spell_still_goes_out_with_the_rest() {
-        // `ServerCapabilities` has no `typeHierarchyProvider` field in any published version of
-        // the crate, so this is the one capability that is added on the way to JSON. The second
-        // half of the assertion is the point: a flatten that stopped flattening would announce
-        // *only* the type hierarchy, and every other feature would silently stop being offered.
+        // `ServerCapabilities` has no `typeHierarchyProvider` field in any published version of the
+        // crate, so this is the one capability added on the way to JSON. The second half of the
+        // assertion is the point: a flatten that stopped flattening would announce *only* the type
+        // hierarchy, and every other feature would silently stop being offered.
         let advertised =
-            serde_json::to_value(advertised(PositionEncoding::Utf8)).expect("plain data");
+            serde_json::to_value(advertised(PositionEncoding::Utf8, Path::new("/project")))
+                .expect("plain data");
         assert_eq!(advertised["typeHierarchyProvider"], serde_json::json!(true));
         assert_eq!(advertised["hoverProvider"], serde_json::json!(true));
         assert!(advertised["completionProvider"].is_object());
@@ -680,10 +794,10 @@ mod tests {
 
     #[test]
     fn the_v0_3_0_rename_provider_asks_to_be_consulted_before_the_editor_prompts() {
-        // A bare `renameProvider: true` would still work, and would move every refusal to
-        // *after* the user has typed a new name. `prepareProvider` is what buys the earlier
-        // question, and it is the only option this provider has.
-        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        // A bare `renameProvider: true` would still work, but would move every refusal to *after*
+        // the user has typed a new name. `prepareProvider` buys the earlier question, and it is
+        // this provider's only option.
+        let capabilities = server_capabilities(PositionEncoding::Utf8, Path::new("/project"));
         let OneOf::Right(rename) = capabilities.rename_provider.expect("a rename provider") else {
             panic!("announced without options, so nothing asks before the prompt");
         };
@@ -692,13 +806,13 @@ mod tests {
 
     #[test]
     fn the_m5_provider_is_announced_with_its_triggers() {
-        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        let capabilities = server_capabilities(PositionEncoding::Utf8, Path::new("/project"));
         let completion = capabilities
             .completion_provider
             .expect("a completion provider");
         assert_eq!(completion.resolve_provider, Some(true));
-        // Without `.` in this list a client narrows the list it already had instead of asking
-        // again, and `foo.` would complete against whatever `foo` matched.
+        // Without `.` here, a client narrows the list it already had instead of asking again, and
+        // `foo.` would complete against whatever `foo` matched.
         let triggers = completion.trigger_characters.expect("trigger characters");
         assert!(triggers.contains(&".".to_owned()));
         assert!(triggers.contains(&":".to_owned()));
@@ -706,18 +820,18 @@ mod tests {
 
     #[test]
     fn the_v0_3_0_highlight_provider_is_announced() {
-        // Announced without options: `documentHighlight` has none, and the whole of the
-        // decision is that a client stops matching words itself the moment it is told.
-        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        // Announced without options: `documentHighlight` has none, and the whole decision is that a
+        // client stops matching words itself as soon as it is told.
+        let capabilities = server_capabilities(PositionEncoding::Utf8, Path::new("/project"));
         assert!(capabilities.document_highlight_provider.is_some());
     }
 
     #[test]
     fn the_v0_3_0_provider_is_announced_with_its_triggers() {
-        // `(` and `,` are where an argument list gains an argument; `)` only re-triggers, so
-        // the popup is asked once more as the call closes and takes ya-lsp's `null` as its cue
-        // to go away. A client is asked nothing at all for a character that is on neither list.
-        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        // `(` and `,` are where an argument list gains an argument; `)` only re-triggers, so the
+        // popup is asked once more as the call closes and takes ya-lsp's `null` as its cue to
+        // close. A character on neither list asks nothing.
+        let capabilities = server_capabilities(PositionEncoding::Utf8, Path::new("/project"));
         let help = capabilities
             .signature_help_provider
             .expect("a signature help provider");
@@ -730,34 +844,34 @@ mod tests {
 
     #[test]
     fn the_v0_3_0_range_providers_are_announced() {
-        // Neither takes options, and the two are announced for opposite reasons: expand-selection
-        // has nothing to displace in a Ruby file, while folding takes the editor's indentation
-        // guess out of play the moment it is told — which is why `analysis::ranges` covers what
-        // that guess got right as well as what it could not see.
-        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        // Neither takes options, and they are announced for opposite reasons: expand-selection has
+        // nothing to displace in a Ruby file, while folding takes the editor's indentation guess
+        // out of play as soon as it is told, which is why `analysis::ranges` covers what that guess
+        // got right as well as what it could not see.
+        let capabilities = server_capabilities(PositionEncoding::Utf8, Path::new("/project"));
         assert!(capabilities.selection_range_provider.is_some());
         assert!(capabilities.folding_range_provider.is_some());
     }
 
     #[test]
     fn the_call_hierarchy_is_announced_and_the_type_hierarchy_beside_it() {
-        // The two hierarchies are announced through different mechanisms — one is a field
-        // `lsp-types` has and the other is flattened in beside it — and a client that gets one
-        // and not the other shows a "show call hierarchy" command that reports no results. So
-        // both are asserted here, in one test, against the struct that goes out on the wire.
-        let advertised = serde_json::to_value(advertised(PositionEncoding::Utf16))
-            .expect("the advertised capabilities serialize");
+        // The two hierarchies are announced by different mechanisms (one is an `lsp-types` field,
+        // the other flattened in beside it), and a client that gets one but not the other shows a
+        // "show call hierarchy" command with no results. So both are asserted here, in one test,
+        // against the struct that goes on the wire.
+        let advertised =
+            serde_json::to_value(advertised(PositionEncoding::Utf16, Path::new("/project")))
+                .expect("the advertised capabilities serialize");
         assert_eq!(advertised["callHierarchyProvider"], true);
         assert_eq!(advertised["typeHierarchyProvider"], true);
     }
 
     #[test]
     fn the_document_link_provider_says_it_resolves_nothing() {
-        // `Some(false)` rather than `None`, and the difference is what the client does with it:
-        // an absent field and a `false` mean the same to the protocol, but a server that has
-        // *decided* not to resolve and one that forgot to answer look identical on the wire.
-        // The target is known when the link is made, so the round trip would buy nothing.
-        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        // `Some(false)`, not `None`. The protocol treats absent and `false` the same, but a server
+        // that *decided* not to resolve and one that forgot to say look identical on the wire. The
+        // target is known when the link is made, so a round trip would buy nothing.
+        let capabilities = server_capabilities(PositionEncoding::Utf8, Path::new("/project"));
         let links = capabilities
             .document_link_provider
             .expect("a document link provider");
@@ -766,12 +880,11 @@ mod tests {
 
     #[test]
     fn the_inlay_hint_provider_says_it_resolves_the_tooltip() {
-        // The opposite answer from the document link's, for the opposite reason. A link's
-        // target is known the moment the link is made, so a resolve step would buy a round trip
-        // per link and nothing else; a hint's tooltip is a paragraph nobody sees until they
-        // point at one, and shipping it eagerly puts markdown on the wire for every line of the
-        // file on every scroll.
-        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        // The opposite answer from the document link's, for the opposite reason. A link's target is
+        // known when the link is made, so resolving would only add a round trip per link; a hint's
+        // tooltip is a paragraph nobody sees until they point at it, and shipping it eagerly puts
+        // markdown on the wire for every line on every scroll.
+        let capabilities = server_capabilities(PositionEncoding::Utf8, Path::new("/project"));
         let Some(OneOf::Right(InlayHintServerCapabilities::Options(hints))) =
             capabilities.inlay_hint_provider
         else {
@@ -783,10 +896,10 @@ mod tests {
     #[test]
     fn the_v0_4_0_semantic_token_legend_is_the_one_the_tokens_are_numbered_against() {
         // The legend *is* the wire contract: a client reads every token's type as an index into
-        // this list. A mismatch between it and `tokens::Kind` recolours every token in every
-        // file, consistently and plausibly, which is the hardest kind of wrong to notice — so
-        // the two are asserted against each other rather than each against a hand-written list.
-        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        // this list. A mismatch with `tokens::Kind` recolours every token in every file,
+        // consistently and plausibly, the hardest kind of wrong to notice, so the two are asserted
+        // against each other, not each against a hand-written list.
+        let capabilities = server_capabilities(PositionEncoding::Utf8, Path::new("/project"));
         let SemanticTokensServerCapabilities::SemanticTokensOptions(options) = capabilities
             .semantic_tokens_provider
             .expect("a semantic tokens provider")
@@ -806,8 +919,8 @@ mod tests {
             "a modifier nothing sends is a promise nothing keeps"
         );
         // The full document and nothing else. A delta is a wire optimisation over an answer the
-        // server computes anyway; announcing it would oblige ya-lsp to keep every response it
-        // has sent, per document, keyed by an id it must invalidate on every edit.
+        // server computes anyway; announcing it would oblige ya-lsp to keep every response sent,
+        // per document, keyed by an id invalidated on every edit.
         assert!(matches!(
             options.full,
             Some(lsp_types::SemanticTokensFullOptions::Bool(true))
@@ -817,18 +930,17 @@ mod tests {
 
     #[test]
     fn the_m4_providers_are_announced() {
-        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        let capabilities = server_capabilities(PositionEncoding::Utf8, Path::new("/project"));
         assert!(capabilities.references_provider.is_some());
         assert!(capabilities.workspace_symbol_provider.is_some());
     }
 
     #[test]
     fn text_sync_is_incremental_and_the_m2_providers_are_announced() {
-        // These four are a contract with the client, fixed at `initialize` and never
-        // renegotiated. Getting `change` wrong is the expensive one: the client would send
-        // ranges while the server expected whole buffers, and every edit would corrupt the
-        // document with no error anywhere.
-        let capabilities = server_capabilities(PositionEncoding::Utf8);
+        // These four are a contract with the client, fixed at `initialize` and never renegotiated.
+        // Getting `change` wrong is the costly one: the client would send ranges while the server
+        // expected whole buffers, and every edit would silently corrupt the document.
+        let capabilities = server_capabilities(PositionEncoding::Utf8, Path::new("/project"));
         assert_eq!(
             sync_kind(&capabilities),
             Some(TextDocumentSyncKind::INCREMENTAL)
@@ -872,9 +984,8 @@ mod tests {
 
     #[test]
     fn the_watchers_cover_the_config_and_everything_the_index_includes() {
-        // Without this the server never asks anyone to watch anything: `ya-lsp.toml` reloads
-        // only in the one editor that brought its own watcher, and no editor anywhere notices a
-        // `git checkout`.
+        // Without this, the server never asks anyone to watch anything: `ya-lsp.toml` reloads only
+        // in the one editor that brings its own watcher, and no editor notices a `git checkout`.
         let root = Path::new("/tmp/ya-lsp-watch/project");
         let index = IndexConfig {
             include: vec!["**/*.rb".to_owned(), "sig/**/*.rbs".to_owned()],
@@ -884,10 +995,10 @@ mod tests {
             .expect("a watcher is registered");
         assert_eq!(registration.method, "workspace/didChangeWatchedFiles");
         assert_eq!(registration.id, WATCHED_FILES_ID);
-        // The schema dump is a constant and not derived from this configuration, which is the
-        // property that makes it correct: this runs once, at `initialize`, and a pattern
-        // computed from a `ya-lsp.toml` the user can reload would be stale for the life of the
-        // process. It also cannot be spelled by `index.include`, which is Ruby's shapes.
+        // The schema dump is a constant, not derived from this configuration, which makes it
+        // correct: this runs once, at `initialize`, and a pattern computed from a reloadable
+        // `ya-lsp.toml` would be stale for the life of the process. `index.include` cannot spell it
+        // anyway; that is for Ruby's shapes.
         assert!(
             !index
                 .include
@@ -896,9 +1007,9 @@ mod tests {
         );
 
         let watchers = watchers(&registration);
-        // `kind` unset is create|change|delete. A `ya-lsp.toml` that is deleted, or written for
-        // the first time, changes the configuration exactly as much as an edit does — and a
-        // deleted `.rb` is the only way the index ever hears that a declaration has gone.
+        // `kind` unset means create, change and delete. A `ya-lsp.toml` deleted, or written for the
+        // first time, changes the configuration as much as an edit, and a deleted `.rb` is the only
+        // way the index hears that a declaration has gone.
         assert!(watchers.iter().all(|watcher| watcher.kind.is_none()));
         assert_eq!(
             watchers
@@ -908,7 +1019,7 @@ mod tests {
             vec![
                 // A client without relative patterns gets absolute ones, with `/` separators.
                 GlobPattern::String("/tmp/ya-lsp-watch/project/ya-lsp.toml".to_owned()),
-                // The two constants come first and neither is `index.include`'s: both name a
+                // The two constants come first, and neither is from `index.include`: both name a
                 // file this server reads and never indexes.
                 GlobPattern::String("/tmp/ya-lsp-watch/project/db/*structure.sql".to_owned()),
                 GlobPattern::String("/tmp/ya-lsp-watch/project/**/*.rb".to_owned()),
@@ -921,9 +1032,9 @@ mod tests {
 
     #[test]
     fn a_client_that_takes_relative_patterns_gets_one() {
-        // The absolute form is glob syntax all the way down, so a root under a directory named
-        // `[wip]` would be read as a character class and match nothing. The relative form's base
-        // is a URI, so the only glob in it is the part we wrote.
+        // The absolute form is glob syntax throughout, so a root under a directory named `[wip]`
+        // would be read as a character class and match nothing. The relative form's base is a URI,
+        // so the only glob in it is the part we wrote.
         let root = Path::new("/tmp/ya-lsp-watch/[wip]/project");
         let registration = watched_files(
             root,
@@ -938,9 +1049,9 @@ mod tests {
                 pattern: pattern.to_owned(),
             })
         };
-        // Derived from the default rather than spelled out: what this test is about is the
-        // *form* of each pattern, and `the_watchers_cover_the_config_and_everything_the_index_
-        // includes` above already pins that the list is `index.include` verbatim.
+        // Derived from the default, not spelled out: this test is about the *form* of each pattern,
+        // and `the_watchers_cover_the_config_and_everything_the_index_includes` above already pins
+        // that the list is `index.include` verbatim.
         let expected: Vec<GlobPattern> = [CONFIG_FILE_NAME.to_owned(), SCHEMA_DUMP_GLOB.to_owned()]
             .into_iter()
             .chain(IndexConfig::default().include)
@@ -957,10 +1068,9 @@ mod tests {
 
     #[test]
     fn a_relative_root_falls_back_to_the_pattern_it_can_still_spell() {
-        // `workspace_root` ends at `.` when the client sent no folder and the process has no
-        // working directory. There is no URI for that, so there is no relative pattern either —
-        // and answering `None` here would drop the watcher over a case the absolute form
-        // handles.
+        // `workspace_root` is `.` when the client sent no folder and the process has no working
+        // directory. There is no URI for that, so no relative pattern either, and answering `None`
+        // here would drop the watcher over a case the absolute form handles.
         let registration = watched_files(
             Path::new("."),
             &IndexConfig::default(),
@@ -975,10 +1085,10 @@ mod tests {
 
     #[test]
     fn a_client_that_cannot_be_asked_is_not_asked() {
-        // Nothing to fall back on: the protocol has no static form for file watching, so a
-        // client that does not take a dynamic registration cannot be given a watcher at all.
-        // The server says so in the log rather than leaving the user to discover it by editing
-        // `ya-lsp.toml`, or checking out a branch, and watching nothing happen.
+        // Nothing to fall back on: the protocol has no static form for file watching, so a client
+        // that takes no dynamic registration cannot get a watcher at all. The server says so in the
+        // log, instead of leaving the user to discover it by editing `ya-lsp.toml` or switching
+        // branches and seeing nothing happen.
         let root = Path::new("/tmp/ya-lsp-watch/project");
         let index = IndexConfig::default();
         assert!(watched_files(root, &index, &ClientCapabilities::default()).is_none());
@@ -1003,10 +1113,10 @@ mod tests {
 
     #[test]
     fn the_sync_kind_is_read_out_of_either_shape_the_protocol_allows() {
-        // `sync_kind` is how the test above checks the contract, so it has to read both
-        // spellings or the assertion could be passing on a `None` it produced itself.
-        // `textDocumentSync` is either a bare kind or an options object, and swapping this
-        // server to the options form must not quietly turn that test vacuous.
+        // `sync_kind` is how the test above checks the contract, so it must read both spellings, or
+        // the assertion could pass on a `None` it produced itself. `textDocumentSync` is either a
+        // bare kind or an options object, and switching this server to the options form must not
+        // quietly make that test vacuous.
         assert_eq!(
             sync_kind(&ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -1032,17 +1142,18 @@ mod tests {
         assert_eq!(sync_kind(&ServerCapabilities::default()), None);
     }
 
-    /// The table that generates the registration must cover everything the handshake advertised.
+    /// The table that generates the registrations must cover everything the handshake advertised.
     ///
-    /// This is the test the whole mechanism turns on. Text synchronisation is registrable on its
-    /// own, so a capability missing from `DYNAMIC` gets a gem file **claimed for `didOpen` and
-    /// silent for that one request** — which is worse than the file being silent for everything,
-    /// because it looks like it is working. `NOT_A_DOCUMENT` is the other half: a capability nobody
-    /// has ruled on fails here rather than being quietly left out.
+    /// The test the whole mechanism turns on. Text synchronisation is registrable on its own, so a
+    /// capability missing from `DYNAMIC` gets a gem file **claimed for `didOpen` and silent for
+    /// that one request**, which is worse than silent for everything, because it looks like it
+    /// works. `NOT_A_DOCUMENT` is the other half: a capability nobody has ruled on fails here
+    /// instead of being quietly left out.
     #[test]
     fn every_advertised_document_capability_can_be_registered_again() {
-        let advertised = serde_json::to_value(advertised(PositionEncoding::Utf8))
-            .expect("the advertised capabilities serialize");
+        let advertised =
+            serde_json::to_value(advertised(PositionEncoding::Utf8, Path::new("/project")))
+                .expect("the advertised capabilities serialize");
         let advertised = advertised.as_object().expect("an object of capabilities");
 
         for name in advertised.keys() {
@@ -1072,6 +1183,7 @@ mod tests {
         let requested = dynamic_documents(
             PositionEncoding::Utf16,
             &every_dynamic_registration_accepted(),
+            Path::new("/project"),
         );
         let roots = [
             "file:///gems/activerecord-8.1.3.1/".to_owned(),
@@ -1129,14 +1241,15 @@ mod tests {
     /// The pattern is the protocol's own shape, and this is what a client does with anything else.
     ///
     /// `vscode-languageclient` recognises a `baseUri` that is a **string** and drops every other
-    /// shape — and a dropped pattern does not narrow, it *widens*, to language and scheme alone.
-    /// So getting this wrong claims every Ruby file the editor has open anywhere, which is the
-    /// failure the narrow per-folder selector exists to prevent, arriving from the server instead.
+    /// shape, and a dropped pattern does not narrow but *widens*, to language and scheme alone.
+    /// Getting this wrong claims every Ruby file the editor has open anywhere: the failure the
+    /// narrow per-folder selector exists to prevent, caused by the server instead.
     #[test]
     fn the_pattern_is_a_uri_string_the_client_will_recognise() {
         let requested = dynamic_documents(
             PositionEncoding::Utf16,
             &every_dynamic_registration_accepted(),
+            Path::new("/project"),
         );
         let registrations = document_registrations(&requested, &["file:///gems/".to_owned()]);
         let filter =
@@ -1157,6 +1270,7 @@ mod tests {
         let requested = dynamic_documents(
             PositionEncoding::Utf16,
             &every_dynamic_registration_accepted(),
+            Path::new("/project"),
         );
         let registrations = document_registrations(&requested, &["file:///gems/".to_owned()]);
         let options = |method: &str| {
@@ -1169,8 +1283,8 @@ mod tests {
                 .expect("options")
         };
 
-        // Without these the popup never re-opens on a typed `.` inside a gem, which is the one
-        // request whose trigger is the whole feature.
+        // Without these, the popup never re-opens on a typed `.` inside a gem, the one request
+        // whose trigger is the whole feature.
         assert_eq!(
             options("textDocument/completion")["triggerCharacters"],
             serde_json::json!([".", ":", "@", "$"])
@@ -1185,8 +1299,8 @@ mod tests {
                 .len(),
             crate::analysis::tokens::LEGEND.len()
         );
-        // A registration that dropped `syncKind` leaves the client at its own default, and
-        // `position::Rebase` is handed whole-document changes it is not written for.
+        // A registration without `syncKind` leaves the client on its own default, and
+        // `position::Rebase` would get whole-document changes it is not written for.
         assert_eq!(
             options("textDocument/didChange")["syncKind"],
             serde_json::json!(TextDocumentSyncKind::INCREMENTAL)
@@ -1198,15 +1312,16 @@ mod tests {
 
     /// `didOpen` is registered last, because registering it is what sends the notifications.
     ///
-    /// The client's own `didOpen` feature **back-fills** — it walks the documents already open and
-    /// sends one for every file the new selector newly matches — so a gem file the user is looking
-    /// at right now starts answering at registration rather than at the next tab switch. Every
-    /// provider has to be in place before that happens.
+    /// The client's `didOpen` feature **back-fills**: it walks the documents already open and sends
+    /// one for every file the new selector newly matches, so a gem file the user is looking at
+    /// starts answering at registration, not at the next tab switch. Every provider must be in
+    /// place before that.
     #[test]
     fn synchronisation_is_registered_after_the_requests_and_did_open_last_of_all() {
         let requested = dynamic_documents(
             PositionEncoding::Utf16,
             &every_dynamic_registration_accepted(),
+            Path::new("/project"),
         );
         let methods: Vec<&str> = requested.iter().map(|entry| entry.method).collect();
 
@@ -1223,6 +1338,7 @@ mod tests {
         let requested = dynamic_documents(
             PositionEncoding::Utf16,
             &every_dynamic_registration_accepted(),
+            Path::new("/project"),
         );
         let registrations = document_registrations(&requested, &["file:///gems/".to_owned()]);
         let ids: std::collections::BTreeSet<&str> = registrations
@@ -1248,9 +1364,9 @@ mod tests {
 
     /// A client that will not dynamically register `didOpen` is asked for nothing at all.
     ///
-    /// All-or-nothing on purpose: a file the client never says is open cannot be asked about, so
-    /// the sixteen requests over it would claim files and answer nothing. What such a client gets
-    /// is exactly today's behaviour, plus one line saying what it does not have.
+    /// All-or-nothing on purpose: a file the client never reports open cannot be asked about, so
+    /// registering the requests over it would claim files and answer nothing. Such a client keeps
+    /// the unregistered behaviour, plus one log line saying what it lacks.
     #[test]
     fn a_client_that_will_not_sync_dynamically_is_asked_for_nothing() {
         let capabilities: ClientCapabilities = serde_json::from_value(serde_json::json!({
@@ -1261,18 +1377,30 @@ mod tests {
         }))
         .expect("client capabilities");
 
-        assert!(dynamic_documents(PositionEncoding::Utf16, &capabilities).is_empty());
         assert!(
-            dynamic_documents(PositionEncoding::Utf16, &ClientCapabilities::default()).is_empty(),
+            dynamic_documents(
+                PositionEncoding::Utf16,
+                &capabilities,
+                Path::new("/project")
+            )
+            .is_empty()
+        );
+        assert!(
+            dynamic_documents(
+                PositionEncoding::Utf16,
+                &ClientCapabilities::default(),
+                Path::new("/project")
+            )
+            .is_empty(),
             "a client that says nothing about textDocument at all"
         );
     }
 
-    /// One capability declined leaves the rest of the batch standing.
+    /// One declined capability leaves the rest of the batch standing.
     ///
-    /// Not merely politeness about the protocol: `doRegisterCapability` rejects the *whole* array
-    /// on the first method it has no feature for, so a registration the client never agreed to
-    /// would take every method after it down with it.
+    /// Not just protocol politeness: `doRegisterCapability` rejects the *whole* array at the first
+    /// method it has no feature for, so a registration the client never agreed to would take down
+    /// every method after it.
     #[test]
     fn a_capability_the_client_declines_is_left_out_and_the_rest_stand() {
         let mut accepted = serde_json::to_value(every_dynamic_registration_accepted())
@@ -1282,10 +1410,14 @@ mod tests {
         let capabilities: ClientCapabilities =
             serde_json::from_value(accepted).expect("client capabilities");
 
-        let methods: Vec<&str> = dynamic_documents(PositionEncoding::Utf16, &capabilities)
-            .iter()
-            .map(|entry| entry.method)
-            .collect();
+        let methods: Vec<&str> = dynamic_documents(
+            PositionEncoding::Utf16,
+            &capabilities,
+            Path::new("/project"),
+        )
+        .iter()
+        .map(|entry| entry.method)
+        .collect();
 
         assert!(!methods.contains(&"textDocument/semanticTokens"));
         assert!(methods.contains(&"textDocument/hover"));
@@ -1297,6 +1429,7 @@ mod tests {
         let requested = dynamic_documents(
             PositionEncoding::Utf16,
             &every_dynamic_registration_accepted(),
+            Path::new("/project"),
         );
         assert!(
             document_registrations(&requested, &[]).is_empty(),

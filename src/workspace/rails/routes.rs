@@ -1,12 +1,12 @@
 //! `config/routes.rb`: which helpers Rails names, and the line of the DSL that named each.
 //!
-//! `*_path` and `*_url` call sites are everywhere in a Rails application and in its templates,
-//! and none of them resolves without this reader. All of it is static and every helper returns
-//! `String`, so `story_path` jumps to the `resources :stories` that named it.
+//! `*_path` and `*_url` calls are everywhere in a Rails application and its templates, and none
+//! resolves without this reader. It is all static and every helper returns `String`, so
+//! `story_path` jumps to the `resources :stories` that named it.
 //!
-//! # The naming rule is Rails', copied rather than approximated
+//! # The naming rule is Rails', copied, not approximated
 //!
-//! `ActionDispatch::Routing::Mapper#name_for_action` joins four words and the *scope level*
+//! `ActionDispatch::Routing::Mapper#name_for_action` joins four words, and the *scope level*
 //! decides their order:
 //!
 //! | level | the join |
@@ -18,32 +18,30 @@
 //! | `:root` | `[names, collection_name, prefix]` |
 //! | anything else | `[names, member_name, prefix]` |
 //!
-//! `names` is the prefix `namespace`, `scope as:` and nesting have accumulated; `prefix` is the
-//! route's `as:` or its action, dropped when the action is one of [`CANONICAL`] at a level that
-//! has a resource. That table is the whole feature: nothing here is a rule of thumb about how
-//! Rails spells things.
+//! `names` is what `namespace`, `scope as:` and nesting have accumulated; `prefix` is the route's
+//! `as:` or its action, dropped when the action is one of [`CANONICAL`] at a level with a resource.
+//! That table is the whole feature: nothing here is a rule of thumb about how Rails spells things.
 //!
-//! The reader is checked against **the real router** rather than against fixtures —
-//! `ActionDispatch::Routing::RouteSet` draws each corpus' own routes files and its
-//! `named_routes.names` is compared with this reader's, file by file. What it does not name is
-//! one construct: a path interpolated from a loop variable, where Rails names a helper per
-//! iteration and the text says none of them.
+//! The reader is checked against **the real router**, not fixtures:
+//! `ActionDispatch::Routing::RouteSet` draws real routes files and its `named_routes.names` is
+//! compared with this reader's, file by file. The one construct it does not name is a path
+//! interpolated from a loop variable, where Rails names a helper per iteration and the text names
+//! none.
 //!
-//! # Three things this reads that look like Ruby running and are not
+//! # Three things that look like running Ruby and are read anyway
 //!
-//! - **`if`, `unless` and their `else`.** Both arms are routes written in the file with exact
-//!   names and exact spans; what the condition decides is whether they are *mounted*, which no
-//!   reader of text can know — and which is equally true of the `Rails.env.development?` blocks
-//!   that are live in the environment an editor runs in. Applications routinely put a whole
-//!   front end or a whole engine inside one.
-//! - **A literal array with a block.** `%w[a b].each do |x| … end` is walked **once**: every name
-//!   inside it that is a literal is the same on every pass, and every name that is not declines
-//!   for being interpolated.
-//! - **An unknown call that carries a block.** `constraints`, `defaults`, `authenticate`,
-//!   `devise_scope :super_admin do … end` — every one changes what a route *requires*, never what
-//!   it is called, so the block is walked in the scope it was written in. There is deliberately
-//!   no allowlist: the four Rails ships and the two Devise does would be a list that is wrong for
-//!   the seventh, and the real router does the same thing for the same reason.
+//! - **`if`, `unless` and their `else`.** Both arms are routes written in the file, with exact
+//!   names and spans; the condition only decides whether they are *mounted*, which no text reader
+//!   can know (and which also applies to `Rails.env.development?` blocks live in the editor's
+//!   environment). Applications routinely put a whole front end or engine inside one.
+//! - **A literal array with a block.** `%w[a b].each do |x| … end` is walked **once**: every
+//!   literal name inside it is the same on every pass, and every non-literal one declines as
+//!   interpolated.
+//! - **An unknown call with a block.** `constraints`, `defaults`, `authenticate`,
+//!   `devise_scope :super_admin do … end`: each changes what a route *requires*, never what it is
+//!   called, so the block is walked in the scope it was written in. No allowlist on purpose: a list
+//!   of Rails' four and Devise's two would be wrong for the seventh, and the real router does the
+//!   same for the same reason.
 
 use std::collections::BTreeSet;
 
@@ -60,22 +58,22 @@ const VERBS: [&str; 8] = [
     "get", "post", "put", "patch", "delete", "options", "head", "match",
 ];
 
-/// `Mapper::Resources::CANONICAL_ACTIONS`, and it is a list about *names* rather than actions.
+/// `Mapper::Resources::CANONICAL_ACTIONS`, which is really a list about *names*, not actions.
 ///
-/// An action on this list contributes no word of its own at a level that has a resource, which
-/// is why `resources :stories` names `story_path` and not `show_story_path`. At any other level
-/// the same word is an ordinary prefix: a top-level `get "new"` is `new_path`.
+/// An action on this list adds no word of its own at a level with a resource, which is why
+/// `resources :stories` names `story_path`, not `show_story_path`. At any other level it is an
+/// ordinary prefix: a top-level `get "new"` is `new_path`.
 const CANONICAL: [&str; 6] = ["index", "create", "new", "show", "update", "destroy"];
 
-/// Calls that name a route this reader will not name, and each is a decline with a reason.
+/// Calls that name a route this reader will not name, each declined for a reason.
 ///
-/// `mount` really does install a helper — `mount Sidekiq::Web, at: "/sidekiq"` is
-/// `sidekiq_web_path` — and it is declined because the name comes from **a constant's**, which
-/// is a second inflector over somebody else's class name for the corpus' 23 calls. `direct` and
-/// `resolve` name a helper from a block that only runs. `devise_for` installs about fifteen
-/// whose list depends on which Devise modules the model declares, which is a file this does not
-/// read: it is the largest single miss in the corpus — forem's `sign_up_path` alone is 129 call
-/// sites — and it is a miss rather than a guess.
+/// - `mount` really installs a helper (`mount Sidekiq::Web, at: "/sidekiq"` is `sidekiq_web_path`),
+///   but the name comes from **a constant**, which would need a second inflector over somebody
+///   else's class name.
+/// - `direct` and `resolve` name a helper from a block that only runs.
+/// - `devise_for` installs about fifteen, and which ones depends on the Devise modules the model
+///   declares, in a file this does not read. It is the biggest single miss (`sign_up_path` is
+///   called a lot), and it is a miss rather than a guess.
 const DECLINED: [&str; 5] = [
     "mount",
     "direct",
@@ -94,7 +92,7 @@ enum Level {
     Resources,
     /// Directly inside `resource :session do … end`.
     Resource,
-    /// One resource written inside another's block, and the level `nested` puts it at.
+    /// One resource written inside another's block: the level `nested` puts it at.
     Nested,
     /// `member do … end`, and every route a resource's `:show`, `:edit`, `:update` implies.
     Member,
@@ -107,12 +105,12 @@ enum Level {
 }
 
 impl Level {
-    /// Whether a resource or a `namespace` written here is `nested` — `RESOURCE_SCOPES`.
+    /// Whether a resource or `namespace` written here is `nested` (`RESOURCE_SCOPES`).
     fn nests(self) -> bool {
         matches!(self, Self::Resources | Self::Resource)
     }
 
-    /// Whether [`CANONICAL`] applies here — `RESOURCE_METHOD_SCOPES`.
+    /// Whether [`CANONICAL`] applies here (`RESOURCE_METHOD_SCOPES`).
     fn canonical(self) -> bool {
         matches!(self, Self::Member | Self::Collection | Self::New)
     }
@@ -120,9 +118,9 @@ impl Level {
 
 /// Everything about where a route is written that changes what it is called.
 ///
-/// A value rather than a stack, so that entering a block is `walk(body, &scope.with(…))` and
-/// leaving it is returning: nothing has to be undone, which is the bug `with_scope_level`'s
-/// `ensure` exists to prevent in the original.
+/// A value, not a stack, so entering a block is `walk(body, &scope.with(…))` and leaving it is
+/// returning: nothing needs undoing, which is the bug `with_scope_level`'s `ensure` guards against
+/// in Rails.
 #[derive(Debug, Clone, Default)]
 struct Scope {
     /// `@scope[:as]`: the words `namespace`, `scope as:` and nesting have accumulated.
@@ -137,10 +135,10 @@ struct Scope {
 }
 
 impl Scope {
-    /// `Mapper::Scope#action_name`, joined and cleaned: the name of one route.
+    /// `Mapper::Scope#action_name`, joined and cleaned: one route's name.
     ///
-    /// Empty for a route Rails leaves unnamed, and the two ways that happens are both here: no
-    /// word survives the join, or the first character is not one a method name may start with.
+    /// Empty for a route Rails leaves unnamed, both ways: no word survives the join, or the first
+    /// character cannot start a method name.
     fn named(&self, prefix: Option<&str>) -> String {
         let (collection, member) = match &self.resource {
             Some((collection, member)) => (Some(collection.as_str()), Some(member.as_str())),
@@ -169,8 +167,8 @@ impl Scope {
         }
     }
 
-    /// `nested`: the parent's member name joins the prefix, and this stops being a resource
-    /// scope so that it happens once however deep the nesting goes.
+    /// `nested`: the parent's member name joins the prefix, and this stops being a resource scope,
+    /// so it happens once however deep the nesting goes.
     fn nested(&self) -> Self {
         let Some((_, member)) = self.resource.as_ref().filter(|_| self.level.nests()) else {
             return self.clone();
@@ -197,8 +195,8 @@ impl Scope {
         inner
     }
 
-    /// The scope a member route of a shallow resource is named in: the nesting is dropped and
-    /// the words `namespace` contributed are kept.
+    /// The scope a shallow resource's member route is named in: the nesting is dropped and the
+    /// words `namespace` contributed are kept.
     fn shallowed(&self) -> Self {
         if !self.shallow {
             return self.clone();
@@ -214,7 +212,7 @@ impl Scope {
 struct Helper {
     /// The name without its `_path` / `_url` suffix, which is how Rails holds it too.
     name: String,
-    /// The whole call — `resources :stories, only: [:index]`.
+    /// The whole call: `resources :stories, only: [:index]`.
     at: (u32, u32),
     /// What to select inside it: the symbol, the path, or the `as:`.
     name_at: (u32, u32),
@@ -222,12 +220,11 @@ struct Helper {
     spelled: String,
 }
 
-/// A `draw :admin`, and the prefix the scope it was written in had accumulated.
+/// A `draw :admin`, and the prefix its scope had accumulated.
 ///
-/// The reader cannot open `config/routes/admin.rb` itself — nothing in this directory does I/O —
-/// so it says which file and at which prefix, and the caller reads it. That the prefix travels
-/// is not a nicety: forem draws `config/routes/api.rb` **twice**, once under `scope module: :v1`
-/// and once under `:v0`, and mastodon draws all five of its at the top level.
+/// The reader cannot open `config/routes/admin.rb` (nothing in this directory does I/O), so it says
+/// which file and at which prefix, and the caller reads it. The prefix really must travel: one
+/// application draws `config/routes/api.rb` **twice**, under `scope module: :v1` and under `:v0`.
 #[derive(Debug, Clone)]
 pub struct Draw {
     pub name: String,
@@ -243,30 +240,29 @@ pub struct Routes {
 
 /// Read one routes file, at the prefix the `draw` that reached it had accumulated.
 ///
-/// `prefix` is empty for `config/routes.rb` itself and is the scope's words for a drawn file.
+/// `prefix` is empty for `config/routes.rb` itself, and the scope's words for a drawn file.
 #[must_use]
-/// Whose routes file this is, which is the whole of what makes a `draw` receiver mean anything.
+/// Whose routes file this is: the only thing that makes a `draw` receiver meaningful.
 ///
-/// The application's own file may draw into any route set and every helper it names is one this
+/// The application's own file may draw into any route set, and every helper it names is one this
 /// project's classes call: solidus writes `Spree::Core::Engine.routes.draw` in its own
-/// `core/config/routes.rb` for its own routes, and reading receiver-blind is wrong on
-/// purpose because of it. **A gem's file is the case where the receiver carries information.**
-/// Four of the seven engines that ship a routes file open with `Rails.application.routes.draw`,
-/// so their helpers land on the host application's controllers exactly as if the application had
-/// written them; blazer, pghero and mission_control-jobs draw into their own `Engine.routes`,
-/// and those helpers are reached as `blazer.queries_path` after a `mount` — a spelling this
-/// crate does not read and which zero of six applications use.
+/// `core/config/routes.rb` for its own routes, so reading receiver-blind is right there. **A gem's
+/// file is where the receiver carries information.** Some engines open with
+/// `Rails.application.routes.draw`, so their helpers land on the host application's controllers as
+/// if the application wrote them; others (blazer, pghero, mission_control-jobs) draw into their own
+/// `Engine.routes`, and those helpers are reached as `blazer.queries_path` after a `mount`, a
+/// spelling this crate does not read.
 ///
 /// So the discriminator is receiver **and** location, not receiver alone, which is why this is a
-/// parameter rather than a rule inside the reader.
+/// parameter, not a rule inside the reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Whose {
-    /// The workspace's own routes file. Any `.routes.draw` receiver, and no wrapper at all is
-    /// fine too — a file reached by `draw :admin` is its body directly.
+    /// The workspace's own routes file. Any `.routes.draw` receiver is fine, and so is no wrapper
+    /// at all: a file reached by `draw :admin` is its body directly.
     Own,
-    /// A gem's. Only `Rails.application.routes.draw` reaches the host application, and anything
-    /// else — including a file with no wrapper — declares **nothing** rather than falling
-    /// through to the top-level statements.
+    /// A gem's. Only `Rails.application.routes.draw` reaches the host application; anything else,
+    /// including a file with no wrapper, declares **nothing** instead of falling through to the
+    /// top-level statements.
     Gem,
 }
 
@@ -283,15 +279,15 @@ pub fn read_routes(source: &str, prefix: &[String], whose: Whose) -> Routes {
         shallow_names: prefix.to_vec(),
         ..Scope::default()
     };
-    // `Rails.application.routes.draw do … end` wraps the whole file, and an engine's spelling —
-    // `Spree::Core::Engine.routes.draw do` — is the same call on a different receiver. A drawn
-    // file has no wrapper at all and its statements are the body directly, which is why the
-    // wrapper is looked for rather than required.
+    // `Rails.application.routes.draw do … end` wraps the whole file, and an engine's
+    // `Spree::Core::Engine.routes.draw do` is the same call on another receiver. A drawn file has
+    // no wrapper and its statements are the body directly, which is why the wrapper is looked for,
+    // not required.
     //
-    // For a gem it is required *and* its receiver is read, and the fall-through is deliberately
-    // not taken: `Reader::call` walks an unknown call's block transparently, so falling back to
-    // the top-level statements would read `Blazer::Engine.routes.draw`'s body as though it were
-    // the application's. `None` walks nothing.
+    // For a gem it is required *and* its receiver is read, and the fall-through is deliberately not
+    // taken: `Reader::call` walks an unknown call's block transparently, so falling back to the
+    // top-level statements would read `Blazer::Engine.routes.draw`'s body as the application's.
+    // `None` walks nothing.
     let statements = parsed
         .node()
         .as_program_node()
@@ -316,32 +312,30 @@ pub fn read_routes(source: &str, prefix: &[String], whose: Whose) -> Routes {
 
 /// Whether the route helpers are `include`d into this class or module.
 ///
-/// Three rules and each covers what the others cannot. The framework's two base classes are
-/// exact, because they are the hook Rails itself hangs on. The `Controller` suffix is what
-/// reaches an application whose base is a **gem's** class — every application built on solidus
-/// or spree, which is `Spree::StoreController < ActionController::Base` inside a gem this
-/// application only depends on — and it is the same suffix rule a `Mailer` gets.
-/// And a mailer is [`convention_of`]'s already, asked here so that the two cannot disagree about
-/// what a mailer is.
+/// Three rules, each covering what the others cannot:
 ///
-/// A **module** is a host when its name ends `Helper`, which is Rails' own convention for
-/// `app/helpers` and the only thing about a helper module that a name can see. The path would be
-/// a better test and is not available: a generated document is keyed by the source file, but
-/// which file a *class* was defined in is not something the pass records, and recording it for
-/// one suffix would be a projection of the graph for a rule the corpus does not stress —
-/// **45 call sites in six applications** are inside a helper module, against 868 in a controller.
+/// 1. The framework's two base classes match exactly, because they are the hook Rails itself uses.
+/// 2. The `Controller` suffix reaches an application whose base is a **gem's** class (every
+///    application on solidus or spree: `Spree::StoreController < ActionController::Base` lives in a
+///    gem), the same suffix rule a `Mailer` gets.
+/// 3. A mailer is [`convention_of`]'s already, asked here so the two cannot disagree about what a
+///    mailer is.
 ///
-/// **A name that is not a constant path is not a host, and that clause is not defensive.** The
-/// name here is the one rubydex holds, and for an anonymous class — `Class.new(ApplicationController)`,
-/// which forem writes in its specs — that is `1640350138339398774:1364<anonymous>`. Three of them
-/// reached this in forem, `class` + that is not RBS, and
-/// [`Synthesized::record`](crate::analysis::synthesized::Synthesized::record)'s parse gate then
-/// threw away **the whole document** — which is the one carrying every `include`, so the feature
-/// was silently reduced to the name rung across the entire application. It is also right on its
-/// own terms: an anonymous class has no name to reopen, so a declaration on it could never reach
-/// anything. The test itself is [`generated::is_constant_path`](crate::generated::is_constant_path)
-/// rather than a copy of it here, because the same shape is reachable a second time from a
-/// different generator and one rule found twice is one rule.
+/// A **module** is a host when its name ends `Helper`, Rails' convention for `app/helpers` and the
+/// only thing a name can show about a helper module. The path would be a better test but is not
+/// available: the pass does not record which file a *class* was defined in, and recording it for
+/// one suffix is not worth it, since far fewer helper calls happen inside helper modules than in
+/// controllers.
+///
+/// **A name that is not a constant path is not a host, and this is not defensive.** The name is the
+/// one rubydex holds, and for an anonymous class (`Class.new(ApplicationController)` in specs) that
+/// is `1640350138339398774:1364<anonymous>`. `class` + that is not RBS, so
+/// [`Synthesized::record`](crate::analysis::synthesized::Synthesized::record)'s parse gate would
+/// throw away **the whole document**, the one carrying every `include`, silently dropping the
+/// feature to the name rung across the whole application. It is also right on its own terms: an
+/// anonymous class has no name to reopen. The test is
+/// [`generated::is_constant_path`](crate::generated::is_constant_path), not a copy, because another
+/// generator can reach the same shape, and one rule should live in one place.
 #[must_use]
 pub fn hosts_routes(name: &str, superclass: Option<&str>, mixins: &[String], module: bool) -> bool {
     if !crate::generated::is_constant_path(name) {
@@ -362,11 +356,10 @@ pub fn hosts_routes(name: &str, superclass: Option<&str>, mixins: &[String], mod
 /// Every class and module the route helpers are `include`d into, as one generated document.
 ///
 /// Rails installs them with an `inherited` hook on `ActionController::Base` and
-/// `ActionMailer::Base`, so **every** controller and mailer really does get its own copy — which
-/// is why this writes one `include` per host rather than one on a base and a hope that the base
-/// is the application's. An application whose controllers descend from a gem's class, which is
-/// every application built on solidus or spree, has no base this pass defines — and writing
-/// every host bounds that gap at zero.
+/// `ActionMailer::Base`, so **every** controller and mailer really gets its own copy. That is why
+/// this writes one `include` per host instead of one on a base, hoping the base is the
+/// application's: an application whose controllers descend from a gem's class has no base this pass
+/// defines, and writing every host closes that gap.
 #[must_use]
 pub fn mixins(hosts: &BTreeSet<Owner>) -> Facts {
     let mut facts = Facts::default();
@@ -384,11 +377,11 @@ impl Routes {
 
     /// Every helper this file names, so the caller can decide which file writes which.
     ///
-    /// Two routes files naming one helper is ordinary — an engine and its host application, or
-    /// the same name in `config/routes.rb` and a drawn file — and the two declarations would land
-    /// in two *different* generated documents, where [`Facts`]' precedence cannot see them and
-    /// RBS would hold them as an overload set. The caller resolves it the way a shared relation
-    /// class is resolved: first in URI order writes it.
+    /// Two routes files naming one helper is ordinary (an engine and its host, or
+    /// `config/routes.rb` and a drawn file), and the two declarations would land in *different*
+    /// generated documents, where [`Facts`]' precedence cannot see them and RBS would read an
+    /// overload set. The caller resolves it like a shared relation class: first in URI order writes
+    /// it.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.helpers.iter().map(|helper| helper.name.as_str())
     }
@@ -429,21 +422,20 @@ impl Routes {
 /// The receiver of the only `draw` in a gem that reaches the host application.
 ///
 /// `constant_spelling` drops a leading `::`, so `::Rails.application.routes.draw` counts; a
-/// receiver split across lines does not, and declining is the safe direction — a helper not
-/// offered, rather than one invented on every controller in the project.
+/// receiver split across lines does not, and declining is the safe direction: a helper not offered,
+/// instead of one invented on every controller in the project.
 const APPLICATION_ROUTES: &str = "Rails.application.routes";
 
 /// The `… .routes.draw do` this file opens with, wherever in the program it is.
 ///
-/// **Not simply a statement of the program**, and the corpus is emphatic about why: both
-/// `activestorage` and `turbo-rails` end their routes file `end if ActiveStorage.draw_routes`, a
-/// modifier `if`, so the wrapper is an `IfNode`'s body. That is two of the four engines which
-/// draw into the application and **ten of the twenty-one helpers** they name between them —
-/// including every one of activestorage's, which is where the corpus' single call site is.
+/// **Not necessarily a top-level statement**: both `activestorage` and `turbo-rails` end their
+/// routes file with `end if ActiveStorage.draw_routes`, a modifier `if`, so the wrapper is an
+/// `IfNode`'s body, and those engines name many of the app-level engine helpers. A flat scan of the
+/// program's statements would miss them.
 ///
-/// It was a latent defect on the workspace side too, not a new rule for gems: [`Reader::walk`]
-/// skips a call that has a receiver, so falling back to the top-level statements never found a
-/// wrapped `draw` either. Descending here fixes both at once.
+/// This matters on the workspace side too: [`Reader::walk`] skips calls with a receiver, so falling
+/// back to the top-level statements would never find a wrapped `draw` either. Descending here
+/// handles both.
 fn wrapper<'pr>(statements: &StatementsNode<'pr>) -> Option<CallNode<'pr>> {
     statements.body().iter().find_map(|statement| {
         if let Some(call) = statement.as_call_node() {
@@ -464,7 +456,7 @@ fn wrapper<'pr>(statements: &StatementsNode<'pr>) -> Option<CallNode<'pr>> {
 struct Reader<'src, 'pr> {
     source: &'src str,
     /// Every name already taken, because `has_named_route?` means the **first** route to claim a
-    /// name keeps it and every later one is silently unnamed.
+    /// name keeps it, and every later one is silently unnamed.
     named: BTreeSet<String>,
     routes: Routes,
     /// `concern :commentable do … end`, kept until a `concerns:` asks for it.
@@ -474,9 +466,9 @@ struct Reader<'src, 'pr> {
 impl<'pr> Reader<'_, 'pr> {
     /// One body of the DSL, and every statement of it that can hold a route.
     ///
-    /// `None` is a body that is not there — a `do … end` this call does not have, an `else` with
-    /// nothing in it — and is the ordinary case rather than a failure, which is why it is an
-    /// argument here instead of a test at every call site.
+    /// `None` is a missing body (a `do … end` the call does not have, an empty `else`): the
+    /// ordinary case, not a failure, which is why it is an argument here instead of a check at
+    /// every call site.
     fn walk(
         &mut self,
         statements: Option<&StatementsNode<'pr>>,
@@ -490,9 +482,9 @@ impl<'pr> Reader<'_, 'pr> {
             if let Some(call) = statement.as_call_node() {
                 match call.receiver() {
                     None => self.call(call, scope, hosts),
-                    // A literal list iterated with a block, walked **once**. Every name inside
-                    // it that is a literal is the same on every pass, and every name that is
-                    // interpolated from the block's parameter declines for not being one.
+                    // A literal list iterated with a block, walked **once**. Every literal name
+                    // inside it is the same on every pass, and every name interpolated from the
+                    // block's parameter declines.
                     Some(receiver) if receiver.as_array_node().is_some() => {
                         self.walk(block_body(&call).as_ref(), scope, hosts);
                     }
@@ -523,8 +515,8 @@ impl<'pr> Reader<'_, 'pr> {
         let Some(otherwise) = otherwise else {
             return;
         };
-        // `elsif` is an `IfNode` of its own and `else` is an `ElseNode`; both hold statements and
-        // this reader wants them on the same terms.
+        // `elsif` is its own `IfNode` and `else` an `ElseNode`; both hold statements, and this
+        // reader wants them on the same terms.
         self.walk(
             otherwise
                 .as_else_node()
@@ -563,8 +555,8 @@ impl<'pr> Reader<'_, 'pr> {
                 hosts,
             ),
             "with_options" => {
-                // The body is taken before the node moves onto the stack; it borrows the parse
-                // and not the node, so it outlives the move.
+                // The body is taken before the node moves onto the stack; it borrows the parse, not
+                // the node, so it outlives the move.
                 let body = block_body(&node);
                 hosts.push(node);
                 self.walk(body.as_ref(), scope, hosts);
@@ -590,9 +582,9 @@ impl<'pr> Reader<'_, 'pr> {
             }
             _ if VERBS.contains(&name.as_str()) => self.verb(&node, scope, hosts),
             _ if DECLINED.contains(&name.as_str()) => {}
-            // Everything else with a block is a wrapper until proven otherwise, which is the
-            // rule the real router follows for the same reason: an unknown call that yields is
-            // changing what a route requires, not what it is called.
+            // Anything else with a block is a wrapper until proven otherwise, the rule the real
+            // router follows for the same reason: an unknown call that yields changes what a route
+            // requires, not what it is called.
             _ => self.block(&node, scope, hosts),
         }
     }
@@ -614,11 +606,11 @@ impl<'pr> Reader<'_, 'pr> {
             return;
         };
         let (spelled, at) = self.spelling(node, &arguments);
-        // One call may name several — `resources :photos, :videos` — and Rails re-enters itself
-        // once per name, so each gets the same options and its own span.
+        // One call may name several (`resources :photos, :videos`), and Rails re-enters itself once
+        // per name, so each gets the same options and its own span.
         for (given, name_at) in self.symbols(&arguments) {
-            // `Resource#name` is `@as || @name`: `as:` replaces the word rather than decorating
-            // it, so `resources :mails, as: "mod_mails"` is a resource called `mod_mails`.
+            // `Resource#name` is `@as || @name`: `as:` replaces the word instead of decorating it,
+            // so `resources :mails, as: "mod_mails"` is a resource called `mod_mails`.
             let named = self
                 .inherited_text(node, hosts, "as")
                 .map_or(given, |(as_, _)| as_);
@@ -662,8 +654,8 @@ impl<'pr> Reader<'_, 'pr> {
             {
                 say(&shallowed.at(Level::Member), None);
             }
-            // `new` is a level of its own and is never shallow — which is why a shallow nested
-            // resource still names `new_option_type_option_value_path`.
+            // `new` is a level of its own and never shallow, which is why a shallow nested resource
+            // still names `new_option_type_option_value_path`.
             if actions.contains(&"new") {
                 say(&here.at(Level::New), None);
             }
@@ -697,10 +689,10 @@ impl<'pr> Reader<'_, 'pr> {
 
     /// `namespace :admin do … end`.
     ///
-    /// `Resources#namespace` is `nested { super }` inside a resource scope, which is the one
-    /// ordering rule that is easy to get backwards: `resources :accounts do namespace :whatsapp`
-    /// names `account_whatsapp_calls`, because the parent's member name joins the prefix
-    /// **before** the namespace's own word.
+    /// `Resources#namespace` is `nested { super }` inside a resource scope: the one ordering rule
+    /// that is easy to get backwards. `resources :accounts do namespace :whatsapp` names
+    /// `account_whatsapp_calls`, because the parent's member name joins the prefix **before** the
+    /// namespace's own word.
     fn namespace(&mut self, node: &CallNode<'pr>, scope: &Scope, hosts: &mut Vec<CallNode<'pr>>) {
         let Some((given, _)) = first_symbol_or_string(self.source, node) else {
             return;
@@ -713,9 +705,9 @@ impl<'pr> Reader<'_, 'pr> {
 
     /// `scope module: :admin do … end`, which changes a name only when it says `as:`.
     ///
-    /// Unlike `namespace` this never nests: Rails' `scope` is `@scope.new(…)` with no
-    /// `with_scope_level`, so a `resources` written inside one is still directly inside whatever
-    /// resource the `scope` is in and nests there instead.
+    /// Unlike `namespace`, this never nests: Rails' `scope` is `@scope.new(…)` without
+    /// `with_scope_level`, so a `resources` inside one is still directly inside whatever resource
+    /// the `scope` is in, and nests there.
     fn scoped(&mut self, node: &CallNode<'pr>, scope: &Scope, hosts: &mut Vec<CallNode<'pr>>) {
         let mut inner = match self.inherited_text(node, hosts, "as") {
             Some((named, _)) => scope.prefixed(&named),
@@ -740,11 +732,11 @@ impl<'pr> Reader<'_, 'pr> {
         self.expand(&wanted, scope, hosts);
     }
 
-    /// `root to: "home#index"`, whose name is `root` unless it says otherwise.
+    /// `root to: "home#index"`, named `root` unless it says otherwise.
     ///
     /// It really can say otherwise: `root` is `match "/", as: :root, via: :get, **options`, and
-    /// because the caller's options come last a `root to: …, as: "categories_index"` overrides
-    /// the word outright. discourse writes six of them.
+    /// since the caller's options come last, `root to: …, as: "categories_index"` overrides the
+    /// word outright. Real applications do this.
     fn root(&mut self, node: &CallNode<'pr>, scope: &Scope, hosts: &mut Vec<CallNode<'pr>>) {
         let Some(arguments) = node.arguments() else {
             return;
@@ -767,8 +759,8 @@ impl<'pr> Reader<'_, 'pr> {
             return;
         };
         let (spelled, at) = self.spelling(node, &arguments);
-        // `decomposed_match`: a route written directly inside a resource's block and given no
-        // `on:` is nested for a collection resource and a member route for a singular one.
+        // `decomposed_match`: a route written directly inside a resource's block without `on:` is
+        // nested for a collection resource and a member route for a singular one.
         let on = self.inherited_text(node, hosts, "on");
         let here = match on.as_ref().map(|(word, _)| word.as_str()) {
             Some("member") => scope.at(Level::Member),
@@ -785,9 +777,9 @@ impl<'pr> Reader<'_, 'pr> {
             return;
         }
         let Some((action, name_at)) = self.action(&arguments) else {
-            // A path Rails cannot turn into an action still names a route — but only outside a
+            // A path Rails cannot turn into an action still names a route, but only outside a
             // resource scope, where `name_for_action` returns `nil` outright. `namespace :mod`
-            // with a `get "notes(/:period)"` in it is how a bare `mod_path` comes to exist.
+            // holding a `get "notes(/:period)"` is how a bare `mod_path` comes to exist.
             if here.resource.is_none() {
                 self.declare(here.named(None), at, at, &spelled);
             }
@@ -800,12 +792,12 @@ impl<'pr> Reader<'_, 'pr> {
 
     /// The word a verb's path or symbol contributes, by `Mapper.normalize_name`.
     ///
-    /// `None` for everything Rails also refuses: no literal argument at all, an interpolated
-    /// path, and a path holding a dynamic segment, a format or an optional group.
+    /// `None` for everything Rails also refuses: no literal argument, an interpolated path, and a
+    /// path with a dynamic segment, a format or an optional group.
     fn action(&mut self, arguments: &ArgumentsNode<'pr>) -> Option<(String, (u32, u32))> {
         let first = arguments.arguments().iter().next()?;
         // `get :upvote` names the action outright; a path is normalized; `get "x" => "y#z"` puts
-        // the path in the first *string* key of the trailing hash, which is `match`'s own rule.
+        // the path in the trailing hash's first *string* key, which is `match`'s own rule.
         let (raw, at) = match symbol_or_string(self.source, &first) {
             Some(found) if first.as_symbol_node().is_some() => return Some(found),
             Some(found) => found,
@@ -860,10 +852,10 @@ impl<'pr> Reader<'_, 'pr> {
 
     /// Walk the concern bodies `wanted` names, in the scope that asked for them.
     ///
-    /// The list is taken out of the reader for the duration, which Prism forces — a
-    /// `StatementsNode` does not clone, so a body cannot be held while `self` is borrowed to
-    /// walk it — and which bounds the recursion for free: a concern that uses `concerns` sees
-    /// an empty list, so `concern :a` written in terms of itself walks once instead of forever.
+    /// The list is taken out of the reader for the duration, which Prism forces (a `StatementsNode`
+    /// does not clone, so a body cannot be held while `self` is borrowed to walk it), and which
+    /// bounds the recursion for free: a concern using `concerns` sees an empty list, so a
+    /// self-referencing `concern :a` walks once instead of forever.
     fn expand(&mut self, wanted: &[String], scope: &Scope, hosts: &mut Vec<CallNode<'pr>>) {
         if wanted.is_empty() || self.concerns.is_empty() {
             return;
@@ -906,9 +898,9 @@ impl<'pr> Reader<'_, 'pr> {
 
     /// The value a call passes for `name`, or the innermost `with_options` around it that does.
     ///
-    /// The same rule the model macros follow, and it is load-bearing here for the
-    /// same reason: mastodon writes `with_options only: [:index], concerns: :batch do` around
-    /// three resources, and without the merge each of them declares four helpers Rails does not.
+    /// The same rule as the model macros, and just as necessary:
+    /// `with_options only: [:index], concerns: :batch do` around three resources would otherwise
+    /// make each declare four helpers Rails does not.
     fn inherited(
         &self,
         node: &CallNode<'pr>,
@@ -930,10 +922,10 @@ impl<'pr> Reader<'_, 'pr> {
 
     /// A call's own line, and how it should be quoted back to a reader.
     ///
-    /// The span is the call's start to its **arguments'** end, which is `syntax::header` minus
-    /// its two `Option`s: a call this reader reached is receiverless and named, so its own
-    /// location starts where its message does, and the caller has already established that it
-    /// has arguments. Stopping at the arguments is what keeps a `do … end` out of the target.
+    /// The span runs from the call's start to its **arguments'** end: `syntax::header` without its
+    /// two `Option`s. A call this reader reached is receiverless and named, so its location starts
+    /// at its message, and the caller already checked it has arguments. Stopping at the arguments
+    /// keeps a `do … end` out of the target.
     fn spelling(
         &self,
         node: &CallNode<'pr>,
@@ -983,9 +975,9 @@ fn block_body<'pr>(node: &CallNode<'pr>) -> Option<StatementsNode<'pr>> {
 
 /// `Mapper.normalize_name`: squeeze the slashes, drop the trailing one, then join with `_`.
 ///
-/// `None` for a path Rails would refuse to turn into an action — anything holding a character
-/// that is not a word character, a dash or a slash, which is every dynamic segment (`:id`),
-/// every optional group (`(/:page)`) and every format (`.json`).
+/// `None` for a path Rails would refuse to turn into an action: anything holding a character other
+/// than a word character, dash or slash, which covers every dynamic segment (`:id`), optional group
+/// (`(/:page)`) and format (`.json`).
 fn normalize_name(path: &str) -> Option<String> {
     if path.is_empty()
         || !path
@@ -1015,9 +1007,8 @@ mod tests {
     ///
     /// The expected list below is **the real router's**: this exact text was drawn by
     /// `ActionDispatch::Routing::RouteSet` and its `named_routes.names` written out, so the
-    /// assertion is not a reading of Rails but Rails' own answer. The two names it does not hold
-    /// — `pages_one` and `pages_two` — are the one thing that separates them, and they are
-    /// interpolated from the block's parameter.
+    /// assertion is Rails' own answer, not a reading of Rails. The only two names it has that this
+    /// reader lacks, `pages_one` and `pages_two`, are interpolated from the block's parameter.
     const FIXTURE: &str = r##"root to: "home#index"
 get "about", to: "pages#about"
 get "top(/:length)" => "home#top", :as => "top"
@@ -1091,12 +1082,12 @@ mount Sidekiq::Web, at: "/sidekiq"
             [
                 // A path that is a word, and `root`, which is one by another name.
                 "about",
-                // `scope as:` prefixes, and `series` is its own plural so its collection takes
-                // `_index` — Rails' rule, and why `collection_name` is not just the word.
+                // `scope as:` prefixes, and `series` is its own plural, so its collection takes
+                // `_index` (Rails' rule, and why `collection_name` is not just the word).
                 "beta_flags",
                 "beta_series_index",
-                // A shallow nested resource: the member routes lose the nesting and `new` keeps
-                // it, because `new` is a level of its own and `member` is what goes shallow.
+                // A shallow nested resource: the member routes lose the nesting and `new` keeps it,
+                // because `new` is its own level and `member` is what goes shallow.
                 "edit_option_type",
                 "edit_option_value",
                 // `resources :stories, except: [:index]` declares three of the seven.
@@ -1106,8 +1097,8 @@ mount Sidekiq::Web, at: "/sidekiq"
                 // An `if` both arms of which are routes, and an unknown block that is a wrapper.
                 "letter_opener",
                 "logout",
-                // A path Rails cannot name, inside a `namespace`: the scope's own word is the
-                // whole candidate, and only the first such route in a scope gets it.
+                // A path Rails cannot name, inside a `namespace`: the scope's own word is the whole
+                // candidate, and only the first such route in a scope gets it.
                 "mod",
                 // `as:` replaces a resource's word rather than decorating it.
                 "mod_mod_mails",
@@ -1124,14 +1115,14 @@ mount Sidekiq::Web, at: "/sidekiq"
                 "recent_stories",
                 "root",
                 "session",
-                // A literal array with a block, walked once: the interpolated path declines and
-                // the literal one is named.
+                // A literal array with a block, walked once: the interpolated path declines and the
+                // literal one is named.
                 "static",
                 // The collection route `recent` hangs off, from the nested `resources`.
                 "stories",
                 "story",
-                // Two resources nested in one, and a `namespace` inside a resource block —
-                // where the parent's member name joins the prefix *before* the namespace's word.
+                // Two resources nested in one, and a `namespace` inside a resource block, where the
+                // parent's member name joins the prefix *before* the namespace's word.
                 "story_admin_notes",
                 "story_comment",
                 "story_comments",
@@ -1143,8 +1134,8 @@ mount Sidekiq::Web, at: "/sidekiq"
         );
     }
 
-    /// `only:` and `except:` decide which of the seven exist, and both are read from a
-    /// `with_options` around the call as well as from the call.
+    /// `only:` and `except:` decide which of the seven exist, read from a surrounding
+    /// `with_options` as well as from the call.
     #[test]
     fn which_actions_a_resource_declares() {
         assert_eq!(named("resources :as, only: [:index]\n"), ["as"]);
@@ -1163,8 +1154,8 @@ mount Sidekiq::Web, at: "/sidekiq"
             named("with_options only: [:index] do\n  resources :as, only: [:new]\nend\n"),
             ["new_a"]
         );
-        // A word that is its own plural takes `_index` for its collection, so that the two
-        // routes of `resources :series` are not one name.
+        // A word that is its own plural takes `_index` for its collection, so the two routes of
+        // `resources :series` do not share one name.
         assert_eq!(
             named("resources :series\n"),
             ["edit_series", "new_series", "series", "series_index"]
@@ -1201,8 +1192,8 @@ mount Sidekiq::Web, at: "/sidekiq"
             named("scope module: :admin, path: \"x\" do\n  resources :as, only: [:index]\nend\n"),
             ["as"]
         );
-        // `namespace` nests first and prefixes second; a plain `scope` never nests at all, so
-        // the resource inside it nests itself and the parent's word lands after the scope's.
+        // `namespace` nests first and prefixes second; a plain `scope` never nests, so the resource
+        // inside it nests itself and the parent's word lands after the scope's.
         assert_eq!(
             named(
                 "resources :as, only: [] do\n  namespace :x do\n    resources :bs, only: [:index]\n  end\nend\n"
@@ -1224,7 +1215,7 @@ mount Sidekiq::Web, at: "/sidekiq"
         assert_eq!(named("get \"/a/b\" => \"p#a\"\n"), ["a_b"]);
         assert_eq!(named("get \"a-b\", to: \"p#a\"\n"), ["a_b"]);
         assert_eq!(named("match \"x\", to: \"p#a\", via: :all\n"), ["x"]);
-        // A canonical action names nothing of its own at a level that has a resource, and is an
+        // A canonical action names nothing of its own at a level with a resource, and is an
         // ordinary word anywhere else.
         assert_eq!(
             named(
@@ -1232,24 +1223,24 @@ mount Sidekiq::Web, at: "/sidekiq"
             ),
             ["a", "new_a"]
         );
-        // `on: :collection` is the third level a route can be moved to, and its join puts the
-        // collection name last where `:member` puts the member name.
+        // `on: :collection` is the third level a route can move to, and its join puts the
+        // collection name last, where `:member` puts the member name.
         assert_eq!(
             named("resources :as, only: [] do\n  get :recent, on: :collection\nend\n"),
             ["recent_as"]
         );
         assert_eq!(named("get \"show\", to: \"p#a\"\n"), ["show"]);
-        // A route written directly in a `resources` block with no `on:` is *nested*: the
-        // parent's member name joins the prefix and the action follows it, which is the one
-        // level whose join puts the action last.
+        // A route written directly in a `resources` block with no `on:` is *nested*: the parent's
+        // member name joins the prefix and the action follows, the one level whose join puts the
+        // action last.
         assert_eq!(
             named(
                 "resources :as, only: [] do\n  get \"preview\", to: \"p#a\"\n  resource :cover, only: [:show]\nend\n"
             ),
             ["a_cover", "a_preview"]
         );
-        // A path with a dynamic segment, an optional group or a format names nothing — unless
-        // an enclosing scope has a word of its own to give it.
+        // A path with a dynamic segment, an optional group or a format names nothing, unless an
+        // enclosing scope has a word of its own to give it.
         assert_eq!(named("get \"a/:id\", to: \"p#a\"\n"), Vec::<String>::new());
         assert_eq!(
             named("get \"a(/:id)\", to: \"p#a\"\n"),
@@ -1272,13 +1263,13 @@ mount Sidekiq::Web, at: "/sidekiq"
         assert_eq!(named("match \"x\" => \"p#a\", via: :all\n"), ["x"]);
     }
 
-    /// The three level blocks say what `on:` says, and the reader has to agree with itself.
+    /// The three level blocks say what `on:` says, and the reader must agree with itself.
     ///
-    /// `member do … end`, `collection do … end` and `new do … end` set the same scope level that
-    /// `on: :member`, `on: :collection` and `on: :new` set on one route, so each pair has to name
-    /// its helper identically. Rails writes both spellings — the block for a run of routes, `on:`
-    /// for a single one — and a reader that drifted between them would answer one and not the
-    /// other on the same application.
+    /// `member do … end`, `collection do … end` and `new do … end` set the same scope level as
+    /// `on: :member`, `on: :collection` and `on: :new` on one route, so each pair must name its
+    /// helper identically. Rails code uses both spellings (the block for a run of routes, `on:` for
+    /// one), and a reader drifting between them would answer one and not the other in the same
+    /// application.
     #[test]
     fn a_level_block_names_what_the_same_level_on_a_route_names() {
         for (block, inline) in [
@@ -1297,16 +1288,16 @@ mount Sidekiq::Web, at: "/sidekiq"
         ] {
             assert_eq!(named(block), named(inline), "{block:?}");
         }
-        // And the names themselves, so the pair agreeing is not the two of them agreeing on
-        // nothing: `new`'s join is the one that puts a word between the prefix and the member.
+        // And the names themselves, so the pair is not agreeing on nothing: `new`'s join is the one
+        // that puts a word between the prefix and the member.
         assert_eq!(
             named("resources :as, only: [] do\n  new do\n    get :preview\n  end\nend\n"),
             ["preview_new_a"]
         );
     }
 
-    /// The first route to claim a name keeps it — `has_named_route?` — and this is what makes a
-    /// file read twice produce the same document both times.
+    /// The first route to claim a name keeps it (`has_named_route?`), which makes a file read twice
+    /// produce the same document both times.
     #[test]
     fn the_first_route_to_claim_a_name_keeps_it() {
         assert_eq!(
@@ -1404,11 +1395,10 @@ namespace :x do\n  concerns :searchable\nend\n";
     /// A `draw` says which file and at which prefix, and reads nothing itself.
     #[test]
     fn only_a_gems_draw_into_the_application_declares_anything() {
-        // A gem engine's own routes file, and the whole rule is the receiver — but *only* in a gem.
-        // Four of the seven engines that ship a routes file open with
-        // `Rails.application.routes.draw` and their helpers really are the host application's;
-        // blazer, pghero and mission_control-jobs draw into their own `Engine.routes` and theirs
-        // are reached as `blazer.queries_path` after a `mount`.
+        // A gem engine's own routes file, where the whole rule is the receiver, but *only* in a
+        // gem. Engines that open with `Rails.application.routes.draw` name helpers that really are
+        // the host application's; blazer, pghero and mission_control-jobs draw into their own
+        // `Engine.routes`, whose helpers are reached as `blazer.queries_path` after a `mount`.
         let names = |source: &str, whose| {
             let mut found: Vec<String> = read_routes(source, &[], whose)
                 .names()
@@ -1424,13 +1414,13 @@ namespace :x do\n  concerns :searchable\nend\n";
         assert_eq!(names(application, Whose::Gem), vec!["blob".to_owned()]);
         assert!(names(engine, Whose::Gem).is_empty(), "an engine's own set");
 
-        // The regression this rule could most easily cause, and the reason `Whose` is a
-        // parameter rather than a check inside the reader: solidus writes exactly the declined
-        // spelling in its **own** `core/config/routes.rb`, for its own routes.
+        // The regression this rule could most easily cause, and why `Whose` is a parameter, not a
+        // check inside the reader: solidus writes exactly the declined spelling in its **own**
+        // `core/config/routes.rb`, for its own routes.
         assert_eq!(names(engine, Whose::Own), vec!["query".to_owned()]);
 
-        // A gem file with no wrapper at all declares nothing rather than falling through to the
-        // top-level statements — which `Reader::call` would otherwise walk transparently.
+        // A gem file with no wrapper declares nothing instead of falling through to the top-level
+        // statements, which `Reader::call` would otherwise walk transparently.
         assert!(names("resources :blobs\n", Whose::Gem).is_empty());
         assert_eq!(
             names("resources :blobs\n", Whose::Own),
@@ -1450,12 +1440,11 @@ namespace :x do\n  concerns :searchable\nend\n";
             "a `draw` with no block is not a wrapper"
         );
 
-        // The shape that made this differential worth running: activestorage and turbo-rails
-        // both end `end if ActiveStorage.draw_routes`, so the wrapper is inside a modifier `if`
-        // and a flat scan of the program's statements finds nothing at all. Ten of the
-        // twenty-one helpers the app-set engines name were lost to it, in **both** directions —
-        // `Reader::walk` skips a call with a receiver, so the workspace fall-through missed it
-        // too.
+        // The shape that makes this necessary: activestorage and turbo-rails both end with
+        // `end if ActiveStorage.draw_routes`, so the wrapper is inside a modifier `if` and a flat
+        // scan of the program's statements finds nothing. That would lose their helpers in **both**
+        // directions: `Reader::walk` skips a call with a receiver, so the workspace fall-through
+        // would miss it too.
         let guarded =
             "Rails.application.routes.draw do\n  root to: \"x#y\"\nend if Turbo.draw_routes\n";
         assert_eq!(names(guarded, Whose::Gem), vec!["root".to_owned()]);
@@ -1666,8 +1655,8 @@ namespace :x do\n  concerns :searchable\nend\n";
                 false,
             ),
             ("Api::BaseController", Some("ActionController::API"), false),
-            // The framework's own base classes are an exact match and not the suffix, which is
-            // what reaches a class that subclasses one without being named for it.
+            // The framework's own base classes match exactly, not by suffix, which reaches a class
+            // that subclasses one without being named for it.
             ("Health", Some("ActionController::Base"), false),
             ("Api::V1::Legacy_Controller", None, false),
             ("UserMailer", Some("ApplicationMailer"), false),
@@ -1680,8 +1669,8 @@ namespace :x do\n  concerns :searchable\nend\n";
             ("PlainModule", None, true),
             // A job is not a host: Rails installs the helpers on controllers and mailers.
             ("ImportJob", Some("ApplicationJob"), false),
-            // And the name rubydex holds for an anonymous class is not a constant at all, which
-            // is the clause that keeps `class …<anonymous>` out of the generated RBS.
+            // And the name rubydex holds for an anonymous class is not a constant at all: the
+            // clause that keeps `class …<anonymous>` out of the generated RBS.
             (
                 "1640350138339398774:1364<anonymous>",
                 Some("ActionController::Base"),
@@ -1718,11 +1707,11 @@ namespace :x do\n  concerns :searchable\nend\n";
 
     #[test]
     fn an_engines_routes_reach_the_applications_controllers_only_when_they_draw_into_it() {
-        // The routes reader, over a gem's own `config/routes.rb`. `activestorage` writes
-        // `Rails.application.routes.draw` and its `rails_direct_uploads_path` really is a method
-        // on this application's controllers; `blazer` writes `Blazer::Engine.routes.draw` and
-        // its helpers are reached as `blazer.queries_path` after a `mount`, which is a spelling
-        // this crate does not read and which zero of six applications use.
+        // The routes reader over a gem's own `config/routes.rb`. `activestorage` writes
+        // `Rails.application.routes.draw`, and its `rails_direct_uploads_path` really is a method
+        // on this application's controllers; `blazer` writes `Blazer::Engine.routes.draw`, and its
+        // helpers are reached as `blazer.queries_path` after a `mount`, a spelling this crate does
+        // not read.
         let (dir, root, env) = project_with_engine(&[]);
         let gem = root.join("gems/shouty-1.2.3/config");
         std::fs::create_dir_all(&gem).unwrap();
@@ -1736,8 +1725,8 @@ namespace :x do\n  concerns :searchable\nend\n";
         .unwrap();
 
         let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
-        // The application names one of the two itself, which is the collision that decides
-        // whether "the project's own routes file first" is load-bearing or cosmetic.
+        // The application names one of the two itself: the collision that decides whether "the
+        // project's own routes file first" matters.
         harness.write(
             "config/routes.rb",
             "Rails.application.routes.draw do\n  resources :stories\nend\n",
@@ -1757,8 +1746,8 @@ namespace :x do\n  concerns :searchable\nend\n";
             "the engine's helper is a method on this application's controller: {engine}"
         );
 
-        // And the application's own routes file declares the name they share, so the jump lands
-        // in the project rather than in somebody's bundle.
+        // And the application's own routes file declares the name they share, so the jump lands in
+        // the project, not in somebody's bundle.
         let own = harness.hover_at(&uri, source, "stories_path").to_string();
         assert!(
             own.contains("config/routes.rb") && !own.contains("shouty-1.2.3"),
@@ -1769,11 +1758,10 @@ namespace :x do\n  concerns :searchable\nend\n";
 
     #[test]
     fn an_engine_that_draws_into_its_own_route_set_declares_no_helper() {
-        // The three of seven that would otherwise put a helper on every controller in the
-        // project: blazer, pghero and mission_control-jobs. The decline is `rails::Whose`, and
-        // it has to survive the whole pass rather than only the reader — `Reader::call` walks an
-        // unknown call's block transparently, so a fall-through would read this body as though
-        // the application had written it.
+        // The engines that would otherwise put a helper on every controller in the project: blazer,
+        // pghero and mission_control-jobs. `rails::Whose` declines them, and that must survive the
+        // whole pass, not just the reader: `Reader::call` walks an unknown call's block
+        // transparently, so a fall-through would read this body as the application's.
         let (dir, root, env) = project_with_engine(&[]);
         let gem = root.join("gems/shouty-1.2.3/config");
         std::fs::create_dir_all(&gem).unwrap();
@@ -1816,9 +1804,8 @@ namespace :x do\n  concerns :searchable\nend\n";
 
     #[test]
     fn a_route_helper_is_a_method_on_every_controller_and_jumps_to_the_routing_dsl() {
-        // `story_path` in a controller resolves through the `include` this pass wrote — an
-        // `include` nobody's code contains, which is what `Facts::mixins` exists for — and the
-        // jump lands on the
+        // `story_path` in a controller resolves through the `include` this pass wrote (one nobody's
+        // code contains, which is what `Facts::mixins` is for), and the jump lands on the
         // `resources :stories` line that named it.
         let (mut harness, _uri) = routes_project("");
         let source = "class StoriesController < ApplicationController\n  def index\n    redirect_to story_path\n  end\nend\n";
@@ -1827,7 +1814,7 @@ namespace :x do\n  concerns :searchable\nend\n";
 
         let card = card(&mut harness, &controller, source, "story_path");
         // No return type: a hover card prints the signature and the provenance, never the
-        // `-> String`, which is true of every card here.
+        // `-> String`, as for every card here.
         assert!(card.contains("RouteHelpers#story_path"), "{card}");
         assert!(
             !card.contains("Matched on the method name alone"),
@@ -1844,14 +1831,12 @@ namespace :x do\n  concerns :searchable\nend\n";
 
     #[test]
     fn a_route_helper_answers_in_a_helper_module_and_in_a_template() {
-        // The other two contexts a helper is called from. A helper module is a host, so the
-        // answer inside one is exact. A template has no enclosing class at all, so without a
-        // view context its `story_path` reaches the same module by the *name* rung — enough for
-        // the jump and not for completion. It is exact there too, by a route neither convention
-        // planned: the route helpers go into one module that is
-        // `include`d into every `app/helpers` module, and the view context *is* those modules,
-        // so the chain from a template to `resources :stories` is two conventions long and has
-        // no guess in it.
+        // The other two contexts a helper is called from. A helper module is a host, so the answer
+        // inside one is exact. A template has no enclosing class, so without a view context its
+        // `story_path` would reach the module only by the *name* rung (enough for the jump, not for
+        // completion). It is exact there too, through two conventions together: the route helpers
+        // go into one module `include`d into every `app/helpers` module, and the view context *is*
+        // those modules, so the chain from a template to `resources :stories` has no guess in it.
         let (mut harness, _uri) = routes_project("");
         let helper = "module StoriesHelper\n  def link\n    story_path\n  end\nend\n";
         let uri = harness.write("app/helpers/stories_helper.rb", helper);
@@ -1894,9 +1879,9 @@ namespace :x do\n  concerns :searchable\nend\n";
 
     #[test]
     fn a_drawn_routes_file_is_read_at_the_prefix_it_was_drawn_at() {
-        // `draw :admin` is the only thing that says where `config/routes/admin.rb` sits, and
-        // its declarations go into **its own** generated document, because a span is a byte
-        // range with no URI and one recorded against the drawer would open the wrong line.
+        // `draw :admin` is the only thing saying where `config/routes/admin.rb` sits, and its
+        // declarations go into **its own** generated document, because a span is a byte range with
+        // no URI, and one recorded against the drawer would open the wrong line.
         let (harness, _uri) = routes_project("");
         assert!(harness.has("RouteHelpers#admin_flags_path()"));
         let drawn = harness.generated_rbs("config/routes/admin.rb");
@@ -1913,9 +1898,9 @@ namespace :x do\n  concerns :searchable\nend\n";
     #[test]
     fn the_helpers_are_included_once_into_every_controller_mailer_and_helper_module() {
         // Rails installs them with an `inherited` hook on `ActionController::Base`, so every
-        // controller really does get its own copy — and writing one `include` per host is what
-        // bounds that gap at zero: an application whose base is a *gem's* class has no
-        // base this pass defines, and every one of its controllers is still a host.
+        // controller really gets its own copy, and writing one `include` per host closes the gap:
+        // an application whose base is a *gem's* class has no base this pass defines, yet every one
+        // of its controllers is still a host.
         let (mut harness, _uri) = routes_project("");
         let mailer = harness.write("app/mailers/user_mailer.rb", MAILERS);
         let model = harness.write("app/models/plain.rb", "class Plain\nend\n");
@@ -1936,8 +1921,8 @@ namespace :x do\n  concerns :searchable\nend\n";
         // One document holds them all, so a second routes file adds no second copy.
         let drawn = harness.generated_rbs("config/routes/admin.rb");
         assert!(!drawn.contains("include RouteHelpers"), "{drawn}");
-        // …and a plain model still cannot see them, which is what makes the module worth having
-        // instead of declaring two thousand helpers on `Object`.
+        // …and a plain model still cannot see them, which is why a module is worth having instead
+        // of declaring thousands of helpers on `Object`.
         let source = "class Plain\n  def go\n    story_path\n  end\nend\n";
         let plain = harness.write("app/models/plain.rb", source);
         harness.watch(&[&plain]);

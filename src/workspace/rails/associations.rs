@@ -1,24 +1,19 @@
 //! One association macro, read and then declared: `belongs_to`, `has_one`, `has_many`,
 //! `has_and_belongs_to_many` and `scope`.
 //!
-//! The fifth [`read`] in this directory and the last of them to get a module of its own — `enums`,
-//! `attributes`, `delegates` and `tail` have had one since they were written, and these five
-//! macros stayed inside the walk that finds them. What separates a family here is what separates
-//! one there: reading a call is one question and deciding what it may declare is another, and
-//! between the two sits the only gate in the directory that asks about the class a macro is
-//! written **on** rather than about the class it names — because `has_many :comments` is
-//! byte-identical in a model and in a serializer, where it stores an attribute and defines no
-//! method at all.
+//! Like the other families (`enums`, `attributes`, `delegates`, `tail`), reading a call is one
+//! question and deciding what it may declare is another. Between the two sits the only gate in the
+//! directory that asks about the class a macro is written **on** rather than the class it names,
+//! because `has_many :comments` is byte-identical in a model and in a serializer, where it stores
+//! an attribute and defines no method at all.
 //!
-//! The collections are monomorphic. `has_many :comments` returns a `Comment::Relation` this
-//! crate writes — see [`relations`](super::relations) — one per element type rather than one per
-//! association, and **nothing in it is mapped**: no line of anybody's code declares
-//! `Comment::Relation#first`, and a relation four models share could only be pointed at an
-//! arbitrary one of them.
+//! The collections are monomorphic. `has_many :comments` returns a `Comment::Relation` this crate
+//! writes (see [`relations`](super::relations)), one per element type, not one per association, and
+//! **nothing in it is mapped**: no line of code declares `Comment::Relation#first`, and a relation
+//! four models share could only point at an arbitrary one of them.
 //!
-//! Which bodies these calls are read out of is [`models`](super::models)' question, not this
-//! module's: [`read`] is handed a call and the nesting it was written in, and says what the call
-//! means.
+//! Which bodies these calls are read from is [`models`](super::models)' question: [`read`] gets a
+//! call and the nesting it was written in, and says what the call means.
 
 use std::collections::BTreeSet;
 
@@ -35,37 +30,37 @@ use crate::generated::{Declared, Facts, Owner, Source};
 /// What a model macro returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
-    /// `belongs_to :user` — one record, and Rails 5 made it non-`nil` unless `optional: true`.
+    /// `belongs_to :user`: one record, non-`nil` since Rails 5 unless `optional: true`.
     One,
-    /// `has_one :profile` — one record or none, and nothing in the file says which.
+    /// `has_one :profile`: one record or none, and nothing in the file says which.
     Maybe,
-    /// `has_many :comments` — a relation, which is a class this pass generates.
+    /// `has_many :comments`: a relation, which is a class this pass generates.
     Many,
-    /// `scope :recent, -> { ... }` — a *class* method returning a relation of its own class.
+    /// `scope :recent, -> { ... }`: a *class* method returning a relation of its own class.
     Scope,
 }
 
 /// Why an association's own call says no single class can be named.
 ///
-/// Not the same silence as a name the application does not define, and that difference is the
-/// whole of why this exists. `belongs_to :parent_comment` naming no `ParentComment` is a *lookup* that
-/// came back empty — the reader may have camelized the wrong word, or the class may be in a gem
-/// this pass cannot see — and declining it whole is right. These two are the call telling this
-/// reader outright that the question has no answer, and that is knowledge: the member exists,
-/// it is reached at the macro line, and its type is the one thing nobody can write down.
+/// This is a different silence from a name the application does not define, which is why it exists.
+/// `belongs_to :parent_comment` naming no `ParentComment` is a *lookup* that came back empty (the
+/// reader may have camelized the wrong word, or the class is in an unseen gem), and declining it
+/// whole is right. These two are the call saying outright that the question has no answer, and that
+/// is knowledge: the member exists, it is reached at the macro line, and only its type cannot be
+/// written down.
 ///
 /// **Each is also positive evidence that the call is Rails'.** `polymorphic:`, `class_name:` and
-/// `source_type:` are ActiveRecord's own keywords, which is what lets these declare a member
-/// where a bare `belongs_to` with an unknown class still declares nothing — the same argument
-/// [`attributes`](super::attributes) makes from a cast type.
+/// `source_type:` are ActiveRecord's own keywords, which is what lets these declare a member where
+/// a bare `belongs_to` with an unknown class declares nothing. [`attributes`](super::attributes)
+/// makes the same argument from a cast type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Undecided {
-    /// `polymorphic: true` — a companion `*_type` column names the class, one row at a time.
+    /// `polymorphic: true`: a companion `*_type` column names the class, one row at a time.
     Polymorphic,
-    /// One of [`NAMES_A_CLASS`] written as anything but a string literal. Solidus lets the host
-    /// application supply its own user class through a runtime object, and no reading of the
-    /// text can turn one into a name. Which keyword was written is carried because the card
-    /// says it: it is the word the reader has to go and look at.
+    /// One of [`NAMES_A_CLASS`] written as anything but a string literal, such as an engine letting
+    /// the host application supply its user class through a runtime object: no reading of the text
+    /// can turn that into a name. The keyword is carried because the card names it: it is the word
+    /// the reader has to go and look at.
     Unreadable(&'static str),
 }
 
@@ -87,44 +82,41 @@ const UNTYPED: &str = "untyped";
 /// The keywords that name an association's class outright, in Rails' order of precedence.
 ///
 /// `class_name:` is every association's own and wins. `source_type:` is ActiveRecord's
-/// disambiguator for a `through:` whose source association is polymorphic, and where it is
-/// written it is the answer and `source:` is not — which is the whole difference between the two
-/// neighbouring keywords: `source:` names a *member* of the joined model and has to be camelized
-/// to guess at a class, `source_type:` names the class. Rails rejects `source_type:` as an unknown
-/// key on any macro without a `through:`, so it is read wherever it is written rather than gated
-/// on one; a line that could confuse the two does not boot.
+/// disambiguator for a `through:` whose source association is polymorphic; where written, it is the
+/// answer and `source:` is not. That is the difference between the two neighbouring keywords:
+/// `source:` names a *member* of the joined model and must be camelized to guess a class, while
+/// `source_type:` names the class. Rails rejects `source_type:` on any macro without a `through:`,
+/// so it is read wherever written, not gated; a line that confused the two would not boot.
 ///
 /// Both take `compute_type`'s walk over the nesting, and both are read **only** as a string
-/// literal — anything else is an [`Undecided::Unreadable`], not a fall through to the name.
+/// literal. Anything else is an [`Undecided::Unreadable`], not a fall-through to the name.
 const NAMES_A_CLASS: [&str; 2] = ["class_name", "source_type"];
 
 /// One macro call, read.
 #[derive(Debug)]
 pub(super) struct Association {
-    /// The macro as it was written. Five names reach four [`Kind`]s, so the provenance line
-    /// cannot be recovered from the kind: `has_and_belongs_to_many` is a `Kind::Many` and is not
-    /// a `has_many`.
+    /// The macro as written. Five names map to four [`Kind`]s, so the provenance line cannot be
+    /// recovered from the kind: `has_and_belongs_to_many` is a `Kind::Many` but not a `has_many`.
     spelled: &'static str,
     /// The member's name: `user`, `comments`, `recent`.
     name: String,
     /// Every class this macro could name, innermost first and the bare name last.
     ///
-    /// The candidate list is Rails' own rather than a refinement of this reader's.
-    /// `ActiveRecord::Inheritance#compute_type` resolves an association's class against the
-    /// **module nesting of the class the macro is written on**: `Spree::LineItem` naming
-    /// `Adjustment` asks for `Spree::LineItem::Adjustment`, then `Spree::Adjustment`, and the
-    /// bare `Adjustment` **last**. [`Association::resolved`] is the other end of it — the first
-    /// candidate the application defines wins, and a macro naming none of them declares nothing
-    /// exactly as one naming no class at all always has.
+    /// Rails' own candidate list. `ActiveRecord::Inheritance#compute_type` resolves an
+    /// association's class against the **module nesting of the class the macro is written on**:
+    /// `Spree::LineItem` naming `Adjustment` asks for `Spree::LineItem::Adjustment`, then
+    /// `Spree::Adjustment`, and the bare `Adjustment` **last**. [`Association::resolved`] is the
+    /// other end: the first candidate the application defines wins, and a macro naming none of them
+    /// declares nothing.
     ///
-    /// **One entry and no walk** for the two spellings that name a class outright: a
-    /// `class_name: "::Order"` is Rails' own absolute-reference branch, and a `scope` returns a
-    /// relation of the class it is written on, which is a name and never a guess.
+    /// **One entry and no walk** for the two spellings that name a class outright:
+    /// `class_name: "::Order"` is Rails' absolute-reference branch, and a `scope` returns a
+    /// relation of the class it is written on, a name and never a guess.
     pub(super) candidates: Vec<String>,
     pub(super) kind: Kind,
     /// Why the call itself says no class can be named, when it does. [`candidates`] is empty
-    /// whenever this is `Some`, and [`Association::declare`] writes an untyped member instead
-    /// of nothing at all.
+    /// whenever this is `Some`, and [`Association::declare`] then writes an untyped member instead
+    /// of nothing.
     ///
     /// [`candidates`]: Association::candidates
     undecided: Option<Undecided>,
@@ -146,15 +138,13 @@ pub(super) fn read<'pr>(
     let (name, name_at) = first_symbol_or_string(source, node)?;
     let undecided = undecided(source, node, hosts);
     let candidates = match kind {
-        // A scope returns a relation of the class it is written in, and its own name says
-        // nothing about a type. The lambda's body is never read: that is the declarative
-        // rule at its hardest case, and `-> { where(user: Current.user) }` is exactly the
-        // Ruby this crate refuses to run.
+        // A scope returns a relation of the class it is written in, and its name says nothing about
+        // a type. The lambda body is never read: that is the declarative rule at its hardest, and
+        // `-> { where(user: Current.user) }` is exactly the Ruby this crate refuses to run.
         Kind::Scope => vec![nesting.join("::")],
-        // No list to look up, and none is wanted: camelizing the association's own name
-        // here would be a class that does not exist at best and the wrong one at worst,
-        // which is the sentence this decline has always carried. What is new is that the
-        // decline is now written down rather than dropped.
+        // No list to look up, and none wanted: camelizing the association's own name here would
+        // give a class that does not exist at best and the wrong one at worst. The decline is
+        // recorded instead of dropped.
         _ if undecided.is_some() => Vec::new(),
         _ => target(source, nesting, node, hosts, &name, *kind)?,
     };
@@ -173,22 +163,20 @@ pub(super) fn read<'pr>(
     })
 }
 
-/// What the call says about its own class when what it says is "nobody can name it".
+/// What the call says about its own class, when what it says is "nobody can name it".
 ///
-/// **Asked before the candidate list rather than after it**, because neither of these is a
-/// lookup that failed: both are readable from the call alone, and reading them second would
-/// mean camelizing a name first and then throwing the answer away.
+/// **Asked before the candidate list**, because neither case is a failed lookup: both are readable
+/// from the call alone, and asking second would mean camelizing a name and then throwing the answer
+/// away.
 ///
-/// `polymorphic:` is asked first and wins, which is Rails' own order — `compute_type` is
-/// never reached for a polymorphic reflection, whatever else the line carries. The corpus
-/// writes the pair together inside a `with_options class_name: "User"`, so the order is not
-/// hypothetical.
+/// `polymorphic:` is asked first and wins, as in Rails: `compute_type` is never reached for a
+/// polymorphic reflection, whatever else the line carries. Real code writes the pair together
+/// inside a `with_options class_name: "User"`, so the order matters.
 ///
-/// Below it, **the first of [`NAMES_A_CLASS`] the call writes decides and the rest are not
-/// read** — the same precedence [`target`] walks, stated once so the two halves
-/// cannot drift. A readable `class_name:` therefore leaves nothing undecided even when the
-/// `source_type:` beside it is a method call, because that `source_type:` was never going to
-/// be asked.
+/// Below it, **the first of [`NAMES_A_CLASS`] the call writes decides, and the rest are not read**:
+/// the same precedence [`target`] walks, stated once so the two cannot drift. So a readable
+/// `class_name:` leaves nothing undecided even when the `source_type:` beside it is a method call,
+/// because that `source_type:` was never going to be asked.
 fn undecided<'pr>(
     source: &str,
     node: &CallNode<'pr>,
@@ -207,18 +195,16 @@ fn undecided<'pr>(
 
 /// The classes an association could name, innermost first.
 ///
-/// `class_name: "Comment"` wins over everything, which is not a refinement: 32 of the 76
-/// singular associations in the corpus carry one, and `belongs_to :parent_comment` without
-/// it camelizes to a `ParentComment` that no application has ever defined. It does **not**
-/// win over the nesting, and that is Rails rather than a choice here: `compute_type` is
-/// handed the written name and walks it exactly as it walks a derived one, so
-/// `class_name: "Order"` inside `module Spree` is `Spree::Order`. The one spelling that
-/// skips the walk is Rails' own first branch — a leading `::` is an absolute reference.
+/// `class_name: "Comment"` wins over everything, and it is required, not a refinement: without it,
+/// `belongs_to :parent_comment` camelizes to a `ParentComment` no application defines. It does
+/// **not** win over the nesting, and that is Rails, not a choice here: `compute_type` walks the
+/// written name exactly as a derived one, so `class_name: "Order"` inside `module Spree` is
+/// `Spree::Order`. The one spelling that skips the walk is Rails' own first branch: a leading `::`
+/// is an absolute reference.
 ///
-/// `source_type:` is read on the same terms and immediately after it, and the two of them are
-/// [`NAMES_A_CLASS`]. It has to be read *before* `source:`, which is the only reason this read
-/// is worth anything: eight lines across four corpora write both, and `source:` on every one
-/// of them camelizes to a class the application does not have.
+/// `source_type:` is read on the same terms right after it; the two are [`NAMES_A_CLASS`]. It must
+/// be read *before* `source:`, which is what makes it worth reading: where both are written,
+/// `source:` camelizes to a class the application does not have.
 fn target<'pr>(
     source: &str,
     nesting: &[String],
@@ -248,41 +234,38 @@ fn target<'pr>(
     Some(nested(nesting, &bare))
 }
 
-/// The same list [`syntax::candidates`] builds, for the body this reader is inside.
-///
-/// [`syntax::candidates`]: super::syntax::candidates
+/// The list [`candidates`] builds, for the body this reader is inside.
 fn nested(nesting: &[String], name: &str) -> Vec<String> {
     candidates(&nesting.join("::"), name)
 }
 
 /// The body a macro was written in, as much of one as an association needs.
 ///
-/// [`tail::Host`](super::tail::Host)'s shape and for its reason: three things that always
-/// travel together, so that adding a fourth is one line here rather than a seventh parameter
-/// on [`Association::declare`]. Which bodies exist and which of them may declare is
-/// [`models`](super::models)' question — what arrives here is one that already passed it.
+/// Shaped like [`tail::Host`](super::tail::Host), for its reason: three things that always travel
+/// together, so a fourth is one line here instead of another parameter on [`Association::declare`].
+/// Which bodies exist and which may declare is [`models`](super::models)' question; what arrives
+/// here already passed it.
 pub(super) struct Body<'a> {
     /// Spelled with its lexical nesting, exactly as rubydex spells it.
     pub(super) class: &'a str,
     /// Whether it is a `module` rather than a `class` — a concern.
     pub(super) module: bool,
-    /// Every association in the same body, which is what a `through:` reads to find the
-    /// intermediate it names.
+    /// Every association in the same body: what a `through:` reads to find the intermediate it
+    /// names.
     pub(super) siblings: &'a [Association],
 }
 
 impl Association {
-    /// The class this macro names, or `None` where the application defines none of them.
+    /// The class this macro names, or `None` where the application defines none of the candidates.
     ///
-    /// Rails. order, and the order is the whole of it: where a bare name and a nested name both
-    /// exist, Rails takes the nested one. Taking the bare one is **wrong** at real sites — most
-    /// often a `db/migrate` throwaway model shadowing the application's own, but also names like
-    /// `ActiveStorage::Attachment` and `Blazer::Audit`, which are neither migrations nor harmless.
+    /// Rails' order, and the order is the whole point: where both a bare name and a nested name
+    /// exist, Rails takes the nested one. Taking the bare one is **wrong** at real sites: most
+    /// often a throwaway model in `db/migrate` shadowing the application's own, but also names like
+    /// `ActiveStorage::Attachment` and `Blazer::Audit`.
     ///
-    /// A name that is not a constant at all stays declined however it is nested, which is the
-    /// clause solidus needs: its admin controllers write `belongs_to "spree/order"` ten times
-    /// from `Spree::Admin::ResourceController`, and `Spree/order` is nonsense with every prefix
-    /// this list can put in front of it.
+    /// A name that is not a constant stays declined however it is nested: an admin controller's
+    /// `belongs_to "spree/order"` gives `Spree/order`, which is nonsense with every prefix this
+    /// list can add.
     pub(super) fn resolved<'a>(&'a self, known: &BTreeSet<String>) -> Option<&'a str> {
         self.candidates
             .iter()
@@ -306,60 +289,59 @@ impl Association {
             includers,
             ..
         } = *elsewhere;
-        // The one gate in this file that asks about the class the macro is written **on** rather
-        // than about the class it names.
+        // The one gate in this file that asks about the class the macro is written **on**, not the
+        // class it names.
         //
-        // Both serializer gems spell `has_many`, `has_one` and `belongs_to`, store what they are
-        // given and define **no method**. Unlike `attribute` there is no *shape* to gate on:
-        // `has_many :statuses` is byte-identical in a model and in a serializer. So it has to be
-        // the host.
+        // Serializer gems spell `has_many`, `has_one` and `belongs_to`, store what they are given,
+        // and define **no method**. Unlike `attribute`, there is no *shape* to gate on:
+        // `has_many :statuses` is byte-identical in a model and a serializer. So it has to be the
+        // host.
         //
-        // **An admit list and not a decline list**, which costs the same and covers a gem without
-        // naming it — a controller defining its own class-side `belongs_to` for nested-resource
-        // routing declines by the same sentence, where a blocklist would have to be told about
-        // each such gem one at a time. **A `module` passes unconditionally**: a concern inherits
-        // nothing, and most association calls written outside a model are written in one.
+        // **An admit list, not a decline list.** It costs the same and covers gems without naming
+        // them: a controller defining its own class-side `belongs_to` for nested-resource routing
+        // declines by the same rule, where a blocklist would need telling about each gem. **A
+        // `module` passes unconditionally**: a concern inherits nothing, and most association calls
+        // outside a model are in one.
         //
-        // Nothing real is lost because `models` is the *union*. A model whose base class lives in
-        // a gem's `lib/` is out of reach of `Context::models`' walk, and is admitted anyway as a
-        // collection element of some model that names it.
+        // Nothing real is lost, because `models` is the *union*. A model whose base class lives in
+        // a gem's `lib/` is out of reach of `Context::models`' walk, but is admitted as a
+        // collection element of a model that names it.
         //
-        // It is provably a no-op for [`Kind::Scope`]: `relations` is a subset of `models`, and a
-        // `scope` on a class already declines below unless `relations` holds its name.
+        // Provably a no-op for [`Kind::Scope`]: `relations` is a subset of `models`, and a `scope`
+        // on a class already declines below unless `relations` holds its name.
         if !body.module && !models.contains(body.class) {
             return;
         }
         // An undecidable class is not a missing one: `candidates` is empty by construction and
-        // `resolved` would decline every time, so the two are separated here rather than
-        // conflated into one empty list. `untyped` is what the member hands back, and it is the
-        // honest type — the alternative is not a better type, it is no member.
+        // `resolved` would always decline, so the two are separated here instead of merged into one
+        // empty list. The member hands back `untyped`, the honest type; the alternative is not a
+        // better type but no member.
         let target = match (self.resolved(known), self.undecided) {
             (Some(target), _) => target,
             (None, Some(_)) => UNTYPED,
             (None, None) => return,
         };
-        // `has_many :voters, through: :votes` reads a second association, and an intermediate
-        // that is not declared on this class is a macro whose meaning is somewhere this reader
-        // cannot see. Declining is the same answer a missing class gets.
+        // `has_many :voters, through: :votes` reads a second association, and an intermediate not
+        // declared on this class means the macro's meaning is somewhere this reader cannot see. It
+        // declines, as a missing class does.
         if let Some(through) = &self.through
             && !body.siblings.iter().any(|other| other.name == *through)
         {
             return;
         }
-        // A `scope` in a concern is the one macro a module body reads and refuses to write
-        // down, and this is where it is written. Rails `class_eval`s `included do` on the
+        // A `scope` in a concern is the one macro a module body reads and refuses to write on the
+        // module, and this is where it is written instead. Rails `class_eval`s `included do` on the
         // *including* class, so `scope :expired` in `Expireable` is `Poll.expired` **and**
-        // `Invite.expired` — six different relation types for one line, none of them the
-        // module's. Declaring it on the module's own singleton would answer
-        // `Expireable.expired`, which raises, and would still leave `Poll.expired` unanswered.
-        // So the declaration goes on each includer instead, once per pair, and the span still
-        // points at the one `scope` line in the concern.
+        // `Invite.expired`: different relation types from one line, none the module's. Declaring it
+        // on the module's singleton would answer `Expireable.expired`, which raises, and still
+        // leave `Poll.expired` unanswered. So it is declared on each includer, once per pair, with
+        // the span pointing at the one `scope` line in the concern.
         //
-        // **What bounds it is `relations`**, and it needs no gate of its own: every model already
-        // owns a relation class, so a `scope` fanned onto one has a type to return, and a class
-        // that is neither a model nor a collection element — a PORO that includes a concern —
-        // declines here exactly as a `has_many` naming it would. Inventing a `Relation` for a
-        // class with no table is the one way this could answer worse rather than not at all.
+        // **`relations` bounds it**, with no gate of its own: every model already owns a relation
+        // class, so a `scope` fanned onto one has a return type. A class that is neither a model
+        // nor a collection element (a PORO including a concern) declines here, as a `has_many`
+        // naming it would. Inventing a `Relation` for a class with no table is the one way this
+        // could answer worse instead of not at all.
         if body.module && self.kind == Kind::Scope {
             for includer in includers.get(body.class).into_iter().flatten() {
                 if !relations.contains(includer) {
@@ -386,8 +368,8 @@ impl Association {
             return;
         }
         let returns = match self.kind {
-            // Before every other arm, and before the relation gate below it: `untyped?` is not
-            // a type worth writing and `untyped::Relation` is not a class.
+            // Before every other arm, and before the relation gate below: `untyped?` is not worth
+            // writing and `untyped::Relation` is not a class.
             _ if self.undecided.is_some() => UNTYPED.to_owned(),
             Kind::One if self.optional => format!("{target}?"),
             Kind::One => target.to_owned(),
@@ -399,11 +381,11 @@ impl Association {
                 relation_of(target)
             }
         };
-        // A scope is a class method, and rubydex files `def self.` on the singleton exactly as
-        // it files `Story.recent` there — so this is the same fact written on both sides. An
-        // instance member of a concern hangs on the module, which is the whole mechanism:
-        // rubydex indexes an RBS `include` exactly as it indexes a Ruby one, so the member
-        // reaches every includer through the `include` the user already wrote.
+        // A scope is a class method, and rubydex files `def self.` on the singleton exactly as it
+        // files `Story.recent`, so this is one fact written on both sides. An instance member of a
+        // concern hangs on the module, which is the whole mechanism: rubydex indexes an RBS
+        // `include` exactly like a Ruby one, so the member reaches every includer through the
+        // user's own `include`.
         let (owner, parameters) = match self.kind {
             Kind::Scope => (Owner::Singleton(body.class.to_owned()), "(*untyped)"),
             _ if body.module => (Owner::Module(body.class.to_owned()), "()"),
@@ -429,27 +411,27 @@ impl Association {
             overloads: Vec::new(),
         };
         match self.kind {
-            // The relation half — [`chainable`] has the argument. The gate it needs is the one
+            // The relation half; [`chainable`] has the argument. The gate it needs is the one
             // `returns` already applied: a `scope` whose class owns no relation class returned
-            // above, so reaching here is itself the proof that there is a class to write on.
+            // above, so reaching here proves there is a class to write on.
             Kind::Scope => chained.declare(facts, body.class, declared),
             _ => facts.declare(declared),
         }
-        // Everything else the one macro line installs, and the list is Rails' own rather than
-        // this reader's: `associations/builder/` — `Association::define_readers`/`define_writers`
-        // for the pair every macro writes, `SingularAssociation::define_accessors` for the five a
-        // `belongs_to` or a `has_one` adds, `CollectionAssociation`'s pair for `_ids`, and
+        // Everything else the one macro line installs. The list is Rails' own, from
+        // `associations/builder/`: `Association::define_readers`/`define_writers` for the pair
+        // every macro writes, `SingularAssociation::define_accessors` for the five a `belongs_to`
+        // or `has_one` adds, `CollectionAssociation`'s pair for `_ids`, and
         // `BelongsTo::define_change_tracking_methods`.
         //
-        // Two things the builders say that a reading of the macro names would not. The
-        // constructors are written `unless reflection.polymorphic?`, which is the rule the
-        // undecidable branch below applies. And `_changed?` is `belongs_to`'s alone, `BelongsTo`
-        // being the only builder that overrides `define_change_tracking_methods`.
+        // Two things the builders say that the macro names would not: the constructors are written
+        // `unless reflection.polymorphic?` (the rule the undecidable branch below applies), and
+        // `_changed?` is `belongs_to`'s alone, `BelongsTo` being the only builder overriding
+        // `define_change_tracking_methods`.
         //
-        // **Four are declined on a measurement**: `reload_<name>`, `reset_<name>`,
-        // `<name>_changed?` and `<name>_previously_changed?` are each written a handful of times
-        // across six applications, against two declarations on every singular association and two
-        // more on every `belongs_to` — thousands. The four that ship price the other way round.
+        // **Four are deliberately left out**: `reload_<name>`, `reset_<name>`, `<name>_changed?`
+        // and `<name>_previously_changed?` are rarely called, and each would add declarations to
+        // every singular association or every `belongs_to`. The four that ship are called far more
+        // often.
         let mut installs = |name: String, parameters: String, returns: String| {
             facts.declare(Declared {
                 owner: owner.clone(),
@@ -465,38 +447,35 @@ impl Association {
                 overloads: Vec::new(),
             });
         };
-        // **What an undecidable class costs is the type and never the member.** Everything the
-        // macro installs that does not have to name a class is installed exactly as it would
-        // be: `untyped` is already every value, so the `?` a nilable reader would carry says
-        // nothing on top of it.
+        // **An undecidable class costs the type, never the member.** Everything the macro installs
+        // that need not name a class is installed as usual: `untyped` is already every value, so a
+        // nilable reader's `?` adds nothing.
         let assigned = match self.undecided {
             Some(_) => UNTYPED.to_owned(),
             None => format!("{target}?"),
         };
         match self.kind {
             Kind::One | Kind::Maybe => {
-                // **The writer is nilable whatever the reader is**, and the two are not a copy
-                // of each other: `belongs_to :user` reads a `User` because Rails 5 made the
-                // association required, and `story.user = nil` is still ordinary Ruby that
-                // raises nothing — the validation is what fails, at save. Assigning a subclass
-                // hands the subclass back, so the declared type is a supertype of every value
-                // the call can return rather than an approximation of one.
+                // **The writer is nilable whatever the reader is**, so the two are not copies:
+                // `belongs_to :user` reads a `User` because Rails 5 made the association required,
+                // yet `story.user = nil` is ordinary Ruby that raises nothing (the validation
+                // fails, at save). Assigning a subclass returns the subclass, so the declared type
+                // is a supertype of every value, not an approximation.
                 installs(
                     format!("{}=", self.name),
                     format!("({assigned})"),
                     assigned.clone(),
                 );
-                // The three that *do* name a class, and the one group an undecidable macro
-                // loses. Rails writes them `unless reflection.polymorphic?` — there is nothing
-                // to instantiate — and a `(*untyped) -> untyped` constructor for the
-                // `class_name:` half states nothing the association's own name did not.
+                // The three that *do* name a class, and the one group an undecidable macro loses.
+                // Rails writes them `unless reflection.polymorphic?` (there is nothing to
+                // instantiate), and a `(*untyped) -> untyped` constructor for the `class_name:`
+                // case would say nothing the association's own name did not.
                 if self.undecided.is_some() {
                     return;
                 }
-                // **These are not nilable and the reader may be**, which is the row here that
-                // is not a copy of the reader's either, in the other direction:
-                // `belongs_to :user, optional: true` reads a `User?` because the row may not be
-                // there, and `create_user` *makes* one.
+                // **These are not nilable even where the reader is**, which differs from the reader
+                // in the other direction: `belongs_to :user, optional: true` reads a `User?`
+                // because the row may not exist, and `create_user` *makes* one.
                 for name in [
                     format!("build_{}", self.name),
                     format!("create_{}", self.name),
@@ -510,24 +489,23 @@ impl Association {
                 }
             }
             Kind::Many => {
-                // A collection writer takes an array *or* a relation and hands back whatever it
-                // was given, so unlike the singular one there is no type to state: assigning
-                // `[a, b]` returns an `Array` and assigning a relation returns the relation.
+                // A collection writer takes an array *or* a relation and returns what it was given,
+                // so unlike the singular one there is no type to state: assigning `[a, b]` returns
+                // an `Array`, assigning a relation returns the relation.
                 installs(
                     format!("{}=", self.name),
                     "(untyped)".to_owned(),
                     "untyped".to_owned(),
                 );
                 // `ids_reader` is `pluck(primary_key)`, and what a primary key holds is the
-                // schema's to say — in a *different* generated document, which this reader
-                // cannot ask. `Array[untyped]` is what is known: an `Integer` would be right
-                // for a `bigint` and wrong for every `id: :uuid` table, and the element type is
-                // not what these 1,191 call sites want. The array is, and it answers `each`,
-                // `map`, `size` and `include?` exactly.
+                // schema's to say, in a *different* generated document this reader cannot ask.
+                // `Array[untyped]` is what is known: `Integer` would be right for a `bigint` and
+                // wrong for every `id: :uuid` table, and callers want the array, not the element
+                // type. The array answers `each`, `map`, `size` and `include?` exactly.
                 //
-                // Rails singularizes the **association's own name** and not the class it
-                // resolves to — `has_many :authors, class_name: "User"` is `author_ids` — so
-                // this reads `self.name` and never `target`.
+                // Rails singularizes the **association's own name**, not the class it resolves to
+                // (`has_many :authors, class_name: "User"` gives `author_ids`), so this reads
+                // `self.name`, never `target`.
                 let ids = format!("{}_ids", singularize(&self.name));
                 installs(ids.clone(), "()".to_owned(), "Array[untyped]".to_owned());
                 installs(
@@ -536,8 +514,8 @@ impl Association {
                     "untyped".to_owned(),
                 );
             }
-            // A `scope` is not an association: `define_readers` never runs for one, and the
-            // class method declared above is the whole of what the macro installs.
+            // A `scope` is not an association: `define_readers` never runs for one, and the class
+            // method declared above is everything the macro installs.
             Kind::Scope => {}
         }
     }
@@ -555,12 +533,11 @@ mod tests {
 
     /// The whole of what the host test changes: the host, asked one question earlier.
     ///
-    /// One source, three bodies, one macro apiece and the same macro. `Story` inherits
-    /// `ApplicationRecord` and declares; `StorySerializer` inherits `ActiveModel::Serializer`,
-    /// where `has_many` stores an `Attribute` and defines **no method**, and declares nothing;
-    /// `Storyish` is a `module`, which passes whatever it inherits because a concern inherits
-    /// nothing at all. The three are one fixture rather than three because what is being
-    /// asserted is that one rule separates them.
+    /// One source, three bodies, the same macro in each. `Story` inherits `ApplicationRecord` and
+    /// declares. `StorySerializer` inherits `ActiveModel::Serializer`, where `has_many` stores an
+    /// `Attribute` and defines **no method**, so it declares nothing. `Storyish` is a `module`,
+    /// which passes whatever it inherits, because a concern inherits nothing. One fixture, because
+    /// the assertion is that one rule separates them.
     #[test]
     fn only_a_model_or_a_module_hosts_an_association_macro() {
         let model = read_model(
@@ -578,8 +555,8 @@ mod tests {
                 "app/models/story.rb",
                 &Elsewhere {
                     known: &known,
-                    // The serializer is deliberately absent and `Storyish` deliberately too:
-                    // a module must not need to be here.
+                    // The serializer and `Storyish` are both deliberately absent: a module must not
+                    // need to be listed.
                     models: &["Story"].into_iter().map(str::to_owned).collect(),
                     relations: &relations,
                     ..Elsewhere::nothing()
@@ -598,12 +575,11 @@ mod tests {
         );
     }
 
-    /// The half that takes the host gate's cost from seven declarations to nothing.
+    /// The half that keeps the host gate from costing real models.
     ///
-    /// `Tag`'s base class is in a gem's `lib/`, so the walk `Context::models` does cannot reach
-    /// it and it is not a model by inheritance. It is one anyway, because some model in the
-    /// application says `has_many :tags` — which is what puts it in the union this asks. Both
-    /// of forem's two gem-rooted models are exactly this shape.
+    /// `Tag`'s base class is in a gem's `lib/`, so `Context::models`' walk cannot reach it and it
+    /// is not a model by inheritance. It is one anyway, because a model in the application says
+    /// `has_many :tags`, which puts it in the union this asks.
     #[test]
     fn a_model_whose_base_class_is_in_a_gem_is_still_a_host() {
         let model = read_model("class Tag < ActsAsTaggableOn::Tag\n  has_many :taggings\nend\n");
@@ -614,7 +590,7 @@ mod tests {
                 "app/models/tag.rb",
                 &Elsewhere {
                     known: &known,
-                    // Not `ActsAsTaggableOn::Tag`-rooted and so not from the chain — from the
+                    // Not from the chain (its base is `ActsAsTaggableOn::Tag`) but from the
                     // collection half, which is the only reason `Tag` is here.
                     models: &["Tag"].into_iter().map(str::to_owned).collect(),
                     relations: &relations,
@@ -629,13 +605,12 @@ mod tests {
         );
     }
 
-    /// Why this is an admit list rather than a list of serializer names.
+    /// Why this is an admit list, not a list of serializer names.
     ///
-    /// Solidus' `Spree::Admin::ResourceController` defines its own class-side `belongs_to` for
-    /// nested-resource routing and defines no method. The symbol spelling is deliberate: the
-    /// thirteen real calls are written `belongs_to "spree/product"`, which are
-    /// declined today by an unrelated accident of [`camelize`], so a fixture written that way
-    /// would pass with the gate removed.
+    /// An engine's `Spree::Admin::ResourceController` defines its own class-side `belongs_to` for
+    /// nested-resource routing, and defines no method. The symbol spelling is deliberate: the real
+    /// calls are written `belongs_to "spree/product"`, which [`camelize`] happens to decline for an
+    /// unrelated reason, so a fixture written that way would pass with the gate removed.
     #[test]
     fn a_controller_that_spells_an_association_macro_declares_nothing() {
         let model = read_model(
@@ -666,9 +641,9 @@ mod tests {
 
     #[test]
     fn the_rbs_a_model_declares() {
-        // Pinned whole, for the reason the schema's is: every rule in this half shows up in the
-        // text, and asserting them one predicate at a time is how a change to the shape passes
-        // ten green tests.
+        // Pinned whole, like the schema's: every rule in this half shows up in the text, and
+        // asserting them one predicate at a time is how a change to the shape passes ten green
+        // tests.
         let model = read_model(MODEL);
         let declarations = model
             .signatures(
@@ -752,17 +727,17 @@ class Story::Relation
 end
 "
         );
-        // Two: `Story`, and the `Story::Relation` its one `scope` is chained onto — this
-        // document writes no superclass line for either, which is what [`Chained`] relies on.
+        // Two: `Story`, and the `Story::Relation` its one `scope` is chained onto. This document
+        // writes no superclass line for either, which [`Chained`] relies on.
         assert_eq!(declarations.classes, 2);
         // Eight readers; a writer and three constructors for each of the three **singular**
-        // associations whose class this project defines; a writer and the `_ids` pair for each
-        // of the three collections, whose constructors are the relation's; and a writer alone
-        // for `owner`, which is the polymorphic one — it names the member and the line, and
-        // Rails' own `unless reflection.polymorphic?` is why it names no constructor. `ghost`
-        // names a class nothing defines and still declares nothing at all. The last one is the
-        // `scope`'s relation-side copy, which carries the same span as its twin — both halves of
-        // `Story.recent.recent` land on the one `scope :recent` line.
+        // associations whose class the project defines; a writer and the `_ids` pair for each of
+        // the three collections, whose constructors are the relation's; and a writer alone for
+        // `owner`, the polymorphic one (it names the member and the line, and Rails'
+        // `unless reflection.polymorphic?` is why no constructor). `ghost` names a class nothing
+        // defines and declares nothing. The last is the `scope`'s relation-side copy, with the same
+        // span as its twin: both halves of `Story.recent.recent` land on the one `scope :recent`
+        // line.
         assert_eq!(declarations.spans.len(), 8 + 3 * 4 + 3 * 3 + 1 + 1);
     }
 
@@ -787,8 +762,8 @@ end
             )
         };
         assert_eq!(at(&declarations.spans[0]), ("belongs_to :user", "user"));
-        // The writer and the three constructors that macro also installs point at the same
-        // line, because it is the line Rails writes them from — see `Association::declare`.
+        // The writer and three constructors that macro also installs point at the same line,
+        // because Rails writes them from it; see `Association::declare`.
         for span in &declarations.spans[1..5] {
             assert_eq!(at(span), ("belongs_to :user", "user"));
         }
@@ -799,14 +774,14 @@ end
                 "parent_story"
             )
         );
-        // The macro that names no class points at its line exactly as the ones that do, which
-        // is the whole of what an undecidable association buys: two members, one place, and a
-        // `*_type` column deciding the type at run time where no reader can.
+        // The macro that names no class points at its line just like the ones that do. That is what
+        // an undecidable association buys: two members, one place, and a `*_type` column deciding
+        // the type at run time where no reader can.
         for span in &declarations.spans[10..12] {
             assert_eq!(at(span), ("belongs_to :owner, polymorphic: true", "owner"));
         }
-        // And a collection's three do the same: `has_many :comments` is one line and
-        // `comments`, `comments=`, `comment_ids` and `comment_ids=` are four members of it.
+        // A collection's members do the same: `has_many :comments` is one line, and `comments`,
+        // `comments=`, `comment_ids` and `comment_ids=` are four members of it.
         for span in &declarations.spans[17..21] {
             assert_eq!(at(span), ("has_many :comments", "comments"));
         }
@@ -816,14 +791,13 @@ end
         );
     }
 
-    /// The macro every corpus lints away, and Rails' own last
-    /// line of it — `has_many name, scope, **hm_options, &extension`.
+    /// `has_and_belongs_to_many`, whose last line in Rails is
+    /// `has_many name, scope, **hm_options, &extension`.
     ///
-    /// So it is one row in `ASSOCIATIONS` and *no* new code path: the element type is
-    /// singularized by the same function, `class_name:` is read by the same one, and the
-    /// relation class is the ordinary one. What it does need is the macro's own spelling, because a
-    /// provenance line that said `has_many :tags` would be naming a macro the file does not
-    /// contain.
+    /// So it is one row in `ASSOCIATIONS` and *no* new code path: the element type is singularized
+    /// by the same function, `class_name:` is read by the same one, and the relation class is the
+    /// ordinary one. What it needs is the macro's own spelling, because a provenance line saying
+    /// `has_many :tags` would name a macro the file does not contain.
     #[test]
     fn has_and_belongs_to_many_is_a_collection_and_says_which_macro_said_so() {
         let source = "\
@@ -841,8 +815,8 @@ end
                         .into_iter()
                         .map(str::to_owned)
                         .collect(),
-                    // `Story` is the host and not a target, so it is here and not in `known`:
-                    // The host test asks whether the class the macro is written on is a model.
+                    // `Story` is the host, not a target, so it is here and not in `known`: the host
+                    // test asks whether the class the macro is written on is a model.
                     models: &["Story", "Tag", "Person", "User"]
                         .into_iter()
                         .map(str::to_owned)
@@ -897,19 +871,19 @@ end
         );
     }
 
-    /// A collection whose class the call refuses to name — and the three of its four members
-    /// that never needed one.
+    /// A collection whose class the call refuses to name, and the three of its four members that
+    /// never needed one.
     #[test]
     fn a_collection_that_names_no_class_keeps_every_name_that_does_not_need_one() {
-        // One corpus writes this exactly: a `has_many :through` whose `class_name:` is a runtime
-        // object the host application supplies. What the call declines is the **type**; the
-        // members are Rails' own and three of the four are type-independent already — the
-        // writer takes anything, and what a primary key holds was never this reader's to say.
+        // A real engine writes exactly this: a `has_many :through` whose `class_name:` is a runtime
+        // object the host application supplies. The call declines the **type**; the members are
+        // Rails' own, and three of the four are type-independent anyway (the writer takes anything,
+        // and what a primary key holds was never this reader's to say).
         //
-        // It matters because the fall-through used to answer, and answer *absurdly*: singularize
-        // and camelize `users` inside `Spree::Promotion::Rules::User` and the first candidate
-        // the project defines is the class the macro is written on, so the collection was
-        // declared as a relation of itself.
+        // It matters because falling through here would answer *absurdly*: singularizing and
+        // camelizing `users` inside `Spree::Promotion::Rules::User` makes the first defined
+        // candidate the very class the macro is written on, declaring the collection as a relation
+        // of itself.
         const SOURCE: &str = "\
 module Shop
   class Rule < ApplicationRecord
@@ -936,11 +910,11 @@ end
             .rbs;
         assert!(rbs.contains("def users: () -> untyped"), "{rbs}");
         assert!(rbs.contains("def users=: (untyped) -> untyped"), "{rbs}");
-        // Singularized from the **association's own name**, exactly as a decidable collection
-        // does — the class was never where that name came from.
+        // Singularized from the **association's own name**, as for a decidable collection: the
+        // class was never where that name came from.
         assert!(rbs.contains("def user_ids: () -> Array[untyped]"), "{rbs}");
         assert!(rbs.contains("def user_ids=: (untyped) -> untyped"), "{rbs}");
-        // And the absurd answer the fall-through used to give is nowhere in the document.
+        // And the absurd fall-through answer is nowhere in the document.
         assert!(
             !rbs.contains("def users: () -> Shop::Rule::Relation"),
             "{rbs}"
@@ -962,18 +936,18 @@ end
             )
             .render(&declaring(&[]))
             .rbs;
-        // `polymorphic:` names a class only a column knows at run time — and says so, which is
-        // why the member is here and untyped rather than absent.
+        // `polymorphic:` names a class only a column knows at run time, and says so, which is why
+        // the member is here and untyped instead of absent.
         assert!(rbs.contains("def owner: () -> untyped"), "{rbs}");
         assert!(!rbs.contains("def build_owner"), "{rbs}");
-        // `belongs_to :ghost` names a class nothing in the project defines, and nothing in the
-        // call says that was deliberate. A lookup that came back empty is still a decline.
+        // `belongs_to :ghost` names a class nothing in the project defines, and nothing in the call
+        // says that was deliberate. A lookup that came back empty is still a decline.
         assert!(!rbs.contains("def ghost"), "{rbs}");
         // `through: :votes` names an association this class does not declare.
         assert!(!rbs.contains("def voters"), "{rbs}");
 
-        // A collection whose element type has no relation class keeps its `belongs_to`s and
-        // loses every collection, which is the decline being local to the macro that needed it.
+        // A collection whose element type has no relation class keeps its `belongs_to`s and loses
+        // every collection: the decline stays local to the macro that needed it.
         let rbs = model
             .signatures(
                 "app/models/story.rb",
@@ -1005,14 +979,13 @@ end
         );
     }
 
-    /// The fixture is the point: **both** spellings exist, so a reader that took
-    /// the bare name would pass a test where only one did.
+    /// The fixture is the point: **both** spellings exist, so a reader that took the bare name
+    /// would pass a test where only one existed.
     ///
-    /// `Spree::LineItem` naming `Adjustment` is `Spree::Adjustment` and never the top-level
-    /// `Adjustment`, which is `ActiveRecord::Inheritance#compute_type`'s order rather than a
-    /// preference. The `has_many` says the same thing about the relation: `collections` and
-    /// `signatures` have to agree about which class was named, or the member is typed as a
-    /// relation of a class it does not hold.
+    /// `Spree::LineItem` naming `Adjustment` is `Spree::Adjustment`, never the top-level
+    /// `Adjustment`: that is `ActiveRecord::Inheritance#compute_type`'s order, not a preference.
+    /// The `has_many` says the same about the relation: `collections` and `signatures` must agree
+    /// on which class was named, or the member is typed as a relation of a class it does not hold.
     #[test]
     fn an_association_resolves_against_the_nesting_of_the_class_it_is_written_on() {
         let model = read_model(
@@ -1067,12 +1040,12 @@ end
         );
     }
 
-    /// A `class_name:` is walked exactly as a derived name is, and `::` is the one escape.
+    /// A `class_name:` is walked exactly like a derived name, and `::` is the one escape.
     ///
-    /// Rails hands `compute_type` whichever name it has and the walk is inside it, so
+    /// Rails hands `compute_type` whichever name it has and walks inside it, so
     /// `class_name: "Order"` inside `module Spree` is `Spree::Order`. A leading `::` takes
-    /// `compute_type`'s own first branch — an absolute reference, constantized with no
-    /// candidates at all — which is why the two lines below answer differently.
+    /// `compute_type`'s first branch (an absolute reference, constantized with no candidates),
+    /// which is why the two lines below differ.
     #[test]
     fn a_written_class_name_is_nested_too_and_a_leading_colon_pair_is_absolute() {
         let model = read_model(
@@ -1106,15 +1079,13 @@ end
 
     /// `belongs_to` is not only ActiveRecord's, and a prefix must not rescue a name.
     ///
-    /// solidus' admin controllers write `belongs_to "spree/order"` ten times from
-    /// `Spree::Admin::ResourceController`, and it is not the macro this reader reads. It
-    /// declines because `Spree/order` is not a constant, and the nesting walk must not turn that
-    /// into an answer: a prefix in front of a name that is not a constant leaves a name that is
-    /// still not one, at every depth.
+    /// An engine's admin controllers write `belongs_to "spree/order"` from
+    /// `Spree::Admin::ResourceController`, and that is not the macro this reader reads. It declines
+    /// because `Spree/order` is not a constant, and the nesting walk must not turn that into an
+    /// answer: prefixing a non-constant leaves a non-constant, at every depth.
     ///
-    /// The second macro is the other half of that, and it declines one step earlier: a name
-    /// [`camelize`] cannot make a constant of at all never reaches the candidate list, so there
-    /// is nothing to put a prefix on.
+    /// The second macro declines one step earlier: a name [`camelize`] cannot make a constant of
+    /// never reaches the candidate list, so there is nothing to prefix.
     #[test]
     fn a_name_that_is_not_a_constant_is_still_nothing_with_every_prefix() {
         let model = read_model(
@@ -1192,8 +1163,8 @@ end
     fn the_class_a_polymorphic_source_names_beats_the_source_and_loses_to_the_class_name() {
         // All three keywords on one association, and `Record` is deliberately a class this
         // application *does* define: a reader that fell through to `source:` would answer here
-        // rather than decline, and answer wrong. Eight lines in four of the reference
-        // repositories are this shape, and `source:` camelizes to the wrong class on every one.
+        // instead of declining, and answer wrong. Real code has this shape, and `source:` camelizes
+        // to the wrong class every time.
         let source = "\
 class Concept
   has_many :concept_memberships
@@ -1240,9 +1211,9 @@ end
 
     #[test]
     fn a_belongs_to_is_a_member_that_types_its_chain_and_jumps_to_the_macro() {
-        // A `belongs_to` in one expression, and the three things that have to happen at once
-        // are the three a column's first test asks for: the member exists, the chain off it is typed,
-        // and the jump lands on the macro that said so rather than anywhere in the class.
+        // A `belongs_to` in one expression, with the three things a column's first test asks for
+        // happening at once: the member exists, the chain off it is typed, and the jump lands on
+        // the macro that said so, not somewhere in the class.
         let source = "Story.new.user\n";
         let (mut harness, story, uri) = models_project(source);
 
@@ -1275,12 +1246,11 @@ end
 
     #[test]
     fn what_an_association_declares_and_what_it_refuses_to() {
-        // The options table, as behaviour. `class_name:` wins over the association's own name
-        // and it is not a refinement — 32 of the corpus's 76 carry one, and without it
-        // `parent_story` camelizes to a class no application has ever defined. What is declined
-        // is a *lookup* that came back empty; a call that says outright that no class can be
-        // named — `polymorphic:`, or a `class_name:` that is not a literal — declares the member
-        // anyway and leaves the type open.
+        // The options table, as behaviour. `class_name:` beats the association's own name, and is
+        // required, not a refinement: without it `parent_story` camelizes to a class no application
+        // defines. What declines is a *lookup* that came back empty; a call that says outright that
+        // no class can be named (`polymorphic:`, or a non-literal `class_name:`) still declares the
+        // member and leaves the type open.
         let (harness, _story, _uri) = models_project("");
 
         assert!(harness.has("Story#user()"));
@@ -1316,9 +1286,9 @@ end
 
     #[test]
     fn a_hover_on_an_association_says_which_file_and_which_class_it_came_from() {
-        // The provenance rule, and the boundary it exists to hold: the card names the file, the
-        // macro and the class it resolved to, and it does so because the *generated RBS* carries
-        // a comment above the `def`. Nothing in `hover.rs` knows the word `belongs_to`.
+        // The provenance rule, and the boundary it holds: the card names the file, the macro and
+        // the resolved class because the *generated RBS* carries a comment above the `def`. Nothing
+        // in `hover.rs` knows the word `belongs_to`.
         let source = "Story.new.parent_story\n";
         let (mut harness, _story, uri) = models_project(source);
 
@@ -1330,12 +1300,11 @@ end
 
     #[test]
     fn a_macro_that_names_no_class_still_names_the_member_and_the_line() {
-        // The whole of the trade, in one expression. A polymorphic `belongs_to` has no class to
-        // name and never had one — but it has a **member**, and the place a reader wants is the
-        // line that declared it. Emitting nothing said both of those at once, and one rung down
-        // nothing is indistinguishable from having never looked: the cursor fell through to the
-        // name-based list, which answered with whichever unrelated `def owner` the workspace
-        // happened to hold. So the decline is written down as a member with no type.
+        // The whole trade in one expression. A polymorphic `belongs_to` has no class to name, but
+        // it does have a **member**, and the place a reader wants is the line that declared it.
+        // Declaring nothing would lose both, and one rung down nothing looks like never having
+        // looked: the cursor would fall to the name-based list and answer with whatever unrelated
+        // `def owner` the workspace holds. So the member is declared with no type.
         let source = "Story.new.owner\n";
         let (mut harness, story, uri) = models_project(source);
 
@@ -1346,7 +1315,7 @@ end
             "{definition}"
         );
         // `  belongs_to :owner, polymorphic: true` on line 3, with the name selected past its
-        // colon — the same span a `belongs_to` that does name a class answers with.
+        // colon: the same span a class-naming `belongs_to` answers with.
         assert_eq!(
             (
                 &definition[0]["targetRange"]["start"]["line"],
@@ -1357,7 +1326,7 @@ end
         );
         assert_eq!(definition.as_array().map(Vec::len), Some(1), "{definition}");
 
-        // And the card says which line and why there is no type, rather than claiming one.
+        // And the card says which line, and why there is no type, instead of claiming one.
         let card = card(&mut harness, &uri, source, "owner");
         assert!(card.contains("belongs_to :owner"), "{card}");
         assert!(card.contains("`_type` column"), "{card}");
@@ -1369,12 +1338,11 @@ end
 
     #[test]
     fn a_class_name_nobody_can_read_a_class_out_of_is_the_same_answer() {
-        // Solidus' `class_name: Spree::UserClassHandle.new` — the host application supplies its
-        // own user class through a runtime object, and no reading of the text turns one into a
-        // name. Measured, the two positions this shape holds answered a *spec* file before this:
-        // the fall-through camelized `user`, found no `Keeper` either, and handed the name to
-        // the list. The keyword is ActiveRecord's own, which is the evidence that makes this a
-        // deliberate refusal rather than a lookup that failed.
+        // An engine's `class_name: Spree::UserClassHandle.new`: the host application supplies its
+        // own user class through a runtime object, and no reading of the text turns that into a
+        // name. Falling through here would camelize `user`, find no `Keeper`, and hand the name to
+        // the list, which can land in a spec file. The keyword is ActiveRecord's own, which is the
+        // evidence that this is a deliberate refusal and not a failed lookup.
         let source = "Story.new.keeper\n";
         let (mut harness, story, uri) = models_project(source);
 
@@ -1391,10 +1359,9 @@ end
 
     #[test]
     fn a_member_with_no_type_ends_the_chain_rather_than_guessing_one() {
-        // The other half of "no type": what is *not* claimed. `owner` answers its own line, and
-        // what a `.` after it can reach is nothing at all — an untyped member is the end of a
-        // chain, and inventing an `Owner` class from six letters is exactly the answer that
-        // must not come back.
+        // The other half of "no type": what is *not* claimed. `owner` answers its own line, and a
+        // `.` after it reaches nothing: an untyped member ends the chain, and inventing an `Owner`
+        // class from six letters is exactly the answer that must not come back.
         let source = "Story.new.owner.title\n";
         let (mut harness, _story, uri) = models_project(source);
 
@@ -1407,9 +1374,9 @@ end
 
     #[test]
     fn optional_is_what_makes_a_belongs_to_nilable_and_a_has_one_always_is() {
-        // The nullability half. Rails 5 made `belongs_to` non-`nil` by default, so the
-        // presence of the option is what makes the member optional — and `has_one` is optional
-        // whatever anyone writes, because nothing in the file says the other record exists.
+        // The nullability half. Rails 5 made `belongs_to` non-`nil` by default, so the option is
+        // what makes the member optional; `has_one` is optional whatever anyone writes, because
+        // nothing in the file says the other record exists.
         let (harness, _story, _uri) = models_project("");
         let rbs = harness.generated_rbs("app/models/story.rb");
 
@@ -1420,16 +1387,16 @@ end
 
     /// The nesting walk, end to end, and the fixture is the point: both spellings exist.
     ///
-    /// Rails resolves an association's class against the module nesting of the class the macro
-    /// is written on — `Spree::LineItem` naming `Adjustment` tries `Spree::LineItem::Adjustment`,
-    /// then `Spree::Adjustment`, and the bare `Adjustment` **last** — so a workspace holding
-    /// both answers with the nested one. Taking the bare one is wrong at real sites, which is why
-    /// the assertion is on the *place* rather than on whether an answer exists: where both
-    /// classes declare a `total`, the wrong order sends the jump to the wrong file, silently.
+    /// Rails resolves an association's class against the module nesting of the class the macro is
+    /// written on (`Spree::LineItem` naming `Adjustment` tries `Spree::LineItem::Adjustment`, then
+    /// `Spree::Adjustment`, then the bare `Adjustment` **last**), so a workspace holding both
+    /// answers with the nested one. Taking the bare one is wrong at real sites, so the assertion is
+    /// on the *place*, not just on an answer existing: where both classes declare a `total`, the
+    /// wrong order silently sends the jump to the wrong file.
     ///
-    /// The `has_many` is the other half and it is not a repetition: `Model::collections` asks
-    /// which relation classes are needed and `Model::signatures` asks what each member returns,
-    /// and two different answers put a `Spree::Order` member behind an `Order::Relation`.
+    /// The `has_many` is the other half, not a repeat: `Model::collections` asks which relation
+    /// classes are needed and `Model::signatures` asks what each member returns, and disagreement
+    /// would put a `Spree::Order` member behind an `Order::Relation`.
     #[test]
     fn an_association_names_the_class_the_nesting_reaches_and_not_the_bare_one() {
         let source =
@@ -1486,14 +1453,13 @@ end
         );
     }
 
-    /// The host test end to end: the same macro in three bodies, and only two of them mean it.
+    /// The host test end to end: the same macro in three bodies, and only two mean it.
     ///
     /// `active_model_serializers` spells `has_many`, `has_one` and `belongs_to`, stores an
-    /// `Attribute` and defines **no method** — a serializer answers `respond_to?` false for
-    /// every name its own macro wrote — and `has_many :comments` is byte-identical in a model
-    /// and in one, so there is no shape to gate on and the host has to be asked. This runs the
-    /// whole pass so that `Context::models` is what answers, rather than a set a unit test
-    /// handed in.
+    /// `Attribute` and defines **no method** (a serializer answers `respond_to?` false for every
+    /// name its macro wrote), and `has_many :comments` is byte-identical in a model and in one.
+    /// With no shape to gate on, the host has to be asked. This runs the whole pass so
+    /// `Context::models` answers, not a set a unit test handed in.
     #[test]
     fn a_serializer_writing_an_association_macro_declares_nothing() {
         let source = "Story.new.comments\n";
@@ -1519,12 +1485,12 @@ end
         );
     }
 
-    /// The same rule, reached from a body that is not a serializer at all.
+    /// The same rule, from a body that is not a serializer at all.
     ///
-    /// Solidus' `Spree::Admin::ResourceController` defines its own class-side `belongs_to` for
-    /// nested-resource routing and defines no method either. A blocklist of serializer names
-    /// would have to be told about it; an admit list already declines it, because a controller
-    /// is neither a model nor a module.
+    /// An engine's `Spree::Admin::ResourceController` defines its own class-side `belongs_to` for
+    /// nested-resource routing and defines no method either. A blocklist of serializer names would
+    /// need telling about it; an admit list already declines it, because a controller is neither a
+    /// model nor a module.
     #[test]
     fn a_controller_writing_an_association_macro_declares_nothing() {
         let source = "Story.new.comments\n";
@@ -1545,11 +1511,10 @@ end
     /// The includer fan-out in one expression: two includers, two relation types, one line.
     #[test]
     fn a_concerns_scope_is_a_class_method_of_every_class_that_includes_it() {
-        // `scope :expired` in `Expireable` is `Poll.expired` **and** `Invite.expired`, and the
-        // two answers are two different types — which is the whole reason a module body reads
-        // the macro and writes nothing. The declaration goes into the *concern's* generated
-        // document, once per pair, so both jumps land on the one `scope` line that said so and
-        // no bookkeeping is added anywhere.
+        // `scope :expired` in `Expireable` is `Poll.expired` **and** `Invite.expired`, two
+        // different types, which is why a module body reads the macro and writes nothing on the
+        // module. The declaration goes into the *concern's* generated document, once per pair, so
+        // both jumps land on the one `scope` line, with no extra bookkeeping anywhere.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         let concern = harness.write(
@@ -1578,8 +1543,8 @@ end
         harness.index();
 
         // The two types, from the text: one member declared twice, once per includer, in the
-        // concern's own generated document. No hover card prints a return type, and the RBS is
-        // where the two `Relation`s are visible at all.
+        // concern's own generated document. No hover card prints a return type, so the RBS is the
+        // only place both `Relation`s are visible.
         let rbs = harness.generated_rbs("app/models/concerns/expireable.rb");
         assert!(
             rbs.contains("def self.expired: (*untyped) -> Poll::Relation"),
@@ -1597,8 +1562,8 @@ end
         assert!(invite.contains("Invite.expired"), "{invite}");
         assert!(invite.contains("which `Invite` includes"), "{invite}");
 
-        // Both jump to the one `scope` line — line 4, the only line in the file that declares
-        // anything — and neither lands in the model that includes the concern.
+        // Both jump to the one `scope` line (line 4, the only line in the file that declares
+        // anything), and neither lands in the model that includes the concern.
         for needle in ["expired()", "expired\n"] {
             let definition = harness.definition_at(&uri, source, needle);
             assert_eq!(
@@ -1619,21 +1584,21 @@ end
     /// The three declines, and the one that is a closure rather than a decline.
     #[test]
     fn which_classes_a_concerns_scope_reaches_and_which_it_does_not() {
-        // A concern nobody includes declares nothing **and does not fall back to itself** —
-        // `Orphan.forgotten` raises in Ruby, and the argument against writing it on the
-        // module's own singleton is unchanged by having the includers in hand.
+        // A concern nobody includes declares nothing and **does not fall back to itself**:
+        // `Orphan.forgotten` raises in Ruby, and knowing the includers does not change the argument
+        // against writing it on the module's singleton.
         //
-        // An `include` naming a constant the application does not define resolves to nothing,
-        // which is the decline every reader in this pass makes: `include Sidekiq::Worker` is a
-        // real `include` of a class this workspace has never seen.
+        // An `include` naming a constant the application does not define resolves to nothing, the
+        // decline every reader in this pass makes: `include Sidekiq::Worker` is a real `include` of
+        // a class this workspace has never seen.
         //
-        // A class that is not a model and owns no collection declines too, and the gate is
-        // `relations` rather than a rule of its own: a `scope` fanned onto a PORO would need a
-        // `Plain::Relation`, which is a class with no table behind it.
+        // A class that is not a model and owns no collection declines too, gated by `relations`,
+        // not a rule of its own: a `scope` fanned onto a PORO would need a `Plain::Relation`, a
+        // class with no table behind it.
         //
-        // And the closure. `ActiveSupport::Concern` hands an inner concern's `included` block
-        // to whatever includes the outer one, so `Deep.forgotten` is real through two hops. No
-        // corpus writes one, so this test is the only evidence for that property.
+        // And the closure: `ActiveSupport::Concern` hands an inner concern's `included` block to
+        // whatever includes the outer one, so `Deep.forgotten` is real through two hops. Real
+        // projects rarely write this, so this test is the evidence for that property.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write(
@@ -1648,9 +1613,9 @@ end
             "app/models/plain.rb",
             "class Plain\n  include Orphan\nend\n",
         );
-        // An `include` that resolves to a **class** is not an edge: only a module can be
-        // included, and a name that resolves to one of the application's classes says nothing
-        // about where a concern's macros land.
+        // An `include` resolving to a **class** is not an edge: only a module can be included, and
+        // a name resolving to an application class says nothing about where a concern's macros
+        // land.
         harness.write("app/models/widget.rb", "class Widget\nend\n");
         harness.write(
             "app/models/boxed.rb",
@@ -1660,8 +1625,8 @@ end
             "app/models/stranger.rb",
             "class Stranger < ApplicationRecord\n  include Sidekiq::Worker\nend\n",
         );
-        // A module that includes itself is a `NoMethodError` at run time and an infinite loop
-        // in a closure, and this walks the text rather than the run.
+        // A module that includes itself is a `NoMethodError` at run time and an infinite loop in a
+        // closure, and this walks the text, not the run.
         harness.write(
             "app/models/concerns/knot.rb",
             "module Knot\n  include Knot\n  included do\n    scope :tied, -> { all }\n  end\nend\n",
@@ -1690,24 +1655,21 @@ end
         assert!(!harness.has("Bigger::<Bigger>#forgotten()"));
     }
 
-    /// The collision worth arguing before believing, and the argument is that **both are
-    /// real**.
+    /// A collision worth arguing before believing, and the argument is that **both are real**.
     #[test]
     fn a_scope_written_in_both_a_concern_and_its_includer_is_two_places_and_one_type() {
-        // `include Expireable` runs `included do … scope :recent … end` on `Poll` and `scope
-        // :recent` in `Poll`'s own body runs on `Poll` too: two lines of Ruby, both of which
-        // really do install `Poll.recent`, and Ruby keeps whichever ran last. Neither is a
-        // guess and neither can be preferred by any evidence a file states, so both stand —
-        // and they *may* stand, because the two declarations agree about the type by
-        // construction. A `scope` returns a relation of the class it is installed on, and a
-        // concern's is installed on the includer, which is the same class.
+        // `include Expireable` runs `included do … scope :recent … end` on `Poll`, and
+        // `scope :recent` in `Poll`'s own body runs on `Poll` too: two lines of Ruby, both really
+        // installing `Poll.recent`, and Ruby keeps whichever ran last. Neither is a guess, and no
+        // evidence in a file prefers one, so both stand. They *may* both stand because they agree
+        // about the type by construction: a `scope` returns a relation of the class it is installed
+        // on, and a concern's is installed on the includer, the same class.
         //
-        // That is the condition, and it is narrower than "two generators collided": where two
-        // documents disagree about a type the rank has to be spent by the loser declining —
-        // `Source::outranks`, or the column-versus-`enum` withdrawal. Here
-        // there is nothing to decide, so the honest card is the one that names both lines.
+        // That condition is narrower than "two generators collided": where two documents disagree
+        // about a type, the loser must decline (`Source::outranks`, or the column-versus-`enum`
+        // withdrawal). Here there is nothing to decide, so the honest card names both lines.
         //
-        // It measures **0** over six corpora; this test is the only place it happens.
+        // Real projects rarely hit this; this test is where it is exercised.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write(
@@ -1736,20 +1698,19 @@ end
             "{recent}"
         );
 
-        // One type, and the chain is what proves it: two declarations of one member disagreeing
-        // about what they return is the thing the rank exists to prevent, and here they cannot.
+        // One type, and the chain proves it: two declarations of one member disagreeing about their
+        // return type is what the rank prevents, and here they cannot disagree.
         let first = card(&mut harness, &uri, source, "first");
         assert!(first.contains("ActiveRecordRelation#first"), "{first}");
     }
 
-    /// The writer half of an association, on both sides of it.
+    /// The writer half of an association, on both sides.
     ///
-    /// A collection's constructors are the **relation's** — `relation.rb` defines `create` at
-    /// 155, `create!` at 170 and `new` at 126 with `alias build new` at 134 — and a singular
-    /// association's are three `def`s Rails writes onto the model from the macro line, in
-    /// `associations/builder/singular_association.rb`. ya-lsp declared `build` and not `new`,
-    /// which is an incoherence rather than a bound since they are one method, and declared none
-    /// of the singular three at all.
+    /// A collection's constructors are the **relation's**: `relation.rb` defines `create`,
+    /// `create!` and `new`, with `alias build new`. A singular association's are three `def`s Rails
+    /// writes onto the model from the macro line, in
+    /// `associations/builder/singular_association.rb`. Since `build` and `new` are one method, both
+    /// must be declared.
     #[test]
     fn an_association_answers_what_it_builds_and_creates() {
         let source = "Story.first.comments.create!.story\n\
@@ -1768,8 +1729,8 @@ end
             );
         }
         assert!(harness.has("ActiveRecordRelation#new()"));
-        // …and `new` is the relation's alone, because a model gets its own from `Class` and a
-        // declaration on the class side would shadow something real.
+        // …and `new` is the relation's alone, because a model gets its own from `Class`, and a
+        // class-side declaration would shadow something real.
         assert!(!harness.has("Story::<Story>#new()"));
 
         // The singular half, on the model, from the macro line.
@@ -1782,9 +1743,9 @@ end
             created.contains("`belongs_to :user`"),
             "the macro line is the place: {created}"
         );
-        // It chains, and it is **not** nilable where the reader is: `belongs_to :parent_story,
-        // optional: true` reads a `Story?` and `create_parent_story` makes one, so it is a
-        // `Story`.
+        // It chains, and it is **not** nilable where the reader is:
+        // `belongs_to :parent_story, optional: true` reads a `Story?`, but `create_parent_story`
+        // makes one, so it is a `Story`.
         let chained = card(&mut harness, &uri, source, "comments");
         assert!(chained.contains("Story#comments"), "{chained}");
         assert!(
@@ -1792,23 +1753,23 @@ end
             "{chained}"
         );
 
-        // A collection macro installs none of the three, because a collection's are the
-        // relation's — and `has_many :comments` is in the same file as the `belongs_to` above.
+        // A collection macro installs none of the three, because a collection's constructors are
+        // the relation's, and `has_many :comments` is in the same file as the `belongs_to` above.
         assert!(!harness.has("Story#build_comments()"));
         assert!(!harness.has("Story#create_comment()"));
-        // A polymorphic `belongs_to` names no class, so Rails writes no constructors and
-        // neither does this — `owner` is the fixture's polymorphic one.
+        // A polymorphic `belongs_to` names no class, so Rails writes no constructors, and neither
+        // does this; `owner` is the fixture's polymorphic one.
         assert!(!harness.has("Story#build_owner()"));
         // …and `belongs_to :ghost` names a class the project does not define.
         assert!(!harness.has("Story#build_ghost()"));
-        // `reload_x` and `reset_x` come off the same Rails method and are declined on their
-        // measurement: 1 call site and 0 in six corpora.
+        // `reload_x` and `reset_x` come from the same Rails method and are left out because they
+        // are rarely called.
         assert!(!harness.has("Story#reload_user()"));
         assert!(!harness.has("Story#reset_user()"));
     }
 
-    /// The rest of what one association line installs — Rails' own "Auto-generated methods"
-    /// table, and every row of it this reader can name.
+    /// The rest of what one association line installs: Rails' own "Auto-generated methods" table,
+    /// every row this reader can name.
     #[test]
     fn an_association_answers_its_writer_and_the_ids_of_a_collection() {
         let source = "Story.first.user = User.first\n\
@@ -1818,9 +1779,8 @@ end
                       Story.first.comments.reload.first.story\n";
         let (mut harness, _story, uri) = models_project(source);
 
-        // The singular writer, which is nilable whatever the reader is: `belongs_to :user` is
-        // required and `story.user = nil` is still ordinary Ruby — the validation is what
-        // fails, at save.
+        // The singular writer, nilable whatever the reader is: `belongs_to :user` is required, yet
+        // `story.user = nil` is ordinary Ruby; the validation fails, at save.
         assert!(harness.has("Story#user=()"));
         let written = card(&mut harness, &uri, source, "user =");
         assert!(written.contains("Story#user="), "{written}");
@@ -1829,9 +1789,9 @@ end
             "the macro line is the place: {written}"
         );
 
-        // The collection's three. `has_many` singularizes the **association's own name** rather
-        // than the class it resolves to, which is what `has_many :tags, through: :taggings`
-        // shows: it collects a `Tag` and its ids are `tag_ids`.
+        // The collection's three. `has_many` singularizes the **association's own name**, not the
+        // class it resolves to, as `has_many :tags, through: :taggings` shows: it collects a `Tag`
+        // and its ids are `tag_ids`.
         assert!(harness.has("Story#comments=()"));
         assert!(harness.has("Story#comment_ids()"));
         assert!(harness.has("Story#comment_ids=()"));
@@ -1840,32 +1800,31 @@ end
         assert!(!harness.has("Story#draft_ids()"));
         assert!(!harness.has("Story#comment_ids_ids()"));
 
-        // The name comes from the **association** and the card says which macro wrote it —
-        // `has_many :tags, through: :taggings` collects a `Tag`, and `tag_ids` is singularized
-        // from `tags` rather than from the class.
+        // The name comes from the **association**, and the card says which macro wrote it:
+        // `has_many :tags, through: :taggings` collects a `Tag`, and `tag_ids` is singularized from
+        // `tags`, not from the class.
         let ids = card(&mut harness, &uri, source, "tag_ids");
         assert!(ids.contains("`has_many :tags`"), "{ids}");
-        // `Array[untyped]` and not a bare `untyped`. No hover card prints a return type, so the
-        // chain is what states it: what a primary key holds is the schema's to say and is in
-        // another generated document this reader cannot ask, but the *array* is known and is
-        // what the call sites want.
+        // `Array[untyped]`, not a bare `untyped`. No hover card prints a return type, so the chain
+        // states it: what a primary key holds is the schema's to say, in another generated document
+        // this reader cannot ask, but the *array* is known and is what callers want.
         let joined = card(&mut harness, &uri, source, "join");
         assert!(joined.contains("Array#join"), "{joined}");
 
-        // `Relation#reload` hands the relation back, so a chain runs on through it. It is the
-        // relation's alone — `ActiveRecord::Base#reload` is an instance method, so
-        // `Story.reload` reaches `Class`, finds nothing and raises.
+        // `Relation#reload` returns the relation, so a chain runs through it. It is the relation's
+        // alone: `ActiveRecord::Base#reload` is an instance method, so `Story.reload` reaches
+        // `Class`, finds nothing and raises.
         assert!(harness.has("ActiveRecordRelation#reload()"));
         assert!(!harness.has("Story::<Story>#reload()"));
         let reloaded = card(&mut harness, &uri, source, "story\n");
         assert!(reloaded.contains("Comment#story"), "{reloaded}");
 
-        // The four Rails installs that are declined on their measurement: eight call sites in
-        // six applications against a name per association.
+        // The four Rails installs that are left out because they are rarely called, against a name
+        // per association.
         assert!(!harness.has("Story#user_changed?()"));
         assert!(!harness.has("Story#user_previously_changed?()"));
-        // A polymorphic `belongs_to` names no class, and the writer is one of the two names
-        // that do not need one: `story.owner = account` is what the column is for.
+        // A polymorphic `belongs_to` names no class, and the writer is one of the two names that
+        // need none: `story.owner = account` is what the column is for.
         assert!(harness.has("Story#owner=()"));
     }
 }

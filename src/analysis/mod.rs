@@ -2,29 +2,28 @@
 //!
 //! # Containment rule
 //!
-//! This is the only module allowed to name a rubydex type. rubydex is pre-1.0 with one
-//! published release; when its API churns the blast radius must be one directory.
+//! This is the only module allowed to name a rubydex type. rubydex is pre-1.0 and its API churns,
+//! so the blast radius must be one directory.
 //!
 //! # Threading
 //!
-//! rubydex is synchronous and `Graph` has a single `&mut` writer, so there is exactly one
-//! analysis thread and every request serialises behind it. That is affordable because rubydex
-//! is fast, but it makes debouncing and cancellation load-bearing rather than optional.
+//! rubydex is synchronous and `Graph` has a single `&mut` writer, so there is exactly one analysis
+//! thread and every request queues behind it. rubydex is fast enough for that, but it makes
+//! debouncing and cancellation essential.
 //!
 //! # What is here and what is next door
 //!
-//! This file is the thread: the tasks it takes, the graph and buffers it owns, the indexing
-//! lifecycle that keeps them current, the diagnostics it pushes without being asked, and the
-//! run loop that orders all of it. The LSP request layer — every handler, the method table, and
-//! the bulkhead around answering — is [`requests`], and the pass that writes the workspace's own
-//! RBS is [`synthesize`]. Both are sibling files holding an `impl Analysis`, which Rust allows
-//! because privacy is by module *descendant*.
+//! - **This file is the thread**: the tasks it takes, the graph and buffers it owns, the indexing
+//!   lifecycle, the diagnostics it pushes, and the run loop ordering all of it.
+//! - **[`requests`]** is the LSP request layer: every handler, the method table, and the bulkhead
+//!   around answering.
+//! - **[`synthesize`]** is the pass that writes the workspace's own RBS.
 //!
-//! The same rule is why `testing` is here and not at the crate root: the `Harness` every
-//! end-to-end test in the crate drives the server through holds an `Analysis`, and a child of
-//! this module sees every private field of one. The tests left below are the thread's own — the
-//! buffer against the disk, the skip list, the gem stepper, what gets published and whose code
-//! it is; everything else went to the module whose invariant it would break.
+//! Both siblings hold an `impl Analysis`, which Rust allows because privacy is by module
+//! *descendant*. For the same reason `testing` lives here: the `Harness` every end-to-end test
+//! drives holds an `Analysis`, and a child module sees its private fields. The tests below are the
+//! thread's own (buffer against disk, the skip list, the gem stepper, what gets published, whose
+//! code it is); the rest live with the invariant they would break.
 
 pub mod annotations;
 pub mod code_actions;
@@ -34,16 +33,16 @@ pub mod diagnostics;
 mod environment;
 // The two lists a project may replace, and the only things this private module publishes.
 //
-// They are *defaults a user is shown*: the VS Code manifest documents both, and a default
-// written out in JSON with nothing holding it to the code is documentation that rots — which is
-// how `ya-lsp.logLevel` shipped two releases saying `warn`. `tests/vscode_manifest.rs` reads
-// them from here so the manifest and the rule cannot drift.
+// They are *defaults a user is shown*: the VS Code manifest documents both, and a default copied
+// into JSON with nothing tying it to the code rots. `tests/vscode_manifest.rs` reads them from here
+// so the two cannot drift.
 pub use environment::{MIGRATION_PAIR, TEST_TREES};
 pub mod erb;
 pub mod hierarchy;
 pub mod highlight;
 pub mod hints;
 pub mod hover;
+mod indexed;
 pub mod indexer;
 pub mod locator;
 pub mod position;
@@ -77,11 +76,8 @@ use std::{
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use lsp_server::{Message, Request, RequestId, Response};
 use lsp_types::{ClientCapabilities, DiagnosticSeverity};
-use rubydex::{
-    indexing::LanguageId,
-    model::{graph::Graph, ids::UriId},
-    resolution::Resolver,
-};
+use rubydex::{indexing::LanguageId, model::ids::UriId, resolution::Resolver};
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::messages;
 use crate::workspace::{DocUri, Workspace, gems, rails};
@@ -89,42 +85,33 @@ use position::{PositionEncoding, Rebase, TextDocument};
 use progress::Progress;
 use synthesized::Synthesized;
 
-/// How long to wait for typing to settle before the graph catches up with it.
+/// How long to wait for typing to settle before the graph catches up.
 ///
-/// What waits is all of it: the buffer's own index, the generator pass,
-/// `Resolver::resolve` — which links declarations across the whole graph — and the diagnostics
-/// push. A keystroke leaves its edit in `pending_index` and arms this timer; `Analysis::settle`
-/// is the one place any of that happens. rubydex's resolver is incremental
-/// (`Graph::take_pending_work`), so a settle coalesces a burst rather than repeating
-/// whole-graph work.
+/// What waits is all of it: the buffer's index, the generator pass, `Resolver::resolve` (which
+/// links declarations across the whole graph), and the diagnostics push. A keystroke leaves its
+/// edit in `pending_index` and arms this timer; `Analysis::settle` is the only place any of that
+/// runs. rubydex's resolver is incremental (`Graph::take_pending_work`), so a settle coalesces a
+/// burst.
 ///
-/// **Why 500 ms, and why it is not freely tunable.** The timer is renewed by every edit, so it
-/// fires only when the typist stops for longer than it, and the cost of a settle firing
-/// mid-burst is `debounce + settle - gap`. Two values drive that to zero: one small enough that
-/// the settle finishes inside the gap, and one larger than the gap itself. 150 ms is the first
-/// and it stops working once the index is deferred, because a mid-burst settle is then the
-/// *only* thing a completion waits for. Measured at
-/// a 250 ms pace, a keystroke costs 2, 5, 4, 53, 11 and 261 ms at 150 on lobsters, chatwoot,
-/// mastodon, forem, solidus and discourse — and 2, 5, 4, 9, 3 and 24 at 500. **A debounce equal
-/// to the pace is worse than either**, because the settle then fires precisely between two
-/// keystrokes: the first five measure 67, 116, 128, 167 and 130.
+/// - **Why 500 ms.** Every edit renews the timer, so it fires only when the typist pauses longer
+///   than it, and a settle firing mid-burst costs `debounce + settle - gap`. That is zero either
+///   when the settle fits inside the gap, or when the debounce exceeds the gap. A short debounce
+///   stops working once indexing is deferred, because a mid-burst settle is then the *only* thing a
+///   completion waits for. Measured at a 250 ms typing pace, 500 ms keeps keystrokes cheap on every
+///   corpus where 150 ms does not.
+/// - **A debounce equal to the typing pace is worse than either**, because the settle then fires
+///   exactly between two keystrokes.
+/// - **Scaling it per workspace was tried and abandoned.** No stable signal picks the value: a
+///   settle costs what the *last edit* made it cost.
 ///
-/// **Scaling it per workspace was built, measured and abandoned.** The
-/// lower regime is worth nothing in latency — lobsters and chatwoot are identical at both values
-/// — so its only value was keeping diagnostics prompt on small workspaces, and no stable signal
-/// picks it: a settle costs what the *last edit* made it cost, and the cheap ones during a member
-/// burst pull the estimate under any threshold within a keystroke or two.
-///
-/// So the trade is made once and stated: **diagnostics appear 350 ms later after the typist
-/// stops**, in exchange for completion during typing that is 8 to 22 times faster and never
-/// slower.
+/// The trade: **diagnostics appear about 350 ms later after typing stops**, in exchange for much
+/// faster completion while typing.
 const RESOLVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// [`RESOLVE_DEBOUNCE`], with the override the benchmarks set it through.
+/// [`RESOLVE_DEBOUNCE`], with the override the benchmarks set.
 ///
-/// Not a `ya-lsp.toml` key: the constant is calibrated against a measurement rather than a
-/// preference, and a project that set it wrong would make every completion in it slower without
-/// changing a single answer.
+/// Not a `ya-lsp.toml` key: the value is calibrated by measurement, not preference, and a wrong
+/// project setting would slow every completion without changing any answer.
 fn resolve_debounce() -> Duration {
     std::env::var("YA_LSP_RESOLVE_DEBOUNCE_MS")
         .ok()
@@ -134,56 +121,52 @@ fn resolve_debounce() -> Duration {
 
 /// How many gem files one background step indexes before handing the thread back.
 ///
-/// The cost of a step is not the indexing — that is a few milliseconds — but the *resolve* the
-/// next request has to run over what the step added, which is what the user actually waits for.
-/// Measured on a real Rails bundle (151 gems, 6159 files), asking for a documentSymbol as fast
-/// as the server would answer, p90 latency during the index runs 94 ms at 50 files per step,
-/// 117 ms at 100, 127 ms at 200 and 333 ms at 400, while the time to finish indexing when
-/// nobody is asking is 0.25 s either way. 100 is where the worst case is still interactive and
-/// the idle path pays nothing for it.
+/// The cost of a step is not the indexing (milliseconds) but the *resolve* the next request must
+/// run over what the step added, which is what the user waits for. Measured on a real Rails bundle,
+/// worst-case request latency during indexing grows with step size, while total indexing time for
+/// an idle server is the same either way. 100 keeps the worst case interactive and costs the idle
+/// path nothing.
 const GEM_FILES_PER_STEP: usize = 100;
 
 /// How many symbols one `workspace/symbol` answers with.
 ///
-/// A ceiling is not optional at gem scale: rubydex's fuzzy match is a subsequence test, so a
-/// two-letter query matches a large fraction of a Rails bundle's declarations and the request
-/// arrives on every keystroke. What the number buys is only how far down the ranking a client
-/// that does its own filtering can still reach — VS Code shows a few dozen rows — so the cost
-/// of raising it is paid on every keystroke and the benefit is invisible.
+/// Required at gem scale: rubydex's fuzzy match is a subsequence test, so a two-letter query
+/// matches much of a Rails bundle, on every keystroke. The number only sets how far down the
+/// ranking a self-filtering client can reach (VS Code shows a few dozen rows), so raising it costs
+/// every keystroke and buys nothing visible.
 const MAX_WORKSPACE_SYMBOLS: usize = 256;
 
 /// How many references one `textDocument/references` answers with.
 ///
-/// Unlike the symbol ceiling this one should never be reached: it exists so that a name-based
-/// match on `call` in a workspace of tens of thousands of files cannot hand the editor a
-/// multi-megabyte response. Reaching it is logged, because a silently truncated "find all
-/// references" is a wrong answer that looks like a right one.
+/// - **Why:** a name-based match on `call` in a huge workspace must not send the editor a
+///   multi-megabyte response.
+/// - **Reaching it is logged and shown.** A silently truncated "find all references" is a wrong
+///   answer that looks right. Places are ordered by file before the cap, so what is dropped is
+///   whole directories, and the message names the file the list stops in.
+/// - **It is reached in practice**, on name matches for common names in large workspaces.
 const MAX_REFERENCES: usize = 10_000;
 
 /// How many suggestions one `textDocument/completion` answers with.
 ///
-/// Unlike `MAX_WORKSPACE_SYMBOLS`, this one is not a latency control, and measuring said so:
-/// sweeping it over 128 / 256 / 512 / 1024 on a Rails app moved the worst request by about a
-/// millisecond and typing latency not at all, because the cost is the graph work in front of it
-/// and not the rows behind it. What it bounds is the *response* — a thousand items is around
-/// 200 KB of JSON on every keystroke — and how deep a client that filters the list itself can
-/// reach before the `isIncomplete` flag makes it ask again. Since reaching it is now the only
-/// thing that sets that flag, it also decides how often the client has to come back at all.
+/// Not a latency control: measured, the size barely moves request time, because the cost is the
+/// graph work, not the rows. It bounds the *response* (a thousand items is around 200 KB of JSON
+/// per keystroke) and how deep a self-filtering client can reach before `isIncomplete` makes it ask
+/// again. Reaching it is the only thing that sets that flag.
 const MAX_COMPLETION_ITEMS: usize = 512;
 
-/// How many candidates the **name-based** list may have before it answers with nothing at all.
+/// How many candidates the **name-based** list may have before it answers with nothing.
 ///
-/// The admission ceiling, and a separate question from both of the others. [`MAX_COMPLETION_ITEMS`]
-/// bounds the *response* of a list this server believes in; [`MAX_UNTYPED_COMPLETION_ITEMS`] bounds
-/// how many rows of a **guess** are worth reading; this one decides whether the guess is worth
-/// making. `completion::by_name` produces every method name in the project that matches what has
-/// been typed, attached to no class in particular, and above this many of them there is no reason
-/// to believe the ranking put the right one near the top.
+/// The admission ceiling, separate from the other two:
 ///
-/// **Measured by `make audit-prefix`, and it is the reason there are two ceilings rather than one.**
-/// Following 335 untyped cursors over five corpora outwards through their own word, against a
-/// binary built with this raised, the word the file wrote sits inside the first
-/// [`MAX_UNTYPED_COMPLETION_ITEMS`] rows of the server's own order:
+/// - [`MAX_COMPLETION_ITEMS`] bounds the *response* of a list this server believes in.
+/// - [`MAX_UNTYPED_COMPLETION_ITEMS`] bounds how many rows of a **guess** are worth reading.
+/// - **This** decides whether the guess is worth making. `completion::by_name` produces every
+///   matching method name in the project, attached to no class, and above this many there is no
+///   reason to believe the ranking put the right one near the top.
+///
+/// **Measured by `make audit-prefix`:** following untyped cursors outwards through their own word,
+/// the word sits within the first [`MAX_UNTYPED_COMPLETION_ITEMS`] rows every time up to 512
+/// candidates, and starts slipping above it:
 ///
 /// | candidates | lists | word in the first 128 |
 /// |---|---|---|
@@ -193,68 +176,96 @@ const MAX_COMPLETION_ITEMS: usize = 512;
 /// | 513–1,024 | 157 | 152 |
 /// | 1,025+ | 156 | 141 |
 ///
-/// So 512 is the largest value with **no measured loss at all**, and it is where the table first
-/// stops being perfect rather than a round number. Above it the ranking starts to slip — gradually,
-/// which is why this is a judgement and not a cliff.
-///
-/// The empty prefix is untouched by any of this: the candidate set there is the project's whole
-/// name universe, 26,073 to 45,953 over the five corpora, far above every row of that table. That
-/// case declines, which is the defect this pair of ceilings exists for.
+/// The empty prefix is untouched: its candidate set is the whole project's name universe, tens of
+/// thousands, so it declines.
 const MAX_UNTYPED_CANDIDATES: usize = 512;
 
 /// How many rows of the **name-based** list are worth reading, once it is worth offering.
 ///
-/// The display ceiling. [`MAX_UNTYPED_CANDIDATES`] decides whether to answer; this decides how much
-/// of the answer to send, and the two are split because the measurement says the ranking is good
-/// and the row count is not: a guess of 512 candidates holds the word in its first 128 rows every
-/// time, and nobody reads 512 rows of anything.
-///
-/// **Nothing is offered for the first three keystrokes**, at any of these values — over five corpora
-/// the share of untyped cursors whose candidates fit under 512 runs 0% at two characters, 45% at
-/// three, 74% at four and 95% at five. So for the commonest case this is still a flat decline, and
-/// the bounded list only exists mid-word.
-///
-/// Truncating here is honest where truncating at an **empty** prefix would not be: `tier` is 1 for
-/// every row and `length` is 0 when nothing has been typed, leaving `Locality` — which directory
-/// the name lives in — as the only live term, so the rows kept would be arbitrary. From three
-/// characters on, `tier` and `length` are both live and rank p90 is 112 even in thousand-item
-/// lists.
+/// - **The display ceiling.** [`MAX_UNTYPED_CANDIDATES`] decides whether to answer; this decides
+///   how much to send. They are split because the ranking is good and the row count is not: a
+///   512-candidate guess holds the word in its first 128 rows, and nobody reads 512 rows.
+/// - **Usually nothing is offered for the first few keystrokes.** Most untyped cursors have too
+///   many candidates at two or three characters, so the bounded list mostly exists mid-word.
+/// - **Truncating is honest here but not at an empty prefix.** With nothing typed, `tier` is 1 and
+///   `length` 0 for every row, leaving only `Locality` (which directory the name is in), so the
+///   kept rows would be arbitrary. From three characters, `tier` and `length` both rank.
 const MAX_UNTYPED_COMPLETION_ITEMS: usize = 128;
 
 /// How many subtypes one `typeHierarchy/subtypes` answers with.
 ///
-/// Finding them is free — rubydex maintains the reverse index as it linearizes, so the lookup is
-/// the same work for three descendants as for thirty thousand. What costs is the *rows*: each has
-/// to be placed in its own file, which is a read and a line index per file. So the cap bounds the
-/// response *and* the only part of this request that scales.
-///
-/// The number is the measured worst *legitimate* question plus headroom rather than a guess.
-/// `StandardError`'s 458 descendants in Ruby's own signatures is a real question with a real
-/// answer, and is what ruled out 512; `Object`, `Kernel` and `BasicObject` come to about 1,980
-/// each, and every namespace in a mid-sized Ruby project is far below that. All of those fit.
-/// What does not is a Rails bundle, where the three roots are an order of magnitude larger and
-/// the answer would be megabytes and a quarter of a second — the case this exists for, and
-/// reaching it says so out loud.
+/// - **Finding them is free**: rubydex keeps the reverse index as it linearizes. What costs is the
+///   *rows*, each placed in its own file (a read and a line index per file). So the cap bounds the
+///   response and the only part that scales.
+/// - **Sized to the worst legitimate question plus headroom.** `StandardError`'s descendants in
+///   Ruby's signatures ruled out 512; `Object`, `Kernel` and `BasicObject` come to about 2,000 each
+///   outside a bundle. A Rails bundle's roots are an order of magnitude larger, megabytes and a
+///   quarter-second: the case this exists for, and reaching it says so.
 const MAX_SUBTYPES: usize = 2048;
 
 /// How many callers one `callHierarchy/incomingCalls` answers with.
 ///
-/// The rows are buckets rather than call sites — one per method that calls, however many times it
-/// calls — and drawing one reads the file it lives in, which is `MAX_SUBTYPES`' cost exactly. What
-/// differs is how it is reached: a wide type hierarchy takes a deliberate click near the root of
-/// the object model, and a wide *call* hierarchy takes a method named `call`, which is ordinary.
-///
-/// So the number is the measured worst *legitimate* question plus headroom, as `MAX_SUBTYPES` is.
-/// Measured 2026-09-11 over five real applications at their pinned commits, asking for the callers
-/// of the ten commonest method names in each: the widest answer anywhere was forem's `id` at
-/// **1,475 callers over 1,103 files, in 64 ms**, with chatwoot's `id` at 1,202 and mastodon's at
-/// 1,057. Nothing else on any corpus passed 716, and lobsters' widest was 97. Every one of those
-/// is a real question with a real answer and fits; what does not is a workspace several times the
-/// size of these, where the response rather than the latency is what fails.
+/// - **Rows are buckets, not call sites**: one per calling method, however often it calls. Drawing
+///   one reads its file, `MAX_SUBTYPES`' cost exactly.
+/// - **Easier to reach than a wide type hierarchy.** That takes a deliberate click near the object
+///   model's root; a wide call hierarchy takes a method named `call`.
+/// - **Sized like `MAX_SUBTYPES`**: the widest real answers in the corpora (callers of `id`) fit
+///   well inside. What does not fit is a workspace several times larger, where the response, not
+///   latency, fails.
 const MAX_INCOMING_CALLS: usize = 2048;
 
-/// The `$/progress` token for the gem index. A fixed string is fine — only one runs at a time.
+/// The `$/progress` token for the gem index. Fixed, since only one runs at a time.
 const GEM_PROGRESS_TOKEN: &str = "ya-lsp/index-gems";
+
+/// The `$/progress` token for the pipeline's last stage. Fixed for [`GEM_PROGRESS_TOKEN`]'s reason,
+/// and *different* because the two streams are adjacent: one ends as the other begins, and a shared
+/// token could render as one stream that never closed.
+const GENERATE_PROGRESS_TOKEN: &str = "ya-lsp/generate";
+
+/// The one command this server registers; all it does is open a document.
+///
+/// Namespaced on the server, because `workspace/executeCommand` is a flat namespace shared by every
+/// language server in the session. Advertised in `capabilities::advertised` and answered in
+/// `requests`. A client may also run it by name, which is what the code-action entry point gives a
+/// client with no lightbulb.
+///
+/// A **prefix**, not the full name: see [`show_generated_command`].
+pub const SHOW_GENERATED: &str = "ya-lsp.showGenerated";
+
+/// The command name one server advertises, carrying the workspace root it was started for.
+///
+/// **Two servers in one window must not advertise one name.** The VS Code extension starts a client
+/// per workspace folder, and `vscode-languageclient` registers every `executeCommandProvider` name
+/// with `vscode.commands.registerCommand`, which *throws* on a taken name and kills the second
+/// client's handshake. A multi-root workspace would lose every feature in its second folder.
+/// Nothing else in the protocol has this shape: other capabilities are scoped to a document
+/// selector, while a command id is scoped to the editor.
+///
+/// So the root goes in the name, hashed: the id is never shown (readers see the action's title),
+/// and a path would be long and leak someone's disk layout to any extension enumerating commands.
+#[must_use]
+pub fn show_generated_command(root: &std::path::Path) -> String {
+    format!(
+        "{SHOW_GENERATED}.{:016x}",
+        xxhash_rust::xxh3::xxh3_64(root.as_os_str().as_encoded_bytes())
+    )
+}
+
+/// Which watcher saw a change on disk. It decides exactly one thing.
+///
+/// **A saved buffer yields to the disk only for the server's own watcher.** A client holding the
+/// `didChangeWatchedFiles` registration reloads an unmodified file itself (VS Code always, Neovim
+/// with `autoread`), then sends a `didChange` whose *ranges are measured against the text it had*.
+/// If the server had already swapped in the disk's text, the ranges would land in the wrong string.
+/// So the swap happens only where the server is the only watcher, which means a client that reloads
+/// nothing itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Watched {
+    /// The client's own watcher, over `workspace/didChangeWatchedFiles`.
+    ByTheClient,
+    /// [`crate::server::watcher`], which runs only where the client has none.
+    ByTheServer,
+}
 
 /// Work sent from the main loop to the analysis thread.
 #[derive(Debug)]
@@ -262,14 +273,14 @@ pub enum Task {
     DidOpen {
         uri: DocUri,
         text: String,
-        /// The editor's version of this buffer, echoed back on `publishDiagnostics` so the
-        /// client can discard results for text it has already typed past.
+        /// The editor's version of this buffer, echoed on `publishDiagnostics` so the client can
+        /// drop results for text it has typed past.
         version: Option<i32>,
     },
     DidChange {
         uri: DocUri,
-        /// In the order the client sent them. Each range is expressed against the text the
-        /// previous change left behind, so they cannot be reordered or coalesced.
+        /// In the client's order. Each range is measured against the text the previous change left,
+        /// so they cannot be reordered or merged.
         changes: Vec<TextChange>,
         version: Option<i32>,
     },
@@ -280,54 +291,49 @@ pub enum Task {
         uri: DocUri,
     },
     Request(Request),
-    /// Paths a `workspace/didChangeWatchedFiles` named, deduplicated, with `ya-lsp.toml`
-    /// already split off — that one is [`Task::ReloadConfig`], which is a different order of
-    /// magnitude of work.
+    /// Paths a `workspace/didChangeWatchedFiles` named, deduplicated, with `ya-lsp.toml` split off
+    /// (that is [`Task::ReloadConfig`], far more work).
     ///
-    /// No change *kind* is carried. The client sends created, changed and deleted, and all
-    /// three are answered by looking: a file that is there is indexed and a file that is not is
-    /// dropped. That is not a shortcut — during a branch switch the events and the filesystem
-    /// genuinely disagree, and a `Deleted` for a path git has already written back would
-    /// otherwise drop a file that exists.
+    /// No change *kind* is carried. Created, changed and deleted are all answered by looking: a
+    /// file that exists is indexed, one that does not is dropped. During a branch switch the events
+    /// and the filesystem genuinely disagree, and a `Deleted` for a path git already wrote back
+    /// would otherwise drop an existing file.
     WatchedFiles {
         uris: Vec<DocUri>,
+        watched: Watched,
     },
     /// `ya-lsp.toml` changed on disk.
     ReloadConfig,
     /// The client changed the settings it sent as `initializationOptions`.
     ///
-    /// Carried rather than re-read, because these never touch the filesystem: they are the
-    /// editor's own settings, and the editor is the only thing that knows them.
+    /// Carried, not re-read: these are the editor's own settings and never touch the filesystem.
     ChangeConfig {
         options: Option<serde_json::Value>,
     },
     /// Kill the analysis thread, from a test.
     ///
-    /// A stand-in in the same sense [`crash_the_next_resolve_if_asked`] is, and for a narrower
-    /// reason: the panic [`AnalysisHandle::join`] reports is by construction the *unforeseen*
-    /// one — everything foreseen here is either handled or caught in [`Analysis::resolve`] — so
-    /// there is no input that provokes it and nothing to reproduce. What the arm is worth
-    /// pinning is ya-lsp's half: that a thread which died is noticed at all rather than joined
-    /// silently, which is the difference between one line in the log and a server that answers
-    /// nothing for the rest of the session with nothing said anywhere.
+    /// A stand-in, like [`crash_the_next_resolve_if_asked`]: the panic [`AnalysisHandle::join`]
+    /// reports is by construction the *unforeseen* one (everything foreseen is handled or caught in
+    /// [`Analysis::resolve`]), so no input provokes it. What this pins is ya-lsp's half: a dead
+    /// thread is noticed, not joined silently. That is the difference between one log line and a
+    /// server that silently answers nothing for the rest of the session.
     #[cfg(test)]
     Panic,
 }
 
 impl Task {
-    /// What one line of the log calls this task, and the one thing it is about.
+    /// What one log line calls this task, and the one thing it is about.
     ///
-    /// The names are the client's own — `didChange`, not `DidChange` — because the reader who
-    /// needs this line has the editor's LSP trace open beside it and is matching the two up.
+    /// Names are the client's own (`didChange`, not `DidChange`), because the reader has the
+    /// editor's LSP trace open beside the log and is matching them up.
     fn describe(&self) -> (&'static str, &str) {
         match self {
             Task::DidOpen { uri, .. } => ("didOpen", uri.as_str()),
             Task::DidChange { uri, .. } => ("didChange", uri.as_str()),
             Task::DidClose { uri } => ("didClose", uri.as_str()),
             Task::DidSave { uri } => ("didSave", uri.as_str()),
-            // The count goes on the arm that handles it rather than here: a branch switch names
-            // thousands of paths, and a number is not a `&str` without allocating one per
-            // notification.
+            // The count goes on the handling arm, not here: a branch switch names thousands of
+            // paths, and a number is not a `&str` without allocating per notification.
             Task::WatchedFiles { .. } => ("didChangeWatchedFiles", "-"),
             Task::ChangeConfig { .. } => ("didChangeConfiguration", "-"),
             Task::ReloadConfig => ("ya-lsp.toml", "-"),
@@ -348,53 +354,90 @@ pub struct TextChange {
 
 /// How to ask the client for the files outside the workspace, given their URI prefixes.
 ///
-/// A function rather than the table it reads. The table is `server::capabilities`, which already
-/// reads `analysis::tokens` and `analysis::position`, so naming its types here would close a cycle
-/// between capability negotiation and the thread that answers — and the only thing this side has
-/// to know is the trade: hand over the prefixes, get back registrations to send. An empty answer
-/// for a non-empty list of prefixes means the client takes no dynamic registration, which
-/// [`Analysis::register_documents`] says once and then stops saying.
+/// A function, not the table it reads. The table is `server::capabilities`, which already reads
+/// `analysis::tokens` and `analysis::position`, so naming its types here would create a cycle. This
+/// side only needs the trade: prefixes in, registrations out. An empty answer for a non-empty
+/// prefix list means the client takes no dynamic registration, which
+/// [`Analysis::register_documents`] says once.
 pub type DocumentRegistrar = Box<dyn Fn(&[String]) -> Vec<lsp_types::Registration> + Send>;
 
-/// What a client that takes no dynamic registration gets: today's behaviour, unchanged.
+/// What a client that takes no dynamic registration gets: no registrations, behaviour unchanged.
 #[must_use]
 pub fn no_document_registrar() -> DocumentRegistrar {
     Box::new(|_| Vec::new())
 }
 
-/// The parts of the client's capabilities that change what we are allowed to send back.
+/// The parts of the client's capabilities that change what the server may send back.
 ///
-/// Both of these default to `false` — the pre-3.10 shapes — because a client that does not
-/// advertise a capability may not merely ignore the richer response; it can fail to parse it.
+/// All default to `false` (the pre-3.10 shapes), because a client that does not advertise a
+/// capability may fail to parse the richer response, not merely ignore it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClientSupport {
-    /// `textDocument/documentSymbol` may answer with a nested tree rather than a flat list.
+    /// `textDocument/documentSymbol` may answer with a nested tree instead of a flat list.
     pub hierarchical_symbols: bool,
-    /// `textDocument/definition` may answer with `LocationLink`s, which carry the origin span
-    /// and let the editor preview the target's name separately from its body.
+    /// `textDocument/definition` may answer with `LocationLink`s, which carry the origin span and
+    /// let the editor preview the target's name apart from its body.
     pub definition_links: bool,
-    /// `window/workDoneProgress` — the client will render a progress stream if we open one.
-    /// Without it, gem indexing has to happen silently.
-    pub work_done_progress: bool,
-    /// A `WorkspaceEdit` may be sent as `documentChanges` rather than as the older `changes`
-    /// map. Worth negotiating rather than always sending the older shape, because the richer
-    /// one carries the version of each file the edit was computed against — so a client can
-    /// reject a rename the user has typed past instead of applying it to moved text.
-    pub versioned_edits: bool,
-    /// `workspace/inlayHint/refresh` — the client will ask for its inlay hints again if told to.
+    /// The same for `textDocument/implementation`, as a **separate flag**.
     ///
-    /// The only capability here that is about an answer going *stale* rather than about the
-    /// shape of one. A client re-asks for hints when the document changes and when the window
-    /// scrolls, and neither happens while a user waits for a cold index to finish — so the file
-    /// they opened would keep the margin it had before the types arrived, for as long as they
-    /// left it alone. Nothing is lost where the client says no: the hints are right from the
-    /// next keystroke, as they were before this existed.
+    /// The protocol gives each of the four gotos its own `linkSupport`, and clients differ: Claude
+    /// Code declares `definition.linkSupport: true` and nothing for `implementation`, so it expects
+    /// `Location[]` there. Answering with links because it takes them elsewhere reads a capability
+    /// it did not send.
+    pub implementation_links: bool,
+    /// The same for `textDocument/typeDefinition`, a **third** flag for the same reason.
+    ///
+    /// Each goto is negotiated separately, and a client taking links for one may take none for
+    /// another. Reading a neighbouring capability is how a response arrives in a shape the client
+    /// cannot parse. `requests::goto_response` takes the right flag as an argument.
+    pub type_definition_links: bool,
+    /// And the **fourth**, for `textDocument/declaration`.
+    ///
+    /// Four gotos, four capabilities, four fields; the protocol never says they agree. Neovim
+    /// advertises `linkSupport` for this and the two above; Claude Code for `definition` alone, and
+    /// never sends this request.
+    pub declaration_links: bool,
+    /// `window/workDoneProgress`: the client will render a progress stream if one is opened.
+    /// Without it, gem indexing is silent.
+    pub work_done_progress: bool,
+    /// A `WorkspaceEdit` may be sent as `documentChanges` instead of the older `changes` map. The
+    /// richer shape carries each file's version, so a client can reject a rename the user has typed
+    /// past instead of applying it to moved text.
+    pub versioned_edits: bool,
+    /// `workspace/inlayHint/refresh`: the client will re-ask for inlay hints when told to.
+    ///
+    /// The only capability here about an answer going *stale*. A client re-asks for hints on
+    /// document change and on scroll, and neither happens while a user waits for a cold index, so
+    /// the open file would keep its pre-types margin until touched. Where the client says no,
+    /// nothing is lost: hints are right from the next keystroke.
     pub hint_refresh: bool,
+    /// `window/showDocument`: the client will open a document the server names.
+    ///
+    /// The only way a server shows a document without an edit, and the one entry point a
+    /// *generated* document can have: nothing may hand out its URI as a `Location`, so the code
+    /// action that opens it is a command, and the command answers with this request.
+    pub show_document: bool,
+    /// `workspace/textDocumentContent`: the client will ask the server for a document's text.
+    ///
+    /// - **Read from the raw capabilities**, because `lsp-types` 0.97 has no field for it (the same
+    ///   gap `server::capabilities::Advertised` works around on the way out).
+    /// - **It gates the code action, not just the answer.** `window/showDocument` and this are
+    ///   separate, and a client can have the first without the second. Neovim does: its
+    ///   `window/showDocument` opens a buffer named after the URI and `bufload`s it from a disk
+    ///   with no such file, and nothing in its client implements this request. So a client that
+    ///   cannot read the document is never offered it, and when it can, the action appears with no
+    ///   change here.
+    pub generated_content: bool,
 }
 
 impl ClientSupport {
+    /// What the client said it can take, read from one object in two shapes.
+    ///
+    /// `raw` is the same `capabilities` value as it arrived, for the one capability `lsp-types`
+    /// 0.97 cannot spell. Passing both rather than re-parsing keeps one source: named fields read
+    /// the typed struct, and the unnamed one reads the JSON.
     #[must_use]
-    pub fn negotiate(capabilities: &ClientCapabilities) -> Self {
+    pub fn negotiate(capabilities: &ClientCapabilities, raw: &serde_json::Value) -> Self {
         let text_document = capabilities.text_document.as_ref();
         Self {
             hierarchical_symbols: text_document
@@ -403,6 +446,18 @@ impl ClientSupport {
                 .unwrap_or(false),
             definition_links: text_document
                 .and_then(|it| it.definition.as_ref())
+                .and_then(|it| it.link_support)
+                .unwrap_or(false),
+            implementation_links: text_document
+                .and_then(|it| it.implementation.as_ref())
+                .and_then(|it| it.link_support)
+                .unwrap_or(false),
+            type_definition_links: text_document
+                .and_then(|it| it.type_definition.as_ref())
+                .and_then(|it| it.link_support)
+                .unwrap_or(false),
+            declaration_links: text_document
+                .and_then(|it| it.declaration.as_ref())
                 .and_then(|it| it.link_support)
                 .unwrap_or(false),
             work_done_progress: capabilities
@@ -422,15 +477,28 @@ impl ClientSupport {
                 .and_then(|it| it.inlay_hint.as_ref())
                 .and_then(|it| it.refresh_support)
                 .unwrap_or(false),
+            show_document: capabilities
+                .window
+                .as_ref()
+                .and_then(|it| it.show_document.as_ref())
+                .is_some_and(|it| it.support),
+            // The object's presence, not a field inside it: the client capability's only member is
+            // `dynamicRegistration`, which says how a provider may be *registered*, not whether the
+            // request is answered. A client sending the object has the feature;
+            // vscode-languageclient sends exactly `{"dynamicRegistration": true}`.
+            generated_content: raw
+                .get("workspace")
+                .and_then(|workspace| workspace.get("textDocumentContent"))
+                .is_some_and(|content| !content.is_null()),
         }
     }
 }
 
 /// Request ids the client has cancelled.
 ///
-/// Owned by the main thread and read by the analysis thread. It has to be shared state rather
-/// than another channel message: tasks are processed in order, so a `$/cancelRequest` sent
-/// through the same queue would always arrive *after* the request it cancels had been answered.
+/// Owned by the main thread, read by the analysis thread. Shared state, not a channel message:
+/// tasks run in order, so a `$/cancelRequest` in the same queue would always arrive *after* its
+/// request was answered.
 #[derive(Debug, Clone, Default)]
 pub struct Cancellations(Arc<Mutex<std::collections::HashSet<RequestId>>>);
 
@@ -450,8 +518,8 @@ impl Cancellations {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<RequestId>> {
-        // A panic in another thread must not take the server down; the set is plain data and
-        // is safe to keep using.
+        // A panic in another thread must not take the server down; the set is plain data and safe
+        // to keep using.
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -481,8 +549,8 @@ impl AnalysisHandle {
 
 /// Start the analysis thread.
 ///
-/// `outgoing` is a clone of the LSP connection's sender: the analysis thread writes responses
-/// and notifications straight to the transport so the main loop never has to poll two channels.
+/// `outgoing` is a clone of the LSP connection's sender: the analysis thread writes responses and
+/// notifications straight to the transport, so the main loop never polls two channels.
 pub fn spawn(
     workspace: Workspace,
     encoding: PositionEncoding,
@@ -495,6 +563,12 @@ pub fn spawn(
     let (sender, receiver) = crossbeam_channel::unbounded();
     let thread = std::thread::Builder::new()
         .name("ya-lsp-analysis".to_owned())
+        // Rust's default is 2 MiB. Real gem RBS (activerecord's, actionpack's, activesupport's)
+        // lets a receiver chain reach the depth `types.rs`' bounds allow (`BODY_HOPS`,
+        // `MAX_BRANCHES`, `MAX_WIDTH`), and installing a `.gem_rbs_collection` overflows the
+        // default stack on the first `textDocument/inlayHint` that reaches those gems. 64 MiB is
+        // headroom over the reproduction, not a measured minimum.
+        .stack_size(64 * 1024 * 1024)
         .spawn(move || {
             let mut analysis = Analysis::new(
                 workspace,
@@ -506,11 +580,11 @@ pub fn spawn(
                 logging,
             );
             analysis.index_workspace();
-            // The startup index is already resolved, so publish now rather than waiting for the
-            // first edit: a project with a syntax error should light up before anyone types.
+            // The startup index is already resolved, so publish now instead of after the first
+            // edit: a project with a syntax error should light up before anyone types.
             analysis.publish_diagnostics();
-            // Queued, not indexed: the gems go in during the run loop's idle time, so the
-            // workspace is answering questions while the bundle is still arriving.
+            // Queued, not indexed: gems go in during the run loop's idle time, so the workspace
+            // answers questions while the bundle arrives.
             analysis.queue_background_indexing();
             analysis.run(&receiver);
         })
@@ -519,12 +593,11 @@ pub fn spawn(
     AnalysisHandle { sender, thread }
 }
 
-// The real trigger for the recovery below is rubydex's, and it needs a couple of hundred files
-// of a real project to fire — solargraph v0.58.2, minus its own
-// `lib/solargraph/yard_map/to_method.rb` — which is not something to vendor into this repository
-// to hold one test up. So what is pinned here is ya-lsp's half of it, which is the half ya-lsp
-// can be wrong about: that the panic is caught, that the user is told, that the graph comes
-// back, and that a rebuild which crashes again stops rather than recurring.
+// The real trigger for the recovery below is in rubydex and needs a couple of hundred files of a
+// real project (solargraph v0.58.2 minus its own `lib/solargraph/yard_map/to_method.rb`), which is
+// not worth vendoring for one test. So this pins ya-lsp's half, the half ya-lsp can get wrong: the
+// panic is caught, the user is told, the graph comes back, and a rebuild that crashes again stops
+// instead of recurring.
 #[cfg(test)]
 thread_local! {
     /// How many of the next resolves a test has asked to crash.
@@ -541,15 +614,14 @@ fn crash_the_next_resolve_if_asked() {
     }
 }
 
-// The same shape for the request seam, and it is a stand-in for the same reason.
+// The same shape for the request seam, also a stand-in.
 //
-// The fixture that provoked it was real Ruby — a class reopened under a constant that aliases
-// it, with the cursor on the `def` — and upstream's `ab88ef1` fixed the `graph.rs:452` unwraps behind
-// it. `a_constant_alias_reopened_under_its_alias_answers_rather_than_crashing` still writes
-// that Ruby and asserts the answer, so the fix is pinned; what has no input any more is the
-// *seam*, and the seam is what has to keep working. `create_declaration`'s two unwraps are
-// still on upstream's `main` and every handler below `dispatch` reaches the graph, so what is
-// unavailable is a reproduction rather than the hazard.
+// The Ruby that provoked it (a class reopened under a constant aliasing it, with the cursor on the
+// `def`) was fixed upstream in `ab88ef1`, and
+// `a_constant_alias_reopened_under_its_alias_answers_rather_than_crashing` still pins that. What
+// has no input now is the *seam*, and the seam must keep working: `create_declaration`'s two
+// unwraps are still on upstream's `main`, and every handler below `dispatch` reaches the graph. The
+// hazard remains; only a reproduction is missing.
 #[cfg(test)]
 thread_local! {
     /// How many of the next requests a test has asked to crash.
@@ -568,274 +640,331 @@ fn crash_the_next_request_if_asked() {
 
 /// A buffer the editor has open, which shadows whatever is on disk.
 ///
-/// We keep our own copy of the text because rubydex's `Document` exposes a `line_index()` but
-/// not the source, and incremental sync and cursor context both need it.
+/// Kept as our own copy because rubydex's `Document` exposes a `line_index()` but not the source,
+/// and incremental sync and cursor context both need it.
 #[derive(Debug)]
 struct OpenDocument {
     text: TextDocument,
     version: Option<i32>,
+    /// Whether the last thing the client said about this document was `didOpen` or `didSave`.
+    ///
+    /// **The condition for letting the disk win.** A buffer changed since its last save holds text
+    /// that exists nowhere else, and only the editor can resolve that. A saved one is a copy of the
+    /// disk, which is exactly what an agent editing through a shell leaves stale. Claude Code sends
+    /// `didSave` right after every `didChange`, so its buffers are always saved.
+    saved: bool,
+    /// The text the client last measured its changes against, when the server swapped the buffer
+    /// for the disk's.
+    ///
+    /// **Almost always `None`.** Filled by the swap and emptied by the next `didChange`, which is
+    /// applied to *it*, not to the buffer: that change's ranges were computed against the client's
+    /// text, and applying them to the disk's text would corrupt it. Set only when `None`, so a
+    /// second swap cannot overwrite the client's copy with the first swap's result.
+    client_copy: Option<TextDocument>,
 }
 
 /// Gem files waiting to be indexed in the background, plus what the editor is being told.
 #[derive(Debug)]
 struct GemIndexing {
-    /// Reversed, so taking the next batch off the end is a pointer move rather than a shift.
+    /// Reversed, so taking the next batch off the end is a pointer move, not a shift.
     remaining: Vec<PathBuf>,
     total: usize,
     gems: usize,
-    /// How many of `total` are RBS signatures rather than gem sources. Reported separately
-    /// because "indexed 41,000 files from 151 gems" is a different claim from "and Ruby's own
-    /// core", and the second one is the one that breaks silently.
+    /// How many of `total` are RBS signatures rather than gem sources. Reported separately because
+    /// "indexed 41,000 files from 151 gems" and "and Ruby's own core" are different claims, and the
+    /// second breaks silently.
     signature_files: usize,
     progress: Option<Progress>,
     started: Instant,
 }
 
-struct Analysis {
-    graph: Graph,
-    /// What RBS says the methods in the graph return.
+/// Where the cold start has got to, and the only thing that says so.
+///
+/// **One stage at a time, each naming the next when it finishes.** Nothing else writes this field,
+/// and no stage does another's work: the workspace index does not generate, the bundle does not
+/// resolve for anyone, and the generator pass runs once, when nothing is left to index.
+///
+/// - **Why the pass runs only at the end.** Run before the bundle is in, it sees a fraction of the
+///   concerns and `place_generated_members` finds none of the bundle's definitions. The later full
+///   run then spends most of its time deleting what the early run wrote
+///   (`rubydex::Declaration::remove_definition` is a linear scan plus `shrink_to_fit`, and the pass
+///   re-records every generated document). So an early run is pure cost.
+/// - **Why [`Analysis::settle`] regenerates only at [`Stage::Ready`].** `serve` settles a dirty
+///   graph before dispatching, so a request arriving mid-bundle would otherwise trigger the pass,
+///   possibly several times during one cold start.
+enum Stage {
+    /// The workspace's own files are indexed and linked; the bundle has not been queued.
     ///
-    /// Beside the graph rather than in it, because rubydex models no types at all: see
-    /// [`types`]. Filled as signature files are indexed, and thrown away with the graph.
+    /// The entry state, which the run loop never steps: [`Analysis::index_workspace`] is called
+    /// eagerly (by `spawn` before `run`, by [`Analysis::rebuild`], by the test harness), because a
+    /// client whose `didOpen` is already queued would otherwise be answered against an empty graph.
+    Workspace,
+    /// The bundle is queued and goes in one batch per idle turn of the run loop.
+    Bundle(GemIndexing),
+    /// Everything is indexed and nothing has been generated yet.
+    Generate,
+    /// Every stage has run. Every change from here is the settle's job.
+    Ready,
+}
+
+impl Stage {
+    /// Whether the pipeline has finished: **"the graph is all there will be"**, which a request
+    /// must know before it treats its own answer as a shortfall.
+    fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Whether the bundle is queued and still arriving. Narrower than `!is_ready()` on purpose, and
+    /// only for tests that pin which stage a fixture is in. Production reads `is_ready`: a request
+    /// needs to know whether more is coming, not which stage produces it.
+    #[cfg(test)]
+    fn indexing_bundle(&self) -> bool {
+        matches!(self, Self::Bundle(_))
+    }
+}
+
+struct Analysis {
+    graph: indexed::Indexed,
+    /// What RBS says the graph's methods return.
+    ///
+    /// Beside the graph, because rubydex models no types (see [`types`]). Filled as signature files
+    /// are indexed, and dropped with the graph.
     types: types::Types,
+    /// What every document's `def`s were read to return, kept across requests.
+    ///
+    /// The body rung reads a method from the document declaring it, which would otherwise dominate
+    /// a whole-file `inlayHint` on every keystroke, over unchanged gem and model files. Keyed by
+    /// the text, so it cannot go stale. See [`types::HeldExits`], which also explains why the
+    /// `Rebase` is rebuilt per request instead of kept here.
+    exits: types::HeldExits,
     /// Where the declarations ya-lsp wrote itself were really declared.
     ///
-    /// Beside the graph for the reason the type table is. The mapping exists before any
-    /// generator does, because a server that types `@story.title` and then jumps to a file the
-    /// user does not have is worse than one that does not type it. See [`synthesized`].
+    /// Beside the graph, like the type table. The mapping exists before any generator does, because
+    /// typing `@story.title` and then jumping into a file the user does not have is worse than not
+    /// typing it. See [`synthesized`].
     synthesized: Synthesized,
-    /// What a template can call, rebuilt by the same pass and for the same
-    /// reason the RBS is. Nothing in it is a declaration — see [`views`].
+    /// What a template can call, rebuilt by the same pass as the RBS, for the same reason. Nothing
+    /// in it is a declaration; see [`views`].
     views: views::Views,
-    /// Which source files [`Analysis::synthesize`] generated from, the last time it ran.
+    /// Which source files [`Analysis::synthesize`] generated from last time.
     ///
-    /// The pass's own bookkeeping and not the side table's: a source that stops declaring
-    /// anything sends no notification, so the only way to be sure nothing stale is left is to
-    /// compare what this pass wrote last time against what it just wrote. Scoped to this pass
-    /// deliberately — the table is shared, and pruning "everything I did not just write" would
-    /// delete anything else that ever records into it.
+    /// The pass's own bookkeeping, not the side table's. A source that stops declaring anything
+    /// sends no notification, so the only way to find stale output is to compare what this pass
+    /// wrote last time with what it just wrote. Scoped to this pass on purpose: the table is
+    /// shared, and pruning "everything I did not just write" would delete other recorders' entries.
     generated: HashSet<String>,
     /// The projection [`Analysis::synthesize`] last ran the generators on, for the pass gate.
     ///
-    /// `None` until the first pass has run, which is the honest answer for "would it write the
-    /// same thing again": nothing is known about a pass that has not happened.
+    /// `None` until the first pass, the honest answer to "would it write the same thing again":
+    /// nothing is known about a pass that has not happened.
     generated_from: Option<crate::knowledge::Context>,
     /// What every document the walk visited contributed to `generated_from`.
     ///
-    /// **Two jobs, one map.** As the *gate's evidence*: comparing the whole `Context` can only
-    /// be asked after the walk, because the walk is the only thing that answers it, so a
-    /// keystroke re-derives the contribution of the file it touched and compares that one — the
-    /// other twenty-five thousand are known not to have moved because nothing else was indexed.
-    /// As the *walk's memo*: that same sentence read the other way round, so the next walk takes
-    /// the held value for every document rubydex has not re-indexed rather than projecting it
-    /// again. On discourse that is 181 ms of a 247 ms walk.
+    /// **Two jobs, one map:**
     ///
-    /// A document the walk does not visit has **no entry**, which is not the same as an entry
-    /// for an empty contribution — see `Analysis::contribution`. `Analysis::walk` owns the
-    /// invalidation, and it is the same `touched`/`touched_all` pair the gate narrows on.
+    /// 1. **The gate's evidence.** The whole `Context` can only be compared after the walk. So a
+    ///    keystroke re-derives the contribution of the one file it touched and compares that; the
+    ///    other documents cannot have moved, since nothing else was indexed.
+    /// 2. **The walk's memo.** The next walk reuses the held value for every document rubydex has
+    ///    not re-indexed instead of projecting it again, most of a walk's cost on a large app.
+    ///
+    /// A document the walk does not visit has **no entry**, which differs from an entry with an
+    /// empty contribution (see `Analysis::contribution`). `Analysis::walk` owns invalidation, using
+    /// the same `touched`/`touched_all` pair the gate narrows on.
     contributions: HashMap<rubydex::model::ids::UriId, crate::knowledge::Contribution>,
     /// Every body of knowledge this build has, and the only place one is named.
     ///
-    /// **Not in the pass**, which is the whole of the seam: `synthesize` reads this and never a
-    /// module, so a build that registers nothing still compiles, runs and declares nothing. See
-    /// [`crate::knowledge`].
+    /// **Not in the pass**, which is the seam: `synthesize` reads this, never a module, so a build
+    /// that registers nothing still compiles, runs and declares nothing. See [`crate::knowledge`].
     knowledge: crate::knowledge::Registry,
-    /// The text each open buffer was **last handed to the indexer** as, which is what makes a
-    /// deferred index answerable: rubydex's `Document` keeps a `content_hash` and a `LineIndex`
-    /// and not the source, so the graph cannot be asked what its own offsets index.
+    /// The text each open buffer was **last handed to the indexer** as, which makes a deferred
+    /// index answerable: rubydex's `Document` keeps a `content_hash` and a `LineIndex`, not the
+    /// source, so the graph cannot say what its own offsets index.
     ///
-    /// Written by `index_buffer`, which is also where the text may not be the buffer's: a
-    /// template is indexed as `erb::ruby_view` and an `.rbs` as `signatures::without_interfaces`.
-    /// Recording what was *actually* indexed is what keeps the map honest for both — an `.rbs`
-    /// simply produces a rebase that refuses nearly everything, which falls back rather than
-    /// answering from a coordinate system it does not share.
+    /// Written by `index_buffer`, where the text may differ from the buffer: a template is indexed
+    /// as `erb::ruby_view` and an `.rbs` as `signatures::without_interfaces`. Recording what was
+    /// *actually* indexed keeps the map honest for both. An `.rbs` just produces a rebase that
+    /// refuses nearly everything, which falls back instead of answering in a coordinate system it
+    /// does not share.
     indexed_text: HashMap<DocUri, String>,
-    /// Which documents have been re-indexed since that pass, where exactly one is known.
+    /// Which documents were re-indexed since that pass, when exactly one is known.
     touched: HashSet<String>,
-    /// How many times the generators have actually run, rather than been gated out.
+    /// How many times the generators actually ran, rather than being gated out.
     ///
-    /// The gate's own instrument. Its whole claim is that it changes no answer, so the
-    /// only way to see it working at all is to count the passes it prevented.
+    /// The gate's instrument. Its claim is that it changes no answer, so counting the passes it
+    /// prevented is the only way to see it working.
     passes: u64,
-    /// How many times the **walk** has run, which is the same instrument one level down.
+    /// How many times the **walk** ran: the same instrument one level down.
     ///
-    /// `passes` cannot see this: the outer gate stops the generators and leaves the projection
-    /// they are handed being rebuilt in full to decide that. A pass that is gated out either
-    /// walks or does not, and only a counter says which.
+    /// `passes` cannot see this: the outer gate stops the generators but the projection they get is
+    /// still rebuilt in full to decide that. Only a counter says whether a gated pass walked.
     walks: u64,
 
-    /// Every file that pass read, and what it looked like on disk when it did.
+    /// Every file that pass read, and its on-disk state when it did.
     ///
-    /// The half of the pass gate that needs no notification: the pass claims the answer is a
-    /// function of what is on disk, so the gate has to look at the disk.
+    /// The half of the pass gate needing no notification: the pass claims its answer is a function
+    /// of the disk, so the gate looks at the disk.
     stamps: Vec<(std::path::PathBuf, Option<(std::time::SystemTime, u64)>)>,
-    /// Whether something was indexed that reported no document.
+    /// Whether something was indexed without reporting a document.
     ///
-    /// Every bulk route sets it — the workspace walk, a gem batch, the file watcher, a rebuild
-    /// — which is what keeps the gate a *narrowing* of one path rather than a claim about all
-    /// of them. Only [`Analysis::index_buffer`] names its document, and that is the keystroke
-    /// path the gate is for.
+    /// Every bulk route sets it (the workspace walk, a gem batch, the file watcher, a rebuild),
+    /// which keeps the gate a *narrowing* of one path, not a claim about all of them. Only
+    /// [`Analysis::index_buffer`] names its document, and that keystroke path is what the gate is
+    /// for.
     touched_all: bool,
     open: HashMap<DocUri, OpenDocument>,
     encoding: PositionEncoding,
     client: ClientSupport,
-    /// How to claim the files the server has answers about and the client's own selector did not.
+    /// How to claim the files the server can answer about that the client's own selector did not
+    /// cover.
     ///
-    /// Held rather than called at startup because its one argument — the gem roots, Ruby's own
-    /// library, the RBS root — does not exist until the bundle has been discovered, which happens
-    /// on this thread and not in the handshake.
+    /// Held rather than called at startup, because its argument (the gem roots, Ruby's library, the
+    /// RBS root) exists only once the bundle is discovered, on this thread, after the handshake.
     documents: DocumentRegistrar,
-    /// The document registrations currently live in the client, for unregistering them again.
+    /// The document registrations currently live in the client, kept for unregistering.
     ///
-    /// A reload can move every one of the prefixes — `[gems] enabled`, an `[rbs] path`, a
-    /// workspace root — and re-registering an id the client already holds **replaces its record
-    /// of the registration without disposing the provider behind it**, which leaves the old
-    /// selector answering beside the new one. So the old ids go first, by name, which is why they
-    /// are fixed strings rather than generated.
+    /// A reload can move every prefix (`[gems] enabled`, an `[rbs] path`, a workspace root), and
+    /// re-registering an id the client holds **replaces its record without disposing the old
+    /// provider**, leaving the old selector answering beside the new one. So old ids are
+    /// unregistered first, by name, which is why they are fixed strings.
     documents_live: Vec<lsp_types::Unregistration>,
     /// Whether the client has already been told it will not be asked again.
     ///
-    /// Said once per process, not once per reload: a client that declines dynamic registration
-    /// declines it for the session, and a `ya-lsp.toml` saved five times would otherwise repeat
-    /// the same sentence five times.
+    /// Once per process, not per reload: a client that declines dynamic registration declines it
+    /// for the session, and saving `ya-lsp.toml` five times should not repeat the sentence five
+    /// times.
     documents_declined: bool,
+    /// Generated documents the client has actually asked for the text of.
+    ///
+    /// - **Refresh only these.** `workspace/textDocumentContent/refresh` is the only way a client
+    ///   learns a fileless document changed, and the only clue to which are on screen is which were
+    ///   asked about. A cold index regenerates every body, and a refresh per body would be hundreds
+    ///   of requests, at the busiest moment, about documents nobody opened.
+    /// - **Spelled as the client asked, not as the server names it**, because they differ (see
+    ///   `Synthesized::content`). A refresh with a URI the client cannot match refreshes nothing.
+    /// - **Never pruned.** Closing a generated document sends no notification, so forgetting would
+    ///   be guessing, and the set is bounded by what one person opened in one session.
+    served: HashMap<String, String>,
     workspace: Workspace,
     outgoing: Sender<Message>,
     cancellations: Cancellations,
-    /// Whether the graph holds indexed-but-unresolved work. Separate from `resolve_at` because
-    /// the two answer different questions: this one is "would an answer be stale", which a
-    /// request has to check, while `resolve_at` is only "when should we do it unprompted".
-    /// Background gem indexing sets this without touching the timer, so a burst of gem work
-    /// cannot keep pushing the user's own diagnostics further out.
+    /// Whether the graph holds indexed-but-unresolved work.
+    ///
+    /// Separate from `resolve_at` because they answer different questions: this is "would an answer
+    /// be stale" (a request must check), `resolve_at` is "when to resolve unprompted". Background
+    /// gem indexing sets this without touching the timer, so a burst of gem work cannot push the
+    /// user's diagnostics further out.
     dirty: bool,
-    /// When the debounced global resolve is due. `None` means no resolve is scheduled.
+    /// When the debounced global resolve is due. `None` means none is scheduled.
     resolve_at: Option<Instant>,
-    /// Buffers whose edit has been applied and whose index has not run yet.
+    /// Buffers whose edit has been applied but not yet indexed.
     ///
-    /// A `didChange` does two things and only the second is expensive: it applies the edit to
-    /// `open`, which is microseconds, and it puts the document into the graph, which is 265–305
-    /// ms for `app/models/user.rb` on discourse because rubydex's invalidation cascades over
-    /// every declaration that names it. The four requests `needs_the_graph` exempts read the
-    /// buffer and never the graph, and an editor sends `semanticTokens/full` after every
-    /// keystroke — so on the loop as it stood they waited for an index they do not read.
-    ///
-    /// Drained by [`Analysis::settle`] and nowhere else, and **that only works with two things
-    /// under it**: the map, so a completion answers from the last settled graph instead of
-    /// waiting for this, and [`RESOLVE_DEBOUNCE`] at 500 ms, so the settle falls outside the
-    /// burst rather than into it. Without both it is a 2x regression on discourse — 155–198 ms
-    /// a completion becomes 324–397 — because a 410 ms settle armed at a 150 ms debounce is
-    /// still in flight when the next request arrives and cannot be interrupted. An eager drain
-    /// at the loop's next idle moment is the other design and is **worse than either**: it
-    /// leaves the graph holding a class with no members at all rather than a stale one.
+    /// - **Why deferred.** A `didChange` applies the edit to `open` (microseconds) and indexes the
+    ///   document into the graph (hundreds of milliseconds for a central model on a large app,
+    ///   because rubydex's invalidation cascades over every declaration naming it). The four
+    ///   requests `needs_the_graph` exempts read only the buffer, and editors send
+    ///   `semanticTokens/full` after every keystroke, so they must not wait for an index they do
+    ///   not read.
+    /// - **Drained only by [`Analysis::settle`], which needs two things:** the map, so completion
+    ///   answers from the last settled graph instead of waiting; and [`RESOLVE_DEBOUNCE`] at 500
+    ///   ms, so the settle falls after a burst, not inside it. Without both, a settle armed at a
+    ///   short debounce is still running when the next request arrives and cannot be interrupted.
+    /// - **An eager drain at the next idle moment is worse than either**: it leaves the graph
+    ///   holding a class with no members, not a stale one.
     pending_index: Vec<DocUri>,
-    /// Gem files still waiting to be indexed in the background.
-    gem_work: Option<GemIndexing>,
+    /// Where the cold start has got to. See [`Stage`]: one stage at a time, each naming the next.
+    stage: Stage,
     /// How many of the user's own files the index holds, against `index.max_files`.
     ///
-    /// The walk's cap has to keep applying after the walk: a watcher can add files the walk
-    /// stopped before, and the cap exists because a pathological repository exists. Counted as
-    /// files come and go rather than recomputed, because the graph has no cheap answer — by the
-    /// time a bundle is in, asking it means walking tens of thousands of documents, and a
-    /// branch switch would ask once per changed file.
+    /// The walk's cap must keep applying after the walk: a watcher can add files the walk stopped
+    /// before, and the cap exists because pathological repositories exist. Counted as files come
+    /// and go, not recomputed: once a bundle is in, asking the graph means walking tens of
+    /// thousands of documents, per changed file on a branch switch.
     workspace_files: usize,
-    /// Documents whose last indexing attempt crashed rubydex — the bulkhead's skip list.
+    /// Documents whose last indexing attempt crashed rubydex: the bulkhead's skip list.
     ///
-    /// The recovery a contained index panic wants is *not* [`Analysis::rebuild`]. `resolve`
-    /// rebuilds because a half-linked graph is in an unknown state; a contained index panic
-    /// leaves a known one — the graph minus one document — and the file is still on disk, so a
-    /// rebuild re-reads it and trips over it again. So the file is remembered instead, and this
-    /// set is the one thing `rebuild` deliberately does **not** clear.
-    ///
-    /// A document is on it exactly while the last attempt to index it panicked, which is what
-    /// makes it self-clearing: every route that indexes because the text may have moved —
-    /// `didOpen`, `didChange`, `didClose`, the watcher — simply tries again and removes the
-    /// entry when it works. The two routes that re-read text which has *not* moved consult it
-    /// instead: the workspace walk, which a rebuild runs again, and the gem batch, which a
-    /// rebuild re-queues.
+    /// - **Not [`Analysis::rebuild`].** `resolve` rebuilds because a half-linked graph is in an
+    ///   unknown state. A contained index panic leaves a known one (the graph minus one document),
+    ///   and the file is still on disk, so a rebuild would re-read it and crash again. So the file
+    ///   is remembered, and `rebuild` deliberately does **not** clear this set.
+    /// - **Self-clearing.** A document is here exactly while its last attempt panicked. Every route
+    ///   that indexes because the text may have moved (`didOpen`, `didChange`, `didClose`, the
+    ///   watcher) just tries again and removes the entry on success.
+    /// - **Consulted by the two routes that re-read unmoved text**: the workspace walk (which a
+    ///   rebuild reruns) and the gem batch (which a rebuild re-queues).
     skipped: HashSet<DocUri>,
-    /// Whether a rebuild after a resolver panic is already under way.
+    /// Whether a rebuild after a resolver panic is already running.
     ///
-    /// Guards the one recursion that matters: the rebuild indexes the workspace, indexing
-    /// resolves, and a rebuild that panics again would rebuild again forever.
+    /// Guards the one recursion that matters: the rebuild indexes, indexing resolves, and a rebuild
+    /// that panics again would rebuild forever.
     recovering: bool,
-    /// Whether the user has already been told the index is full, since the last reload.
+    /// Whether the user was already told the index is full, since the last reload.
     ///
-    /// Said once. A `git checkout` in a workspace that is over the cap would otherwise raise
-    /// the same notification on every branch switch for the life of the process.
+    /// Said once. A `git checkout` in a workspace over the cap would otherwise raise the same
+    /// notification on every branch switch.
     index_full_reported: bool,
-    /// Every workspace document URI starts with this. Used to keep gem diagnostics off the
-    /// screen without parsing a URL per diagnostic.
+    /// Every workspace document URI starts with this. Keeps gem diagnostics off screen without
+    /// parsing a URL per diagnostic.
     workspace_prefix: String,
-    /// The project's own code that is **not** under the root: `[index] load_paths` entries
-    /// pointing outside it, as directory URI prefixes.
+    /// The project's own code **outside** the root: `[index] load_paths` entries pointing outside
+    /// it, as directory URI prefixes.
     ///
-    /// A second way to be the user's own code, and the only one there is. A monorepo whose
-    /// applications share a tree beside them names it here, and every surface that asks "may I
-    /// act on this file?" has to say yes: without it a shared model gets no diagnostics, is not
-    /// offered for rename, and ranks as somebody else's code in search — in a directory the
-    /// project wrote down by hand. The gem roots stay out of it, which is the whole reason this
-    /// is a separate list rather than a wider `workspace_prefix`.
+    /// The only other way to be the user's own code. A monorepo whose apps share a tree beside them
+    /// names it here, and every "may I act on this file?" surface must say yes. Without it a shared
+    /// model gets no diagnostics, cannot be renamed, and ranks as someone else's code in search, in
+    /// a directory the project wrote down by hand. Gem roots stay out, which is why this is a
+    /// separate list, not a wider `workspace_prefix`.
     own_prefixes: Vec<String>,
-    /// URI prefixes of everything indexed that is not the user's code: the gem roots, and the
-    /// RBS root Ruby's own signatures came from.
+    /// URI prefixes of everything indexed that is not the user's code: the gem roots, and the RBS
+    /// root of Ruby's own signatures.
     ///
     /// The workspace prefix alone is not enough: a *vendored* bundle lives at
-    /// `vendor/bundle/ruby/<abi>` — inside the workspace root by construction — so every gem in
-    /// it would otherwise pass the workspace test and publish diagnostics nobody can fix. The
-    /// same goes for an `[rbs] path` pointing inside the project. Kept per root rather than per
-    /// gem so the test stays a handful of comparisons instead of one per gem in the bundle.
+    /// `vendor/bundle/ruby/<abi>`, inside the root, so every gem there would pass the workspace
+    /// test and publish diagnostics nobody can fix. Likewise an `[rbs] path` inside the project.
+    /// Kept per root, not per gem, so the test stays a handful of comparisons.
     foreign_prefixes: Vec<String>,
-    /// URI prefixes of the `app/` directory of every gem that has one — a Rails engine's Ruby.
+    /// URI prefixes of the `app/` directory of every gem that has one: a Rails engine's Ruby.
     ///
-    /// A *second* list beside `foreign_prefixes` rather than a hole in it, because the two
-    /// answer different questions and only one of them has changed. `is_own_code` still says no
-    /// to every one of these: nobody can fix a warning inside someone else's engine or rename a
-    /// method in one, which is the reason that test exists. What an engine's `app/` is good for
-    /// is the thing a generator wants — `has_many :attachments` on `ActiveStorage::Blob` is a
-    /// member of a class the user really does name — so [`Analysis::walk`] asks
-    /// [`Analysis::is_generator_source`] and every other caller goes on asking `is_own_code`.
+    /// A *second* list beside `foreign_prefixes`, not a hole in it, because they answer different
+    /// questions. `is_own_code` still says no to these: nobody can fix a warning in someone else's
+    /// engine or rename a method there. But an engine's `app/` matters to generators:
+    /// `has_many :attachments` on `ActiveStorage::Blob` is a member of a class the user does name.
+    /// So [`Analysis::walk`] asks [`Analysis::is_generator_source`], and every other caller asks
+    /// `is_own_code`.
     ///
-    /// Filled from [`gems::Gems::engine_paths`] rather than guessed from a path, so the two
-    /// cannot disagree about which directories were walked.
+    /// Filled from [`gems::Gems::engine_paths`], not guessed from a path, so the two cannot
+    /// disagree about which directories were walked.
     engine_prefixes: Vec<String>,
-    /// The load path as document-URI prefixes, in the order `require` searches them.
+    /// The load path as document-URI prefixes, in `require`'s search order.
     ///
-    /// A **third** list beside the two above, and the only one that is an order rather than a
-    /// set: the other two ask *is this document foreign*, and this one asks *which of two
-    /// copies of one file would this project load*. `locator::places` is the caller, and a
-    /// bundle that pins `cgi` is the case — the gem's `lib/cgi/escape.rb` comes first and the
-    /// copy inside Ruby is one `require` will never reach.
+    /// A **third** list, and the only one that is an order, not a set: the other two ask *is this
+    /// document foreign*, this one asks *which of two copies of a file would this project load*.
+    /// `locator::places` is the caller; a bundle pinning `cgi` is the case (the gem's
+    /// `lib/cgi/escape.rb` comes first, and Ruby's own copy is never reached).
     ///
-    /// From `Workspace::load_paths`, which is the same list `require` resolution reads, so the
-    /// two cannot come apart about which copy wins. Empty until the bundle is discovered, which
-    /// is exactly the window in which there is no second copy to be wrong about.
+    /// From `Workspace::load_paths`, the same list `require` resolution reads, so the two cannot
+    /// disagree. Empty until the bundle is discovered, which is exactly when there is no second
+    /// copy to get wrong.
     load_prefixes: Vec<String>,
-    /// The last non-empty diagnostic set we sent per URI.
+    /// The last non-empty diagnostic set sent per URI.
     ///
-    /// `publishDiagnostics` is stateful: whatever was last sent for a URI stays on screen until
-    /// something else is sent for it. Keeping the last publish lets us send only what changed —
-    /// and, just as importantly, an explicit empty set for a URI whose problems went away.
+    /// `publishDiagnostics` is stateful: the last set sent for a URI stays on screen until
+    /// something replaces it. Keeping it lets the server send only changes, and, just as important,
+    /// an explicit empty set for a URI whose problems went away.
     published: HashMap<DocUri, Vec<lsp_types::Diagnostic>>,
     /// The one handle that can re-point the log, held because `[log]` is re-read here.
     ///
-    /// A `ya-lsp.toml` change arrives on this thread, so this is the thread that has to apply
-    /// it — otherwise every setting in the file reloads except the one that says what to write
-    /// down about the reload.
+    /// A `ya-lsp.toml` change arrives on this thread, so this thread must apply it; otherwise every
+    /// setting would reload except the one saying what to log about the reload.
     logging: crate::logging::Reload,
 }
 
 impl Analysis {
-    /// Every body of knowledge this build has, in the order they run.
+    /// How many source files every module has read (from disk or a buffer) and parsed.
     ///
-    /// **The one line core says about Rails**, and it is deliberately not in the pass: a build
-    /// that registers nothing compiles, runs and declares nothing, which is the property that
-    /// makes the seam real rather than asserted. See [`crate::knowledge`].
-    /// How many source files every module has read off the disk or out of a buffer and parsed.
-    ///
-    /// The third instrument beside [`Analysis::passes`] and [`Analysis::walks`], and it is the
-    /// modules' own now: each keeps its own memo, so each counts its own reads and this adds
-    /// them up. It counts **files and not parses** — one file on three of one module's lists is
-    /// one read and up to three readers, which is itself part of the saving.
+    /// The third instrument beside [`Analysis::passes`] and [`Analysis::walks`]. Each module keeps
+    /// its own memo and counts its own reads; this adds them up. It counts **files, not parses**:
+    /// one file on three of a module's lists is one read and up to three readers.
     #[cfg(test)]
     fn reads(&self) -> u64 {
         let rails = self
@@ -849,6 +978,11 @@ impl Analysis {
         rails + annotated
     }
 
+    /// Every body of knowledge this build has, in the order they run.
+    ///
+    /// **The one line core says about Rails**, and deliberately not in the pass: a build that
+    /// registers nothing compiles, runs and declares nothing, which makes the seam real rather
+    /// than asserted. See [`crate::knowledge`].
     fn registered() -> crate::knowledge::Registry {
         crate::knowledge::Registry::new(vec![
             Box::new(crate::knowledge::rails::Rails::default()),
@@ -866,19 +1000,19 @@ impl Analysis {
         cancellations: Cancellations,
         logging: crate::logging::Reload,
     ) -> Self {
-        // A directory URI, so the prefix test cannot match a sibling whose name merely starts
-        // the same way (`/app` must not swallow `/app-vendor`).
+        // A directory URI, so the prefix test cannot match a sibling that merely starts the same
+        // way (`/app` must not swallow `/app-vendor`).
         let workspace_prefix = DocUri::from_path(workspace.root())
             .map(|uri| format!("{}/", uri.as_str().trim_end_matches('/')))
             .unwrap_or_default();
 
-        // Deliberately not calling `Graph::set_encoding`. It only feeds `Graph::encoding()`;
-        // `Offset::to_location` ignores it entirely (`Encoding::to_wide` is never called in the
-        // crate). Leaving it at the default keeps every offset rubydex hands us in bytes, which
-        // is exactly what `position::TextDocument` expects to convert from.
+        // Deliberately not calling `Graph::set_encoding`: it only feeds `Graph::encoding()`, and
+        // `Offset::to_location` ignores it. Leaving the default keeps every rubydex offset in
+        // bytes, which is what `position::TextDocument` converts from.
         Self {
-            graph: Graph::new(),
+            graph: indexed::Indexed::default(),
             types: types::Types::new(),
+            exits: types::HeldExits::new(),
             synthesized: Synthesized::new(),
             views: views::Views::default(),
             generated: HashSet::new(),
@@ -897,6 +1031,7 @@ impl Analysis {
             documents,
             documents_live: Vec::new(),
             documents_declined: false,
+            served: HashMap::new(),
             workspace,
             outgoing,
             cancellations,
@@ -906,35 +1041,31 @@ impl Analysis {
             load_prefixes: Vec::new(),
             resolve_at: None,
             pending_index: Vec::new(),
-            gem_work: None,
+            stage: Stage::Workspace,
             workspace_files: 0,
             skipped: HashSet::new(),
             recovering: false,
             index_full_reported: false,
             workspace_prefix,
-            // Filled by `index_workspace` rather than here, so that a `ya-lsp.toml` reload —
-            // which re-runs that walk and can change `[index] load_paths` — cannot leave it
-            // describing the previous configuration. Every other prefix list works this way.
+            // Filled by `index_workspace`, not here, so a `ya-lsp.toml` reload (which reruns that
+            // walk and can change `[index] load_paths`) cannot leave it describing the old
+            // configuration. Every other prefix list works this way.
             own_prefixes: Vec::new(),
             published: HashMap::new(),
             logging,
         }
     }
 
-    /// Add the project's load paths that lie outside the workspace root to the walk's result.
+    /// Add the project's load paths outside the workspace root to the walk's result.
     ///
-    /// **`[index] load_paths` said "extra roots to index" for four releases and indexed nothing.**
-    /// It reached `require` resolution and the prefix list that says which code is the project's
-    /// own, and no walk ever visited it — so a monorepo that put its shared tree on the list got
-    /// a `require` that resolved to a document the graph did not hold. The list is small, it is
-    /// written by hand, and it is the only way to name project code the root does not contain:
-    /// `discover` starts at the root and `follow_links` is off, so a sibling directory, or a
-    /// symlink to one, is reached by nothing else.
-    ///
-    /// Taken as `.rb` and `.rbs`, the way every other load path in the crate is walked, rather
-    /// than through `index.include`: those globs are written relative to the root and cannot
-    /// describe a tree outside it. Inside `index.max_files` all the same — it is a budget over
-    /// the project's own code, and this is the project's own code.
+    /// - **Why.** `discover` starts at the root with `follow_links` off, so a sibling directory, or
+    ///   a symlink to one, is reached by nothing else. Without this, a monorepo's shared tree on
+    ///   `[index] load_paths` would resolve `require`s to documents the graph does not hold.
+    /// - **Taken as `.rb` and `.rbs`**, like every other load path in the crate, not through
+    ///   `index.include`: those globs are relative to the root and cannot describe a tree outside
+    ///   it.
+    /// - **Inside `index.max_files` all the same**: it is a budget over the project's own code, and
+    ///   this is the project's own code.
     fn collect_external_load_paths(&mut self, discovery: &mut crate::workspace::Discovery) {
         let external = self.workspace.external_load_paths();
         if external.is_empty() {
@@ -961,14 +1092,14 @@ impl Analysis {
         discovery.files.extend(found);
     }
 
-    /// Index everything in the workspace, once, at startup.
+    /// Index everything in the workspace, once, at startup (and on rebuild).
     fn index_workspace(&mut self) {
         let started = Instant::now();
         self.warn_about_unknown_rules();
         self.say_what_the_fences_replaced();
-        // Before the walk that reads them, and re-read on every rebuild: `[index] load_paths` is
-        // configuration, and a reload arrives here. A directory URI so the prefix test cannot
-        // match a sibling whose name merely starts the same way.
+        // Before the walk that reads them, and re-read on every rebuild, because
+        // `[index] load_paths` is configuration and a reload arrives here. A directory URI, so the
+        // prefix test cannot match a sibling that merely starts the same way.
         self.own_prefixes = self
             .workspace
             .external_load_paths()
@@ -985,25 +1116,22 @@ impl Analysis {
         }
 
         let count = discovery.files.len();
-        // What the cap is measured against from here on. `truncated` already said its piece;
-        // this is the same budget, carried forward so that a file created later still meets it.
+        // What the cap is measured against from here on. `truncated` already reported; this carries
+        // the same budget forward so a file created later still meets it.
         self.workspace_files = count;
         self.index_full_reported = discovery.truncated;
-        // `index.include` covers `**/*.rbs` by default now, so a project that keeps its own
-        // `sig/` reaches this path with no configuration at all — this path and no other, and an
-        // `interface` there lands its members on `Object` exactly as one in Ruby's own
-        // signatures would.
-        // The bulkhead's skip list, consulted here because this is one of the two routes that
-        // re-reads text which has not moved: whatever crashed the indexer is still on disk, and
-        // `rebuild` runs this again. It goes first so that it covers the two pre-passes as well,
-        // which are inline and would trip over the same file on the way past.
+        // The bulkhead's skip list. This is one of the two routes that re-reads unmoved text:
+        // whatever crashed the indexer is still on disk, and `rebuild` runs this again. It goes
+        // first so it also covers the two pre-passes, which are inline and would hit the same file.
         let files = self.without_skipped(discovery.files);
-        // Two pre-passes over the batch, each taking the files it has to edit before the
-        // graph sees them and handing the rest on. Both are the same rule: a file that reaches
-        // rubydex unedited is indexed *wrongly*, not merely differently.
+        // Two pre-passes over the batch, each taking the files it must edit before the graph sees
+        // them and passing the rest on. Same rule for both: a file that reaches rubydex unedited is
+        // indexed *wrongly*, not just differently. `index.include` covers `**/*.rbs` by default, so
+        // a project's own `sig/` reaches this path with no configuration, and an `interface` there
+        // would otherwise land its members on `Object`, as one in Ruby's own signatures would.
         let files = self.index_edited_signatures(files);
         let files = self.index_templates(files);
-        let batch = indexer::index_files(&mut self.graph, files);
+        let batch = indexer::index_files(self.graph.graph_mut(), files);
         let indexed = started.elapsed();
 
         for error in &batch.errors {
@@ -1013,20 +1141,35 @@ impl Analysis {
             self.record_skip(&uri);
         }
 
-        // A whole tree just went into the graph and this route names no document for any of it,
-        // which is exactly what `touched_all` means. It was the one bulk route whose docstring
-        // claimed it and whose code did not. The cheap gate trusts `touched` to be the whole
-        // of what moved, so a bulk route that forgets to say so makes it unsound. In production the two callers happen to cover it
-        // (`generated_from` is `None` on startup and `Analysis::rebuild` clears it), which is a
-        // property of the callers rather than of this method, and the suite caught it.
+        // A whole tree just went into the graph, and this route names no document for it: exactly
+        // what `touched_all` means. The cheap gate trusts `touched` to be everything that moved, so
+        // a bulk route that forgets this makes it unsound. (The two production callers happen to be
+        // covered anyway, since `generated_from` is `None` at startup and `Analysis::rebuild`
+        // clears it, but that is the callers' property, not this method's.)
         self.touched_all = true;
+        // There is something to settle: a whole tree just went into the graph. Set here, not
+        // inferred at the generator stage, so that stage is idempotent: a request settling before
+        // the loop steps does the pass, and the step then finds nothing left to do.
+        self.dirty = true;
 
-        self.regenerate();
+        // **Indexed, but neither linked nor generated.** This stage only promises every workspace
+        // file is in the graph; linking is the generator stage's first act, because
+        // [`Self::regenerate`] is one ordered sequence whose middle step is the resolve.
+        //
+        // - **Resolving here is not a free head start.** The pass is *written* for an unresolved
+        //   graph holding only `Object`, `BasicObject`, `Module` and `Class`, and a linked one
+        //   sends `types::harvest` into a recursion that hangs the suite.
+        // - **Generating here cannot be right either.** The generators read `graph.definitions()`
+        //   whole, so before the bundle is in they see a fraction of the concerns, and
+        //   `place_generated_members` finds none of the bundle's definitions. See [`Stage`].
+        //
+        // **This stage is done and names the next: the generator pass.** That is the whole pipeline
+        // for a project with no gems. `queue_background_indexing`, which both production callers
+        // run right after this, inserts the bundle stage first when there is a bundle.
+        self.stage = Stage::Generate;
         let refused = self.skipped.len();
         tracing::info!(
-            "indexed {count} files in {indexed:.2?}, {refused} refused, resolved in {:.2?} \
-             (total {:.2?})",
-            started.elapsed() - indexed,
+            "indexed {count} files in {indexed:.2?}, {refused} refused (total {:.2?})",
             started.elapsed()
         );
     }
@@ -1034,21 +1177,18 @@ impl Analysis {
     /// Main loop with a debounce timer for the settle.
     fn run(&mut self, receiver: &Receiver<Task>) {
         loop {
-            // Gem indexing runs only in the gaps. Checking the queue first is what makes
-            // "background" true rather than aspirational: with work waiting, the editor's
-            // request goes first and the bundle waits.
+            // Gem indexing runs only in the gaps. Checking the queue first makes "background" real:
+            // with work waiting, the editor's request goes first and the bundle waits.
             //
-            // The `continue` is also why an armed `resolve_at` is not looked at until the
-            // background work runs out. An edit made during a cold start reaches the *buffer*
-            // ahead of the bundle — it is a task, and tasks come first — but its index and the
-            // resolve its debounce armed are both the settle's, and the settle waits for the
-            // bundle. A request arriving meanwhile is not stalled by that: `defers` answers it
-            // over the map, and one that cannot be mapped settles, which is what jumps the queue.
-            // The delay is bounded by the background index, and reversing the order would cost a
-            // resolve per debounce of typing — a decision for a measurement on a real bundle.
-            // `threaded_tests::push_diagnostics_for_an_edit_wait_for_the_background_index` holds
-            // the current answer, so changing it fails there and nowhere else.
-            if receiver.is_empty() && self.step_gem_indexing() {
+            // The `continue` also means an armed `resolve_at` is not checked until background work
+            // runs out. An edit during a cold start reaches the *buffer* before the bundle (it is a
+            // task, and tasks come first), but its index and debounced resolve belong to the
+            // settle, which waits for the bundle. A request arriving meanwhile is not stalled:
+            // `defers` answers it over the map, and one that cannot be mapped settles, which jumps
+            // the queue. Reversing the order would cost a resolve per debounce of typing.
+            // `threaded_tests::push_diagnostics_for_an_edit_wait_for_the_background_index` pins the
+            // current choice.
+            if receiver.is_empty() && self.step_pipeline() {
                 continue;
             }
 
@@ -1076,22 +1216,21 @@ impl Analysis {
             self.handle(task);
         }
 
-        // Drain any pending resolution so a shutdown does not leave the graph half-linked; a
-        // future on-disk cache would be written from here.
+        // Drain pending resolution so a shutdown does not leave the graph half-linked. A future
+        // on-disk cache would be written from here.
         if self.dirty {
             self.settle();
         }
     }
 
     fn handle(&mut self, task: Task) {
-        // **What arrived that was not a request.** A notification changes what every later answer
-        // is made of and none of them said so: a `didChange` that was dropped, a watched-file
-        // change that turned out to be nothing this workspace indexes, a configuration reload
-        // that threw the graph away — all of it happened silently, and all of it is the
-        // explanation for an answer somebody is about to report as wrong.
+        // **Log what arrived that was not a request.** A notification changes every later answer
+        // without saying so: a dropped `didChange`, a watched-file change this workspace does not
+        // index, a config reload that threw the graph away. Any of these may explain an answer
+        // someone is about to report as wrong.
         //
-        // A request is deliberately not logged here. `serve` writes its own pair, and a third
-        // line in front of them would say the same thing less precisely.
+        // Requests are not logged here: `serve` writes its own pair, and a third line would say the
+        // same thing less precisely.
         let (kind, about) = task.describe();
         if !matches!(task, Task::Request(_)) {
             tracing::debug!(
@@ -1110,6 +1249,9 @@ impl Analysis {
                     OpenDocument {
                         text: TextDocument::new(text.clone(), self.encoding),
                         version,
+                        // What the client just sent is what it read from disk.
+                        saved: true,
+                        client_copy: None,
                     },
                 );
                 self.index_buffer(&uri, &text);
@@ -1120,16 +1262,24 @@ impl Analysis {
                 version,
             } => {
                 if !self.open.contains_key(&uri) {
-                    // A change for a buffer we never saw opened. Clients do occasionally get
-                    // this wrong, and dropping the edit strands the file on stale content
-                    // forever — but an incremental range only means anything against the exact
-                    // text it was computed from. Recover only when the client sent a whole
-                    // buffer; applying a range to the wrong base is worse than not applying it.
+                    // A change for a buffer never opened. Clients occasionally do this, and
+                    // dropping the edit strands the file on stale content, but an incremental range
+                    // only means something against the exact text it was computed from. So recover
+                    // only when the client sent the whole buffer: applying a range to the wrong
+                    // base is worse than not applying it.
                     if !changes.iter().any(|change| change.range.is_none()) {
                         tracing::warn!(
                             "didChange for un-opened {uri}; an incremental edit cannot be \
                              reconstructed, so it is being dropped"
                         );
+                        return;
+                    }
+                    if uri.is_untitled() {
+                        // The recovery below invents an open document, and for a buffer with no
+                        // file that is the *only* way it would be indexed. Which unsaved buffers
+                        // are indexed is decided by `didOpen`'s `languageId` alone (a `didChange`
+                        // has none), so a buffer refused there must not get in through here.
+                        tracing::debug!("didChange for un-opened {uri}; it was never admitted");
                         return;
                     }
                     tracing::warn!("didChange for un-opened {uri}; treating it as an open");
@@ -1138,33 +1288,52 @@ impl Analysis {
                         OpenDocument {
                             text: TextDocument::new(String::new(), self.encoding),
                             version,
+                            saved: false,
+                            client_copy: None,
                         },
                     );
                 }
 
                 {
                     let document = self.open.get_mut(&uri).expect("inserted above if missing");
+                    // **The ranges belong to the client's copy, not the buffer.** They were
+                    // computed against what the client last held, which is the buffer unless the
+                    // server swapped in the disk's text under `Watched::ByTheServer`. Taking the
+                    // copy here puts them back in step: the change lands on the text it was
+                    // measured against, and the result is the buffer again.
+                    if let Some(theirs) = document.client_copy.take() {
+                        document.text = theirs;
+                    }
                     for change in &changes {
                         document.text.apply(change.range, &change.text);
                     }
                     document.version = version;
+                    // Anything on disk is now older than this, whoever wrote it.
+                    document.saved = false;
                 }
-                // The edit is applied; the index is not. See `pending_index` — this is the one
-                // route where something cheap is routinely queued behind it. `mark_dirty_for`
-                // has to happen here rather than with the index, or a graph request arriving in
-                // between would find `dirty` false and answer without the edit at all.
+                // The edit is applied; the index is not (see `pending_index`). `mark_dirty_for`
+                // must happen here, not with the index, or a graph request in between would see
+                // `dirty` false and answer without the edit.
                 if !self.pending_index.contains(&uri) {
                     self.pending_index.push(uri.clone());
                 }
                 self.mark_dirty_for(&uri);
             }
             Task::DidClose { uri } => {
+                // **Whether this document was squiggled for being open**, asked before the buffer
+                // is gone because the answer depends on it: a document outside the project is
+                // published only while open. Closing it moves nothing in the graph (the text on
+                // disk is what was indexed), so no settle follows to clear it, and without this its
+                // squiggles would outlive the tab.
+                let was_beside = self.layout().is_outside(uri.as_str());
                 self.open.remove(&uri);
-                // Closing a buffer does not remove the file from the project. Fall back to
-                // whatever is on disk; only drop the document if the file is really gone.
-                match uri.to_path().filter(|path| path.is_file()) {
+                // Closing a buffer does not remove the file from the project. Fall back to the
+                // disk; drop the document only if the file is really gone.
+                match uri.to_file_path().filter(|path| path.is_file()) {
                     Some(path) => match std::fs::read_to_string(&path) {
-                        Ok(text) => self.index_buffer(&uri, &text),
+                        Ok(text) => {
+                            self.index_buffer(&uri, &text);
+                        }
                         Err(error) => {
                             tracing::warn!(
                                 "could not re-read {} after close: {error}",
@@ -1175,14 +1344,23 @@ impl Analysis {
                     },
                     None => self.forget(&uri),
                 }
+                if was_beside {
+                    self.publish_diagnostics();
+                }
             }
             Task::DidSave { uri } => {
-                // The buffer we already indexed is what got written, so there is nothing to do.
+                // The indexed buffer is what got written, so there is nothing to index. It is now
+                // also what is on disk, which is what makes it safe for a later disk change to
+                // replace it. `client_copy` is left alone: a save does not change what the client
+                // holds, and the next `didChange`'s ranges are still measured against it.
+                if let Some(document) = self.open.get_mut(&uri) {
+                    document.saved = true;
+                }
                 tracing::trace!("saved {uri}");
             }
-            Task::WatchedFiles { uris } => {
-                tracing::debug!(paths = uris.len(), "watched files changed");
-                self.refresh(uris);
+            Task::WatchedFiles { uris, watched } => {
+                tracing::debug!(paths = uris.len(), ?watched, "watched files changed");
+                self.refresh(uris, watched);
             }
             Task::ChangeConfig { options } => {
                 self.workspace.set_options(options);
@@ -1190,8 +1368,13 @@ impl Analysis {
             }
             Task::ReloadConfig => {
                 let mut problems = self.workspace.reload();
-                // The log is re-pointed before the line that says the reload happened, so a
-                // file the user has just turned on holds the reload that turned it on.
+                // Before anything reads the new configuration. `[trees]` and `[index] load_paths`
+                // are the two non-graph inputs to the table beside the graph, so a reload is the
+                // one event that can make a held answer wrong, specifically answers that *drop* a
+                // name from a list.
+                self.graph.forget_placement();
+                // Re-point the log before logging the reload, so a file log just turned on records
+                // the reload that turned it on.
                 let root = self.workspace.root().to_path_buf();
                 problems.extend(self.logging.apply(&self.workspace.config().log, &root));
                 self.workspace.say_which_way_rails_went();
@@ -1220,12 +1403,11 @@ impl Analysis {
     // Gem indexing
     // -----------------------------------------------------------------------
 
-    /// Find everything outside the workspace that belongs in the graph — Ruby's own signatures
-    /// and the project's gems — and queue their files. Indexes nothing itself.
+    /// Find everything outside the workspace that belongs in the graph (Ruby's own signatures and
+    /// the project's gems) and queue their files. Indexes nothing itself.
     ///
-    /// Discovery walks a few hundred directories, so it is not free — but it is bounded and it
-    /// happens once, whereas indexing the files it finds is seconds of work that has to be
-    /// interleaved with serving requests.
+    /// Discovery walks a few hundred directories: not free, but bounded and done once. Indexing the
+    /// files it finds is seconds of work that must be interleaved with serving requests.
     fn queue_background_indexing(&mut self) {
         let started = Instant::now();
         let max_files = self.workspace.config().gems.max_files;
@@ -1256,15 +1438,13 @@ impl Analysis {
                     .chain(discovered.rbs_collection.iter())
                     .cloned()
                     .collect::<Vec<_>>(),
-                // **The directories that hold something, which is a different list from the ones
-                // searched.** `Gems::roots` is every gem path that exists on the machine — every
-                // Ruby asdf has installed, and the system's own — because the first question when
-                // no gems are found is which directories were looked in. That is the right list
-                // for `is_own_code`, where a wider answer is still a correct one, and the wrong
-                // list for a document selector: it would ask the editor to claim every Ruby file
-                // under every Ruby installed here, most of them from bundles this project has
-                // nothing to do with. One directory per gem the lockfile actually resolved, which
-                // contains that gem's `lib/`, its `sig/` and an engine's `app/` alike.
+                // **The directories that hold something, not the directories searched.**
+                // `Gems::roots` is every gem path on the machine (every Ruby asdf installed, plus
+                // the system's), because the first question when no gems are found is where was
+                // looked. Right for `is_own_code`, where wider is still correct; wrong for a
+                // document selector, which would claim every Ruby file of every installed Ruby. So:
+                // one directory per gem the lockfile resolved, containing its `lib/`, `sig/` and
+                // any engine `app/`.
                 discovered
                     .gems
                     .iter()
@@ -1276,32 +1456,37 @@ impl Analysis {
             )
         };
 
-        // `.gem_rbs_collection/` is in `roots` for one reason and it is the reason a vendored
-        // bundle is: it lives *inside* the workspace root, so without it every squiggle in
-        // somebody else's curated signatures would be published as the user's own.
+        // `.gem_rbs_collection/` is in `roots` for the same reason a vendored bundle is: it lives
+        // *inside* the workspace root, so without it every squiggle in someone else's curated
+        // signatures would be published as the user's.
         self.foreign_prefixes = roots
             .iter()
             .chain(signatures.origin.is_some().then_some(&signatures.root))
             .filter_map(|root| DocUri::from_path(root))
             .map(|uri| format!("{}/", uri.as_str().trim_end_matches('/')))
             .collect();
-        // From the same list the walk below uses, so "indexed as an engine" and "read as an
-        // engine" cannot come apart. A directory URI for `workspace_prefix`'s reason: `.../app`
-        // must not match a gem that keeps an `app-bundle/` beside it.
+        // The one moment `is_own_code` changes its mind about documents already in the graph: a
+        // vendored bundle lives *inside* the root, so its files were the user's own until this
+        // line. The bundle indexing below writes the graph and would drop the table anyway; this
+        // covers a request served in between.
+        self.graph.forget_placement();
+        // From the same list the walk below uses, so "indexed as an engine" and "read as an engine"
+        // cannot diverge. A directory URI, for `workspace_prefix`'s reason: `.../app` must not
+        // match a gem's `app-bundle/`.
         self.engine_prefixes = engine_paths
             .iter()
             .filter_map(|path| DocUri::from_path(path))
             .map(|uri| format!("{}/", uri.as_str().trim_end_matches('/')))
             .collect();
-        // The walk's memo is keyed by "has rubydex re-indexed this document", and this is the one
-        // input it holds that is not a document: `Analysis::is_generator_source` reads the list
-        // above, so a contribution projected under the previous one may admit a former engine's
-        // `app/` or refuse a new one. The batch below sets `touched_all` and would drop the map
-        // anyway; saying it here is what stops that being a fact two files apart.
+        // The walk's memo is keyed by "has rubydex re-indexed this document", and this list is its
+        // one non-document input: `Analysis::is_generator_source` reads it, so a contribution
+        // projected under the old list may admit a former engine's `app/` or refuse a new one. The
+        // batch below sets `touched_all` and would drop the map anyway; clearing it here keeps the
+        // dependency visible in one place.
         self.contributions.clear();
-        // `Workspace::load_paths` rather than the `load_paths` above, because the project's own
-        // `lib/` is on it and shadows a gem of the same name — which is what `require "version"`
-        // inside an application means. Order preserved: it is the whole content of the list.
+        // `Workspace::load_paths`, not the `load_paths` above, because the project's own `lib/` is
+        // on it and shadows a same-named gem (what `require "version"` in an application means).
+        // Order preserved: it is the list's whole content.
         self.load_prefixes = self
             .workspace
             .load_paths()
@@ -1310,14 +1495,14 @@ impl Analysis {
             .map(|uri| format!("{}/", uri.as_str().trim_end_matches('/')))
             .collect();
 
-        // Here rather than after the walk below, and deliberately not behind the gem budget: this
-        // is a function of which roots were *discovered*, and a bundle large enough to be
-        // truncated is the one whose gems a user is most likely to be reading in.
-        // The project's own trees outside the root go on the same list as the gems, and for the
-        // same reason: a client's selector is its folder, so a file outside every folder is one
-        // nobody would ever send a request about. They are not *foreign* — `own_prefixes` keeps
-        // them the user's own code — they are merely elsewhere, and being elsewhere is the whole
-        // of what `register_documents` is for.
+        // Here, before the walk below, and not behind the gem budget: this depends on which roots
+        // were *discovered*, and a bundle big enough to be truncated is the one whose gems a user
+        // most likely reads.
+        //
+        // The project's own trees outside the root join the gems' list for the same reason: a
+        // client's selector is its folder, so a file outside every folder never gets a request.
+        // They are not *foreign* (`own_prefixes` keeps them the user's code), just elsewhere, which
+        // is what `register_documents` is for.
         let external = self.workspace.external_load_paths();
         self.register_documents(
             &held
@@ -1332,32 +1517,26 @@ impl Analysis {
             self.show_warning(problem);
         }
 
-        // Signatures first, and outside the gem budget. They are 250 files against a bundle's
-        // tens of thousands, and they are the difference between `String` existing and not —
-        // letting `[gems] max_files` decide whether Ruby's own core gets indexed would make the
-        // built-ins disappear on exactly the largest projects.
+        // Signatures first, outside the gem budget. A few hundred files against a bundle's tens of
+        // thousands, and the difference between `String` existing or not: letting
+        // `[gems] max_files` decide whether Ruby's core is indexed would remove the built-ins on
+        // exactly the largest projects.
         let mut files = signatures.files();
         let signature_files = files.len();
 
-        // Walked one load path at a time, rather than all of them at once, so the budget below
-        // stops at a gem boundary and so the first gem in the lockfile is the first indexed.
-        // That costs a deduplication here: Ruby's platform directory is nested *inside* its
-        // library directory, and a vendored bundle can sit inside a gem root.
+        // One load path at a time, not all at once, so the budget stops at a gem boundary and the
+        // lockfile's first gem is indexed first. That needs a dedup: Ruby's platform directory is
+        // nested *inside* its library directory, and a vendored bundle can sit inside a gem root.
         let mut truncated = false;
         let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        // The bundle's own signatures before its code, so that a bundle large enough to hit the
-        // budget still gets the part that answers what a method *returns* — 52 files against
-        // lobsters' tens of thousands, and the cheapest declarations in the whole pass. They are
-        // inside `[gems] max_files` all the same: unlike Ruby's own core they are not the
-        // difference between `String` existing and not, and a budget with an exception per list
-        // stops being a budget.
-        // Then a Rails engine's `app/`, before the bundle's `lib/`. An engine declares
-        // `require_paths = ["lib"]`, so `ActiveStorage::Blob` — a class thousands of
-        // applications name — is on no load path, so without this it is not a document at all,
-        // while `ActiveStorage::Service` one directory away in `lib/` always answers.
-        // It goes ahead of the load paths on `sig/`'s argument and with `sig/`'s arithmetic:
-        // 417 files against 24,425, so a bundle large enough to hit the budget still gets the
-        // half that is missing rather than more of the half that is not.
+        // 1. **The bundle's signatures before its code**, so a bundle that hits the budget still
+        //    gets what answers what a method *returns*, the cheapest declarations of the pass. They
+        //    stay inside `[gems] max_files`: unlike Ruby's core they are not the difference between
+        //    `String` existing or not, and a budget with per-list exceptions stops being a budget.
+        // 2. **Then each Rails engine's `app/`, before the bundle's `lib/`.** An engine declares
+        //    `require_paths = ["lib"]`, so `ActiveStorage::Blob`, a class countless applications
+        //    name, is on no load path and would not be a document at all. It is small next to the
+        //    bundle, so a truncated bundle still gets the missing half.
         for path in signature_paths
             .iter()
             .chain(&engine_paths)
@@ -1381,6 +1560,8 @@ impl Analysis {
 
         let total = files.len();
         if total == 0 {
+            // Nothing outside the workspace to index, so no bundle stage is inserted, and the stage
+            // `index_workspace` named stands.
             return;
         }
         let gems = gem_count;
@@ -1390,11 +1571,13 @@ impl Analysis {
             started.elapsed()
         );
 
-        // Popped from the back, so reversing here makes the head of the list the first indexed:
-        // the signatures, then the first gem — which is the one the user is most likely to jump
-        // into, since Bundler writes the lockfile in dependency order.
+        // Popped from the back, so reversing makes the list's head the first indexed: signatures,
+        // then the first gem, which Bundler's dependency order makes the one a user most likely
+        // jumps into.
         files.reverse();
-        self.gem_work = Some(GemIndexing {
+        // The bundle stage goes *before* the generator pass, which is the point: the generators
+        // read `graph.definitions()` whole, so they must run when nothing is left to index.
+        self.stage = Stage::Bundle(GemIndexing {
             remaining: files,
             total,
             gems,
@@ -1414,9 +1597,74 @@ impl Analysis {
         });
     }
 
-    /// Index one batch of background files. Returns true while there is more to do.
-    fn step_gem_indexing(&mut self) -> bool {
-        let Some(work) = self.gem_work.as_mut() else {
+    /// Step whichever stage the pipeline is on. Returns true while there is more to do.
+    ///
+    /// **The whole contract is this match**: one stage at a time, each ending by naming the next,
+    /// the loop asking only "is there more". The run loop calls it in idle turns and
+    /// [`Analysis::serve`]'s third rung drains it. Because the generator pass is a stage, not a
+    /// side effect of a settle, that drain hands the retried request a graph with the generated
+    /// documents in it.
+    fn step_pipeline(&mut self) -> bool {
+        match &self.stage {
+            Stage::Bundle(_) => self.step_bundle(),
+            Stage::Generate => {
+                self.generate();
+                true
+            }
+            // Nothing for the loop to do: `Workspace` is stepped by its eager caller, and `Ready`
+            // is the end.
+            Stage::Workspace | Stage::Ready => false,
+        }
+    }
+
+    /// The pipeline's last stage: everything is indexed, so generate from it.
+    ///
+    /// **The stage moves first**, because [`Self::settle`] suppresses the pass while the bundle
+    /// arrives, and this is when that stops. Then an ordinary settle, which makes the step
+    /// idempotent: the workspace index and every gem batch set `dirty`, so the pass runs here,
+    /// unless a request that arrived first already settled, and then this is just a stage flip and
+    /// a hint refresh.
+    ///
+    /// **It streams progress** because otherwise this is the one silent window of a cold start: the
+    /// steps before it are fast or streamed (the bundle), and this pass takes around a second on
+    /// large apps, between the gem stream's end and the first correct answer. It sends nothing
+    /// else: the pass changes no published diagnostic, and a client without `inlayHint` has nobody
+    /// to tell. A server that has gone quiet but is not finished looks like a hang.
+    ///
+    /// **The audit relies on it.** `client.settle` decides a server is ready by three conditions,
+    /// the second being *no `$/progress` stream is open*: a statement, where the third is an
+    /// inference from three seconds of silence. Without a stream, every sweep would depend on the
+    /// pass fitting inside that quiet, which a bigger project or a slower runner can break, and the
+    /// sweep would score a half-built graph as regressions. `audit.md` has the details.
+    ///
+    /// **No `report` in between**: one blocking call with no count to divide, and a made-up
+    /// percentage is worse than a title. The begin message is empty for the same reason.
+    fn generate(&mut self) {
+        self.stage = Stage::Ready;
+        let progress = Progress::begin(
+            &self.outgoing,
+            self.client.work_done_progress,
+            GENERATE_PROGRESS_TOKEN,
+            "Finishing the index",
+            String::new(),
+        );
+        let started = Instant::now();
+        self.settle();
+        // The hints, which have no timer. This is the one moment an already-answered request's
+        // answer changes without the document changing: a file opened before signatures arrived has
+        // an empty margin, and nothing else would ask again.
+        self.refresh_hints();
+        // **After the refresh; that is the stream's contract.** It says "answers are not final
+        // yet", so it may not close while something that changes an answered request is still
+        // coming.
+        if let Some(progress) = progress {
+            progress.end(format!("in {:.2?}", started.elapsed()));
+        }
+    }
+
+    /// Index one batch of the bundle. Returns true while there is more to do.
+    fn step_bundle(&mut self) -> bool {
+        let Stage::Bundle(work) = &mut self.stage else {
             return false;
         };
 
@@ -1432,30 +1680,28 @@ impl Analysis {
         }
 
         if !batch.is_empty() {
-            // The second route that re-reads unmoved text: a rebuild re-queues the whole
-            // bundle, and `mkmf-rice.rb` is a gem file.
+            // The second route that re-reads unmoved text: a rebuild re-queues the whole bundle,
+            // and `mkmf-rice.rb` is a gem file.
             let batch = self.without_skipped(batch);
             let batch = self.index_edited_signatures(batch);
-            let outcome = indexer::index_files(&mut self.graph, batch);
+            let outcome = indexer::index_files(self.graph.graph_mut(), batch);
             for error in &outcome.errors {
-                // Debug, not warn: a bundle of a hundred gems will always contain something
-                // that does not parse, and none of it is the user's problem.
+                // Debug, not warn: a hundred-gem bundle always contains something that does not
+                // parse, and none of it is the user's problem.
                 tracing::debug!("gem indexing error: {error:?}");
             }
-            // A crash is not that. It is one file's worth of a gem answering nothing, which is
-            // exactly what a user would otherwise spend an afternoon on.
+            // A crash is different: one gem file silently answering nothing is what a user would
+            // otherwise spend an afternoon on.
             for uri in outcome.skipped {
                 self.record_skip(&uri);
             }
             // Marked dirty without arming the debounce timer. The next request resolves what is
-            // there; scheduling a resolve per batch would re-link the whole graph dozens of
-            // times for no one's benefit.
+            // there; a resolve per batch would re-link the whole graph dozens of times for nobody.
             //
-            // `touched_all` for the pass gate's reason and not the timer's: a batch of gem
-            // files is a change this loop cannot name a document for, and a gem's `app/` is on
-            // four of the six lists. The `Context` comparison would catch anything the walk
-            // can see anyway — this is the same sentence said where it is cheap rather than
-            // inferred from another line.
+            // `touched_all` for the pass gate, not the timer: a batch of gem files is a change this
+            // loop cannot name a document for, and a gem's `app/` is on four of the six lists. The
+            // `Context` comparison would catch anything the walk sees anyway; this says it where it
+            // is cheap.
             self.touched_all = true;
             self.dirty = true;
         }
@@ -1464,10 +1710,9 @@ impl Analysis {
             return true;
         }
 
-        let work = self
-            .gem_work
-            .take()
-            .expect("present at the top of this method");
+        let Stage::Bundle(work) = std::mem::replace(&mut self.stage, Stage::Generate) else {
+            unreachable!("the bundle stage was matched at the top of this method")
+        };
         let typed = self.types.len();
         tracing::info!(
             "indexed {} signature files and {} files from {} gems in {:.2?}, {typed} methods typed",
@@ -1483,34 +1728,25 @@ impl Analysis {
                 work.gems
             ));
         }
-        // Now arm the timer: everything is in, and the editor is owed the diagnostics that the
-        // finished graph produces.
-        self.mark_dirty();
-        // And the hints, which have no timer of their own. This is the one moment the answer to
-        // an already-answered request changes without the document changing: a file opened
-        // against a graph with no signatures in it has a margin with nothing in it, and nothing
-        // else would ever ask again.
-        self.refresh_hints();
-        false
+        // The stage is now `Generate`, set by the `replace` above. **Not `mark_dirty()`**: that
+        // arms the debounce, delaying the pass by `RESOLVE_DEBOUNCE` after the last gem for no
+        // reason, and it means "something changed" when what happened is "nothing is left to
+        // index". The loop steps the next stage on its next turn.
+        true
     }
 
-    /// Index the signature files in `batch` that need editing first, and hand back the rest.
+    /// Index the signature files in `batch` that need editing first, and return the rest.
     ///
-    /// See [`signatures`] for what is edited and why. Every route an `.rbs` file can take into
-    /// the graph goes through here or through [`Self::index_buffer`] — the signature root that
-    /// `workspace::rbs` discovered, a `sig/` directory `index.include` was widened to cover, and
-    /// a buffer the editor opened. The rule is one rule; a file that is indexed differently
-    /// depending on how it was found is worse than one that is not filtered at all.
-    ///
-    /// Every `.rbs` path is read here — for the return types, which is a second thing this pass
-    /// now does — and only the one in five that holds an interface leaves the parallel path.
-    /// Everything else is still a plain path for a worker thread to read.
-    ///
-    /// Reading each signature twice, once here and once in the indexer, is what that costs.
-    /// Measured over the 250 files of `vendor/rbs`: 10 ms of reading and 30 ms of parsing, in a
-    /// pass that already takes seconds and runs in the background. Indexing them from the string
-    /// this already holds would be the way to avoid it and is much worse — it would move 4 MB of
-    /// parsing off the worker threads and onto this one.
+    /// - **One rule for every route.** See [`signatures`] for what is edited and why. Every `.rbs`
+    ///   enters the graph through here or [`Self::index_buffer`]: the signature root
+    ///   `workspace::rbs` found, a `sig/` that `index.include` covers, or a buffer the editor
+    ///   opened. A file indexed differently depending on how it was found is worse than no
+    ///   filtering at all.
+    /// - **Every `.rbs` is read here**, for the return types, and only the one in five holding an
+    ///   interface leaves the parallel path; the rest stay plain paths for worker threads.
+    /// - **The cost is reading each signature twice**, here and in the indexer, which is small next
+    ///   to a pass that takes seconds in the background. Indexing from the string held here would
+    ///   avoid it but move megabytes of parsing off the workers onto this thread.
     fn index_edited_signatures(&mut self, batch: Vec<PathBuf>) -> Vec<PathBuf> {
         batch
             .into_iter()
@@ -1518,7 +1754,7 @@ impl Analysis {
             .collect()
     }
 
-    /// Whether `path` was a signature file with an interface in it, and has now been indexed.
+    /// Whether `path` was a signature file with an interface in it, now indexed.
     fn index_edited_signature(&mut self, path: &Path) -> bool {
         if path.extension() != Some(OsStr::new("rbs")) {
             return false;
@@ -1526,15 +1762,20 @@ impl Analysis {
         let Ok(source) = std::fs::read_to_string(path) else {
             return false;
         };
-        // Before the edit, and deliberately: the harvest skips `interface` blocks itself, so it
-        // sees the same declarations either way, and doing it here means it happens for the four
-        // files in five that leave this method by the early return below.
-        self.types.harvest(&source);
+        // Harvested before the edit, on purpose: the harvest skips `interface` blocks itself, so it
+        // sees the same declarations either way, and doing it here covers the four files in five
+        // that leave by the early return below.
+        //
+        // The URI must be `DocUri`'s spelling, as below, or an edit would file a second
+        // contribution beside the startup walk's (see `Types::harvest`).
+        if let Some(uri) = DocUri::from_path(path) {
+            self.types.harvest(uri.as_str(), &source);
+        }
         let Some(edited) = signatures::without_interfaces(&source) else {
             return false;
         };
-        // The URI has to be spelled the way `index_files` would have spelled it, or this forks a
-        // second document for the same file. `DocUri` is that spelling.
+        // The URI must be spelled as `index_files` would spell it, or this forks a second document
+        // for the same file. `DocUri` is that spelling.
         let Some(uri) = DocUri::from_path(path) else {
             return false;
         };
@@ -1542,21 +1783,17 @@ impl Analysis {
         true
     }
 
-    /// Index the ERB templates in `batch`, and hand back the rest.
+    /// Index the ERB templates in `batch`, and return the rest.
     ///
-    /// The shape of [`Self::index_edited_signatures`] and for the same reason, but the stakes
-    /// are higher: an `.rbs` file indexed unedited puts extra declarations in the graph, and a
-    /// template indexed unedited records **no references at all** — rubydex reads the markup as
-    /// Ruby, gives up somewhere in the first tag, and files a handful of parse errors instead of
-    /// the call sites. See [`erb`].
-    ///
-    /// This runs on the walk and not only on `didOpen` because a real Rails application keeps
-    /// **one method-call site in seven** in its templates. Indexing only what the editor has
-    /// open would make `references` incomplete by an amount that changes as the user opens tabs,
-    /// which is worse than a consistently narrow answer and is the exact failure
-    /// `coverage.md` holds `references.rs` at 100% to prevent.
-    ///
-    /// Cost, over lobsters' 121 templates: 17 ms, against 35 ms for its 477 `.rb` files.
+    /// - **[`Self::index_edited_signatures`]' shape, with higher stakes.** An unedited `.rbs` adds
+    ///   extra declarations; an unedited template records **no references at all**: rubydex reads
+    ///   the markup as Ruby, gives up in the first tag, and files parse errors instead of call
+    ///   sites. See [`erb`].
+    /// - **Runs on the walk, not only on `didOpen`**, because a real Rails app keeps about one call
+    ///   site in seven in its templates. Indexing only open files would make `references`
+    ///   incomplete by an amount that changes as tabs open, worse than a consistently narrow
+    ///   answer, and exactly what `coverage.md` holds `references.rs` at 100% to prevent.
+    /// - **Cheap**: around half the cost of indexing the app's `.rb` files.
     fn index_templates(&mut self, batch: Vec<PathBuf>) -> Vec<PathBuf> {
         batch
             .into_iter()
@@ -1564,7 +1801,7 @@ impl Analysis {
             .collect()
     }
 
-    /// Whether `path` was a template, and has now been indexed.
+    /// Whether `path` was a template, now indexed.
     fn index_template(&mut self, path: &Path) -> bool {
         if !erb::is_template(path) {
             return false;
@@ -1572,8 +1809,7 @@ impl Analysis {
         let Ok(source) = std::fs::read_to_string(path) else {
             return false;
         };
-        // Spelled the way `index_files` would have spelled it, or this forks a second document
-        // for the same file.
+        // Spelled as `index_files` would, or this forks a second document for the same file.
         let Some(uri) = DocUri::from_path(path) else {
             return false;
         };
@@ -1583,82 +1819,121 @@ impl Analysis {
 
     /// Index whatever `didChange` deferred.
     ///
-    /// [`Analysis::settle`] is the only caller, and it calls this first: the graph has to hold
-    /// every edit before the generators read it or the resolver links over it. It returned
-    /// It returns nothing: no caller needs to know whether a step's worth of work happened.
+    /// [`Analysis::settle`] is the only caller, and calls this first: the graph must hold every
+    /// edit before the generators read it or the resolver links over it. Returns nothing: no caller
+    /// needs to know whether work happened.
     ///
-    /// A buffer that was closed between the edit and this step is skipped rather than replayed:
-    /// `didClose` has already put the file back to what is on disk, and re-indexing the buffer
-    /// over it would undo exactly that.
+    /// A buffer closed between the edit and now is skipped, not replayed: `didClose` already
+    /// restored the file to what is on disk, and re-indexing the buffer would undo that.
     fn index_pending(&mut self) {
         for uri in std::mem::take(&mut self.pending_index) {
             let Some(text) = self.open.get(&uri).map(|open| open.text.text().to_owned()) else {
                 continue;
             };
-            self.index_buffer(&uri, &text);
+            let _ = self.index_buffer(&uri, &text);
         }
     }
 
-    fn index_buffer(&mut self, uri: &DocUri, text: &str) {
-        let path = uri.to_path();
+    /// Put `text` into the graph as `uri`, and say whether the graph was asked to take it.
+    ///
+    /// The return is for [`Self::refresh`], which logs "re-indexed N"; a skip does not count.
+    fn index_buffer(&mut self, uri: &DocUri, text: &str) -> bool {
+        let path = uri.to_file_path();
         let language = path
             .as_deref()
             .map_or(LanguageId::Ruby, indexer::language_of);
-        // The same rule as on the indexing path, or opening a signature file in the editor puts
-        // back the declarations that path took out — and leaves them there, because nothing
-        // re-indexes the file once the buffer closes. A template is the same rule again: this
-        // is the hook `didOpen`, `didChange` and the file watcher all share, and a template that
-        // reached the graph raw through any of them would replace its own call sites with parse
-        // errors.
+        // The same rule as the indexing path. Otherwise opening a signature file puts back the
+        // declarations that path removed, and they stay, since nothing re-indexes the file after
+        // the buffer closes. Templates likewise: `didOpen`, `didChange` and the watcher all share
+        // this hook, and a template reaching the graph raw through any of them would replace its
+        // call sites with parse errors.
         if path.as_deref().is_some_and(erb::is_template) {
             let view = erb::ruby_view(text);
+            // The view, not the buffer, here and below: rubydex's offsets index `ruby_view`, which
+            // is why a template needs no special case.
+            if self.graph_holds(uri, &view) {
+                self.indexed_text.insert(uri.clone(), view);
+                return false;
+            }
             if self.index_contained(uri, &view, &LanguageId::Ruby) {
-                // The view and not the buffer: `ruby_view` is what rubydex's offsets index,
-                // which is `ruby_view`'s property and the reason a template needs no special
-                // case.
                 self.indexed_text.insert(uri.clone(), view);
             }
             self.mark_dirty_for(uri);
-            return;
+            return true;
         }
         let edited = matches!(language, LanguageId::Rbs)
             .then(|| {
-                // The third route a signature takes into the graph, and the return types have to
-                // follow it for the same reason the interface rule does: a table that disagrees
-                // with the graph about a method is a wrong answer rather than an absent one.
-                self.types.harvest(text);
+                // The third route a signature takes into the graph, and the return types must
+                // follow it, as the interface rule does: a table that disagrees with the graph
+                // about a method gives a wrong answer, not a missing one.
+                self.types.harvest(uri.as_str(), text);
                 signatures::without_interfaces(text)
             })
             .flatten();
         let text = edited.as_deref().unwrap_or(text);
-        // **Only when the index actually happened**, which is the bulkhead meeting the map. A
-        // contained panic costs the document its *update* and nothing else: the graph goes on
-        // answering with whatever version it already held. Recording the new text here would
-        // claim the graph holds it, `Rebase::between` would compare two equal strings and
-        // answer `identity`, and every offset would be handed to a graph that is some unknown
-        // number of edits behind — a wrong answer with no refusal to fall back from.
+        if self.graph_holds(uri, text) {
+            self.indexed_text.insert(uri.clone(), text.to_owned());
+            return false;
+        }
+        // **Only when the index actually happened**: where the bulkhead meets the map.
         //
-        // Leaving the previous entry in place is not merely safer, it is *correct*: it is the
-        // text the graph really holds, so the map describes the difference exactly. A document
-        // whose very first index crashes has no entry, which is the identity — and harmless,
-        // because a graph with no such document resolves nothing to be wrong about.
+        // - **A contained panic costs the document its update, nothing else**: the graph keeps
+        //   answering with the version it held. Recording the new text here would claim the graph
+        //   holds it; `Rebase::between` would then compare equal strings, answer `identity`, and
+        //   hand every offset to a graph an unknown number of edits behind, a wrong answer with no
+        //   refusal.
+        // - **Keeping the previous entry is correct**, not just safer: it is the text the graph
+        //   really holds, so the map describes the difference exactly. A document whose very first
+        //   index crashes has no entry (identity), which is harmless: the graph has no such
+        //   document to be wrong about.
         if self.index_contained(uri, text, &language) {
             self.indexed_text.insert(uri.clone(), text.to_owned());
         }
         self.mark_dirty_for(uri);
+        true
     }
 
-    /// How this buffer's offsets relate to the ones the graph holds for it.
+    /// Whether the graph already holds exactly `source` for `uri`, so indexing it would do nothing.
     ///
-    /// `Rebase::identity` wherever the two texts are equal, which is every request that is not
-    /// answered between a keystroke and its index — so on a document nobody is typing in, this
-    /// is a length comparison and two equal strings.
+    /// - **A pre-check of rubydex's own check**, answering yes only where that one would.
+    ///   `Graph::consume_document_changes` compares `Document::content_hash` (`xxh3_64` of the
+    ///   source) and returns early, so an unchanged document still costs a Prism parse and a full
+    ///   walk that is thrown away. Hashing here, one step earlier, skips the parse for
+    ///   microseconds.
+    /// - **It saves more than the parse.** A write goes through [`indexed::Indexed::graph_mut`],
+    ///   which drops the member index, so without this a `didOpen` of an already-indexed file would
+    ///   also cost that index. rubydex's early return cannot help, because the `&mut Graph` is
+    ///   already taken.
+    /// - **The skip list overrides it.** A document whose last index crashed keeps the text the
+    ///   graph accepted *before* the crash, so receiving that text again is a legitimate retry;
+    ///   answering yes would keep the file on the skip list forever, out of every batch
+    ///   [`Self::without_skipped`] filters.
+    /// - **The caller records `indexed_text` either way**: yes means the graph holds these bytes,
+    ///   which is what the map means and what [`Self::rebase_for`] needs to refuse an offset
+    ///   instead of assuming identity.
+    /// - **A hash collision would read two texts as one**, but that is rubydex's exposure, not a
+    ///   new one: its own comparison is this comparison.
+    fn graph_holds(&self, uri: &DocUri, source: &str) -> bool {
+        if self.skipped.contains(uri) {
+            return false;
+        }
+        self.graph
+            .documents()
+            .get(&UriId::from(uri.as_str()))
+            .is_some_and(|document| document.content_hash() == xxh3_64(source.as_bytes()))
+    }
+
+    /// How this buffer's offsets relate to the graph's for it.
+    ///
+    /// `Rebase::identity` wherever the texts are equal, which is every request not answered between
+    /// a keystroke and its index. On a document nobody is typing in, this is a length comparison of
+    /// two equal strings.
     fn rebase_for(&self, uri: &DocUri, buffer: &str) -> Rebase {
         match self.indexed_text.get(uri) {
             Some(indexed) => Rebase::between(buffer, indexed),
-            // Never indexed as a buffer, so the graph holds whatever the disk walk gave it and
+            // Never indexed as a buffer, so the graph holds whatever the disk walk gave it, and
             // nothing here can say how that differs. Identity is the safe assumption, and a
-            // deferred answer is gated on an entry existing.
+            // deferred answer requires an entry to exist.
             None => Rebase::identity(u32::try_from(buffer.len()).unwrap_or(u32::MAX)),
         }
     }
@@ -1667,12 +1942,11 @@ impl Analysis {
 
     /// Put one document into the graph, and remember it if that crashes the indexer.
     ///
-    /// The five inline routes all end here. A crash costs the document its *update* and
-    /// nothing else — the panic is in the build, so the graph is never entered and whatever
-    /// version it already held goes on answering, which is why a buffer that is being typed
-    /// into a bad state keeps the answers it had before the edit rather than losing them.
+    /// All five inline routes end here. A crash costs the document its *update* only: the panic is
+    /// in the build, so the graph is never entered and its old version keeps answering. So a buffer
+    /// being typed into a bad state keeps its previous answers.
     fn index_contained(&mut self, uri: &DocUri, source: &str, language: &LanguageId) -> bool {
-        if indexer::index_source(&mut self.graph, uri.as_str(), source, language) {
+        if indexer::index_source(self.graph.graph_mut(), uri.as_str(), source, language) {
             self.unskip(uri);
             return true;
         }
@@ -1682,25 +1956,26 @@ impl Analysis {
 
     /// Remember that indexing `uri` crashed, and say so.
     ///
-    /// `warn!` every time, because a report is made of two things and the default panic hook
-    /// has just printed the first: rubydex's own file and line, and the file that provoked it.
-    /// `showMessage` only the first time, because the buffer route retries on every keystroke
-    /// and a user editing the offending file is owed one notification rather than one per
-    /// character.
+    /// `warn!` every time: a report needs rubydex's file and line (just printed by the default
+    /// panic hook) plus the file that provoked it. `showMessage` only the first time, because the
+    /// buffer route retries on every keystroke, and a user editing the offending file is owed one
+    /// notification, not one per character.
     fn record_skip(&mut self, uri: &DocUri) {
         tracing::warn!("indexing {uri} crashed; leaving that file out of the index");
         if !self.skipped.insert(uri.clone()) {
             return;
         }
-        let path = uri.to_path().unwrap_or_else(|| PathBuf::from(uri.as_str()));
+        let path = uri
+            .to_file_path()
+            .unwrap_or_else(|| PathBuf::from(uri.as_str()));
         let message = messages::file_not_indexed(&path);
         self.show_warning(&message);
     }
 
-    /// Forget that it ever did, because it has just worked.
+    /// Forget that it crashed, because it just worked.
     ///
-    /// The whole of the "not permanent either" half: a user who fixes the file does not have to
-    /// restart the server, and nothing has to decide what counts as a fix.
+    /// So the skip is not permanent: a user who fixes the file need not restart the server, and
+    /// nothing has to decide what counts as a fix.
     fn unskip(&mut self, uri: &DocUri) {
         if self.skipped.remove(uri) {
             tracing::info!("{uri} indexes cleanly again");
@@ -1709,9 +1984,9 @@ impl Analysis {
 
     /// The paths in `batch` that did not crash the indexer last time.
     ///
-    /// Asked by the two bulk routes and by neither of the four that index because the text may
-    /// have moved. `is_empty` first because this runs over every gem batch and the set is empty
-    /// in every workspace anyone has measured.
+    /// Asked by the two bulk routes, and by none of the four that index because the text may have
+    /// moved. `is_empty` first, because this runs on every gem batch and the set is almost always
+    /// empty.
     fn without_skipped(&self, batch: Vec<PathBuf>) -> Vec<PathBuf> {
         if self.skipped.is_empty() {
             return batch;
@@ -1734,38 +2009,39 @@ impl Analysis {
 
     /// Throw the graph away and build it again: the workspace, the open buffers, the gems.
     ///
-    /// Shared by `ReloadConfig` — where the configuration decides what belongs in the index, so
-    /// nothing computed under the old one can be trusted — and by the recovery in
-    /// [`Analysis::resolve`], where the graph is in an unknown state and starting over is the
-    /// only honest answer.
+    /// Shared by `ReloadConfig` (the configuration decides what belongs in the index, so nothing
+    /// computed under the old one can be trusted) and by the recovery in [`Analysis::resolve`] (the
+    /// graph is in an unknown state, and starting over is the only honest answer).
     fn rebuild(&mut self) {
-        self.graph = Graph::new();
-        // The table is keyed by declarations this graph no longer has, and every signature file
-        // is about to be read again anyway.
+        self.graph = indexed::Indexed::default();
+        // The table is keyed by declarations this graph no longer has, and every signature file is
+        // about to be re-read anyway.
         self.types.clear();
-        // Same reason, one step further: the documents it maps are not in the new graph either,
-        // and whatever generated them will be asked again as their source files are re-read.
+        // Same reason: the documents it maps are not in the new graph, and their generators run
+        // again as the sources are re-read.
         self.synthesized.clear();
         self.generated.clear();
-        // And the pass gate has nothing to compare against: the projection it holds is of a
-        // graph that no longer exists. The `mark_dirty` at the end of this would cover it, but
-        // an invariant that depends on a later line is one a later edit can lose.
+        // The pass gate has nothing to compare against: its projection is of a graph that no longer
+        // exists. The final `mark_dirty` would cover it, but an invariant that depends on a later
+        // line is one a later edit can lose.
         self.generated_from = None;
-        // The per-document half of the same sentence — the gate's evidence and the walk's memo
-        // — keyed by a `UriId` of a graph that is about to be replaced, and every document in it
-        // is about to be re-indexed anyway.
+        // The per-document half of the same thing (the gate's evidence and the walk's memo), keyed
+        // by `UriId`s of the graph being replaced; every document is about to be re-indexed anyway.
         self.contributions.clear();
-        // Same again: every entry describes offsets into the graph being thrown away.
+        // Every entry describes offsets into the graph being thrown away.
         self.indexed_text.clear();
-        // Every module's own parse memo, which each keeps. Keyed by a URI rather than by anything
-        // the graph owns and with the file's own freshness, so it would survive a rebuild
-        // correctly — and a rebuild is a configuration change, which can move the workspace root
-        // and so what every provenance line says. Dropped rather than reasoned about, by building
-        // the registry again.
+        // Every module keeps its own parse memo. It is keyed by URI with the file's own freshness,
+        // so it would survive a rebuild correctly, but a rebuild is a config change that can move
+        // the workspace root and so every provenance line. Rebuilding the registry drops them
+        // instead of reasoning about it.
         self.knowledge = Self::registered();
-        // Whatever was still queued refers to the old configuration's gem roots, and the graph
-        // it was going to be indexed into no longer exists.
-        if let Some(work) = self.gem_work.take()
+        // Anything still queued refers to the old configuration's gem roots and a graph that no
+        // longer exists.
+        //
+        // Back to the entry stage, where `index_workspace` below runs and which
+        // `queue_background_indexing` at the end leaves: a rebuild is the pipeline again from the
+        // top, not a settle.
+        if let Stage::Bundle(work) = std::mem::replace(&mut self.stage, Stage::Workspace)
             && let Some(progress) = work.progress
         {
             progress.end("cancelled".to_owned());
@@ -1773,16 +2049,15 @@ impl Analysis {
         self.foreign_prefixes.clear();
         self.engine_prefixes.clear();
         self.load_prefixes.clear();
-        // The deferred edits. Every open buffer is replayed below, which is a superset of whatever was
-        // waiting, and the graph the deferred index was for has just been thrown away.
+        // The deferred edits. Every open buffer is replayed below (a superset of what was waiting),
+        // and the graph they were for is gone.
         self.pending_index.clear();
-        // The skip list is the one thing here that is deliberately **kept**. Everything above is
-        // keyed by a graph that is about to be replaced; the skip list is keyed by a file that
-        // is still on disk and still crashes the indexer, and the recovery in
-        // [`Analysis::resolve`] runs the walk below — so clearing it would let the file this
-        // rebuild may be recovering from take the rebuild down with it.
+        // The skip list is deliberately **kept**. Everything above is keyed by the graph being
+        // replaced; the skip list is keyed by a file still on disk that still crashes the indexer.
+        // The recovery in [`Analysis::resolve`] runs the walk below, so clearing it would let the
+        // file this rebuild may be recovering from crash the rebuild too.
         self.index_workspace();
-        // Open buffers shadow disk, so replay them over the freshly indexed tree.
+        // Open buffers shadow the disk, so replay them over the freshly indexed tree.
         let buffers: Vec<(DocUri, String)> = self
             .open
             .iter()
@@ -1791,38 +2066,93 @@ impl Analysis {
         for (uri, text) in buffers {
             self.index_buffer(&uri, &text);
         }
-        // Unconditionally, even with no buffers to replay: a reload may have changed which
-        // rules are on, or dropped files from the index, and both change what the editor should
-        // be showing. Without this a project with no open files keeps displaying the
-        // diagnostics from the previous configuration forever.
-        self.mark_dirty();
+        // **Run the generator stage here, not via the loop.** A rebuild promises the graph comes
+        // back, and an unlinked graph is not back: `index_workspace` indexes without resolving,
+        // because the pass is written for an unresolved graph. It also always refreshes the editor,
+        // even with no buffers to replay: a reload may have changed which rules are on or dropped
+        // files from the index, and without a publish a project with no open files would keep the
+        // old configuration's diagnostics forever.
+        self.generate();
+        // The bundle is re-queued *after* that, so it indexes in the background as on a cold start,
+        // followed by one more generator stage, instead of blocking the analysis thread for the
+        // length of a bundle.
         self.queue_background_indexing();
+    }
+
+    /// Replace an open buffer with what is on disk, where the rule in [`Watched`] allows it.
+    ///
+    /// Returns whether it happened: the caller's "this document was re-indexed".
+    ///
+    /// **Four conditions, all required:**
+    ///
+    /// 1. **The event is from the server's own watcher.** Otherwise an editor that reloads
+    ///    unmodified files itself would have its next `didChange`'s ranges land in a string it
+    ///    never measured.
+    /// 2. **The buffer is saved.** Otherwise the swap discards text that exists nowhere else.
+    /// 3. **The path is still a file.** A deletion is the loop's third outcome, not this one.
+    /// 4. **The text actually differs.** Claude Code's edit arrives twice (`didChange` and
+    ///    `didSave`, then the watcher seeing the same write), and the second has nothing to do.
+    fn yield_to_disk(&mut self, uri: &DocUri, watched: Watched) -> bool {
+        if watched != Watched::ByTheServer {
+            return false;
+        }
+        if !self.open.get(uri).is_some_and(|document| document.saved) {
+            return false;
+        }
+        let Some(path) = uri.to_file_path().filter(|path| path.is_file()) else {
+            return false;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::debug!("{uri} changed on disk but could not be re-read: {error}");
+                return false;
+            }
+        };
+        let Some(document) = self.open.get_mut(uri) else {
+            return false;
+        };
+        if document.text.text() == text {
+            return false;
+        }
+        let theirs = std::mem::replace(
+            &mut document.text,
+            TextDocument::new(text.clone(), self.encoding),
+        );
+        // Only when empty: a second disk change before the client speaks must not overwrite the
+        // client's copy with the first swap's result.
+        if document.client_copy.is_none() {
+            document.client_copy = Some(theirs);
+        }
+        tracing::debug!("{uri} changed on disk and its buffer was saved; taking the disk's text");
+        // The swap is what this reports, whether or not the graph needed the text: the editor's
+        // copy was replaced, which is what the caller counts.
+        self.index_buffer(uri, &text);
+        true
     }
 
     /// Bring the index back in line with what is on disk, for paths a watcher named.
     ///
-    /// Four rules, and each is a way to be wrong that nothing else would catch:
+    /// Four rules, each catching a mistake nothing else would:
     ///
     /// - **A buffer beats the disk.** A rebase under an open file must not overwrite what the
-    ///   editor is showing. `didClose` already implements exactly this precedence in the other
-    ///   direction — fall back to disk only once the buffer is gone.
-    /// - **A gem is not the user's code.** Watchers are the client's and shared, so a change
-    ///   inside a vendored bundle can arrive; `is_own_code` is the test that is right when the
-    ///   bundle lives inside the workspace root.
-    /// - **The walk decides what belongs.** `Workspace::indexes` is the same rules the startup
-    ///   walk applied, so a file the user excluded stays excluded however it is written.
-    /// - **`index.max_files` still applies**, because a pathological repository exists and the
-    ///   cap is the only thing standing between it and the process.
+    ///   editor shows. `didClose` applies the same precedence the other way: fall back to disk
+    ///   only once the buffer is gone.
+    /// - **A gem is not the user's code.** Watchers are the client's and shared, so a change in
+    ///   a vendored bundle can arrive; `is_own_code` is right even when the bundle is inside the
+    ///   workspace root.
+    /// - **The walk decides what belongs.** `Workspace::indexes` applies the startup walk's
+    ///   rules, so a file the user excluded stays excluded however it is written.
+    /// - **`index.max_files` still applies**: pathological repositories exist, and the cap is
+    ///   all that stands between one and the process.
     ///
-    /// **This loop has three outcomes and not two**: re-index a document, forget one, or
-    /// neither. A `db/structure.sql` is the third. It is watched —
-    /// `capabilities::watched_files` registers `db/*structure.sql` beside `ya-lsp.toml`, which
-    /// is watched and never indexed — it is read by `synthesize`, and it must never reach
-    /// rubydex, which would read
-    /// SQL as Ruby and file a document full of parse errors. So the branch invalidates and
-    /// indexes nothing, and it sits **above** the `Workspace::indexes` gate because that gate is
-    /// `index.include`, which is the shapes Ruby is written in and will always say no.
-    fn refresh(&mut self, uris: Vec<DocUri>) {
+    /// **Three outcomes, not two**: re-index a document, forget one, or neither. A
+    /// `db/structure.sql` is the third. `capabilities::watched_files` watches it (beside
+    /// `ya-lsp.toml`, which is watched and never indexed), `synthesize` reads it, and it must
+    /// never reach rubydex, which would parse SQL as Ruby. So its branch invalidates and indexes
+    /// nothing, and sits **above** the `Workspace::indexes` gate, which is `index.include` (Ruby
+    /// shapes) and would always say no.
+    fn refresh(&mut self, uris: Vec<DocUri>, watched: Watched) {
         let started = Instant::now();
         let max_files = self.workspace.config().index.max_files;
         let (mut indexed, mut forgotten, mut full) = (0_usize, 0_usize, false);
@@ -1830,24 +2160,30 @@ impl Analysis {
 
         for uri in uris {
             if self.open.contains_key(&uri) {
-                // The editor's copy is newer than anything on disk by definition, and it is
-                // what every answer is already computed against.
-                tracing::trace!(
-                    "{uri} changed on disk but is open in the editor; keeping the buffer"
-                );
+                // **An open document is decided here and nowhere else in this loop.** Either it
+                // yields to the disk (the rule in [`Watched`]) or the buffer stands, since the
+                // editor's copy is by definition newer than the disk and is what every answer is
+                // computed against.
+                if self.yield_to_disk(&uri, watched) {
+                    indexed += 1;
+                } else {
+                    tracing::trace!(
+                        "{uri} changed on disk but is open in the editor; keeping the buffer"
+                    );
+                }
                 continue;
             }
             if !self.is_own_code(uri.as_str()) {
                 tracing::trace!("{uri} changed, but it is not this project's code to index");
                 continue;
             }
-            // Above the `is_file` test as well as above the index gate, so that one branch
-            // covers a dump being written, edited and deleted alike: `synthesize` re-reads the
-            // directory every settle, so which of the three it was is a question this loop
-            // never has to ask, and a deleted one is pruned by `forget_stale` rather than by
-            // anything here.
+            // Above the `is_file` test as well as the index gate, so one branch covers a dump being
+            // written, edited or deleted: `synthesize` re-reads the directory every settle, so this
+            // loop never needs to know which, and a deleted dump is pruned by `forget_stale`.
             if self.workspace.features().schema
-                && uri.to_path().is_some_and(|path| rails::is_structure(&path))
+                && uri
+                    .to_file_path()
+                    .is_some_and(|path| rails::is_structure(&path))
             {
                 tracing::trace!(
                     "{uri} changed; it is a schema dump, so the next settle re-reads it"
@@ -1857,11 +2193,10 @@ impl Analysis {
                 continue;
             }
 
-            // Gone, or never a file — `didClose`'s own test, for the same reason. Whether the
-            // workspace *would* index it is not a question that can be asked of a path that is
-            // not there, and it does not need to be: a document the graph holds is one that was
-            // indexed, so it is one to drop, and one it does not hold is nothing at all.
-            let Some(path) = uri.to_path().filter(|path| path.is_file()) else {
+            // Gone, or never a file: `didClose`'s test, for the same reason. Whether the workspace
+            // *would* index a missing path cannot be asked and need not be: a document the graph
+            // holds was indexed, so drop it; one it does not hold is nothing.
+            let Some(path) = uri.to_file_path().filter(|path| path.is_file()) else {
                 if self.forget_indexed(&uri) {
                     forgotten += 1;
                 }
@@ -1871,9 +2206,9 @@ impl Analysis {
                 tracing::trace!("{uri} changed but is not a file this workspace indexes");
                 continue;
             }
-            // A file the walk skipped is not in the graph and was counted against the cap all
-            // the same — `index_workspace` counts what discovery found, not what survived it —
-            // so without this the retry below would count it twice.
+            // A file the walk skipped is not in the graph but was counted against the cap
+            // (`index_workspace` counts what discovery found, not what survived), so without this
+            // the retry below would count it twice.
             let known = self.indexed(&uri) || self.skipped.contains(&uri);
             if !known && self.workspace_files >= max_files {
                 full = true;
@@ -1892,11 +2227,16 @@ impl Analysis {
             if !known {
                 self.workspace_files += 1;
             }
-            // The same entry point an open buffer takes, so the `.rbs` interface rule is one
-            // rule: a signature file that reaches the graph through the watcher must not put
-            // back the `Object` members the indexing path took out.
-            self.index_buffer(&uri, &text);
-            indexed += 1;
+            // The same entry point as an open buffer, so the `.rbs` interface rule stays one rule:
+            // a signature reaching the graph through the watcher must not restore the `Object`
+            // members the indexing path removed.
+            //
+            // Counted on what it did, not what it was asked: a `git checkout` names every file that
+            // differs *and* every file merely rewritten, and "re-indexed 200" when three documents
+            // changed would hide this working.
+            if self.index_buffer(&uri, &text) {
+                indexed += 1;
+            }
         }
 
         if full && !self.index_full_reported {
@@ -1916,8 +2256,8 @@ impl Analysis {
 
     /// Whether the graph currently holds a document for `uri`.
     ///
-    /// One hash of the URI string, which is what makes it affordable per changed file; the
-    /// alternative — asking the workspace walk — costs a `read_dir` per directory.
+    /// One hash of the URI, cheap enough per changed file; asking the workspace walk would cost a
+    /// `read_dir` per directory.
     fn indexed(&self, uri: &DocUri) -> bool {
         self.graph
             .documents()
@@ -1935,17 +2275,17 @@ impl Analysis {
     }
 
     fn forget(&mut self, uri: &DocUri) {
-        self.graph.delete_document(uri.as_str());
+        self.graph.graph_mut().delete_document(uri.as_str());
         // The map describes offsets into a document that no longer exists.
         self.indexed_text.remove(uri);
-        // Whatever this file *implied* goes with it. Left behind, a generated declaration would
-        // outlive the only thing that could ever refresh it: nothing re-reads a file that is
-        // gone, so the columns of a deleted `db/schema.rb` would answer forever.
-        self.synthesized.forget(&mut self.graph, uri);
+        // Whatever this file *implied* goes with it. A generated declaration left behind would
+        // outlive the only thing that could refresh it: nothing re-reads a deleted file, so a
+        // deleted `db/schema.rb`'s columns would answer forever.
+        self.synthesized.forget(self.graph.graph_mut(), uri);
         self.mark_dirty();
     }
 
-    /// Something changed and the pass cannot know what, so the next one does all of its work.
+    /// Something changed and the pass cannot know what, so the next pass does all its work.
     fn mark_dirty(&mut self) {
         self.touched_all = true;
         self.dirty = true;
@@ -1959,62 +2299,146 @@ impl Analysis {
         self.resolve_at = Some(Instant::now() + resolve_debounce());
     }
 
-    /// Run the debounced work: link the graph, then push whatever diagnostics moved.
+    /// Run the debounced work: link the graph, then push whatever diagnostics changed.
     fn settle(&mut self) {
-        // Before anything else, and before `dirty` is cleared: a buffer whose index the loop
-        // deferred has to be in the graph before the pass reads it or the resolver links over
-        // it. `index_buffer` marks dirty again, which is why this cannot run after the flag.
+        // First, and before `dirty` is cleared: a deferred buffer must be in the graph before the
+        // pass reads it or the resolver links over it. `index_buffer` sets dirty again, which is
+        // why this cannot run after the flag.
         self.index_pending();
         self.resolve_at = None;
+        // **Nothing links the graph until the bundle is fully in.**
+        //
+        // [`Self::regenerate`] is written for an unresolved graph (only `Object`, `BasicObject`,
+        // `Module` and `Class`). A settle that linked a half-indexed bundle would make the first
+        // pass read a resolved one, and rubydex then adds the same reference to a declaration twice
+        // (`model/declaration.rs:160`). A contained panic there rebuilds, which resolves, which
+        // panics: a crash loop, and a server answering nothing looks exactly like one thinking.
+        //
+        // So the whole pipeline is finished here first, on this thread. The cost: a request that
+        // settles during a cold start waits for the last gem. The three methods a caret asks are
+        // still answered over the map without settling (`defers`), which is where latency is felt.
+        //
+        // The whole pipeline, not only the bundle: stopping at [`Stage::Generate`] would make this
+        // call run the pass, then the loop's next turn step `Generate` and run a *second* one
+        // against the graph the first just linked, the same hazard. Draining through `Generate`
+        // lets [`Self::generate`] own the pass, and the `dirty` it clears makes the check below
+        // fall through instead of running twice.
+        if !self.stage.is_ready() {
+            while self.step_pipeline() {}
+        }
         if !self.dirty {
             return;
         }
         self.dirty = false;
         self.regenerate();
+        self.refresh_generated();
         self.publish_diagnostics();
     }
 
-    /// Generate, link, and then find the places only a linked graph can name.
+    /// Tell the client that a generated document it is reading has changed.
     ///
-    /// **One function because the three are one order**, and the middle step is what makes it an
-    /// order rather than a list. Every generator writes the text rubydex is about to link, so
-    /// while the pass is running the graph holds four declarations — `Object`, `BasicObject`,
-    /// `Module` and `Class` — and a generator that needs to ask *where does Rails write `where`*
-    /// cannot be answered where it stands. It states the name instead and
-    /// [`Self::place_generated_members`] answers it, which is only sound after the resolve.
+    /// - **Why.** That document is the one thing on screen nothing watches: no file, so no editor
+    ///   reload, no watcher, no `didChange`. Without this, a reader who adds a column and looks
+    ///   back at the RBS sees the pre-migration version indefinitely, with no hint it is stale.
+    /// - **Drained every settle whether anyone reads or not**, which keeps [`Synthesized`]'s list
+    ///   to one pass's worth instead of accumulating a string per body during a cold index.
+    /// - **Sent only for documents the client asked about** (see [`Self::served`]). On a model
+    ///   keystroke that is one document; on a cold index it would otherwise be every body in the
+    ///   workspace, hundreds of requests at the busiest moment, about documents nobody opened.
+    fn refresh_generated(&mut self) {
+        let changed = self.synthesized.take_changed();
+        if !self.client.generated_content || self.served.is_empty() {
+            return;
+        }
+        for uri in changed.iter().filter_map(|uri| self.served.get(uri)) {
+            // A string id in the server's own id space, as `refresh_hints` and the two
+            // registrations use, one per document: the request names one document, so two changed
+            // documents are two requests.
+            let _ = self.outgoing.send(Message::Request(Request {
+                id: RequestId::from(format!("ya-lsp/generated-refresh/{uri}")),
+                method: "workspace/textDocumentContent/refresh".to_owned(),
+                params: serde_json::json!({ "uri": uri }),
+            }));
+        }
+    }
+
+    /// Ask the client to show a document to the user.
     ///
-    /// Both callers are a bulk route: the first index of a workspace, and a settle. Neither may
-    /// run two of these three.
+    /// All `ya-lsp.showGenerated` does, and why the command exists: a generated document has no
+    /// `file:` URI, so no `Location` may name it and no link may point at it
+    /// (`DocUri::from_graph_uri` refuses the scheme, the backstop `synthesized.md` is built on). A
+    /// command argument is not a `Location`, so the URI reaches the client without weakening that.
+    ///
+    /// The answer is read and dropped like every server-initiated request: a client that declines
+    /// has decided not to open it, and a retry would change nothing.
+    fn show_generated(&self, uri: &str) {
+        let _ = self.outgoing.send(Message::Request(Request {
+            id: RequestId::from(format!("ya-lsp/show-generated/{uri}")),
+            method: "window/showDocument".to_owned(),
+            params: serde_json::json!({ "uri": uri, "external": false, "takeFocus": true }),
+        }));
+    }
+
+    /// The name this server's command goes out under, which carries its root.
+    ///
+    /// Computed from the workspace each time, not held: two hashes a session, on a key the user
+    /// pressed, and a cached copy would be a second answer to a question the workspace already
+    /// answers. [`show_generated_command`] explains why the root is in it.
+    fn show_generated_command(&self) -> String {
+        show_generated_command(self.workspace.root())
+    }
+
+    /// Remember that the client is reading a generated document, and under what name.
+    ///
+    /// Called from the content handler, the only place both spellings are known: the key is
+    /// this crate's, so [`Self::refresh_generated`] can match what the generators rewrote, and
+    /// the value is the client's, so the refresh names a document the client can find.
+    fn serving(&mut self, spelling: &str, asked: &str) {
+        self.served.insert(spelling.to_owned(), asked.to_owned());
+    }
+
+    /// Generate, link, then find the places only a linked graph can name.
+    ///
+    /// **One function because the three are one order**, and the middle step makes it an order.
+    /// Every generator writes text rubydex is about to link, so during the pass the graph holds
+    /// four declarations (`Object`, `BasicObject`, `Module`, `Class`), and a generator asking
+    /// *where does Rails write `where`* cannot be answered there. It states the name instead, and
+    /// [`Self::place_generated_members`] answers it, which is sound only after the resolve.
+    ///
+    /// Both callers are bulk routes: a workspace's first index and a settle. Neither may run only
+    /// two of the three.
     fn regenerate(&mut self) {
         self.synthesize();
         self.resolve();
         self.place_generated_members();
+        // **One more step that needs the resolve first**, for a similar reason:
+        // `alias_method :blank?, :empty?` is written in ActiveSupport and `empty?` declared in
+        // `vendor/rbs`, so the row a Ruby alias copies exists only once every signature is
+        // harvested. See [`Types::adopt_aliases`](types::Types::adopt_aliases).
+        self.types.adopt_aliases(&self.graph);
     }
 
-    /// Link the graph — and survive rubydex panicking while it does.
+    /// Link the graph, and survive rubydex panicking while it does.
     ///
-    /// rubydex 0.2.5 panics inside `Resolver::resolve` after a document is deleted:
-    /// `Graph::delete_document` invalidates first and untracks the document's strings second, so
-    /// the work the invalidation queued can name a string that is no longer there, and
-    /// `resolution.rs:748` unwraps it. Reproduced by deleting
-    /// `lib/solargraph/yard_map/to_method.rb` from a solargraph v0.58.2 checkout; reachable
-    /// through `didClose` on a file that is gone, and routine once the watcher is on, because a
-    /// `git checkout` that removes a file is an ordinary Tuesday.
-    ///
-    /// There is nothing to upgrade to and the alternative is a fork, so it is contained here
-    /// instead.
-    /// Left alone it is the worst failure this server has: the analysis thread dies, the editor
-    /// keeps sending requests, and a language server that answers nothing at all looks exactly
-    /// like one that is thinking. A graph half-way through a resolve is in an unknown state, so
-    /// the only honest recovery is to throw it away and index everything again.
+    /// - **The bug.** rubydex panics inside `Resolver::resolve` after a document is deleted:
+    ///   `Graph::delete_document` invalidates first and untracks the document's strings second, so
+    ///   queued work can name a string that is gone, and `resolution.rs:748` unwraps it. Reproduced
+    ///   by deleting `lib/solargraph/yard_map/to_method.rb` from a solargraph v0.58.2 checkout.
+    ///   Reachable through `didClose` on a vanished file, and routine with the watcher on: a
+    ///   `git checkout` that removes a file is ordinary.
+    /// - **Contained here**, since there is nothing to upgrade to and the alternative is a fork.
+    /// - **Uncontained, it is the worst failure this server has**: the analysis thread dies, the
+    ///   editor keeps sending requests, and a server answering nothing looks like one thinking. A
+    ///   graph half-way through a resolve is in an unknown state, so the only honest recovery is to
+    ///   throw it away and index everything again.
     fn resolve(&mut self) {
         let started = Instant::now();
-        // The panic message itself still reaches stderr through the default hook, which is
-        // where the rubydex file and line a report needs are written.
+        // The panic message still reaches stderr through the default hook, which prints the rubydex
+        // file and line a report needs.
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(test)]
             crash_the_next_resolve_if_asked();
-            Resolver::new(&mut self.graph).resolve();
+            Resolver::new(self.graph.graph_mut()).resolve();
         }))
         .is_err();
         if !crashed {
@@ -2022,8 +2446,8 @@ impl Analysis {
             return;
         }
         if self.recovering {
-            // The rebuild crashed too, so rebuilding again would only crash again. The graph
-            // keeps whatever it managed to link; every feature degrades rather than stopping.
+            // The rebuild crashed too, so rebuilding again would only crash again. The graph keeps
+            // whatever it managed to link; features degrade instead of stopping.
             tracing::error!(
                 "linking the graph crashed again during recovery; leaving the index as it is"
             );
@@ -2043,9 +2467,9 @@ impl Analysis {
 
     /// Push the diagnostics that changed since the last publish.
     ///
-    /// Sending every URI every time would mean one notification per workspace file on every
-    /// keystroke, so this diffs: URIs whose set is unchanged are skipped, and a URI that has
-    /// dropped out gets an explicit empty publish, which is the only way to clear it.
+    /// Sending every URI every time would be one notification per workspace file per keystroke, so
+    /// this diffs: unchanged URIs are skipped, and a URI that dropped out gets an explicit empty
+    /// publish, the only way to clear it.
     fn publish_diagnostics(&mut self) {
         let current = self.collect_diagnostics();
 
@@ -2066,18 +2490,39 @@ impl Analysis {
             self.send_diagnostics(&uri, Vec::new());
         }
 
-        // `current` never holds an empty entry, so the map stays the size of "files with
-        // problems" rather than the size of the workspace.
+        // `current` never holds an empty entry, so the map stays the size of "files with problems",
+        // not of the workspace.
         self.published = current;
     }
 
-    /// Every diagnostic the graph currently holds, grouped by document and converted to LSP.
+    /// Every diagnostic the graph holds, grouped by document and converted to LSP.
+    ///
+    /// - **Two kinds of document are squiggled**: the user's own code, and an open buffer the
+    ///   project does not contain (a file beside it, or an unsaved tab). A syntax error is a syntax
+    ///   error wherever it is typed; a missing `end` in a scratch buffer deserves red.
+    /// - **Widening [`Self::is_own_code`] instead would be the bug.** That test is also asked by
+    ///   `rename`, the picker and both ranked surfaces, and widening it would publish diagnostics
+    ///   inside gems, offer renames there, and put the bundle's classes in `workspace/symbol`. A
+    ///   gem file the reader opens is under a gem root, not outside the project, so it stays
+    ///   silent: the fence's asymmetry, unchanged.
+    /// - **The rule table keeps this quiet.** Eight of the ten rules ship `Off` or `Hint`, because
+    ///   they are rubydex saying *it* gave up; only `parse-error` and `parse-warning` are
+    ///   statements about the user's code. See `diagnostics.rs`.
     fn collect_diagnostics(&self) -> HashMap<DocUri, Vec<lsp_types::Diagnostic>> {
         let config = &self.workspace.config().diagnostics;
+        // Built once per publish and read once per diagnostic: a handful of open buffers checked
+        // against `Layout::is_outside`, instead of parsing a URL for each of a bundle's tens of
+        // thousands of diagnostics.
+        let layout = self.layout();
+        let beside: HashSet<&str> = self
+            .open
+            .keys()
+            .map(DocUri::as_str)
+            .filter(|uri| layout.is_outside(uri))
+            .collect();
 
-        // Group by the graph's own URI string first. Turning that into a `DocUri` parses a URL
-        // and touches the filesystem check, and a file with a hundred parse errors should pay
-        // for that once, not a hundred times.
+        // Group by the graph's URI string first. Converting to a `DocUri` parses a URL and checks
+        // the filesystem, and a file with a hundred parse errors should pay that once.
         let mut by_document: HashMap<
             &str,
             Vec<(&rubydex::diagnostic::Diagnostic, DiagnosticSeverity)>,
@@ -2087,19 +2532,19 @@ impl Analysis {
             let rule = *diagnostic.rule();
             let configured =
                 config.severity(diagnostics::name(rule), diagnostics::default_severity(rule));
-            // `Off` has no LSP spelling — the diagnostic has to be dropped, not downgraded.
+            // `Off` has no LSP spelling: the diagnostic is dropped, not downgraded.
             let Some(severity) = diagnostics::to_lsp_severity(configured) else {
                 continue;
             };
             let Some(document) = self.graph.documents().get(diagnostic.uri_id()) else {
-                // The document was deleted but a declaration still carries its diagnostic.
-                // There is no file to attach it to.
+                // The document was deleted, but a declaration still carries its diagnostic. There
+                // is no file to attach it to.
                 continue;
             };
-            // Filtered here, on the raw URI string, rather than after grouping: a Rails bundle
-            // contributes tens of thousands of diagnostics nobody can act on, and parsing a URL
-            // for each of them on every settle would cost more than the diagnostics do.
-            if !self.is_own_code(document.uri()) {
+            // Filtered here, on the raw URI string, before grouping: a Rails bundle contributes
+            // tens of thousands of diagnostics nobody can act on, and parsing a URL for each on
+            // every settle would cost more than the diagnostics.
+            if !self.is_own_code(document.uri()) && !beside.contains(document.uri()) {
                 continue;
             }
             by_document
@@ -2110,21 +2555,28 @@ impl Analysis {
 
         let mut collected = HashMap::with_capacity(by_document.len());
         for (raw_uri, entries) in by_document {
-            let Some(uri) = DocUri::from_uri_str(raw_uri) else {
-                // rubydex's synthetic built-in document, or anything else with no file.
+            let Some(uri) = DocUri::from_graph_uri(raw_uri) else {
+                // rubydex's synthetic built-in document, or anything else without a file.
                 continue;
             };
             // A template's diagnostics are not about anything the user wrote. What survives a
-            // correct scan is `<%= yield :subnav %>` in a layout — two of them over lobsters'
-            // 121 templates, and both legal, because a compiled Rails template is a method body
-            // and Prism is reading a file. A rule that fires on correct input does not earn a
-            // squiggle; see `diagnostics.rs`, and `erb.rs` for the other two scanners that were
-            // measured against this one.
+            // correct scan is `<%= yield :subnav %>` in a layout: legal, because a compiled Rails
+            // template is a method body, but Prism reads a file. A rule that fires on correct input
+            // earns no squiggle; see `diagnostics.rs`, and `erb.rs` for the scanners measured
+            // against this one.
+            //
+            // **Keyed on the markup, not the handler, on evidence.** Rails compiles `.jbuilder`,
+            // `.builder` and `.ruby` into method bodies just like `.erb`, so this looks like it
+            // should cover all four. But across the corpora's such files, no line uses a construct
+            // legal only in a compiled template (`yield` is the whole reason for the drop, and a
+            // jbuilder has no layout). And the cost runs the other way: a template's Ruby is a view
+            // this crate synthesised, while a `.jbuilder` is the user's own Ruby, so a syntax error
+            // there is real and earns its squiggle.
             if erb::is_template_uri(&uri) {
                 continue;
             }
-            // Reading the file to place the ranges is only affordable because this runs for
-            // files that *have* diagnostics, which on healthy code is none of them.
+            // Reading the file to place ranges is affordable only because this runs for files that
+            // *have* diagnostics, which on healthy code is none.
             let Some(mut items) = self.with_text(&uri, |text| {
                 entries
                     .iter()
@@ -2133,8 +2585,8 @@ impl Analysis {
                         lsp_types::Diagnostic {
                             range: text.range_at(offset.start(), offset.end()),
                             severity: Some(*severity),
-                            // The rule name, so the Problems panel shows the key the user needs
-                            // to put in `[diagnostics.rules]` to change or silence it.
+                            // The rule name, so the Problems panel shows the key to put in
+                            // `[diagnostics.rules]` to change or silence it.
                             code: Some(lsp_types::NumberOrString::String(
                                 diagnostics::name(*diagnostic.rule()).to_owned(),
                             )),
@@ -2145,14 +2597,14 @@ impl Analysis {
                     })
                     .collect::<Vec<_>>()
             }) else {
-                // No readable text means no trustworthy ranges. Publishing nothing beats
-                // publishing squiggles in the wrong place.
+                // No readable text means no trustworthy ranges. Publishing nothing beats squiggles
+                // in the wrong place.
                 tracing::debug!("skipping diagnostics for unreadable {uri}");
                 continue;
             };
 
-            // `all_diagnostics` walks hash maps, so its order varies run to run. Sorting makes
-            // the set comparable against the last publish, which is what keeps the diff honest.
+            // `all_diagnostics` walks hash maps, so its order varies between runs. Sorting makes
+            // the set comparable with the last publish, which keeps the diff honest.
             items.sort_by(|a, b| {
                 (a.range.start, a.range.end, &a.message).cmp(&(
                     b.range.start,
@@ -2173,7 +2625,7 @@ impl Analysis {
         let params = lsp_types::PublishDiagnosticsParams {
             uri: lsp_uri,
             diagnostics: items,
-            // Lets the client throw away diagnostics for text the user has already edited past.
+            // Lets the client discard diagnostics for text the user has edited past.
             version: self.open.get(uri).and_then(|open| open.version),
         };
         let _ = self
@@ -2184,45 +2636,30 @@ impl Analysis {
             )));
     }
 
-    /// Whether a document is the user's own code — inside the workspace, outside every gem.
+    /// Whether a document is the user's own code: inside the workspace, outside every gem.
     ///
-    /// Three features turn on this one test, and they want it for the same reason: a result the
-    /// user cannot act on is worse than no result. Nobody can fix a warning inside someone
-    /// else's gem, nobody is going to edit a gem to rename their own method, and a Rails bundle
-    /// would bury the answer under tens of thousands of them either way.
-    ///
-    /// The second check is not redundant with the workspace check. A *vendored* bundle lives at
-    /// `vendor/bundle/ruby/<abi>`, inside the workspace root by construction, so the prefix test
-    /// alone calls a hundred gems — and, for a project that vendors its own signatures, the
-    /// whole of Ruby's core — the user's own code.
-    ///
-    /// Compared as a URI prefix rather than a path: both sides come from `Url::from_file_path`,
-    /// so they are already canonical, and this runs once per diagnostic.
+    /// - **Three features rely on it, for one reason**: a result the user cannot act on is worse
+    ///   than none. Nobody fixes a warning in someone's gem or edits a gem to rename their own
+    ///   method, and a Rails bundle would bury the answer under tens of thousands of such results.
+    /// - **The gem check is not redundant.** A *vendored* bundle lives at
+    ///   `vendor/bundle/ruby/<abi>`, inside the root, so the prefix test alone would call a hundred
+    ///   gems (and, for a project vendoring its signatures, all of Ruby's core) the user's own
+    ///   code.
+    /// - **Compared as URI prefixes**: both sides come from `Url::from_file_path`, so they are
+    ///   canonical, and this runs once per diagnostic.
     fn is_own_code(&self, uri: &str) -> bool {
-        let named = uri.starts_with(&self.workspace_prefix)
-            || self
-                .own_prefixes
-                .iter()
-                .any(|prefix| uri.starts_with(prefix));
-        named
-            && !self
-                .foreign_prefixes
-                .iter()
-                .any(|prefix| uri.starts_with(prefix))
+        self.layout().is_own(uri)
     }
 
     /// Whether a generator may read this document: the user's own code, or a Rails engine's.
     ///
-    /// The one place the answer differs from [`Analysis::is_own_code`]. An engine ships its
-    /// models under `app/`, declares `require_paths = ["lib"]`,
-    /// and its `has_many :variant_records` is a member of `ActiveStorage::Blob` — a class an
-    /// application names and chains off, and one nothing in the bundle's `lib/` declares.
-    ///
-    /// Widening `is_own_code` itself would have been one line and three regressions: a
-    /// diagnostic published inside somebody's gem, a rename offered there, and the bundle's
-    /// classes in `workspace/symbol`. Those three want "code the user can act on"; a generator
-    /// wants "code whose declarations the user can reach", and the honest way to have both is
-    /// two predicates.
+    /// - **The one place the answer differs from [`Analysis::is_own_code`].** An engine ships
+    ///   models under `app/` and declares `require_paths = ["lib"]`, and its
+    ///   `has_many :variant_records` is a member of `ActiveStorage::Blob`, a class applications
+    ///   name and chain off that nothing in the bundle's `lib/` declares.
+    /// - **Why two predicates.** Widening `is_own_code` would publish diagnostics inside gems,
+    ///   offer renames there, and put the bundle's classes in `workspace/symbol`. Those want "code
+    ///   the user can act on"; a generator wants "code whose declarations the user can reach".
     fn is_generator_source(&self, uri: &str) -> bool {
         self.is_own_code(uri)
             || self
@@ -2231,29 +2668,24 @@ impl Analysis {
                 .any(|prefix| uri.starts_with(prefix))
     }
 
-    /// Run `f` over the text of `uri`: the open buffer if the editor has one, otherwise the file
-    /// on disk. `None` when there is no readable text.
+    /// Run `f` over the text of `uri`: the open buffer if the editor has one, otherwise the file on
+    /// disk. `None` when there is no readable text.
     ///
-    /// The disk read is what rubydex indexed, unless the file changed underneath us — in which
-    /// case a re-index is already on its way and the ranges correct themselves.
+    /// The disk read is what rubydex indexed, unless the file changed underneath, in which case a
+    /// re-index is on its way and the ranges correct themselves.
     ///
-    /// **A template is handed over blanked**, which is the other half of what makes ERB work at
-    /// all. Nine of the seventeen requests parse the document themselves rather than reading the
-    /// graph — the outline, the folds, the scope walk under highlight and rename, the semantic
-    /// tokens, the cursor under a typed receiver — and every one of them would be handed markup
-    /// to parse as Ruby. Blanking here is not a second rule: it is [`erb::ruby_view`] again, the
-    /// same bytes rubydex was given, and because it preserves length and line breaks the offsets
-    /// on both sides of the server are the same offsets. The buffer itself stays exactly what
-    /// the editor sent, because that is what incremental edits are applied to.
-    ///
-    /// **It is handed over blanked and addressed unblanked**, and getting that wrong is
-    /// silent. An LSP position is a count of code units in the text the *client*
-    /// has, and blanking replaces a 3-byte `“` with three spaces — so a column counted against
-    /// the view is displaced left by (bytes − units) of every non-ASCII character in the markup
-    /// before it on the line, and every span answered from it is displaced right by the same
-    /// amount. [`TextDocument::blanked`] carries both texts for that reason. The template is
-    /// read twice on the disk path and cloned once on the buffer path, which is one allocation
-    /// the size of a template beside a Prism parse of it.
+    /// - **A template is handed over blanked.** Nine of the seventeen requests parse the document
+    ///   themselves (outline, folds, the scope walk under highlight and rename, semantic tokens,
+    ///   the cursor under a typed receiver), and each would otherwise get markup to parse as Ruby.
+    ///   This is [`erb::ruby_view`] again, the same bytes rubydex got, and it preserves length and
+    ///   line breaks, so offsets agree on both sides. The buffer itself stays exactly what the
+    ///   editor sent, since incremental edits apply to it.
+    /// - **Blanked for reading, unblanked for addressing**, and getting that wrong is silent. An
+    ///   LSP position counts code units in the *client's* text, and blanking replaces a 3-byte `“`
+    ///   with three spaces. A column counted against the view is off by (bytes − units) for every
+    ///   non-ASCII character earlier in the line's markup. [`TextDocument::blanked`] carries both
+    ///   texts for that reason. The cost is one extra read (disk) or clone (buffer), small beside a
+    ///   Prism parse.
     fn with_text<R>(&self, uri: &DocUri, f: impl FnOnce(&TextDocument) -> R) -> Option<R> {
         let template = erb::is_template_uri(uri);
         if let Some(open) = self.open.get(uri) {
@@ -2268,7 +2700,7 @@ impl Analysis {
                 self.encoding,
             )));
         }
-        let text = std::fs::read_to_string(uri.to_path()?).ok()?;
+        let text = std::fs::read_to_string(uri.to_file_path()?).ok()?;
         if template {
             let view = erb::ruby_view(&text);
             return Some(f(&TextDocument::blanked(text, view, self.encoding)));
@@ -2278,31 +2710,28 @@ impl Analysis {
 
     /// The document exactly as the editor has it, markup and all.
     ///
-    /// The one question [`Self::with_text`] cannot answer, because it answers every other one by
-    /// taking the markup away: whether the cursor is in Ruby. Only `completion` asks.
+    /// The one question [`Self::with_text`] cannot answer, since it removes the markup: whether the
+    /// cursor is in Ruby. Only `completion` asks.
     fn with_source<R>(&self, uri: &DocUri, f: impl FnOnce(&str) -> R) -> Option<R> {
         match self.open.get(uri) {
             Some(open) => Some(f(open.text.text())),
-            None => Some(f(&std::fs::read_to_string(uri.to_path()?).ok()?)),
+            None => Some(f(&std::fs::read_to_string(uri.to_file_path()?).ok()?)),
         }
     }
 
     /// Another document's text, by the URI rubydex filed it under, and its map onto the graph.
     ///
-    /// The one thing [`types`] reads that is not the graph, and it goes through
-    /// [`Self::with_text`] rather than straight to disk for the reason that function exists: an
-    /// open buffer is authoritative, so a controller being edited types the template it renders
-    /// before it is saved. It clones, unlike every other accessor here — the text has to outlive
-    /// the borrow because what reads it is a parse in another module — and it is reached only
-    /// where a receiver in a *template* was nothing but a name, which is a path no ordinary Ruby
-    /// file takes.
-    ///
-    /// **The [`Rebase`] is that same sentence finished.** Preferring the open buffer is what
-    /// makes an unsaved controller answer, and it is also what puts the offsets a whole file
-    /// behind the graph the moment somebody types in it. Both come from the one `with_text`
-    /// call, so the text handed out and the map handed out describe the same string.
+    /// - **The one non-graph thing [`types`] reads.** It goes through [`Self::with_text`], not
+    ///   straight to disk: an open buffer is authoritative, so a controller being edited types its
+    ///   template before it is saved.
+    /// - **It clones**, unlike every other accessor here: the text must outlive the borrow because
+    ///   a parse in another module reads it. Reached only where a *template* receiver was just a
+    ///   name, a path ordinary Ruby never takes.
+    /// - **The [`Rebase`] finishes the thought.** Preferring the buffer is what lets an unsaved
+    ///   controller answer, and also what puts its offsets out of step with the graph once someone
+    ///   types. Both come from one `with_text` call, so text and map describe the same string.
     fn read_of(&self, uri: &str) -> Option<(String, Rebase)> {
-        let uri = DocUri::from_uri_str(uri)?;
+        let uri = DocUri::from_graph_uri(uri)?;
         self.with_text(&uri, |text| {
             (text.text().to_owned(), self.rebase_for(&uri, text.text()))
         })
@@ -2310,8 +2739,8 @@ impl Analysis {
 
     /// What the type side reads besides the graph, built per request.
     ///
-    /// Per request rather than held, because the closure borrows `self` and the flag is
-    /// configuration that a `workspace/didChangeConfiguration` can move underneath it.
+    /// Per request, not held, because the closure borrows `self` and the flag is configuration a
+    /// `workspace/didChangeConfiguration` can change.
     fn sources<'a>(
         &'a self,
         read: &'a dyn Fn(&str) -> Option<(String, Rebase)>,
@@ -2324,27 +2753,33 @@ impl Analysis {
             guess: self.workspace.config().types.guess_from_names,
             features: self.workspace.features(),
             layout: self.layout(),
-            // One cursor, so the one arm that places an offset of its own walks the document
-            // once. `inlayHint` is the caller that cannot afford that and hands its own walk
-            // down — see `Sources::bodies`.
-            bodies: None,
-            // Nothing has been followed yet. The one rung that raises it hands a copy down
-            // rather than mutating this, so a request always starts from zero.
+            // One cursor, so the one arm placing its own offset walks the document once.
+            // `inlayHint` cannot afford that and passes its own memo (see `Sources::walked`).
+            walked: None,
+            // Nothing followed yet. The one rung that raises it passes a copy down instead of
+            // mutating this, so each request starts at zero.
             constant_hops: 0,
+            ancestor_hops: 0,
+            body_hops: 0,
+            // One cursor, so a body or two at most is read, and a memo would hold what nothing asks
+            // twice. `inlayHint` asks once per `def` and passes its own (see
+            // `Sources::read_bodies`).
+            read_bodies: None,
+            // The half of that memo that outlives the request, given to every surface: what a
+            // document's `def`s return depends only on its text, and a single cursor re-reads the
+            // same unchanged gem file `inlayHint` does.
+            held_exits: Some(&self.exits),
         }
     }
 
-    /// A `[trees]` key that **replaces** a built-in list says what it replaced.
+    /// Log which built-in list a replacing `[trees]` key replaced.
     ///
-    /// Two of the three lists replace rather than extend, because a name on either *deletes*
-    /// answers when it is wrong — so somebody who set one has taken four directory names six
-    /// repositories agree on out of play, and the only place that is visible is here. It is the
-    /// same debt `include_is_empty` pays for `index.include`.
-    ///
-    /// **A log line and not a `messages::` sentence**, deliberately: setting these is a
-    /// legitimate thing to do, and a `window/showMessage` every session about a setting the user
-    /// meant is a nag rather than a warning. `test_support` is absent for the same reason it is
-    /// additive — it replaces nothing, so there is nothing to say.
+    /// - **Two of the three lists replace instead of extending**, because a wrong name on either
+    ///   *deletes* answers. Setting one takes four directory names out of play, and this is the
+    ///   only place that shows. `include_is_empty` does the same for `index.include`.
+    /// - **A log line, not a `messages::` sentence**: setting these is legitimate, and a
+    ///   `window/showMessage` every session about an intended setting is nagging. `test_support` is
+    ///   additive, replaces nothing, so there is nothing to say.
     fn say_what_the_fences_replaced(&self) {
         let trees = &self.workspace.config().trees;
         if let Some(test) = &trees.test {
@@ -2361,7 +2796,7 @@ impl Analysis {
         }
     }
 
-    /// A misspelled key in `[diagnostics.rules]` does nothing at all, silently, forever. Say so.
+    /// A misspelled key in `[diagnostics.rules]` silently does nothing, forever. Say so.
     fn warn_about_unknown_rules(&self) {
         for name in self.workspace.config().diagnostics.rules.keys() {
             if diagnostics::is_known_name(name) {
@@ -2375,15 +2810,15 @@ impl Analysis {
     }
 
     fn respond(&self, response: Response) {
-        // A send failure means the client is gone; the main loop is already tearing down.
+        // A send failure means the client is gone; the main loop is already shutting down.
         let _ = self.outgoing.send(Message::Response(response));
     }
 
-    /// Ask the client to draw the margin again.
+    /// Ask the client to redraw the margin.
     ///
-    /// A server-initiated request, like `client/registerCapability`: the main loop reads the
-    /// answer and drops it, because there is nothing to do with either one. A string id in the
-    /// server's own id space, which cannot collide with anything the client sent.
+    /// A server-initiated request, like `client/registerCapability`: the main loop reads and drops
+    /// the answer. The id is a string in the server's own id space, so it cannot collide with a
+    /// client id.
     fn refresh_hints(&self) {
         if !self.client.hint_refresh {
             return;
@@ -2395,32 +2830,26 @@ impl Analysis {
         }));
     }
 
-    /// Ask the client to claim the files this server answers about and its own selector did not.
+    /// Ask the client to claim files this server answers about that its own selector did not.
     ///
-    /// A gem's source, Ruby's stdlib and the RBS beside them live outside every workspace folder,
-    /// and the server indexes all three — but a document selector is the only gate on what the
-    /// client ever sends, so until this lands `definition` jumps into a gem and every request in
-    /// the file it opened is dead, with nothing logged anywhere because nothing was asked.
-    ///
-    /// **Sent from here because this is where the answer exists.** The prefixes are the gem roots
-    /// the bundle resolved to, and no part of the handshake knows them: discovery runs on this
-    /// thread. `client/registerCapability` is the same channel the file watcher uses, for the same
-    /// reason — a thing with no static form in the protocol — and the client's own
-    /// `didOpen` registration **back-fills**, walking the documents already open and sending one
-    /// for every file the new selector newly matches. So a gem file the user is already looking at
-    /// starts answering at registration rather than at the next tab switch.
-    ///
-    /// Additive, never a replacement: a client that declines keeps exactly what it has today.
+    /// - **Why.** A gem's source, Ruby's stdlib and their RBS live outside every workspace folder,
+    ///   and the server indexes all three. But a document selector is the only gate on what the
+    ///   client sends, so without this, `definition` jumps into a gem and every request in that
+    ///   file is dead, with nothing logged because nothing was asked.
+    /// - **Sent from here because the answer exists here.** The prefixes are the gem roots the
+    ///   bundle resolved to, which the handshake does not know: discovery runs on this thread.
+    ///   `client/registerCapability` is the same channel the file watcher uses. The client's
+    ///   `didOpen` registration **back-fills**, sending one for every open file the new selector
+    ///   matches, so a gem file already open starts answering at registration.
+    /// - **Additive**: a client that declines keeps exactly what it has.
     fn register_documents(&mut self, held: &[&PathBuf]) {
-        // **Not `foreign_prefixes`**, which is a superset built for a different question — see the
-        // list this is handed in `queue_background_indexing`.
+        // **Not `foreign_prefixes`**, a superset built for another question (see the list passed in
+        // `queue_background_indexing`).
         //
-        // The workspace's own prefix is not among them either, and the filter is what keeps it
-        // out. A vendored bundle at `vendor/bundle/ruby/<abi>` and a project's own
-        // `.gem_rbs_collection/` are foreign *and* inside the root, so the selector the client was
-        // built with already claims them — and claiming a file twice does not add anything, it
-        // puts two providers over one document, which is one server answering the same hover
-        // twice.
+        // The workspace's own prefix is filtered out too. A vendored bundle at
+        // `vendor/bundle/ruby/<abi>` and a project's `.gem_rbs_collection/` are foreign *and*
+        // inside the root, so the client's original selector already claims them. Claiming twice
+        // adds nothing but a second provider on one document: the same hover answered twice.
         let prefixes: Vec<String> = held
             .iter()
             .filter_map(|path| DocUri::from_path(path))
@@ -2451,9 +2880,8 @@ impl Analysis {
                 method: registration.method.clone(),
             })
             .collect();
-        // A string id in the server's own id space, as `register_file_watchers` and
-        // `refresh_hints` use: the main loop reads the answer and logs a refusal, and there is
-        // nothing else to do with either outcome.
+        // A string id in the server's own id space, as `register_file_watchers` and `refresh_hints`
+        // use. The main loop reads the answer and logs a refusal; nothing else to do either way.
         let _ = self.outgoing.send(Message::Request(Request {
             id: RequestId::from("ya-lsp/document-registration".to_owned()),
             method: "client/registerCapability".to_owned(),
@@ -2463,13 +2891,11 @@ impl Analysis {
 
     /// Take back the live document registrations, by the names they were made under.
     ///
-    /// Silent and cheap in the case that happens once per process — there is nothing to take back
-    /// at startup. The case it exists for is a reload: `[gems] enabled`, an `[rbs] path` or a
-    /// changed workspace root all move the set of files this server has answers about, and
-    /// re-registering an id the client already holds replaces its *record* of the registration
-    /// without disposing the provider behind it. The old selector would go on answering beside
-    /// the new one, which is the duplicate the filter in `register_documents` exists to avoid,
-    /// arriving by a different route.
+    /// Nothing to do at startup. It exists for reloads: `[gems] enabled`, an `[rbs] path` or a new
+    /// root all change which files the server answers about, and re-registering an id the client
+    /// holds replaces its *record* without disposing the old provider. The old selector would keep
+    /// answering beside the new one, the duplicate `register_documents`' filter avoids, by another
+    /// route.
     fn unregister_documents(&mut self) {
         if self.documents_live.is_empty() {
             return;
@@ -2496,7 +2922,7 @@ impl Analysis {
     }
 }
 
-/// The run loop itself, driven over the real channel by the real thread.
+/// The run loop itself, driven over the real channel on the real thread.
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 pub(crate) mod testing;
@@ -2511,11 +2937,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn each_goto_reads_its_own_link_support_and_never_a_neighbours() {
+        // Claude Code's `initialize`, as the 2.1.274 binary sends it: link support on `definition`,
+        // no `implementation` capability. Each goto has its own flag, so the negotiated shape is
+        // `LocationLink[]` for one and `Location[]` for the other; reading one flag for both would
+        // send an agent a shape it never asked for.
+        let claude_code: ClientCapabilities = serde_json::from_value(serde_json::json!({
+            "textDocument": {
+                "synchronization": { "dynamicRegistration": false, "didSave": true },
+                "hover": { "contentFormat": ["markdown", "plaintext"] },
+                "definition": { "linkSupport": true },
+                "references": {},
+                "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
+                "callHierarchy": {},
+            },
+        }))
+        .expect("capabilities");
+
+        let negotiated = ClientSupport::negotiate(&claude_code, &serde_json::Value::Null);
+        assert!(negotiated.definition_links);
+        assert!(!negotiated.implementation_links);
+        assert!(!negotiated.type_definition_links);
+        assert!(!negotiated.declaration_links);
+        assert!(negotiated.hierarchical_symbols);
+
+        // The other direction, one goto at a time, so no flag is hard-coded `false` or copied from
+        // a neighbour. Four capabilities, four answers, and each case asserts the other three stay
+        // off.
+        for (capability, definition, implementation, type_definition, declaration) in [
+            ("definition", true, false, false, false),
+            ("implementation", false, true, false, false),
+            ("typeDefinition", false, false, true, false),
+            ("declaration", false, false, false, true),
+        ] {
+            let one: ClientCapabilities = serde_json::from_value(serde_json::json!({
+                "textDocument": { capability: { "linkSupport": true } },
+            }))
+            .expect("capabilities");
+            let negotiated = ClientSupport::negotiate(&one, &serde_json::Value::Null);
+            assert_eq!(negotiated.definition_links, definition, "{capability}");
+            assert_eq!(
+                negotiated.implementation_links, implementation,
+                "{capability}"
+            );
+            assert_eq!(
+                negotiated.type_definition_links, type_definition,
+                "{capability}"
+            );
+            assert_eq!(negotiated.declaration_links, declaration, "{capability}");
+        }
+    }
+
+    #[test]
+    fn the_two_capabilities_the_generated_document_needs_are_read_separately_and_one_has_no_name() {
+        // `workspace.textDocumentContent` has no field in `lsp-types` 0.97 (the gap
+        // `server::capabilities::Advertised` works around the other way), so it is read from the
+        // raw object beside the typed one. This tests that both reads are of the same client.
+        let raw = serde_json::json!({
+            "window": { "showDocument": { "support": true } },
+            "workspace": { "textDocumentContent": { "dynamicRegistration": true } },
+        });
+        let typed: ClientCapabilities = serde_json::from_value(raw.clone()).expect("capabilities");
+        let negotiated = ClientSupport::negotiate(&typed, &raw);
+        assert!(negotiated.show_document);
+        assert!(negotiated.generated_content);
+
+        // Neovim's shape, and why the second flag exists: it will show a document but has nothing
+        // to fill one, so the two flags must not be read off each other.
+        let raw = serde_json::json!({ "window": { "showDocument": { "support": true } } });
+        let typed: ClientCapabilities = serde_json::from_value(raw.clone()).expect("capabilities");
+        let negotiated = ClientSupport::negotiate(&typed, &raw);
+        assert!(negotiated.show_document);
+        assert!(!negotiated.generated_content);
+
+        // The object's presence, not a field: its only member says how a provider may be
+        // *registered*, not whether the request is answered.
+        let raw = serde_json::json!({ "workspace": { "textDocumentContent": {} } });
+        let typed: ClientCapabilities = serde_json::from_value(raw.clone()).expect("capabilities");
+        assert!(ClientSupport::negotiate(&typed, &raw).generated_content);
+
+        // A client that sends neither, as every client did before 3.18.
+        let raw = serde_json::json!({ "workspace": { "textDocumentContent": null } });
+        let typed: ClientCapabilities = serde_json::from_value(raw.clone()).expect("capabilities");
+        let negotiated = ClientSupport::negotiate(&typed, &raw);
+        assert!(!negotiated.show_document);
+        assert!(!negotiated.generated_content);
+    }
+
+    #[test]
     fn indexes_the_workspace_on_startup() {
         let mut harness = Harness::new();
         harness.write("lib/person.rb", "class Person\n  def shout\n  end\nend\n");
 
-        harness.analysis.index_workspace();
+        harness.index();
 
         assert!(harness.has("Person"));
         assert!(harness.has("Person#shout()"));
@@ -2527,7 +3041,7 @@ mod tests {
         // Re-indexing the same URI must not accumulate.
         let mut harness = Harness::new();
         let uri = harness.write("lib/person.rb", "class Person\n  def shout\n  end\nend\n");
-        harness.analysis.index_workspace();
+        harness.index();
         assert!(harness.has("Person#shout()"));
 
         harness.open(&uri, "class Person\n  def shout\n  end\nend\n");
@@ -2585,7 +3099,7 @@ mod tests {
         let uri = harness.write("lib/person.rb", "class Person\n  def shout\n  end\nend\n");
         harness.analysis.index_workspace();
 
-        std::fs::remove_file(uri.to_path().unwrap()).unwrap();
+        std::fs::remove_file(uri.to_file_path().unwrap()).unwrap();
         harness.run(Task::DidClose { uri });
 
         assert!(!harness.has("Person#shout()"));
@@ -2604,17 +3118,63 @@ mod tests {
     }
 
     #[test]
+    fn a_watched_change_to_a_file_that_is_not_the_project_s_own_is_not_indexed() {
+        // The `refresh` loop's second gate, which a bundle makes necessary: a client's watchers are
+        // shared across every server and registration, so gem changes arrive routinely. Re-indexing
+        // would be work nobody asked for: the bundle is read once at startup, and a gem file does
+        // not change under a running editor unless the user is editing the gem.
+        let (dir, gem_home, env) =
+            project_with_gem("module Shouty\n  class Megaphone\n  end\nend\n");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/main.rb", "Shouty\n");
+        harness.index();
+        harness.index_gems();
+        assert!(harness.has("Shouty::Megaphone"));
+
+        let gem = DocUri::from_path(&gem_home.path().join("gems/shouty-1.2.3/lib/shouty.rb"))
+            .expect("an absolute path");
+        std::fs::write(
+            gem.to_file_path().expect("a path"),
+            "module Shouty\n  class Loudhailer\n  end\nend\n",
+        )
+        .unwrap();
+        harness.watch(&[&gem]);
+
+        assert!(!harness.has("Shouty::Loudhailer"));
+        assert!(
+            harness.has("Shouty::Megaphone"),
+            "the graph still holds what the startup walk read"
+        );
+    }
+
+    #[test]
+    fn a_change_for_an_unsaved_buffer_nobody_opened_is_not_a_way_in() {
+        // The recovery above invents an open document from a whole-buffer change, the only way a
+        // fileless document would be indexed. Which unsaved buffers are indexed is decided by
+        // `didOpen`'s `languageId` alone (no other notification has one), so a buffer refused there
+        // must not get in here. A shopping list in a new tab is the case.
+        let mut harness = Harness::new();
+        let untitled = DocUri::from_lsp(&"untitled:Untitled-9".parse().expect("a uri"))
+            .expect("an unsaved buffer is a document");
+        harness.analysis.index_workspace();
+
+        harness.change(&untitled, "class Recovered\nend\n");
+
+        assert!(!harness.has("Recovered"));
+        assert!(!harness.analysis.open.contains_key(&untitled));
+    }
+
+    #[test]
     fn an_edit_reaches_the_buffer_at_once_and_the_graph_at_the_settle() {
-        // `didChange` does two things and only the second is expensive: apply
-        // the edit, which is microseconds, and put the document into rubydex, which is 265-305
-        // ms for `app/models/user.rb` on discourse. The four requests `needs_the_graph` exempts
-        // read the buffer and never the graph — and an editor sends `semanticTokens/full` after
-        // every keystroke — so they were waiting on an index they do not read. Measured on
-        // discourse before and after: **281 ms a keystroke, and 3-9 ms.**
+        // `didChange` does two things and only the second is expensive: apply the edit
+        // (microseconds), and index the document into rubydex (hundreds of milliseconds for a
+        // central model on a large app). The four requests `needs_the_graph` exempts read only the
+        // buffer, and editors send `semanticTokens/full` after every keystroke, so they must not
+        // wait on an index they do not read.
         //
-        // `handle` rather than `Harness::run`, which settles whenever the task left anything
-        // dirty. That is the right default for every other test in this file and it is exactly
-        // what this one is about, so the task goes in unaccompanied.
+        // `handle`, not `Harness::run`: `run` settles whenever the task left anything dirty, which
+        // is right for every other test here and exactly what this one tests, so the task goes in
+        // alone.
         let mut harness = Harness::new();
         let source = "class Story
 end
@@ -2631,16 +3191,16 @@ end
             }],
             version: Some(2),
         });
-        // `definitions_in` and not `has`: a declaration is the resolver's and would be absent
-        // here whether the document was indexed or not.
+        // `definitions_in`, not `has`: a declaration belongs to the resolver and would be absent
+        // here whether or not the document was indexed.
         assert_eq!(
             harness.definitions_in(&uri),
             1,
             "the index was not deferred"
         );
 
-        // A second keystroke before anything has asked for the first: both are deferred and the
-        // document is recorded once, so a burst costs one index rather than one per character.
+        // A second keystroke before anything asked about the first: both are deferred and the
+        // document recorded once, so a burst costs one index, not one per character.
         harness.analysis.handle(Task::DidChange {
             uri: uri.clone(),
             changes: vec![TextChange {
@@ -2656,9 +3216,8 @@ end
             "a burst queued one index per keystroke"
         );
 
-        // The claim, and it is about `serve` rather than about the handler: a request that
-        // never asks the graph a question is answered without settling, so the index stays
-        // deferred across it.
+        // The claim is about `serve`, not the handler: a request that never asks the graph is
+        // answered without settling, so the index stays deferred across it.
         harness.ask(
             "textDocument/foldingRange",
             serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
@@ -2669,9 +3228,8 @@ end
             "a request that never reads the graph settled anyway"
         );
 
-        // And the other half, which is what makes the deferral safe rather than merely cheap:
-        // anything that does read the graph settles, and `settle` indexes what is pending
-        // before it links anything over it.
+        // The other half, which makes deferral safe, not just cheap: anything that reads the graph
+        // settles, and `settle` indexes pending edits before linking anything over them.
         harness.ask(
             "textDocument/documentSymbol",
             serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
@@ -2689,11 +3247,9 @@ end
 
     #[test]
     fn a_buffer_closed_before_its_deferred_index_ran_keeps_what_is_on_disk() {
-        // The one ordering a deferred index adds that nothing else in this file can reach: an
-        // edit is deferred, and the buffer is closed before the settle that would have indexed
-        // it. `didClose` has
-        // already put the file back to what disk says, so replaying the buffer over it would
-        // undo exactly that — and the text it would replay is a version of the file the user
+        // The one ordering a deferred index adds: an edit is deferred, then the buffer closes
+        // before the settle that would index it. `didClose` has already restored the file to what
+        // disk says, so replaying the buffer would undo that, with a version of the file the user
         // explicitly abandoned.
         let mut harness = Harness::new();
         let source = "class Story
@@ -2724,15 +3280,157 @@ end
         );
     }
 
+    #[test]
+    fn a_didopen_of_the_text_the_graph_already_holds_indexes_nothing() {
+        // The commonest thing an editor does: the walk indexed every file at startup, then someone
+        // opens one. rubydex compares `Document::content_hash`, finds it equal and returns, but
+        // only after a full Prism parse, and only after `graph_mut` has dropped the member index
+        // `locator`'s name rung reads.
+        let mut harness = Harness::new();
+        let source = "class Story\n  def title\n  end\nend\n";
+        let uri = harness.write("app/models/story.rb", source);
+        harness.index();
+        harness.analysis.settle();
+
+        // Ask the name rung something, so there is an index to lose.
+        assert_eq!(harness.analysis.graph.members_named("title()").len(), 1);
+
+        harness.analysis.handle(Task::DidOpen {
+            uri: uri.clone(),
+            text: source.to_owned(),
+            version: Some(1),
+        });
+
+        assert!(
+            harness.analysis.graph.members_are_built(),
+            "opening a file the walk already indexed dropped the member index"
+        );
+        assert!(
+            !harness.analysis.dirty,
+            "and armed a settle over a graph nothing had changed in"
+        );
+    }
+
+    #[test]
+    fn a_didopen_that_indexes_nothing_still_records_what_the_graph_holds() {
+        // `rebase_for` translates a deferred answer through `indexed_text`, and a document with no
+        // entry is assumed to be at identity. The walk leaves no entry (it indexes paths, not
+        // buffers), so a skip that also skipped the entry would hand the next keystroke's offsets
+        // to a graph one edit behind, with no refusal. A skip states that the graph holds exactly
+        // these bytes, which is what the map means.
+        let mut harness = Harness::new();
+        let source = "class Story\n  def title\n  end\nend\n";
+        let uri = harness.write("app/models/story.rb", source);
+        harness.index();
+        harness.analysis.settle();
+        assert!(
+            !harness.analysis.indexed_text.contains_key(&uri),
+            "the walk indexes paths, so there is nothing to rebase through yet"
+        );
+
+        harness.open(&uri, source);
+
+        assert_eq!(
+            harness.analysis.indexed_text.get(&uri).map(String::as_str),
+            Some(source),
+            "an index that was skipped left the document with no map"
+        );
+    }
+
+    #[test]
+    fn a_template_the_graph_already_holds_the_view_of_indexes_nothing() {
+        // The same question, asked of the text rubydex was actually given, which for a template is
+        // `erb::ruby_view`, not the buffer. Comparing the buffer would answer no for every
+        // template.
+        let mut harness = Harness::new();
+        let source = "<h1><%= @story.title %></h1>\n";
+        let uri = harness.write("app/views/stories/show.html.erb", source);
+        harness.index();
+        harness.analysis.settle();
+
+        harness.analysis.handle(Task::DidOpen {
+            uri: uri.clone(),
+            text: source.to_owned(),
+            version: Some(1),
+        });
+
+        assert!(
+            !harness.analysis.dirty,
+            "a template was re-indexed over the view the graph already held"
+        );
+        assert_eq!(
+            harness.analysis.indexed_text.get(&uri).map(String::as_str),
+            Some(erb::ruby_view(source).as_str()),
+            "and the map records the view rather than the buffer"
+        );
+    }
+
+    #[test]
+    fn a_document_on_the_skip_list_is_handed_its_text_again_rather_than_left_there() {
+        // The one case where the graph already holding these bytes is no reason to do nothing. The
+        // last index of this document crashed, so the graph holds the version from *before* the
+        // crash, and receiving that version again is a retry. Answering "already held" would keep
+        // the file on the skip list forever, out of every batch `without_skipped` filters.
+        let mut harness = Harness::new();
+        let source = "class Story\nend\n";
+        let uri = harness.write("app/models/story.rb", source);
+        harness.index();
+        harness.analysis.settle();
+        assert!(!harness.analysis.skipped.contains(&uri));
+
+        // An edit the indexer cannot take. The graph keeps its previous version.
+        harness.run(Task::DidOpen {
+            uri: uri.clone(),
+            text: format!("{source}{}", indexer::CRASHES),
+            version: Some(1),
+        });
+        assert!(
+            harness.analysis.skipped.contains(&uri),
+            "the stand-in never reached the bulkhead"
+        );
+
+        // Closing restores the file to what disk says, which is exactly what the graph holds.
+        harness.run(Task::DidClose { uri: uri.clone() });
+
+        assert!(
+            !harness.analysis.skipped.contains(&uri),
+            "a document whose text the graph already held was never retried"
+        );
+    }
+
+    #[test]
+    fn a_file_rewritten_on_disk_with_the_text_it_had_is_not_indexed_again() {
+        // What a `git checkout` between branches does: it names every file it wrote, and rewrote
+        // most of them byte for byte. The watcher cannot tell those apart and should not try; the
+        // hash does it, for the client's watcher and ya-lsp's alike.
+        let mut harness = Harness::new();
+        let source = "class Story\n  def title\n  end\nend\n";
+        let uri = harness.write("app/models/story.rb", source);
+        harness.index();
+        harness.analysis.settle();
+        assert_eq!(harness.analysis.graph.members_named("title()").len(), 1);
+
+        harness.write("app/models/story.rb", source);
+        harness.watch(&[&uri]);
+
+        assert!(
+            harness.analysis.graph.members_are_built(),
+            "a file rewritten with its own text cost the member index"
+        );
+        assert!(
+            harness.has("Story#title()"),
+            "and the document is still in the graph"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The index and the disk
     // -----------------------------------------------------------------------
 
     #[test]
     fn a_file_written_while_the_server_runs_is_indexed_without_the_editor_opening_it() {
-        // `git checkout`, `git pull`, a rebase, `rails g model` — every one of them writes Ruby
-        // the editor never opened. Before this the file did not exist as far as the index was
-        // concerned until someone restarted the server.
+        // `git checkout`, `git pull`, a rebase, `rails g model`: each writes Ruby the editor never
+        // opened, which the index must pick up without a restart.
         let mut harness = Harness::new();
         let source = "Place.new\n";
         let main = harness.write("app/main.rb", source);
@@ -2754,15 +3452,15 @@ end
 
     #[test]
     fn a_file_rewritten_on_disk_replaces_what_the_index_held() {
-        // The branch-switch case: same path, different declarations. Leaving the old ones in
-        // is worse than not noticing at all, because navigation lands somewhere that is gone.
+        // The branch-switch case: same path, different declarations. Keeping the old ones is worse
+        // than not noticing, because navigation lands somewhere that is gone.
         let mut harness = Harness::new();
         let uri = harness.write("app/person.rb", "class Person\n  def shout\n  end\nend\n");
         harness.index();
         assert!(harness.has("Person#shout()"));
 
         std::fs::write(
-            uri.to_path().unwrap(),
+            uri.to_file_path().unwrap(),
             "class Person\n  def whisper\n  end\nend\n",
         )
         .unwrap();
@@ -2782,17 +3480,16 @@ end
 
     #[test]
     fn a_file_deleted_on_disk_is_dropped_and_takes_its_diagnostics_with_it() {
-        // A deletion is the one change no other notification can stand in for: nothing else
-        // ever tells a server that a declaration has gone. And `publishDiagnostics` is stateful
-        // per URI, so a file that vanishes with squiggles on it keeps them on screen forever
-        // unless something sends the empty set.
+        // A deletion is the one change no other notification can replace: nothing else tells a
+        // server a declaration is gone. And `publishDiagnostics` is stateful per URI, so a file
+        // that vanishes with squiggles keeps them forever unless an empty set is sent.
         let mut harness = Harness::new();
         let uri = harness.write("app/broken.rb", "class Broken\n  def oops(\nend\n");
         harness.index();
         assert!(harness.has("Broken"));
         assert!(!harness.latest(&uri).unwrap_or_default().is_empty());
 
-        std::fs::remove_file(uri.to_path().unwrap()).unwrap();
+        std::fs::remove_file(uri.to_file_path().unwrap()).unwrap();
         harness.watch(&[&uri]);
 
         assert!(!harness.has("Broken"));
@@ -2804,11 +3501,164 @@ end
         );
     }
 
+    /// The disk's text for the fixture below, and the buffer's.
+    const ON_DISK: &str = "class Person\n  def shout\n  end\nend\n";
+
+    /// A project with one file, open in a client that has just read it from disk.
+    ///
+    /// `didOpen` carries exactly what is on disk, which makes the buffer *saved*, the condition the
+    /// swap depends on. Each test below changes one thing.
+    fn a_saved_buffer() -> (Harness, DocUri) {
+        let mut harness = Harness::new();
+        let uri = harness.write("app/person.rb", ON_DISK);
+        harness.index();
+        harness.open(&uri, ON_DISK);
+        (harness, uri)
+    }
+
+    fn rewrite(uri: &DocUri, text: &str) {
+        std::fs::write(uri.to_file_path().expect("a path"), text).expect("the file");
+    }
+
+    fn buffer(harness: &Harness, uri: &DocUri) -> String {
+        harness
+            .analysis
+            .open
+            .get(uri)
+            .expect("an open document")
+            .text
+            .text()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_saved_buffer_yields_to_the_disk_when_the_server_is_the_one_watching() {
+        // **The gap this closes.** An agent queries a file through its LSP tool, edits it through a
+        // shell, and queries again, while the document stays open (Claude Code keeps up to fifty
+        // open and never reopens them). Without this, the second answer uses the file's text from
+        // when it was opened, for the whole session: confidently wrong, not absent.
+        let (mut harness, uri) = a_saved_buffer();
+        rewrite(&uri, "class Person\n  def from_disk\n  end\nend\n");
+
+        harness.watched(&[&uri], Watched::ByTheServer);
+
+        assert!(
+            harness.has("Person#from_disk()"),
+            "a saved buffer did not follow the file it is a copy of"
+        );
+        assert!(!harness.has("Person#shout()"));
+    }
+
+    #[test]
+    fn a_buffer_with_unsaved_changes_keeps_its_text_until_it_is_saved() {
+        // The other half, which makes the rule safe: a buffer changed since its last save holds
+        // text that exists nowhere else, and no watcher may discard it. A `didSave` hands it back
+        // to the disk; Claude Code sends one right after every edit.
+        let (mut harness, uri) = a_saved_buffer();
+        harness.change(&uri, "class Person\n  def unsaved\n  end\nend\n");
+        rewrite(&uri, "class Person\n  def from_disk\n  end\nend\n");
+
+        harness.watched(&[&uri], Watched::ByTheServer);
+
+        assert!(
+            harness.has("Person#unsaved()"),
+            "text the editor has not written anywhere must survive a change on disk"
+        );
+        assert!(!harness.has("Person#from_disk()"));
+
+        harness.save(&uri);
+        rewrite(&uri, "class Person\n  def later\n  end\nend\n");
+        harness.watched(&[&uri], Watched::ByTheServer);
+
+        assert!(
+            harness.has("Person#later()"),
+            "a saved buffer is a copy of the disk again, whatever it held before"
+        );
+    }
+
+    #[test]
+    fn a_clients_own_watcher_never_replaces_a_buffer_however_saved_it_is() {
+        // **The VS Code guarantee, as a test.** An editor holding the registration reloads an
+        // unmodified file itself and then sends a `didChange` with ranges measured against *its*
+        // text. Swapping under it corrupts the buffer, so the rule depends on which watcher saw the
+        // change, never on the buffer alone.
+        let (mut harness, uri) = a_saved_buffer();
+        rewrite(&uri, "class Person\n  def from_disk\n  end\nend\n");
+
+        harness.watched(&[&uri], Watched::ByTheClient);
+
+        assert!(harness.has("Person#shout()"), "the buffer still stands");
+        assert!(!harness.has("Person#from_disk()"));
+    }
+
+    #[test]
+    fn a_ranged_change_after_a_swap_lands_in_the_text_the_client_measured_it_against() {
+        // The corruption `client_copy` prevents. The server swapped the buffer for the disk's text;
+        // the client, unaware, sends ranges computed against its own copy. Applied to the disk's
+        // text, `1:6-1:11` covers `from_` and the file becomes `def yelldisk`, which parses,
+        // indexes, and is wrong.
+        let (mut harness, uri) = a_saved_buffer();
+        rewrite(&uri, "class Person\n  def from_disk\n  end\nend\n");
+        harness.watched(&[&uri], Watched::ByTheServer);
+        assert!(harness.has("Person#from_disk()"), "the swap happened");
+
+        harness.edit(
+            &uri,
+            vec![TextChange {
+                range: Some(lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: 1,
+                        character: 6,
+                    },
+                    end: lsp_types::Position {
+                        line: 1,
+                        character: 11,
+                    },
+                }),
+                text: "yell".to_owned(),
+            }],
+        );
+
+        assert_eq!(
+            buffer(&harness, &uri),
+            "class Person\n  def yell\n  end\nend\n",
+            "the change was applied to the disk's text instead of the client's"
+        );
+        assert!(harness.has("Person#yell()"));
+    }
+
+    #[test]
+    fn a_write_the_buffer_already_holds_costs_nothing_and_keeps_no_copy() {
+        // Claude Code's edit arrives twice: `didChange`, `didSave`, then the watcher seeing the
+        // same bytes. The second has nothing to do, and comparing is the cheapest way to know. A
+        // swap here would leave a `client_copy` for a change that never happened, and the next
+        // ranged edit would apply to a stale string.
+        let (mut harness, uri) = a_saved_buffer();
+        let edited = "class Person\n  def renamed\n  end\nend\n";
+        harness.change(&uri, edited);
+        harness.save(&uri);
+        rewrite(&uri, edited);
+
+        harness.watched(&[&uri], Watched::ByTheServer);
+
+        assert!(harness.has("Person#renamed()"));
+        assert!(
+            harness
+                .analysis
+                .open
+                .get(&uri)
+                .expect("an open document")
+                .client_copy
+                .is_none(),
+            "the disk and the buffer already agreed; nothing was swapped"
+        );
+    }
+
     #[test]
     fn a_deletion_for_something_the_index_never_held_costs_nothing() {
-        // Watchers are the client's, so a delete can name a path this server never indexed —
-        // and `Workspace::indexes` cannot be asked about a path that is not there. The graph is
-        // the thing that knows, and it answers for both halves of the question at once.
+        // Watchers are the client's, so a delete can name a path this server never indexed, and
+        // `Workspace::indexes` cannot be asked about a missing path. The graph knows, and answers
+        // both halves of the question at once.
         let mut harness = Harness::new();
         harness.write("app/person.rb", "class Person\nend\n");
         harness.index();
@@ -2822,10 +3672,10 @@ end
 
     #[test]
     fn an_open_buffer_is_not_clobbered_by_a_change_to_the_same_file_on_disk() {
-        // A rebase under an open file must not overwrite what the editor is showing: the buffer
-        // holds edits the disk has never seen, and the editor is still the authority on them
-        // until it says otherwise. `didClose` already implements this precedence in the other
-        // direction, which is what makes the buffer's disappearance the moment disk takes over.
+        // A rebase under an open file must not overwrite what the editor shows: the buffer holds
+        // edits the disk has never seen, and the editor is the authority until it says otherwise.
+        // `didClose` applies the same precedence the other way, handing authority to the disk when
+        // the buffer goes.
         let mut harness = Harness::new();
         let uri = harness.write("app/person.rb", "class Person\n  def shout\n  end\nend\n");
         harness.index();
@@ -2833,7 +3683,7 @@ end
         assert!(harness.has("Person#unsaved()"));
 
         std::fs::write(
-            uri.to_path().unwrap(),
+            uri.to_file_path().unwrap(),
             "class Person\n  def from_disk\n  end\nend\n",
         )
         .unwrap();
@@ -2845,18 +3695,16 @@ end
         );
         assert!(!harness.has("Person#from_disk()"));
 
-        // And the moment the buffer goes, disk is the truth again — through the path that
-        // already existed for it.
+        // Once the buffer goes, disk is the truth again, through the existing path.
         harness.run(Task::DidClose { uri });
         assert!(harness.has("Person#from_disk()"));
     }
 
     #[test]
     fn every_notification_says_it_arrived_and_what_it_was_about() {
-        // A notification changes what every later answer is made of, and none of them said so.
-        // The explanation for an answer somebody is about to report as wrong is very often here
-        // — a `didChange` that was dropped, a reload that threw the graph away — and until now
-        // none of it was written down anywhere.
+        // A notification changes every later answer without saying so. The explanation for an
+        // answer someone is about to report as wrong is often here (a dropped `didChange`, a reload
+        // that threw the graph away), so it is logged.
         let mut harness = Harness::new();
         let source = "class Story\nend\n";
         let uri = harness.write("app/models/story.rb", source);
@@ -2894,9 +3742,9 @@ end
 
     #[test]
     fn a_configuration_reload_says_which_tables_the_file_moved() {
-        // "It is reading my ya-lsp.toml" and "it is reading my ya-lsp.toml and every key in it
-        // is already the default" produce identical behaviour and identical logs, and the second
-        // is what somebody who has just mistyped a table name has.
+        // "It is reading my ya-lsp.toml" and "it is reading my ya-lsp.toml and every key is already
+        // the default" would behave and log identically, and the second is what someone who
+        // mistyped a table name has.
         let mut harness = Harness::new();
         harness.write("app/models/story.rb", "class Story\nend\n");
         harness.index();
@@ -2909,11 +3757,11 @@ end
         let (_, logged) = crate::testing::captured_logs(tracing::Level::INFO, || {
             harness.run(Task::ReloadConfig);
         });
-        // `rails` is on the list too, because the harness sends `rails.enabled = true` where the
-        // default is `auto` — which is the line doing its job: that *is* a setting somebody set.
+        // `rails` is listed too, because the harness sends `rails.enabled = true` where the default
+        // is `auto`: that *is* a setting somebody set.
         assert!(logged.contains("types"), "{logged}");
 
-        // And a file that says nothing the defaults do not already say does not appear on it.
+        // A file that only repeats the defaults does not appear on it.
         std::fs::write(
             harness.root.path().join("ya-lsp.toml"),
             "[types]\nguess_from_names = true\n",
@@ -2923,9 +3771,9 @@ end
             harness.run(Task::ReloadConfig);
         });
         assert!(logged.contains("reloaded configuration"), "{logged}");
-        // And the detection says which way it went **after** the log has been re-pointed, which
-        // is the whole reason that line is not written where the decision is made: a reload that
-        // has just turned the file on has to hold the reload that turned it on.
+        // The detection logs its result **after** the log is re-pointed, which is why that line is
+        // not where the decision is made: a reload that just turned the file log on must record the
+        // reload that turned it on.
         assert!(logged.contains("rails knowledge"), "{logged}");
         assert!(
             !logged.contains("types"),
@@ -2935,10 +3783,9 @@ end
 
     #[test]
     fn a_watched_change_the_workspace_does_not_index_is_ignored() {
-        // A client's watchers are shared across every server it runs and every registration
-        // each one made, so anything can arrive here. Indexing it would put files in the graph
-        // that `index.exclude` says are out — and the walk and this path disagreeing is the one
-        // failure neither the user nor the log would ever show.
+        // A client's watchers are shared across every server and registration, so anything can
+        // arrive. Indexing it would put files `index.exclude` rules out into the graph, and the
+        // walk and this path disagreeing is a failure neither the user nor the log would ever show.
         let mut harness = Harness::new();
         harness.write("app/person.rb", "class Person\nend\n");
         harness.index();
@@ -2959,15 +3806,18 @@ end
 
     #[test]
     fn a_file_that_is_there_but_cannot_be_read_keeps_what_the_index_already_had() {
-        // The gap between `is_file` and reading it: a half-written file mid-checkout, a
-        // permission, or — portably testable — bytes that are not UTF-8. Dropping the document
-        // would be the worse answer of the two, since the old declarations are at least the
-        // ones that were true a moment ago, and the next write brings another notification.
+        // The gap between `is_file` and reading it: a half-written file mid-checkout, a permission,
+        // or (portably testable) non-UTF-8 bytes. Dropping the document is the worse answer: the
+        // old declarations were true a moment ago, and the next write brings another notification.
         let mut harness = Harness::new();
         let uri = harness.write("app/person.rb", "class Person\n  def shout\n  end\nend\n");
         harness.index();
 
-        std::fs::write(uri.to_path().unwrap(), b"class Person\n  def \xff\nend\n").unwrap();
+        std::fs::write(
+            uri.to_file_path().unwrap(),
+            b"class Person\n  def \xff\nend\n",
+        )
+        .unwrap();
         let (_, logged) = crate::testing::captured_logs(tracing::Level::WARN, || {
             harness.watch(&[&uri]);
         });
@@ -2978,11 +3828,10 @@ end
 
     #[test]
     fn a_crash_while_linking_the_graph_rebuilds_instead_of_killing_the_server() {
-        // rubydex 0.2.5 panics in `Resolver::resolve` after a document is deleted, and there is
-        // no published version to upgrade to. Uncaught, the analysis thread dies and the server
-        // answers nothing at all forever — which looks exactly like a server that is thinking,
-        // so nobody restarts it. Reproduced on a real project by deleting one file from a
-        // solargraph v0.58.2 checkout; what this pins is that ya-lsp comes back from it.
+        // rubydex panics in `Resolver::resolve` after a document is deleted, with no fixed release
+        // to upgrade to. Uncaught, the analysis thread dies and the server answers nothing forever,
+        // which looks like a server thinking, so nobody restarts it. Reproduced by deleting one
+        // file from a solargraph v0.58.2 checkout; this pins that ya-lsp recovers.
         let mut harness = Harness::new();
         harness.write("app/person.rb", "class Person\n  def shout\n  end\nend\n");
         harness.index();
@@ -3008,8 +3857,8 @@ end
     #[test]
     fn a_rebuild_that_crashes_again_stops_rather_than_recurring() {
         // The rebuild indexes the workspace and indexing resolves, so without a guard a project
-        // that cannot be linked at all would rebuild itself forever and never answer anything.
-        // Degrading to whatever was linked is the worse index and the better server.
+        // that cannot be linked would rebuild forever and never answer. Degrading to whatever was
+        // linked is the worse index and the better server.
         let mut harness = Harness::new();
         harness.write("app/person.rb", "class Person\nend\n");
         harness.index();
@@ -3028,16 +3877,44 @@ end
         assert!(logged.contains("crashed again during recovery"), "{logged}");
     }
 
+    #[test]
+    fn a_crash_in_the_generator_stage_does_not_spin_the_pipeline() {
+        // **The hazard is the driver, not the crash.** `serve`'s cold rung and the harness both run
+        // `while step_pipeline() {}`, and `rebuild` re-enters the pipeline from the top, so a stage
+        // whose work rebuilds could re-arm itself and the loop would never end. A hung language
+        // server is the worst failure, because it looks like one thinking.
+        //
+        // What bounds it: **`rebuild` finishes its own pipeline**. It runs the generator stage
+        // itself and leaves `Ready` (or `Bundle`, which only moves forward), never `Generate`.
+        // `recovering` bounds the crashing, this bounds the stepping; neither covers the other.
+        let mut harness = Harness::new();
+        harness.write("app/person.rb", "class Person\nend\n");
+
+        RESOLVES_TO_CRASH.set(5);
+        let (_, logged) = crate::testing::captured_logs(tracing::Level::ERROR, || harness.index());
+
+        assert!(logged.contains("crashed again during recovery"), "{logged}");
+        assert!(
+            harness.analysis.stage.is_ready(),
+            "the pipeline has to have finished, or its driver is still stepping it"
+        );
+        assert_eq!(
+            RESOLVES_TO_CRASH.replace(0),
+            3,
+            "two resolves, then the guard"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The bulkhead
     // -----------------------------------------------------------------------
 
-    /// The same bug arrives through a keystroke, and that half is inline on the analysis
-    /// thread with no worker under it.
+    /// The same bug through a keystroke, where it is inline on the analysis thread with no worker
+    /// under it.
     ///
-    /// It reads as a startup problem and is not one: the file need never be on disk, and this
-    /// is the half a user meets while working rather than while waiting — so what is pinned is both halves of the answer: the rest of the workspace goes
-    /// on answering, and *this* document keeps what it had before the edit rather than emptying.
+    /// Not a startup problem: the file need never be on disk, and a user meets this half while
+    /// working. Pinned: the rest of the workspace keeps answering, and *this* document keeps what
+    /// it had before the edit instead of emptying.
     #[test]
     fn five_lines_typed_into_a_buffer_leave_the_workspace_answering() {
         let mut harness = Harness::new();
@@ -3060,9 +3937,8 @@ end
         assert_eq!(harness.messages().len(), 1);
     }
 
-    /// The buffer route retries on every keystroke, which is what makes the skip list
-    /// self-clearing — and what would make a notification per character if `record_skip` did
-    /// not say it once.
+    /// The buffer route retries on every keystroke, which makes the skip list self-clearing, and
+    /// would mean a notification per character if `record_skip` did not speak only once.
     #[test]
     fn a_buffer_that_stays_broken_is_told_about_once() {
         let mut harness = Harness::new();
@@ -3086,11 +3962,11 @@ end
         );
     }
 
-    /// The one thing `rebuild` does not clear, and the reason is the recovery it is part of.
+    /// The one thing `rebuild` does not clear, because of the recovery it belongs to.
     ///
-    /// `resolve`'s crash recovery rebuilds, and a rebuild runs the workspace walk — so a
-    /// workspace holding a file that crashes the indexer would take the recovery down with it
-    /// if the skip list went the way of the eight caches above it.
+    /// `resolve`'s crash recovery rebuilds, and a rebuild runs the workspace walk, so a workspace
+    /// holding a file that crashes the indexer would take the recovery down with it if the skip
+    /// list were cleared like the caches above it.
     #[test]
     fn the_skip_list_survives_a_rebuild() {
         let mut harness = Harness::new();
@@ -3115,10 +3991,10 @@ end
         );
     }
 
-    /// The other half of "not permanent either": nothing has to decide what counts as a fix.
+    /// The other half of "not permanent": nothing decides what counts as a fix.
     ///
-    /// Every route that indexes because the text may have moved simply tries again, so the
-    /// entry goes when the file works — and the user does not restart the server.
+    /// Every route that indexes because the text may have moved just tries again, so the entry goes
+    /// once the file works, without a server restart.
     #[test]
     fn a_file_that_is_fixed_is_indexed_again_without_a_restart() {
         let mut harness = Harness::new();
@@ -3127,7 +4003,7 @@ end
         assert!(harness.analysis.skipped.contains(&bad));
 
         std::fs::write(
-            bad.to_path().unwrap(),
+            bad.to_file_path().unwrap(),
             "class Rice\n  def cook\n  end\nend\n",
         )
         .unwrap();
@@ -3137,8 +4013,8 @@ end
         assert!(harness.analysis.skipped.is_empty());
     }
 
-    /// A gem's files take the other bulk route, and the file that provokes this is in a gem
-    /// rather than in anybody's application.
+    /// A gem's files take the other bulk route, and the files that provoke this are more often in
+    /// gems than in applications.
     #[test]
     fn a_gem_file_that_crashes_the_indexer_costs_that_file_and_not_the_bundle() {
         let (dir, gem_home, env) = project_with_gem(indexer::CRASHES);
@@ -3159,10 +4035,10 @@ end
 
     #[test]
     fn a_watched_change_inside_a_bundle_is_left_to_the_gem_index() {
-        // `bundle install` rewrites tens of thousands of files at once. Answering that on the
-        // analysis thread, one `index_source` at a time, is exactly the stall the background
-        // gem index exists to avoid — so a gem is not the user's code even when the include
-        // globs would have taken it, which is what a bundle vendored outside `vendor/` does.
+        // `bundle install` rewrites tens of thousands of files at once. Answering on the analysis
+        // thread, one `index_source` at a time, is the stall the background gem index avoids. So a
+        // gem is not the user's code even when the include globs would take it, as for a bundle
+        // vendored outside `vendor/`.
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::write(
@@ -3202,10 +4078,9 @@ end
 
     #[test]
     fn the_index_cap_still_applies_to_a_file_created_after_the_walk() {
-        // `index.max_files` exists because a pathological repository exists, and a watcher can
-        // add the files the walk stopped before. Said once rather than per branch switch: the
-        // condition does not change between them, and a notification that repeats forever is
-        // one people learn to dismiss without reading.
+        // `index.max_files` exists because pathological repositories exist, and a watcher can add
+        // files the walk stopped before. Said once, not per branch switch: the condition does not
+        // change between them, and a notification that repeats forever gets dismissed unread.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("ya-lsp.toml"),
@@ -3232,8 +4107,8 @@ end
             "said once, not once per file"
         );
 
-        // And the budget is a count, not a high-water mark: deleting the file that filled it
-        // makes room for the next one.
+        // The budget is a count, not a high-water mark: deleting the file that filled it makes room
+        // for the next.
         std::fs::remove_file(harness.root.path().join("app/person.rb")).unwrap();
         let person = DocUri::from_path(&harness.root.path().join("app/person.rb")).unwrap();
         harness.watch(&[&person, &second]);
@@ -3243,13 +4118,12 @@ end
 
     #[test]
     fn a_settings_change_takes_effect_without_a_restart_and_the_file_still_wins() {
-        // The editor's settings are a layer, not the truth: `ya-lsp.toml` is committed so a
-        // whole team gets the same behaviour whatever editor they use, and it has to keep
-        // outranking whatever one person has in their own preferences.
+        // The editor's settings are a layer, not the truth: `ya-lsp.toml` is committed so a whole
+        // team behaves the same in any editor, so it must keep outranking one person's preferences.
         let mut harness = Harness::new();
         harness.write("lib/person.rb", "class Person\nend\n");
         harness.write("spec/person_spec.rb", "class PersonSpec\nend\n");
-        harness.analysis.index_workspace();
+        harness.index();
         assert!(harness.has("PersonSpec"), "indexed by default");
 
         harness.run(Task::ChangeConfig {
@@ -3258,7 +4132,7 @@ end
         assert!(!harness.has("PersonSpec"), "the client's settings applied");
 
         // A project file that says something different wins, and keeps winning across a later
-        // settings change that does not mention the same key.
+        // settings change that does not mention the key.
         std::fs::write(
             harness
                 .root
@@ -3272,7 +4146,7 @@ end
         });
         assert!(harness.has("PersonSpec"), "ya-lsp.toml outranks the editor");
 
-        // And dropping the layer altogether goes back to the server's own defaults.
+        // Dropping the layer entirely returns to the server's defaults.
         harness.run(Task::ChangeConfig { options: None });
         assert!(harness.has("PersonSpec"));
     }
@@ -3282,7 +4156,7 @@ end
         let mut harness = Harness::new();
         let uri = harness.write("lib/person.rb", "class Person\nend\n");
         harness.write("spec/person_spec.rb", "class PersonSpec\nend\n");
-        harness.analysis.index_workspace();
+        harness.index();
         assert!(harness.has("PersonSpec"), "indexed by default");
 
         harness.open(&uri, "class Person\n  def in_buffer\n  end\nend\n");
@@ -3335,21 +4209,21 @@ end
                 .all(|item| item.source.as_deref() == Some("ya-lsp")),
             "{items:?}"
         );
-        // Prism also emits an indentation warning for this fixture, and it must arrive under its
-        // own rule so `[diagnostics.rules]` can silence it independently.
+        // Prism also emits an indentation warning here, which must arrive under its own rule so
+        // `[diagnostics.rules]` can silence it separately.
         assert!(
             items.iter().any(|item| item.code == code("parse-warning")
                 && item.severity == Some(DiagnosticSeverity::WARNING)),
             "{items:?}"
         );
-        // Sorted by position, so the first diagnostic is the one at the top of the file.
+        // Sorted by position, so the first diagnostic is at the top of the file.
         assert_eq!(items[0].range.start, lsp_types::Position::new(0, 0));
     }
 
     #[test]
     fn fixing_the_file_publishes_an_empty_set_rather_than_going_quiet() {
-        // The failure this guards is the classic one: diagnostics that never clear. LSP keeps
-        // whatever was last sent for a URI on screen forever, so silence is not a retraction.
+        // Guards the classic failure: diagnostics that never clear. LSP keeps the last set sent for
+        // a URI on screen forever, so silence is not a retraction.
         let mut harness = Harness::new();
         let uri = harness.write("lib/broken.rb", UNTERMINATED);
         harness.index();
@@ -3365,8 +4239,8 @@ end
 
     #[test]
     fn an_unchanged_set_is_not_republished() {
-        // Otherwise every keystroke anywhere in the project re-sends diagnostics for every file
-        // that has any, which is the whole reason the publisher diffs.
+        // Otherwise every keystroke anywhere re-sends diagnostics for every file that has any,
+        // which is why the publisher diffs.
         let mut harness = Harness::new();
         let broken = harness.write("lib/broken.rb", UNTERMINATED);
         let other = harness.write("lib/fine.rb", "class Fine\nend\n");
@@ -3404,9 +4278,9 @@ end
 
     #[test]
     fn a_resolution_diagnostic_reaches_the_document_its_declaration_lives_in() {
-        // Resolution diagnostics hang off declarations rather than documents, so the uri_id
-        // lookup is the only thing that puts them in the right file. The rule ships off (it
-        // fires on correct Ruby), so this turns it on — which exercises the config path too.
+        // Resolution diagnostics hang off declarations, not documents, so the `uri_id` lookup is
+        // what puts them in the right file. The rule ships off (it fires on correct Ruby), so this
+        // turns it on, which also exercises the config path.
         let root = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             root.path().join(crate::workspace::config::CONFIG_FILE_NAME),
@@ -3431,9 +4305,9 @@ end
 
     #[test]
     fn ranges_are_in_the_negotiated_encoding() {
-        // rubydex hands us UTF-8 byte offsets and `Offset::to_location` only ever returns UTF-8
-        // columns, so a diagnostic sitting *after* a wide character is where a naive mapping
-        // silently lands in the wrong place. Two emoji are 8 UTF-8 bytes but 4 UTF-16 units.
+        // rubydex gives UTF-8 byte offsets and `Offset::to_location` only returns UTF-8 columns, so
+        // a diagnostic *after* a wide character is where a naive mapping lands in the wrong place.
+        // Two emoji are 8 UTF-8 bytes but 4 UTF-16 units.
         let source = "def thing\n  \"\u{1f600}\u{1f600}\"; unused = 1\nend\n";
 
         let mut utf16 = Harness::with_encoding(PositionEncoding::Utf16);
@@ -3459,28 +4333,74 @@ end
 
         assert_eq!(wide.line, 1);
         assert_eq!(narrow.line, 1);
-        // `  "` is 3 units, then the emoji: 4 UTF-16 vs 8 UTF-8, then `"; ` is 3 more.
+        // `  "` is 3 units, then the emoji (4 UTF-16 vs 8 UTF-8), then `"; ` is 3 more.
         assert_eq!(wide.character, 10, "utf-16 column");
         assert_eq!(narrow.character, 14, "utf-8 column");
     }
 
     #[test]
-    fn files_outside_the_workspace_root_are_not_published() {
-        // Nobody can fix a warning inside somebody else's gem, and a Rails app would
-        // bury the user's own problems under thousands of them.
+    fn a_buffer_the_project_does_not_contain_is_squiggled_and_a_gem_is_not() {
+        // **Both halves of the diagnostics clause, the one place the outward fence is deliberately
+        // open.** A syntax error is one wherever it is typed, and a missing `end` in a file beside
+        // the project deserves red. The exception is *an open buffer outside the project*, not
+        // *code that is not the user's own*: a gem is a full member of the project, not outside it,
+        // so it stays silent.
         let mut harness = Harness::new();
         harness.index();
 
         let outside = tempfile::tempdir().expect("tempdir");
-        let path = outside.path().join("vendored.rb");
+        let path = outside.path().join("scratch_pad.rb");
         std::fs::write(&path, UNTERMINATED).unwrap();
         let uri = DocUri::from_path(&path).unwrap();
 
         harness.open(&uri, UNTERMINATED);
+        let published = harness.latest(&uri).expect("the buffer is squiggled");
+        assert!(!published.is_empty());
+        assert!(
+            published.iter().all(|item| matches!(
+                item.code.as_ref(),
+                Some(lsp_types::NumberOrString::String(rule))
+                    if rule == "parse-error" || rule == "parse-warning"
+            )),
+            "only the two rules that are statements about the user's own code reach an outside \
+             buffer, because the other eight ship `Off` or `Hint`: {published:?}"
+        );
+        assert!(
+            published
+                .iter()
+                .any(|item| item.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+            "{published:?}"
+        );
+
+        // **Open, not merely indexed.** After a close the file is still on disk and in the graph
+        // (`didClose` re-reads it), so the empty publish shows the clause is read as written, not
+        // as "anything in the graph outside the project".
+        harness.run(Task::DidClose { uri: uri.clone() });
+        assert_eq!(
+            harness.latest(&uri),
+            Some(Vec::new()),
+            "closing it clears what was published, because the exception was the buffer"
+        );
+    }
+
+    #[test]
+    fn a_gem_a_reader_has_open_is_still_not_squiggled() {
+        // The other half, which keeps the clause from being a widening of `is_own_code`: nobody can
+        // fix a warning inside someone's gem, a Rails bundle would bury the user's problems under
+        // thousands of them, and opening the file does not make it the reader's to fix. A gem is
+        // under a gem root, which `Layout::is_outside` checks first.
+        let (dir, gem_home, env) = project_with_gem(UNTERMINATED);
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.index();
+        harness.index_gems();
+
+        let uri = DocUri::from_path(&gem_home.path().join("gems/shouty-1.2.3/lib/shouty.rb"))
+            .expect("an absolute path");
+        harness.open(&uri, UNTERMINATED);
 
         assert!(
-            harness.latest(&uri).is_none(),
-            "a file outside the workspace must not be published"
+            harness.latest(&uri).is_none_or(|items| items.is_empty()),
+            "a gem the reader has open is still not theirs to fix"
         );
     }
 
@@ -3524,10 +4444,9 @@ end
 
     #[test]
     fn a_change_to_a_buffer_that_was_never_opened_is_recovered_only_when_it_is_safe() {
-        // Clients do occasionally get this wrong. An incremental range only means anything
-        // against the exact text it was computed from, so applying one to an empty buffer is
-        // worse than dropping it — but a whole-buffer change carries its own base and can be
-        // treated as the `didOpen` that never arrived.
+        // Clients occasionally do this. An incremental range means something only against its exact
+        // base text, so applying one to an empty buffer is worse than dropping it; a whole-buffer
+        // change carries its own base and can stand in for the missing `didOpen`.
         let mut harness = Harness::new();
         let uri = harness.write("app/person.rb", "class Person\nend\n");
         harness.index();
@@ -3571,9 +4490,9 @@ end
 
     #[test]
     fn closing_a_buffer_falls_back_to_disk_and_forgets_a_file_that_is_gone() {
-        // Closing an editor tab does not remove the file from the project. The graph has to
-        // return to what is on disk — and only drop the document when there is no disk copy
-        // left, which is what a rename or a delete looks like from here.
+        // Closing a tab does not remove the file from the project. The graph must return to the
+        // disk's version, dropping the document only if no disk copy remains (a rename or delete,
+        // from here).
         let mut harness = Harness::new();
         let uri = harness.write("app/person.rb", "class Person\nend\n");
         harness.index();
@@ -3589,7 +4508,7 @@ end
         );
 
         harness.open(&uri, "class Person\nend\n");
-        std::fs::remove_file(uri.to_path().expect("a path")).unwrap();
+        std::fs::remove_file(uri.to_file_path().expect("a path")).unwrap();
         harness.run(Task::DidClose { uri: uri.clone() });
         assert!(
             !harness.has("Person"),
@@ -3599,8 +4518,8 @@ end
 
     #[test]
     fn saving_changes_nothing_because_the_buffer_was_already_indexed() {
-        // `didSave` arrives after every `didChange` for the same text. Re-indexing here would
-        // double the work of typing for no new information at all.
+        // `didSave` follows every `didChange` for the same text. Re-indexing here would double the
+        // work of typing for no new information.
         let mut harness = Harness::new();
         let uri = harness.write("app/person.rb", "class Person\nend\n");
         harness.index();
@@ -3615,8 +4534,8 @@ end
 
     #[test]
     fn a_reload_that_breaks_the_config_warns_and_keeps_serving() {
-        // `ya-lsp.toml` is edited by hand and saved half-written. The server has to say so and
-        // carry on with the defaults; going quiet is indistinguishable from a crash.
+        // `ya-lsp.toml` is edited by hand and can be saved half-written. The server must say so and
+        // continue with defaults; going quiet looks like a crash.
         let mut harness = Harness::new();
         let uri = harness.write("app/person.rb", "class Person\nend\n");
         harness.index();
@@ -3646,9 +4565,8 @@ end
 
     #[test]
     fn changed_editor_settings_reload_the_config_without_a_file() {
-        // The editor's layer never touches the filesystem, so it arrives carried rather than
-        // re-read — and it still has to rebuild the graph, because it can change what is
-        // indexed at all.
+        // The editor's layer never touches the filesystem, so it arrives carried, not re-read, and
+        // it still rebuilds the graph, because it can change what is indexed.
         let mut harness = Harness::new();
         harness.write("app/person.rb", "class Person\nend\n");
         harness.write("spec/person_spec.rb", "class PersonSpec\nend\n");
@@ -3668,8 +4586,8 @@ end
 
     #[test]
     fn gem_indexing_stops_at_max_files_and_says_so() {
-        // Silence here is the worst outcome: half a bundle indexed looks exactly like a bundle
-        // where the gem you wanted was never installed.
+        // Silence is the worst outcome here: a half-indexed bundle looks exactly like a gem that
+        // was never installed.
         let (dir, _gem_home, env) = project_with_gem("module Shouty\nend\n");
         std::fs::write(
             dir.path().join("ya-lsp.toml"),
@@ -3694,13 +4612,13 @@ end
         );
     }
 
-    /// A gem's source lives outside every workspace folder, so the server has to claim it itself.
+    /// A gem's source lives outside every workspace folder, so the server must claim it itself.
     ///
-    /// The client's document selector is the only gate on what it ever sends, and it cannot name a
-    /// gem root without a second copy of `workspace::gems` in TypeScript. So the server says where
-    /// its answers are, over the same channel the file watcher is registered on. Before this,
-    /// `definition` jumped into `activerecord-8.1.3.1/lib/active_record.rb` and every request in
-    /// the file it had just opened was dead, with nothing logged, because nothing was asked.
+    /// The client's document selector is the only gate on what it sends, and it cannot name a gem
+    /// root without a second copy of `workspace::gems` in TypeScript. So the server says where its
+    /// answers are, over the file watcher's channel. Otherwise `definition` jumps into
+    /// `activerecord-8.1.3.1/lib/active_record.rb` and every request in that file is dead, with
+    /// nothing logged because nothing was asked.
     #[test]
     fn the_client_is_asked_to_claim_the_gem_roots_and_not_the_workspace() {
         let (dir, gem_home, env) = project_with_gem("module Shouty\nend\n");
@@ -3741,12 +4659,11 @@ end
             .map(|filter| filter["pattern"]["baseUri"].as_str().unwrap().to_owned())
             .collect();
 
-        // **The gem's own directory, not the directory it was found in.** `Gems::roots` holds
-        // every gem path that exists on this machine — every Ruby installed here, and the system's
-        // own — and asking the editor to claim all of them would claim every Ruby file under every
-        // bundle on the machine. It is also what makes the arbitration in the extension mean
-        // something: two folders on one Ruby with *different* bundles claim different gems, and a
-        // gem only one of them locked stays with that one.
+        // **The gem's own directory, not where it was found.** `Gems::roots` holds every gem path
+        // on the machine (every installed Ruby, plus the system's), and claiming all of them would
+        // claim every Ruby file of every bundle. It also makes the extension's arbitration
+        // meaningful: two folders on one Ruby with *different* bundles claim different gems, and a
+        // gem only one locked stays with that one.
         assert_eq!(
             bases
                 .iter()
@@ -3772,11 +4689,10 @@ end
         );
     }
 
-    /// A gem file the client opens answers like any other file, which is the claim's other half.
+    /// A gem file the client opens answers like any other file: the claim's other half.
     ///
-    /// The server was never the part that was broken — the bundle is already in the graph, so the
-    /// only thing missing was ever being asked. This is what makes the registration worth sending:
-    /// `didOpen` a gem's source and all three of the requests a user reaches for inside one answer.
+    /// The server was never broken here (the bundle is already in the graph); it just was never
+    /// asked. `didOpen` a gem's source and all three requests a user reaches for inside one answer.
     #[test]
     fn a_gem_file_the_client_opens_answers_like_any_other() {
         const SOURCE: &str =
@@ -3804,7 +4720,7 @@ end
             !harness.hover_at(&gem_file, SOURCE, "Megaphone").is_null(),
             "hover inside a gem"
         );
-        // A `LocationLink`, because the harness's client takes them; the point is the URI.
+        // A `LocationLink`, because the harness's client takes them; the URI is the point.
         assert_eq!(
             harness.definition_at(&gem_file, SOURCE, "Shouty\n    end")[0]["targetUri"],
             serde_json::json!(gem_file.as_str()),
@@ -3812,11 +4728,11 @@ end
         );
     }
 
-    /// A vendored bundle is already claimed, and asking for it again answers every hover twice.
+    /// A vendored bundle is already claimed, and claiming it again answers every hover twice.
     ///
-    /// `vendor/bundle/ruby/<abi>` is inside the workspace root by construction, so it is *foreign*
-    /// — nobody can fix a warning in it — and *claimed*, by the selector the client was built with.
-    /// The two questions have different answers and only one of them decides this.
+    /// `vendor/bundle/ruby/<abi>` is inside the root by construction, so it is *foreign* (nobody
+    /// can fix a warning in it) and also *claimed* by the client's original selector. The two
+    /// questions differ, and only the second decides this.
     #[test]
     fn a_bundle_vendored_inside_the_project_is_not_claimed_a_second_time() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3862,10 +4778,10 @@ end
 
     /// A reload takes the old registrations back by name before making new ones.
     ///
-    /// Re-registering an id the client already holds replaces its *record* of the registration
-    /// without disposing the provider behind it, so the old selector goes on answering beside the
-    /// new one — the same duplicate the workspace filter avoids, arriving by another route. The ids
-    /// are fixed strings for exactly this: something has to be able to name them again.
+    /// Re-registering an id the client holds replaces its *record* without disposing the old
+    /// provider, so the old selector would keep answering beside the new one, the duplicate the
+    /// workspace filter avoids, by another route. The ids are fixed strings so they can be named
+    /// again.
     #[test]
     fn a_reload_takes_the_document_registrations_back_before_remaking_them() {
         let (dir, _gem_home, env) = project_with_gem("module Shouty\nend\n");
@@ -3884,7 +4800,7 @@ end
         assert!(harness.requests("client/unregisterCapability").is_empty());
 
         harness.run(Task::ReloadConfig);
-        while harness.analysis.step_gem_indexing() {}
+        while harness.analysis.step_pipeline() {}
 
         let taken_back = harness.requests("client/unregisterCapability");
         assert_eq!(
@@ -3906,12 +4822,11 @@ end
         );
     }
 
-    /// A client that takes no dynamic registration keeps exactly what it has, and is told once.
+    /// A client that takes no dynamic registration keeps what it has, and is told once.
     ///
-    /// Silence is the expensive outcome here: the symptom is one file answering nothing while every
-    /// file beside it answers, which reads as the server being wrong rather than the server never
-    /// having been asked. Once per process and not once per reload — a `ya-lsp.toml` saved five
-    /// times would otherwise repeat the sentence five times.
+    /// Silence is expensive here: one file answering nothing while its neighbours answer reads as
+    /// the server being wrong, not as never being asked. Once per process, not per reload, so
+    /// saving `ya-lsp.toml` five times does not repeat it five times.
     #[test]
     fn a_client_that_takes_no_registration_is_told_once_and_keeps_what_it_has() {
         let (dir, _gem_home, env) = project_with_gem("module Shouty\nend\n");
@@ -3943,8 +4858,8 @@ end
 
     #[test]
     fn diagnostics_are_skipped_for_a_file_that_has_gone_from_disk() {
-        // The declaration still carries its diagnostic after the file is deleted. Placing a
-        // range needs the text, and squiggles in guessed positions are worse than none.
+        // The declaration still carries its diagnostic after the file is deleted. Placing a range
+        // needs the text, and squiggles in guessed positions are worse than none.
         let mut harness = Harness::new();
         let uri = harness.write("app/broken.rb", "class Broken\n  def oops(\nend\n");
         harness.index();
@@ -3953,12 +4868,12 @@ end
             "the syntax error is reported while the file is there"
         );
 
-        std::fs::remove_file(uri.to_path().expect("a path")).unwrap();
+        std::fs::remove_file(uri.to_file_path().expect("a path")).unwrap();
         harness.analysis.publish_diagnostics();
 
-        // Not silence: `publishDiagnostics` is stateful per URI, so the squiggles that are no
-        // longer placeable have to be cleared with an explicit empty array. Sending nothing
-        // would leave them on screen for as long as the editor is open.
+        // Not silence: `publishDiagnostics` is stateful per URI, so unplaceable squiggles must be
+        // cleared with an explicit empty array, or they stay on screen as long as the editor is
+        // open.
         assert_eq!(
             harness.latest(&uri),
             Some(Vec::new()),
@@ -3969,14 +4884,11 @@ end
     #[test]
     fn closing_an_unsaved_buffer_clears_the_squiggles_it_had() {
         // A different loss from `..._gone_from_disk`: there the document stays in the graph and
-        // only its text goes, so the diagnostics survive with nowhere to be placed. Here the
-        // document is deleted outright — `didClose` on a buffer with no file behind it — and
-        // its diagnostics go with it.
+        // only its text goes, so the diagnostics survive with nowhere to go. Here the document is
+        // deleted outright (`didClose` on a fileless buffer), and its diagnostics go with it.
         //
-        // Which makes the *clearing* the whole assertion: `publishDiagnostics` is stateful per
-        // URI, so a document that no longer exists still needs an explicit empty array sent
-        // for it. Publishing nothing would leave the squiggles on screen with no buffer under
-        // them and no way to ever remove them.
+        // So the *clearing* is the whole assertion: the gone document still needs an explicit empty
+        // array, or its squiggles stay on screen with no buffer and no way to remove them.
         let mut harness = Harness::new();
         let uri = DocUri::from_path(&harness.root.path().join("untitled.rb")).expect("a uri");
 
@@ -4005,10 +4917,10 @@ end
     #[cfg(unix)]
     #[test]
     fn closing_a_buffer_whose_file_cannot_be_read_forgets_it_rather_than_keeping_stale_text() {
-        // On close the buffer stops shadowing disk and the file is re-read, so the graph holds
-        // what is really there. A file that exists and cannot be read is the one case where
-        // neither answer is available: keeping the buffer's text would leave the graph
-        // asserting the contents of a file nobody can open.
+        // On close the buffer stops shadowing disk and the file is re-read, so the graph holds what
+        // is really there. A file that exists but cannot be read is the one case with neither
+        // answer: keeping the buffer's text would make the graph assert the contents of a file
+        // nobody can open.
         use std::os::unix::fs::PermissionsExt;
 
         let mut harness = Harness::new();
@@ -4021,7 +4933,7 @@ end
             "indexed to start"
         );
 
-        let path = uri.to_path().expect("a path");
+        let path = uri.to_file_path().expect("a path");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         harness.run(Task::DidClose { uri: uri.clone() });
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -4034,9 +4946,8 @@ end
 
     #[test]
     fn a_gems_own_problems_are_never_published() {
-        // Measured on a real Rails app: without this filter, opening it publishes 208
-        // diagnostics inside other people's gems. Nobody can act on any of them, and they bury
-        // whatever the user actually broke.
+        // Without this filter, opening a real Rails app publishes hundreds of diagnostics inside
+        // other people's gems. Nobody can act on them, and they bury what the user actually broke.
         let (dir, _gem_home, env) = project_with_gem("class Broken\n  def oops(\nend\n");
         let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
 
@@ -4061,9 +4972,8 @@ end
 
     #[test]
     fn a_vendored_bundles_problems_are_not_published_either() {
-        // Regression: a vendored bundle sits at `vendor/bundle/ruby/<abi>` — inside the
-        // workspace root by construction — so a workspace-prefix test alone lets every gem in
-        // it publish diagnostics. Found by a fixture, not by reasoning.
+        // A vendored bundle sits at `vendor/bundle/ruby/<abi>`, inside the root, so a
+        // workspace-prefix test alone lets every gem there publish diagnostics.
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::write(
@@ -4098,8 +5008,8 @@ end
     #[test]
     fn reloading_the_config_does_not_lose_the_gems() {
         // The graph is thrown away and rebuilt on reload. If the gems are not re-queued they are
-        // gone for the rest of the session, and the only symptom is navigation quietly getting
-        // worse after someone edits ya-lsp.toml.
+        // gone for the session, and the only symptom is navigation quietly degrading after someone
+        // edits ya-lsp.toml.
         let (dir, _gem_home, env) =
             project_with_gem("module Shouty\n  class Megaphone\n  end\nend\n");
         let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
@@ -4111,8 +5021,8 @@ end
         assert!(!harness.definition_at(&uri, source, "Megaphone").is_null());
 
         harness.run(Task::ReloadConfig);
-        // The reload queues the gems again but indexes none of them; that is background work.
-        while harness.analysis.step_gem_indexing() {}
+        // The reload queues the gems again but indexes none; that is background work.
+        while harness.analysis.step_pipeline() {}
         harness.analysis.settle();
 
         assert!(
@@ -4127,12 +5037,10 @@ end
 
     #[test]
     fn an_engines_models_are_indexed_though_they_are_not_on_its_load_path() {
-        // The engine walk, and the measurement it came from written as a test: against a
-        // real bundle `ActiveStorage::Service` answered and `ActiveStorage::Blob` did not,
-        // because the first is in `lib/` and the second is in `app/models/` and an engine
-        // declares `require_paths = ["lib"]`. Both halves are asserted, because a fix that
-        // reached `app/` by making it a load path would pass the first assertion and break
-        // `require`.
+        // The engine walk. `ActiveStorage::Service` lives in `lib/` and always answers;
+        // `ActiveStorage::Blob` lives in `app/models/`, and an engine declares
+        // `require_paths = ["lib"]`, so without the walk it does not. Both halves are asserted: a
+        // fix that made `app/` a load path would pass the first and break `require`.
         let (dir, root, env) = project_with_engine(&[(
             "models/shouty/message.rb",
             "class Shouty::Message\n  def shout\n  end\nend\n",
@@ -4156,9 +5064,9 @@ end
             "the jump lands in the engine's own app/: {target}"
         );
 
-        // The engine is indexed and is still not the user's code. Three features turn on that
-        // test for a reason that has not changed — nobody fixes a warning inside somebody's
-        // engine — so gate 2 asked a differently-named question instead of widening it.
+        // The engine is indexed and still not the user's code. Three features depend on that test
+        // for an unchanged reason (nobody fixes a warning in someone's engine), so generators ask a
+        // separately named question instead of widening it.
         let engine =
             DocUri::from_path(&root.join("gems/shouty-1.2.3/app/models/shouty/message.rb"))
                 .expect("an absolute path");
@@ -4176,14 +5084,12 @@ end
 
     #[test]
     fn a_curated_collection_is_indexed_and_is_not_the_users_own_code() {
-        // `.gem_rbs_collection/` is hidden, so the workspace walk prunes it at the
-        // directory — it arrives as a signature path of its own instead, on the same background
-        // pass as a gem's `sig/`.
+        // `.gem_rbs_collection/` is hidden, so the workspace walk prunes it; it arrives as its own
+        // signature path, on the same background pass as a gem's `sig/`.
         //
-        // The second assertion is the one that would have bitten. The collection lives *inside*
-        // the workspace root, which is exactly the shape that made a vendored bundle publish 208
-        // unfixable squiggles: `is_own_code` has to exclude it explicitly, because "under the
-        // root" is not the question.
+        // The second assertion is the important one. The collection lives *inside* the root, the
+        // shape that made a vendored bundle publish unfixable squiggles: `is_own_code` must exclude
+        // it explicitly, because "under the root" is the wrong question.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("Gemfile.lock"),
@@ -4209,7 +5115,7 @@ end
             !harness.analysis.is_own_code(curated.as_str()),
             "the collection is under the workspace root and is still not the user's code"
         );
-        // And the filter is a filter rather than a mute button: the file beside it is.
+        // A filter, not a mute button: the file beside it is the user's.
         assert!(harness.analysis.is_own_code(uri.as_str()));
 
         let found = harness.declarations_at(&uri, "Blanket.new.~\n");
@@ -4217,11 +5123,9 @@ end
     }
     /// A reload that changes `[index] load_paths` changes what counts as the user's own code.
     ///
-    /// `own_prefixes` is the one prefix list that is not derived from the bundle, so it has no
-    /// other reason to be rebuilt — and it was first written where `workspace_prefix` is, which is
-    /// read once at construction. `rebuild` re-runs the walk and clears every neighbouring list;
-    /// a stale one here would keep answering about the *previous* configuration's directories for
-    /// the rest of the session, which is the shape every bug in this family has.
+    /// `own_prefixes` is the one prefix list not derived from the bundle, so nothing else would
+    /// rebuild it. `rebuild` re-runs the walk and clears every neighbouring list; a stale one here
+    /// would answer about the *previous* configuration's directories for the rest of the session.
     #[test]
     fn a_reload_that_changes_the_load_paths_changes_what_is_owned() {
         let shared = tempfile::tempdir().expect("tempdir");
@@ -4255,16 +5159,17 @@ end
         );
     }
 
-    /// A tree outside the workspace root, named by `[index] load_paths`, is indexed, is the
-    /// user's own code, and is a root the client is asked to claim.
+    /// A tree outside the root, named by `[index] load_paths`, is indexed, is the user's own code,
+    /// and is a root the client is asked to claim.
     ///
-    /// The monorepo case, and every one of the three had its own way of failing quietly. The
-    /// setting documented itself as "extra roots to index" and indexed nothing — it reached
-    /// `require` resolution and stopped — so a shared model was a name the graph did not hold.
-    /// Once indexed it would have been *foreign*, because `is_own_code` is a prefix test against
-    /// the root: no diagnostics, no rename, ranked below the bundle in search, in a directory
-    /// the project wrote down by hand. And a file outside every workspace folder is one no
-    /// client's selector claims, so nothing would ever have asked about it.
+    /// The monorepo case, where each of the three can fail quietly:
+    ///
+    /// 1. **Not indexed**: a shared model would be a name the graph does not hold.
+    /// 2. **Foreign**: `is_own_code` is a prefix test against the root, so no diagnostics, no
+    ///    rename, and ranked below the bundle in search, in a directory the project wrote down by
+    ///    hand.
+    /// 3. **Unclaimed**: a file outside every workspace folder is claimed by no selector, so
+    ///    nothing would ask about it.
     #[test]
     fn a_load_path_outside_the_root_is_indexed_owned_and_claimed() {
         let shared = tempfile::tempdir().expect("tempdir");
@@ -4291,21 +5196,20 @@ end
             "a load path outside the root has to be walked, or `require` resolves to nothing: {landed}"
         );
 
-        // The user's own code: the prefix test has a second way to say yes now.
+        // The user's own code: the prefix test's second way to say yes.
         //
-        // Canonicalized, because that is the spelling the index holds: `resolve_load_path`
-        // resolves the path once and everything downstream — the walk, `own_prefixes`, the
-        // registration — is a function of that one answer. A temp directory on macOS reaches
-        // disk through `/var -> /private/var`, so the two spellings genuinely differ here and
-        // asserting the wrong one is how this test first failed.
+        // Canonicalized, because the index holds that spelling: `resolve_load_path` resolves the
+        // path once, and the walk, `own_prefixes` and the registration all derive from it. On macOS
+        // a temp directory reaches disk via `/var -> /private/var`, so the spellings really differ
+        // here.
         let real = shared.path().canonicalize().unwrap();
         let user_uri = DocUri::from_path(&real.join("models/user.rb")).unwrap();
         assert!(
             harness.analysis.is_own_code(user_uri.as_str()),
             "a tree the project named by hand is not somebody else's gem"
         );
-        // The guard, in the direction that widening a prefix test always threatens: a real gem
-        // root must still be foreign, or diagnostics start appearing inside the bundle.
+        // The guard in the direction a widened prefix test threatens: a real gem root must stay
+        // foreign, or diagnostics appear inside the bundle.
         assert!(
             !harness
                 .analysis

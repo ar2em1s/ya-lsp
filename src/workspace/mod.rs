@@ -28,31 +28,30 @@ pub struct Workspace {
     config: Config,
     /// Which bodies of knowledge apply here, with `rails.enabled = "auto"` already decided.
     ///
-    /// Held rather than recomputed, because deciding it reads the filesystem: `auto` asks
-    /// whether `config/application.rb` is there and, failing that, reads `Gemfile.lock`. It is
-    /// rebuilt by [`Workspace::reload`] with everything else the configuration decides.
+    /// Held, not recomputed: deciding reads the filesystem (`config/application.rb`, then
+    /// `Gemfile.lock`). [`Workspace::reload`] rebuilds it with everything else the configuration
+    /// decides.
     features: Features,
-    /// Which way `rails.enabled` went and why, as the one sentence that says so.
+    /// Which way `rails.enabled` went and why, as one sentence.
     ///
-    /// Held rather than logged where it is decided, because that is inside `load` — before
-    /// `[log]` has been read and therefore before the file sink exists. See
-    /// [`Workspace::say_which_way_rails_went`].
+    /// Held, not logged on the spot: the decision happens inside `load`, before `[log]` is read and
+    /// the file sink exists. See [`Workspace::say_which_way_rails_went`].
     rails_detection: String,
     config_path: Option<PathBuf>,
     initialization_options: Option<serde_json::Value>,
-    /// The process environment gem discovery reads. Captured once at load so a fixture test can
-    /// substitute a whole synthetic version-manager tree.
+    /// The process environment gem discovery reads. Captured once at load, so a test can substitute
+    /// a whole synthetic version-manager tree.
     env: gems::Env,
-    /// Resolved lazily, and only once: the whole point is that it happens off the startup path.
+    /// Resolved lazily and once, off the startup path.
     gems: Option<Gems>,
-    /// Same, for Ruby's own signatures. Discovery is a glob over the gem roots plus, in the
-    /// worst case, extracting the vendored copy — neither belongs on the startup path.
+    /// Same, for Ruby's own signatures. Discovery globs the gem roots and may extract the vendored
+    /// copy. Neither belongs on the startup path.
     signatures: Option<Signatures>,
 }
 
 impl Workspace {
-    /// Load configuration for `root`. Never fails: a broken config degrades to defaults and
-    /// reports the reason through `problems`.
+    /// Load configuration for `root`. Never fails: a broken config falls back to defaults and
+    /// reports why in `problems`.
     #[must_use]
     pub fn load(
         root: PathBuf,
@@ -86,9 +85,8 @@ impl Workspace {
 
     /// Replace the client's settings layer, for `workspace/didChangeConfiguration`.
     ///
-    /// Nothing is re-read here: the caller follows with [`Workspace::reload`], so a settings
-    /// change and a `ya-lsp.toml` change take exactly the same path afterwards — including the
-    /// precedence, which stays "the file wins" whatever the editor was just told.
+    /// Nothing is re-read here. The caller follows with [`Workspace::reload`], so a settings change
+    /// and a `ya-lsp.toml` change take the same path. The file still wins.
     pub fn set_options(&mut self, options: Option<serde_json::Value>) {
         self.initialization_options = options;
     }
@@ -99,8 +97,8 @@ impl Workspace {
         (self.features, self.rails_detection) = Features::resolve(&self.root, &loaded.config);
         self.config = loaded.config;
         self.config_path = loaded.path;
-        // `[gems]` and `[rbs]` may have moved; the next caller re-discovers rather than
-        // trusting a result that was computed under the old configuration.
+        // `[gems]` and `[rbs]` may have moved. The next caller re-discovers instead of trusting a
+        // stale result.
         self.gems = None;
         self.signatures = None;
         loaded.problems
@@ -124,10 +122,9 @@ impl Workspace {
 
     /// Say which way `rails.enabled` went, once, at `info`.
     ///
-    /// **Called by whoever has just pointed the log**, never from `load`: the detection happens
-    /// before `[log]` has been read, so a line written where the decision is made reaches stderr
-    /// and never the file a user is about to attach to a bug report — which is the one place it
-    /// is most worth having.
+    /// **Called by whoever just pointed the log**, never from `load`. Detection runs before `[log]`
+    /// is read, so a line written there reaches stderr but never the log file — the file a user
+    /// attaches to a bug report.
     pub fn say_which_way_rails_went(&self) {
         tracing::info!("{}", self.rails_detection);
     }
@@ -138,16 +135,15 @@ impl Workspace {
         self.config_path.as_deref()
     }
 
-    /// Find the project's gems, once. The result is cached until the configuration reloads.
+    /// Find the project's gems, once. Cached until the configuration reloads.
     ///
-    /// The walk is a few hundred `read_dir` calls, so this is not free — call it off the
-    /// critical path.
+    /// The walk is a few hundred `read_dir` calls. Call it off the critical path.
     pub fn gems(&mut self) -> &Gems {
         self.gems
             .get_or_insert_with(|| gems::discover(&self.root, &self.config.gems, &self.env))
     }
 
-    /// Find Ruby's own signatures, once. The result is cached until the configuration reloads.
+    /// Find Ruby's own signatures, once. Cached until the configuration reloads.
     ///
     /// Independent of `[gems] enabled`: see `rbs::newest_installed`.
     pub fn signatures(&mut self) -> &Signatures {
@@ -158,8 +154,7 @@ impl Workspace {
 
     /// Absolute load paths to resolve `require` against, workspace first.
     ///
-    /// Order is Ruby's: the project's own `$LOAD_PATH` entries shadow a gem of the same name,
-    /// which is what `require "version"` inside an app means.
+    /// That is Ruby's order: the project's own `$LOAD_PATH` entries shadow a gem of the same name.
     #[must_use]
     pub fn load_paths(&self) -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = self.project_load_paths();
@@ -169,10 +164,10 @@ impl Workspace {
         paths
     }
 
-    /// The project's own load paths, resolved — without the bundle's.
+    /// The project's own load paths, resolved, without the bundle's.
     ///
-    /// Its own method because two callers want exactly this list and neither wants the gems:
-    /// [`Workspace::external_load_paths`] below, and the tests that pin the resolution.
+    /// Two callers want exactly this list: [`Workspace::external_load_paths`] below, and the tests
+    /// that pin the resolution.
     #[must_use]
     pub fn project_load_paths(&self) -> Vec<PathBuf> {
         self.config
@@ -185,13 +180,12 @@ impl Workspace {
 
     /// The project's load paths that lie **outside** the workspace root.
     ///
-    /// The split is what decides who indexes them. A load path inside the root is already the
-    /// walk's business — `discover` collected it, under `index.include` and the root's own
-    /// spelling — and walking it a second time here would index every file twice, which is two
-    /// declarations of every class and a definition list with each place in it twice. One
-    /// outside the root is reached by nothing else: the walk starts at the root and
-    /// `follow_links` is off, so a sibling directory, or a symlink to one, is invisible until
-    /// something names it. That is what this list is for.
+    /// The split decides who indexes them:
+    /// - **Inside the root**: the walk already collected it. Walking it again would index every
+    ///   file twice: two declarations of every class, every definition listed twice.
+    /// - **Outside the root**: nothing else reaches it. The walk starts at the root with
+    ///   `follow_links` off, so a sibling directory, or a symlink to one, stays invisible until
+    ///   something names it.
     #[must_use]
     pub fn external_load_paths(&self) -> Vec<PathBuf> {
         self.project_load_paths()
@@ -208,43 +202,57 @@ impl Workspace {
 
     /// Whether [`Workspace::discover`]'s walk would have collected `path`.
     ///
-    /// The question a file watcher asks: a change arrives as a path, and the server has to
-    /// decide whether it is one this workspace indexes at all. Two answers that disagree is the
-    /// failure this exists to prevent — a file the walk indexes and this rejects is a file that
-    /// never refreshes, and the reverse indexes something the user excluded — so it is the same
-    /// globs and the same walker, restricted to the directories between the root and `path`
-    /// rather than a second reading of what `.gitignore` means.
+    /// The file watcher's question: a change arrives as a path, and the server must decide whether
+    /// this workspace indexes it. The two must never disagree:
+    /// - The walk indexes it and this rejects it: the file never refreshes.
+    /// - This admits it and the walk skips it: an excluded file gets indexed.
     ///
-    /// `index.max_files` is deliberately not consulted: it is a budget over the whole index
-    /// rather than a property of one path, and only the caller knows how much of it is spent.
+    /// So it reuses the same globs and the same walker, restricted to the directories between the
+    /// root and `path`.
+    ///
+    /// `index.max_files` is not consulted. It is a budget over the whole index, not a property of
+    /// one path, and only the caller knows how much is spent.
     #[must_use]
     pub fn indexes(&self, path: &Path) -> bool {
         indexes(&self.root, &self.config.index, path)
     }
 
+    /// Every directory [`Workspace::discover`]'s walk went into, for the server's own watcher.
+    ///
+    /// **One list, used two ways**, so a watcher cannot disagree with the index:
+    /// - **Linux**: each directory gets an inotify watch. A recursive watch would cost one per
+    ///   directory (`node_modules`, `tmp`, `log`, a vendored bundle) against `max_user_watches`.
+    /// - **Elsewhere**: one recursive watch on the root is cheap, and this list filters its events.
+    ///
+    /// Either way `.git` and `vendor/bundle` are out because the walk never went in. That is
+    /// `index.exclude` and the hidden-file rule, not a second list to keep in step.
+    ///
+    /// The root is always in it: a file created directly under it is a change, and on Linux nothing
+    /// else would hear it.
+    #[must_use]
+    pub fn watched_directories(&self) -> Vec<PathBuf> {
+        watched_directories(&self.root, &self.config.index)
+    }
+
     /// Whether the project has ruled `path` out, for a file `index.include` can never name.
     ///
-    /// [`Workspace::indexes`] without its include half, and it exists because that half is a
-    /// list of the shapes **Ruby** is written in: a `db/structure.sql` cannot be on it however
-    /// the user spells it, so asking `indexes` about one is asking a question whose answer is
-    /// always no. What is still a real question is whether the user wants that directory looked
-    /// at, and `index.exclude`, `.gitignore` and the hidden-file rule are where they said —
-    /// which is why this is the same walk and the same compiled globs rather than a second
-    /// predicate that could drift from them.
+    /// This is [`Workspace::indexes`] without its include half. That half lists the shapes **Ruby**
+    /// is written in, so it always says no to a `db/structure.sql`. The real question is whether
+    /// the user wants that directory looked at, and `index.exclude` and the hidden-file rule answer
+    /// it. Same walk, same compiled globs, so the two cannot drift.
     ///
-    /// The one caller is the `db/*structure.sql` reader, and it is deliberately narrow: this is
-    /// not a licence to read anything, it is the gate on the one non-Ruby file the generator
-    /// pass knows about.
+    /// The one caller is the `db/*structure.sql` reader. This is not a licence to read anything: it
+    /// gates the one non-Ruby file the generator pass knows.
     #[must_use]
     pub fn admits(&self, path: &Path) -> bool {
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return false;
         };
         let mut reported_by_the_walk = Vec::new();
-        !matches_any(
-            &Globs::compile(&self.config.index, &mut reported_by_the_walk).exclude,
-            relative,
-        ) && visible(&self.root, &self.config.index, path)
+        let excluded = Globs::compile(&self.config.index, &mut reported_by_the_walk).exclude;
+        !matches_any(&excluded, relative)
+            && !prunes_an_ancestor(&excluded, relative)
+            && visible(&self.root, path)
     }
 }
 
@@ -256,9 +264,8 @@ pub struct Discovery {
     pub problems: Vec<String>,
 }
 
-/// Glob semantics: `*` never crosses a path separator, so `vendor/*` does not swallow
-/// `vendor/a/b`. `**` is the only wildcard that spans directories, which is what users expect
-/// from `.gitignore` and from every other tool that takes globs.
+/// Glob semantics: `*` never crosses a path separator, so `vendor/*` does not swallow `vendor/a/b`.
+/// Only `**` spans directories, as in `.gitignore` and every other glob tool.
 const MATCH_OPTIONS: MatchOptions = MatchOptions {
     case_sensitive: true,
     require_literal_separator: true,
@@ -267,9 +274,8 @@ const MATCH_OPTIONS: MatchOptions = MatchOptions {
 
 /// `index.include` and `index.exclude`, compiled.
 ///
-/// One compiled set with two entry points — [`discover`]'s walk and [`indexes`]' one path —
-/// rather than two implementations of the same globs, which is the half of the predicate that
-/// could drift silently.
+/// One compiled set, two entry points: [`discover`]'s walk and [`indexes`]' single path. Two
+/// implementations of the same globs could drift silently.
 struct Globs {
     include: Vec<Pattern>,
     exclude: Vec<Pattern>,
@@ -300,59 +306,81 @@ fn matches_any(patterns: &[Pattern], relative: &Path) -> bool {
 
 /// A configured load path as the filesystem really spells it, or `None` if it is not a directory.
 ///
-/// `is_dir` on the bare join was the whole check, and it let two spellings through that then
-/// matched no document at all. Every path here is compared against the graph's own URIs, and the
-/// graph never writes a `..`: `load_paths = ["../shared"]` joined to `<root>/../shared`, passed
-/// `is_dir` — which follows `..` happily — and resolved nothing, with no warning anywhere. A
-/// `shared` that is a **symlink** out of the tree failed the same way and for the same reason.
+/// Every path here is compared against the graph's URIs, and the graph never writes a `..`. A bare
+/// `is_dir` check lets two spellings through that then match no document, with no warning:
+/// - `load_paths = ["../shared"]`, because `is_dir` follows `..` happily.
+/// - A `shared` that is a **symlink** out of the tree.
 ///
-/// So the path is canonicalized, and then, when it is inside the root, spelled back the way the
-/// root spells it. That second half is not tidiness. `canonicalize` resolves every symlink in the
-/// path, and a workspace root routinely reaches disk through one — every macOS temp directory,
-/// `/var` and `/tmp` on any mac — so a canonicalized `lib` under a root spelled `/tmp/...` comes
-/// back as `/private/tmp/.../lib` and stops being a prefix of any document the walk indexed.
-/// Keeping the root's spelling for what is inside it, and the canonical one for what is outside,
-/// is the only pairing where both comparisons hold.
+/// So the path is canonicalized, then, if it is inside the root, spelled back the way the root
+/// spells it. That second step matters: `canonicalize` resolves every symlink, and a root often
+/// reaches disk through one (`/tmp` and `/var` on macOS). A canonicalized `lib` under `/tmp/...`
+/// comes back as `/private/tmp/.../lib` and stops prefixing any indexed document.
+///
+/// Root spelling inside, canonical spelling outside: the only pairing where both comparisons hold.
 fn resolve_load_path(root: &Path, relative: &Path) -> Option<PathBuf> {
     let resolved = root.join(relative).canonicalize().ok()?;
     if !resolved.is_dir() {
         return None;
     }
-    // `canonicalize` on the root too, because the question is whether the *real* directories
-    // nest — `<root>/../shared` can canonicalize back inside a root that is itself a symlink.
+    // Canonicalize the root too: the question is whether the *real* directories nest.
+    // `<root>/../shared` can canonicalize back inside a root that is itself a symlink.
     match root.canonicalize() {
         Ok(canonical_root) => match resolved.strip_prefix(&canonical_root) {
             Ok(inside) => Some(root.join(inside)),
             Err(_) => Some(resolved),
         },
-        // A root that cannot be canonicalized has been deleted under us. The resolved path is
-        // still the best answer available, and it is what the walk would have failed on too.
+        // A root that cannot be canonicalized was deleted under us. The resolved path is still the
+        // best answer, and the walk would have failed on it too.
         Err(_) => Some(resolved),
     }
 }
 
 /// The ignore rules, spelled once. The other half of what both entry points share.
-fn walker(root: &Path, index: &config::IndexConfig) -> ignore::WalkBuilder {
+///
+/// **No ignore file of any kind is read.** A `.gitignore` can name a tracked file, which git keeps
+/// indexing whatever the ignore file says. Honouring it would leave a cursor in that file answering
+/// nothing, and a rename would leave the file behind.
+///
+/// [`pruning_walker`] prunes whole trees from `index.exclude` instead: a list the user can read in
+/// their own config. It is the only thing that can hide a file, which keeps "why is this file not
+/// indexed?" answerable.
+fn walker(root: &Path) -> ignore::WalkBuilder {
     let mut walker = ignore::WalkBuilder::new(root);
     walker
         .hidden(true)
         .follow_links(false)
-        .git_ignore(index.respect_gitignore)
-        .git_exclude(index.respect_gitignore)
-        // Honour .gitignore even when the workspace is not itself a git repository, which is
-        // common for a subdirectory opened on its own.
-        .require_git(false)
-        // Only rules the project itself commits. Two deliberate exclusions:
-        //
-        // `parents` would apply .gitignore files from *above* the workspace root. Those belong
-        // to a different project and can silently empty the index — a checkout living under a
-        // directory an outer repo ignores would index nothing, with no error anywhere.
-        //
-        // `git_global` (~/.config/git/ignore) is per-machine, so two developers on the same
-        // repo would get different indexes. Keeping both off makes "why is this file not
-        // indexed?" answerable from the repository alone.
-        .parents(false)
-        .git_global(false);
+        // Every ignore-file source the crate has, turned off by name. `ignore` enables them all by
+        // default, so leaving one out brings it back.
+        .ignore(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
+        .parents(false);
+    walker
+}
+
+/// [`walker`], with `index.exclude` pruning directories, not only filtering files.
+///
+/// **`Globs::admits` tests files, and a file test cannot stop a walk.** Without pruning, the walk
+/// would descend all of `node_modules` or `vendor/bundle`, then drop every entry one glob at a
+/// time.
+///
+/// Deliberately **not** in [`walker`]: [`visible`] sets its own `filter_entry` and ignores both
+/// glob lists, and `ignore` keeps one filter instead of composing them.
+fn pruning_walker(root: &Path, excluded: Vec<Pattern>) -> ignore::WalkBuilder {
+    let mut walker = walker(root);
+    let base = root.to_path_buf();
+    // Asked of every entry, not only directories: same answer, fewer branches.
+    // - A *file* the list names would be dropped by `Globs::admits` a step later anyway.
+    // - A *directory* it names must not be entered.
+    //
+    // The root strips to the empty path, which matches no pattern, so the walk cannot prune itself.
+    walker.filter_entry(move |entry| {
+        entry
+            .path()
+            .strip_prefix(&base)
+            .is_ok_and(|relative| !matches_any(&excluded, relative))
+    });
     walker
 }
 
@@ -363,7 +391,7 @@ fn discover(root: &Path, index: &config::IndexConfig) -> Discovery {
     let mut files = Vec::new();
     let mut truncated = false;
 
-    for entry in walker(root, index).build() {
+    for entry in pruning_walker(root, globs.exclude.clone()).build() {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -394,22 +422,19 @@ fn discover(root: &Path, index: &config::IndexConfig) -> Discovery {
     if files.is_empty() {
         let defaults = config::IndexConfig::default();
         if index.include == defaults.include && index.exclude == defaults.exclude {
-            // A folder with no Ruby in it is not a misconfiguration — it is a folder with no
-            // Ruby in it, which in a multi-root workspace is an ordinary thing to have open.
-            // Warning here handed that user a remedy that was wrong for them ("widen
-            // index.include" when the globs are untouched and there is simply nothing to match)
-            // about a folder they had not opened. Still said, because every feature answering
-            // nothing needs something to point at, but said where someone reading a log will
-            // find it rather than in a notification nobody asked for.
+            // A folder with no Ruby in it is not a misconfiguration. In a multi-root workspace it
+            // is ordinary, and "widen index.include" would be the wrong remedy. Still logged, so a
+            // user whose features answer nothing has something to point at, but not as a
+            // notification.
             tracing::debug!(
                 "no Ruby file under {}: navigation, completion and diagnostics answer nothing \
                  for this folder",
                 root.display()
             );
         } else {
-            // The globs were written by hand and matched nothing, which is the case the warning
-            // was always for: otherwise invisible, because every feature just returns nothing,
-            // which reads as "the server is broken" rather than "the server indexed nothing".
+            // Hand-written globs that match nothing: the case the warning is for. Otherwise every
+            // feature just returns nothing, which reads as "the server is broken", not "the server
+            // indexed nothing".
             problems.push(messages::nothing_matched(&index.include, root));
         }
     }
@@ -428,31 +453,65 @@ fn discover(root: &Path, index: &config::IndexConfig) -> Discovery {
     }
 }
 
+/// The walk's directories, as [`Workspace::watched_directories`] describes them.
+///
+/// Free, not only a method: a watcher outlives the `Workspace` it came from (the analysis thread
+/// takes ownership at startup) and re-runs this itself when a directory appears.
+#[must_use]
+pub fn watched_directories(root: &Path, index: &config::IndexConfig) -> Vec<PathBuf> {
+    // Already reported by the walk, which runs beside this. Saying it again adds nothing.
+    let mut reported_by_the_walk = Vec::new();
+    let excluded = Globs::compile(index, &mut reported_by_the_walk).exclude;
+    // `pruning_walker` never enters an excluded directory, so `vendor/bundle` and `node_modules`
+    // are simply absent. The root is in the list because the walk yields it: a file written
+    // directly under it is a change, and on Linux nothing else would hear it.
+    pruning_walker(root, excluded)
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path().to_path_buf())
+        .collect()
+}
+
 /// Whether [`discover`] would have collected `path`. See [`Workspace::indexes`].
 fn indexes(root: &Path, index: &config::IndexConfig, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
-    // A pattern that does not compile drops itself and is reported by the walk, which has
-    // already run by the time anything asks this. Reporting it again, once per changed file,
-    // would say nothing new and say it hundreds of times during a branch switch.
+    // An uncompilable pattern drops itself, and the walk already reported it. Reporting it again
+    // per changed file would repeat it hundreds of times during a branch switch.
     let mut reported_by_the_walk = Vec::new();
-    if !Globs::compile(index, &mut reported_by_the_walk).admits(relative) {
-        return false;
-    }
+    let globs = Globs::compile(index, &mut reported_by_the_walk);
 
-    visible(root, index, path)
+    globs.admits(relative) && !prunes_an_ancestor(&globs.exclude, relative) && visible(root, path)
+}
+
+/// Whether `index.exclude` names a **directory** on the way to `relative`.
+///
+/// [`pruning_walker`] never enters one, so a file inside is never collected, whatever its own name.
+/// This predicate must agree, or the watcher and the walk silently disagree about that file for the
+/// life of the process. It checks the ancestors only; `relative` itself is [`Globs::admits`]'s
+/// half.
+///
+/// A glob test, not a walk, because that is what the walker's filter does: this list against one
+/// directory path at a time.
+fn prunes_an_ancestor(excluded: &[Pattern], relative: &Path) -> bool {
+    relative
+        .ancestors()
+        .skip(1)
+        .any(|ancestor| !ancestor.as_os_str().is_empty() && matches_any(excluded, ancestor))
 }
 
 /// Whether the walk would reach `path` at all, ignoring both glob lists.
 ///
-/// `.gitignore`, `.ignore`, `.git/info/exclude` and the hidden-file rule are the walker's, and
-/// the walker is where they stay: this descends only the directories between the root and
-/// `path`, which is a handful of `read_dir` calls rather than a second implementation of git's
-/// ignore semantics to keep in step with the first.
-fn visible(root: &Path, index: &config::IndexConfig, path: &Path) -> bool {
+/// The hidden-file rule stays in the walker. This descends only the directories between the root
+/// and `path`, a handful of `read_dir` calls, instead of re-implementing it.
+///
+/// [`walker`], not [`pruning_walker`]: the exclude list is the caller's half (`indexes` asks
+/// `Globs::admits` first). Pruning here too would mix *is it excluded* into *is it hidden*.
+fn visible(root: &Path, path: &Path) -> bool {
     let wanted = path.to_path_buf();
-    walker(root, index)
+    walker(root)
         .filter_entry(move |entry| wanted.starts_with(entry.path()))
         .build()
         .filter_map(Result::ok)
@@ -491,12 +550,27 @@ mod tests {
             .collect()
     }
 
+    /// [`names`] with the walk's order taken out, for a fixture spanning several directories.
+    fn sorted(discovery: &Discovery, root: &Path) -> Vec<String> {
+        let mut found = names(discovery, root);
+        found.sort();
+        found
+    }
+
+    fn watched(root: &Path, index: &config::IndexConfig) -> Vec<String> {
+        let mut found: Vec<String> = watched_directories(root, index)
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        found
+    }
+
     #[test]
     fn an_invalid_glob_is_reported_against_the_field_it_came_from() {
-        // Both pattern lists go through the same compiler, and the field name is the only thing
-        // in the message that tells a user which key in their `ya-lsp.toml` to go and fix. A
-        // bad pattern drops itself and nothing else — an unreadable `exclude` must not take
-        // `include` down with it and leave the workspace unindexed.
+        // Both pattern lists share one compiler. The field name is the only thing in the message
+        // that tells a user which `ya-lsp.toml` key to fix. A bad pattern drops only itself: an
+        // unreadable `exclude` must not take `include` down and leave the workspace unindexed.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "lib/thing.rb", "class Thing; end\n");
 
@@ -527,9 +601,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_directory_that_cannot_be_read_is_reported_and_the_rest_is_indexed() {
-        // A workspace with one unreadable directory in it is not an unindexable workspace. The
-        // walker surfaces the failure per entry, and swallowing it would leave a project
-        // silently missing whatever was under there with nothing said about it.
+        // One unreadable directory does not make a workspace unindexable. The walker reports the
+        // failure per entry; swallowing it would silently lose whatever was under there.
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -556,9 +629,9 @@ mod tests {
 
     #[test]
     fn the_config_a_workspace_actually_loaded_is_the_one_it_names() {
-        // `config_path` is what the startup log and any "which settings am I running?" question
-        // read. It is `None` for defaults rather than a guessed path, so that a project with no
-        // `ya-lsp.toml` cannot be reported as having one.
+        // `config_path` feeds the startup log and any "which settings am I running?" question. It
+        // is `None` for defaults, never a guessed path, so a project without a `ya-lsp.toml` is
+        // never reported as having one.
         let dir = tempfile::tempdir().unwrap();
         let (bare, problems) =
             Workspace::load_with_env(dir.path().to_path_buf(), None, gems::Env::default());
@@ -611,25 +684,40 @@ mod tests {
     }
 
     #[test]
-    fn gitignore_files_above_the_workspace_root_are_not_applied() {
-        // A checkout under a directory an outer repo ignores must still index: applying the
-        // outer .gitignore would index zero files, silently. Reachable with any clone under a
-        // path the parent repository excludes — this repo's own `tmp/` is one.
+    fn no_ignore_file_hides_a_file_any_more_wherever_it_is_written() {
+        // **Why ignore files are not read**: a `.gitignore` can name a **tracked** file. Lobsters'
+        // names `app/views/about/about.*`, which the project ships and a deployment replaces.
+        // Honouring it would leave the template answering nothing, and a rename of a constant it
+        // uses would leave it behind: the outcome `renaming.md` exists to prevent.
+        //
+        // The outer file covers a checkout under a directory its parent repository ignores.
+        // `.ignore`, another tool's convention, is not read either.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), ".gitignore", "/checkout/**/*\n");
         let root = dir.path().join("checkout");
-        write(&root, "lib/thing.rb", "x");
+        write(&root, ".gitignore", "generated/\napp/views/about/about.*\n");
+        write(&root, ".ignore", "lib/tool.rb\n");
+        write(&root, "app/views/about/about.html.erb", "x");
+        write(&root, "generated/out.rb", "x");
+        write(&root, "lib/tool.rb", "x");
 
         let discovery = discover(&root, &config::IndexConfig::default());
-        assert_eq!(names(&discovery, &root), vec!["lib/thing.rb"]);
+        assert_eq!(
+            sorted(&discovery, &root),
+            vec![
+                "app/views/about/about.html.erb",
+                "generated/out.rb",
+                "lib/tool.rb"
+            ]
+        );
         assert!(discovery.problems.is_empty(), "{:?}", discovery.problems);
     }
 
     /// A folder with no Ruby in it says nothing to the user.
     ///
-    /// The remedy the warning carries — widen `index.include` — is wrong advice for someone who
-    /// never narrowed it, and in a multi-root workspace an infrastructure or docs folder sitting
-    /// beside a Ruby one is ordinary rather than a mistake. What is lost goes to the log.
+    /// The warning's remedy, widen `index.include`, is wrong for someone who never narrowed it. In
+    /// a multi-root workspace a docs folder beside a Ruby one is ordinary. The message goes to the
+    /// log.
     #[test]
     fn a_folder_with_no_ruby_is_not_a_misconfiguration() {
         let dir = tempfile::tempdir().unwrap();
@@ -646,9 +734,8 @@ mod tests {
 
     /// Globs written by hand that match nothing are still reported.
     ///
-    /// This is the case the warning is for, and the one the test above must not take down with
-    /// it: the user asked for something specific, got an index of nothing, and every feature
-    /// answering nothing reads as a broken server rather than an empty index.
+    /// This is the case the warning is for, and the test above must not silence it: every feature
+    /// answering nothing reads as a broken server, not an empty index.
     #[test]
     fn globs_that_were_narrowed_by_hand_and_matched_nothing_are_reported() {
         let dir = tempfile::tempdir().unwrap();
@@ -673,9 +760,8 @@ mod tests {
 
     /// A hand-written `index.exclude` counts as narrowing too, not only `include`.
     ///
-    /// Excluding everything is the other half of the same mistake, and reaching it through
-    /// `exclude` leaves `include` at its default — so a guard that only watched `include` would
-    /// fall silent on it.
+    /// Excluding everything leaves `include` at its default, so a guard that watched only `include`
+    /// would stay silent.
     #[test]
     fn an_exclude_that_swallows_the_workspace_is_reported() {
         let dir = tempfile::tempdir().unwrap();
@@ -699,20 +785,39 @@ mod tests {
     }
 
     #[test]
-    fn respects_gitignore_by_default_and_can_be_turned_off() {
+    fn index_exclude_prunes_the_directory_rather_than_only_filtering_its_files() {
+        // **A file test cannot stop a walk**, so the walk prunes. Without it, `vendor/bundle` would
+        // be descended in full and dropped one glob at a time, and every directory in it would get
+        // an inotify watch.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write(root, ".gitignore", "generated/\n");
         write(root, "lib/thing.rb", "x");
-        write(root, "generated/out.rb", "x");
+        write(root, "vendor/bundle/ruby/gems/shout/lib/shout.rb", "x");
 
-        let mut index = config::IndexConfig::default();
+        let index = config::IndexConfig::default();
         assert_eq!(names(&discover(root, &index), root), vec!["lib/thing.rb"]);
+        // `vendor` itself stays: the default pattern is `vendor/**/*`, and `vendor`'s own path does
+        // not match it.
+        assert_eq!(watched(root, &index), vec!["", "lib", "vendor"]);
+    }
 
-        index.respect_gitignore = false;
+    #[test]
+    fn a_file_named_by_index_exclude_is_still_excluded_on_its_own() {
+        // Pruning is **additive**: a glob that matches no directory prunes nothing, and the file
+        // test does the work. That keeps `index.exclude` able to name a single file, the only way
+        // to drop one template from the index.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "app/views/about/about.html.erb", "x");
+        write(root, "app/views/about/_subnav.html.erb", "x");
+
+        let index = config::IndexConfig {
+            exclude: vec!["app/views/about/about.*".to_owned()],
+            ..config::IndexConfig::default()
+        };
         assert_eq!(
-            names(&discover(root, &index), root),
-            vec!["generated/out.rb", "lib/thing.rb"]
+            sorted(&discover(root, &index), root),
+            vec!["app/views/about/_subnav.html.erb"]
         );
     }
 
@@ -743,9 +848,8 @@ mod tests {
 
     /// Every file in a tree, ignoring nothing.
     ///
-    /// Deliberately not `ignore::Walk`: the list the predicate is checked against must come
-    /// from something the walker had no part in producing, or the two agree by construction
-    /// and the assertion is vacuous.
+    /// Deliberately not `ignore::Walk`: the expected list must come from something the walker had
+    /// no part in, or the two agree by construction and the assertion proves nothing.
     fn every_file(dir: &Path, into: &mut Vec<PathBuf>) {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
             .unwrap()
@@ -761,6 +865,23 @@ mod tests {
         }
     }
 
+    /// The defaults, plus the `index.exclude` entries [`rule_fixture`] exists to exercise.
+    ///
+    /// Written out here, not in the fixture: two of the three tests that read it assert against
+    /// `discover` with this exact list. It is also the only thing that can hide a file, so
+    /// exclusions from an ignore file would test a rule the walk does not have.
+    fn rule_config() -> config::IndexConfig {
+        let defaults = config::IndexConfig::default();
+        let mut exclude = defaults.exclude.clone();
+        exclude.push("generated".to_owned());
+        exclude.push("**/*.gen.rb".to_owned());
+        exclude.push("app/secret.rb".to_owned());
+        config::IndexConfig {
+            exclude,
+            ..defaults
+        }
+    }
+
     /// A tree holding one of every rule that decides whether a file is indexed.
     fn rule_fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -770,11 +891,14 @@ mod tests {
         write(root, "lib/thing.rb", "module Thing; end");
         write(root, "lib/deep/a/b/c.rb", "module C; end");
         write(root, "README.md", "not ruby");
-        // Ruby that is not `.rb`, and the project's own signatures. All five shapes the default
-        // include gained: an extension at the root, an extension nested, and three fixed names.
+        // Ruby that is not `.rb`, and the project's own signatures: an extension at the root, an
+        // extension nested, and the two fixed names.
         write(root, "sig/thing.rbs", "class Thing end");
         write(root, "Rakefile", "task :default");
         write(root, "config.ru", "run App");
+        // A rackup file under its own name, at depth. `**/*.ru` takes it, so an application that
+        // mounts several sees them all.
+        write(root, "ops/admin.ru", "run Admin");
         write(root, "thing.gemspec", "Gem::Specification.new");
         write(root, "lib/tasks/build.rake", "task :build");
         // `index.exclude`, both a default entry and the depth `*` must not reach.
@@ -784,44 +908,50 @@ mod tests {
             "x",
         );
         write(root, "tmp/cache/thing.rb", "x");
-        // `.gitignore` at the root, and a second one *below* it — the case a single compiled
-        // ignore file at the workspace root gets wrong, silently and only for that directory.
-        write(root, ".gitignore", "generated/\n*.gen.rb\n!keep.gen.rb\n");
+        // Ignore files, written and *not read*. A walk that started honouring one again shows up
+        // here, not in a corpus sweep.
+        write(root, ".gitignore", "generated/\n*.gen.rb\n");
+        write(root, ".ignore", "lib/thing.rb\n");
+        write(root, "app/.gitignore", "secret.rb\n");
+        // What `rule_config` excludes instead, in the three shapes a user writes:
+        // - a whole tree by its own name;
+        // - a glob reaching across directories;
+        // - one file at a fixed path, with `app/models/secret.rb` beside it as the control: naming
+        //   one file names only that file.
         write(root, "generated/out.rb", "x");
         write(root, "lib/thing.gen.rb", "x");
         write(root, "lib/keep.gen.rb", "x");
-        write(root, "app/.gitignore", "secret.rb\n");
         write(root, "app/secret.rb", "x");
         write(root, "app/models/secret.rb", "x");
         // Hidden, which the walker prunes at the directory.
         write(root, ".hidden/thing.rb", "x");
         // The one shape `index.include` can never name, in each of the four positions
-        // `Workspace::admits` has to answer differently about. None of these changes what the
-        // walk collects, because none of them is Ruby.
+        // `Workspace::admits` must answer differently. None changes what the walk collects, because
+        // none is Ruby.
         write(root, "db/structure.sql", "CREATE TABLE t (id bigint);");
         write(root, "tmp/db/structure.sql", "x");
         write(root, "vendor/db/structure.sql", "x");
         write(root, "db/ignored_structure.sql", "x");
+        write(root, "generated/structure.sql", "x");
 
         dir
     }
 
     /// `Workspace::admits` is `indexes` without its include half, and strictly wider.
     ///
-    /// The property is the one that matters, because the failure it prevents is the same one
-    /// `the_predicate_answers_exactly_what_the_walk_collected` prevents one layer up: a second
-    /// predicate that drifts from the first is silent for the life of the process. Anything the
-    /// walk collects has to be admitted here too, or a rule would apply to Ruby and not to the
-    /// one non-Ruby file this server reads.
+    /// A second predicate that drifts from the first is silent for the life of the process, as in
+    /// `the_predicate_answers_exactly_what_the_walk_collected`. Everything the walk collects must
+    /// be admitted here too, or a rule would apply to Ruby but not to the one non-Ruby file this
+    /// server reads.
     #[test]
     fn what_the_project_excluded_is_excluded_for_a_file_the_include_cannot_name() {
         let dir = rule_fixture();
         let root = dir.path();
-        // Through the real loader, so the exclude list this asserts about is one a user could
-        // have written rather than one constructed past the parser.
+        // Through the real loader, so the exclude list is one a user could write, not one built
+        // past the parser.
         std::fs::write(
             root.join("ya-lsp.toml"),
-            "[index]\nexclude = [\"vendor/**/*\", \"tmp/**/*\", \"db/ignored_*\"]\n",
+            "[index]\nexclude = [\"vendor/**/*\", \"tmp/**/*\", \"db/ignored_*\", \"generated\"]\n",
         )
         .unwrap();
         let (workspace, problems) = Workspace::load(root.to_path_buf(), None);
@@ -829,12 +959,16 @@ mod tests {
         let index = workspace.config().index.clone();
 
         let rows = [
-            // `index.include` says no to every one of these, which is why `indexes` cannot be
-            // the gate: it is a list of the shapes Ruby is written in.
+            // `index.include` rejects every one of these, since it lists the shapes Ruby is written
+            // in. So `indexes` cannot be the gate.
             ("db/structure.sql", true),
             ("tmp/db/structure.sql", false),
             ("vendor/db/structure.sql", false),
             ("db/ignored_structure.sql", false),
+            // Inside an excluded **directory**: `generated/structure.sql` matches no pattern,
+            // `generated` does, and the walk never enters. Without `prunes_an_ancestor`, a dump
+            // would be read out of a tree the project told the server to skip.
+            ("generated/structure.sql", false),
             // Not there at all, and outside the root, which a watcher can send.
             ("db/absent_structure.sql", false),
         ];
@@ -862,17 +996,17 @@ mod tests {
 
     /// The predicate and the walk are one set of rules, asserted against each other.
     ///
-    /// This is the invariant the file watcher rests on. A file the walk indexes and the
-    /// predicate rejects is a file that never refreshes once it changes on disk; a file the
-    /// predicate admits and the walk skips is one the user excluded and gets indexed anyway.
-    /// Neither shows up as an error — both are silent for the life of the process — so the two
-    /// are checked against each other over every path in a tree rather than each against a
-    /// hand-written list that could be wrong in the same way twice.
+    /// The file watcher rests on this. Both failures are silent for the life of the process:
+    /// - The walk indexes a file the predicate rejects: it never refreshes after a change on disk.
+    /// - The predicate admits a file the walk skips: an excluded file gets indexed.
+    ///
+    /// So they are checked against each other over every path in a tree, not each against a
+    /// hand-written list that could be wrong the same way twice.
     #[test]
     fn the_predicate_answers_exactly_what_the_walk_collected() {
         let dir = rule_fixture();
         let root = dir.path();
-        let index = config::IndexConfig::default();
+        let index = rule_config();
 
         let collected = discover(root, &index).files;
         assert!(
@@ -893,32 +1027,92 @@ mod tests {
 
         // And the fixture really does exercise each rule, rather than passing because
         // everything answered `false`.
-        let indexed: Vec<String> = collected
+        let mut indexed: Vec<String> = collected
             .iter()
             .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
             .collect();
+        indexed.sort();
         assert_eq!(
             indexed,
             vec![
                 "Rakefile",
+                "app/models/secret.rb",
                 "app/models/user.rb",
                 "config.ru",
                 "lib/deep/a/b/c.rb",
-                "lib/keep.gen.rb",
                 "lib/tasks/build.rake",
                 "lib/thing.rb",
+                "ops/admin.ru",
                 "sig/thing.rbs",
                 "thing.gemspec",
             ],
-            "include, exclude, both .gitignore files, the negation and the hidden directory"
+            "the include list, the three exclude shapes, the hidden directory — and \
+             `lib/thing.rb`, which an unread `.ignore` names and which is indexed anyway"
         );
+    }
+
+    /// Every file the walk indexes lives in a directory the watcher listens to.
+    ///
+    /// **Another entry point on the walk's rules, and one that fails silently.** An indexed file
+    /// whose directory is missing from this list never refreshes. On Linux nothing listens inside
+    /// it; elsewhere this same list filters its events out. Asserted against `discover` itself,
+    /// because a hand-written expectation can be wrong the same way twice.
+    ///
+    /// The other direction is deliberately *not* asserted. The list is wider than the files'
+    /// parents on purpose: `app/assets` holds no Ruby today, but a generator may put some there.
+    /// Listening too widely costs a dropped notification; listening too narrowly costs a file
+    /// nobody notices is stale.
+    #[test]
+    fn every_indexed_file_sits_in_a_directory_the_watcher_listens_to() {
+        let dir = rule_fixture();
+        let root = dir.path();
+        let index = rule_config();
+
+        let watched: std::collections::HashSet<PathBuf> =
+            watched_directories(root, &index).into_iter().collect();
+        assert!(watched.contains(root), "the root is always watched");
+
+        let collected = discover(root, &index).files;
+        assert!(collected.len() > 1, "{collected:?}");
+        for file in &collected {
+            let parent = file.parent().expect("a file has a parent");
+            assert!(
+                watched.contains(parent),
+                "{} is indexed and nothing is watching {}",
+                file.strip_prefix(root).unwrap().display(),
+                parent.strip_prefix(root).unwrap_or(parent).display()
+            );
+        }
+
+        // It really is the walk's answer, not every directory on disk. A directory is out when it
+        // is hidden, or when `index.exclude` names the tree's top directory or only what lies under
+        // it.
+        let relative: Vec<String> = watched
+            .iter()
+            .filter_map(|path| path.strip_prefix(root).ok())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        for out in [".hidden", "generated", "vendor/bundle", "tmp/cache"] {
+            assert!(
+                !relative.iter().any(|path| path == out),
+                "{out} is watched and nothing in it is indexed: {relative:?}"
+            );
+        }
+        // `vendor/**/*` does not name `vendor`, and one watch on it is what notices a directory
+        // appearing there. The same for `tmp`.
+        for kept in ["vendor", "tmp"] {
+            assert!(
+                relative.iter().any(|path| path == kept),
+                "{kept} itself is not excluded: {relative:?}"
+            );
+        }
     }
 
     /// A path the walk could never have produced is not indexed.
     ///
-    /// The watcher is the client's, shared across every server it runs, so a change from
-    /// another project or a directory rather than a file can arrive here. Both have to answer
-    /// `false` from the rules rather than from a walk that happens to find nothing.
+    /// The client's watcher is shared across every server it runs, so a change from another
+    /// project, or a directory, can arrive here. Both must answer `false` from the rules, not from
+    /// a walk that happens to find nothing.
     #[test]
     fn the_predicate_refuses_what_is_not_a_file_under_this_root() {
         let dir = rule_fixture();
@@ -968,10 +1162,9 @@ mod tests {
         assert!(problems.is_empty(), "{problems:?}");
         // `app` does not exist, so only `lib` survives.
         assert_eq!(workspace.load_paths(), vec![root.join("lib")]);
-        // And it is spelled the way the *root* is, not the way the filesystem is. A temp
-        // directory on macOS reaches disk through `/var -> /private/var`, so a canonicalized
-        // `lib` would come back under `/private/...` and stop being a prefix of any document the
-        // walk indexed — every one of which is spelled from this same root.
+        // Spelled the way the *root* is, not the filesystem. A macOS temp directory reaches disk
+        // through `/var -> /private/var`, so a canonicalized `lib` would come back under
+        // `/private/...` and stop prefixing any indexed document.
         assert!(
             workspace.load_paths()[0].starts_with(root),
             "a load path inside the root keeps the root's spelling: {:?}",
@@ -983,9 +1176,8 @@ mod tests {
 
     #[test]
     fn a_load_path_that_leaves_the_root_resolves_and_is_external() {
-        // `../shared` passed `is_dir` — which follows `..` happily — and then matched no
-        // document at all, because the graph spells no URI with a `..` in it. Silent: no
-        // warning, no error, `require` simply resolved nothing.
+        // `../shared` passes `is_dir`, which follows `..`, but matches no document: the graph never
+        // writes a URI with `..` in it. `require` would silently resolve nothing.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         std::fs::create_dir_all(base.join("shared/models")).unwrap();
@@ -1015,9 +1207,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_load_path_that_is_a_symlink_out_of_the_tree_resolves_to_where_the_files_are() {
-        // The other spelling of the same monorepo. `follow_links` is off in the walk, so a
-        // symlinked directory is not indexed by it and never was; naming it here is the only
-        // route, and it only works if the link is resolved to its target.
+        // The other spelling of the same monorepo. `follow_links` is off in the walk, so it never
+        // indexes a symlinked directory. Naming it here is the only route, and only if the link
+        // resolves to its target.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         std::fs::create_dir_all(base.join("shared/models")).unwrap();
@@ -1039,9 +1231,9 @@ mod tests {
             "the link has to resolve to the directory that really holds the files: {:?}",
             external[0]
         );
-        // The guard, and it is the whole point of calling it *external*: the link sits inside
-        // the root, so a resolution that stopped at the link would put it on the wrong side of
-        // the split and the walk would be expected to have indexed it. It did not.
+        // The guard, and the point of *external*: the link sits inside the root. A resolution that
+        // stopped at the link would put it on the wrong side of the split, and the walk would be
+        // expected to have indexed it. It did not.
         assert!(
             !external[0].starts_with(&root),
             "resolved past the link, not to it: {:?}",

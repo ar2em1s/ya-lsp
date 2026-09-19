@@ -1,16 +1,16 @@
 /**
  * Whether a folder lints with RuboCop, and the extension that would do it.
  *
- * ya-lsp never runs Ruby, so it has no cop offences and no autocorrect. That gap is closed by
- * composition rather than by a proxy: RuboCop ships its own language server, the RuboCop team
- * ships the client for it, and LSP allows one language to be served by more than one server. Proxying `rubocop --lsp` through ya-lsp would buy nothing — RuboCop is Ruby and
- * has to be installed either way, so there is no "one thing to install" to win — while costing
- * a supervised child process, a diagnostics merge, and the first module in this repository that
- * CI could not cover without installing Ruby.
+ * ya-lsp never runs Ruby, so it has no cop offences and no autocorrect. The gap is closed by
+ * composition, not a proxy: RuboCop ships its own language server, the RuboCop team ships its
+ * client, and LSP lets one language have several servers. Proxying `rubocop --lsp` through ya-lsp
+ * would buy nothing (RuboCop is Ruby and must be installed either way) and would cost a supervised
+ * child process, a diagnostics merge, and the first module CI could not cover without installing
+ * Ruby.
  *
- * No `vscode` import, for the reason `config.ts` and `server.ts` have none: this is a guess
- * about somebody else's toolchain, and a guess that cannot be unit-tested is one that ships
- * wrong. `extension.ts` owns the notification; this module owns only the question.
+ * No `vscode` import, like `config.ts` and `server.ts`: this guesses at somebody else's toolchain,
+ * and a guess that cannot be unit-tested ships wrong. `extension.ts` owns the notification; this
+ * module owns only the question.
  */
 
 /** The official client, published by the RuboCop team. It starts `rubocop --lsp` over stdio. */
@@ -23,21 +23,21 @@ export interface FolderFiles {
 }
 
 /**
- * RuboCop's own `ConfigFinder::DOTFILE`, plus the spelling YAML users reach for anyway.
+ * RuboCop's own `ConfigFinder::DOTFILE`, plus the `.yaml` spelling people use anyway.
  *
- * Only the folder root is checked. RuboCop itself walks upwards, but a `.rubocop.yml` in a
- * parent of the workspace is somebody else's project, and suggesting an install on the strength
- * of it is exactly the kind of confident wrong guess this project is organised against.
+ * Only the folder root is checked. RuboCop itself walks upwards, but a `.rubocop.yml` above the
+ * workspace belongs to somebody else's project, and suggesting an install because of it is the kind
+ * of confident wrong guess this project avoids.
  */
 const CONFIG_FILES = ['.rubocop.yml', '.rubocop.yaml'];
 
 /**
- * `rubocop` as a resolved *spec* in the lockfile, which is four spaces of indent.
+ * `rubocop` as a resolved *spec* in the lockfile, at four spaces of indent.
  *
- * Not a bare substring search: `rubocop-ast` and `rubocop-rails` appear as dependency lines at
- * six spaces under gems that are not RuboCop, and `DEPENDENCIES` lists names at two. Matching
- * the spec line is what makes "in the bundle at all, however it got there" the question —
- * which is the right one, since a transitive RuboCop still lints.
+ * Not a bare substring: `rubocop-ast` and `rubocop-rails` appear as dependency lines at six spaces
+ * under other gems, and `DEPENDENCIES` lists names at two. Matching the spec line asks "is RuboCop
+ * in the bundle at all, however it got there", the right question, since a transitive RuboCop still
+ * lints.
  */
 const SPEC_LINE = /^ {4}rubocop \(/m;
 

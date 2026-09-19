@@ -7,69 +7,44 @@ paths:
 
 # The canary
 
-- **It is a canary, not a benchmark, and that decides every number in it.** A benchmark tracks a
-  value and gets edited when the value moves; a canary answers one question — does opening a real
-  application still work at all? — and fails only on a change in kind. So the index ceiling is a
-  large multiple of the measurement, not a tight bound: the failures it exists to catch (an
-  accidental quadratic, a discovery rule that stops matching, a parser regression) move the number
-  by a factor, while a shared CI runner with a cold page cache moves it by a small multiple. **A
-  canary that flakes is worse than no canary** — the first thing a flaky check earns is a habit of
-  ignoring it.
-- **The asserted counts live in the `Makefile`, and nowhere else.** Do not restate them in prose;
-  a second copy goes stale and the stale copy is the one somebody reads. The file count has moved
-  twice, and both times it was the point of the change: once when templates were indexed
-  (`erb.md`), once when the default `index.include` grew to cover Ruby not named `.rb` —
-  `Rakefile`, `Gemfile`, `config.ru`, `lib/tasks/*.rake`, a `.gemspec`. Moving this number is a
-  decision, argued on its own terms, never adjusted to make a run go green.
-- **Counts are exact, timing is not.** The file count, the parse-error count, the parse-warning
-  count and *no other code at all* are properties of the pinned commit and of ya-lsp, identical on
-  a laptop and a shared runner, so there is no reason for slack. Time is the only quantity a runner
-  can change, and the only one with a ceiling rather than an equality.
-- **The exact-code assertion catches a decision, not a defect.** `parse-error` and `parse-warning`
-  are the only rules shipping on; the other eight are rubydex saying *it* gave up on legal Ruby.
-  Turning `dynamic-ancestor` on in this workspace produces hundreds of warnings across working
-  code, which is why the default is `Off`. If a code the canary has never seen starts appearing,
-  re-decide the default, not the number in the `Makefile`.
-- **The file count is read out of a log line, because no request answers it.** `workspace/symbol`
-  answers with symbols and a cap; nothing on the wire says how many files are indexed. The driver
-  reads `analysis::Analysis::index_workspace`'s `indexed N files in T` at INFO, which also carries
-  the cold index time. That makes a format string a contract, so the driver pins its shape and
-  fails with `LOG SHAPE` naming the function — a reword produces a legible failure instead of a
-  canary that quietly measures nothing.
-- **Diagnostics are state, not events.** The server republishes a URI whenever its set changes and
-  sends an empty list to clear one, so counting notifications double-counts every file touched
-  twice. The last publish per URI wins; totals come from that map at the end.
-- **The gem half is not covered, and the job says so.** Resolving the canary's bundle needs
-  `bundle install`, which needs a matching Ruby and a hand-built native extension — a lot of CI for
-  a project whose headline is that it needs no Ruby. The run leaves gem settings at their defaults,
-  finding some gems on a developer machine and none on CI, and *nothing asserted depends on which*:
-  `collect_diagnostics` filters to own code before grouping, and the index line is written before
-  gem indexing starts. Gem numbers stay manual.
-- **It is cloned, never vendored, and that is what makes the licence free.** The canary repository
-  is BSD-3-Clause, whose condition is notice retention on redistribution. No artifact ya-lsp ships
-  contains any of it, so no notice is owed (`licensing.md`: per artifact, not per repository). That
-  is a property of *how it is used*: copy one file into `tests/` or cache a tarball here and the
-  obligation attaches, in `THIRD-PARTY-NOTICES.txt`.
-- **The SHA is pinned for the same reason the tool versions are.** An unpinned target makes every
-  asserted number meaningless across runs, and flakes the first time upstream commits. **It lives
-  in `scripts/corpora.toml` and not here**: lobsters is one of the six corpora, `make canary-clone`
-  delegates to `scripts/corpora.py clone --only lobsters`, and a second copy of a commit in the
-  `Makefile` would be the copy that goes stale. The counts stay in the `Makefile`; the pin does not.
-- **Ask git about `$(CANARY_DIR)/.git`, never `git -C $(CANARY_DIR)`** — now enforced in one place,
-  `scripts/corpora.py`, which every corpus including this one clones through. The workspace lives under
-  `tmp/`, inside this repository, and **git searches upwards**: `git -C tmp/x rev-parse --git-dir`
-  in an empty `tmp/x` succeeds and answers about *ya-lsp*. The obvious spelling of "is this a
-  repository yet?" therefore skips the `init`, adds a remote to ya-lsp, fetches the canary into
-  ya-lsp's object store, and runs `checkout --detach` on the working tree being developed in. It
-  was written that way once; what stopped it was an unrelated dirty tree, not the check.
-  `[ -e "$dir/.git" ]` cannot walk up, and the toplevel comparison refuses the root itself.
-- **Nothing on the canary's path may need a Ruby.** The job installs none — that is the same
-  decision as *the gem half is not covered* above, not a second one — so the clone step it now
-  shares with the other five corpora has to stay a git fetch. `scripts/corpora.py` therefore
-  guards on `asdf` per command, off the `needs_ruby` column of its `STEPS` table, and `clone` is
-  the one that says no. A guard at the top of `main` covers the five commands that do drive Ruby
-  and takes this job down with them; that is exactly how it was written when the clone moved
-  there, and a laptop with asdf on PATH cannot reproduce it.
-- **`make canary` is deliberately not in `make ci`.** Everything in `ci` is hermetic; a target that
-  fails on a plane teaches people to skip it. CI runs the canary as its own job, where the name in
-  the checks list says what it covers.
+`make canary` opens a pinned real Rails app (lobsters) and asserts exact counts. It answers one
+question: does opening a real app still work?
+
+## Must
+
+1. **Keep the asserted counts only in the `Makefile`** (`CANARY_FILES`, `CANARY_WARNINGS`). Never
+   restate them in prose, because a second copy goes stale.
+2. **Change a count only as a decision you argue for**, never to make a run go green. If a new
+   diagnostic code shows up, reconsider the rule's default instead of the number.
+3. **Keep the SHA only in `scripts/corpora.toml`.** `make canary-clone` delegates to
+   `scripts/corpora.py clone --only lobsters`.
+4. **Check for `$dir/.git` with `[ -e "$dir/.git" ]`, never `git -C $dir`.** The corpora live under
+   `tmp/`, inside this repo, and git searches upwards. On an empty directory, `git -C` answers
+   about ya-lsp, and the clone step then fetches into ya-lsp and checks out over your working tree.
+   `scripts/corpora.py` enforces this.
+5. **Nothing on the canary's path may need Ruby.** CI installs no Ruby for this job.
+   `scripts/corpora.py` checks for `asdf` per command, using the `needs_ruby` column of `STEPS`,
+   and `clone` needs none. Never move that check to the top of `main`.
+
+## How it measures
+
+- **Counts are exact; only time has a ceiling.** The file count, parse errors, parse warnings and
+  the absence of any other code depend only on the pin and on ya-lsp. The time ceiling is a large
+  multiple of the measured value, so a slow shared runner cannot flake it. A flaky canary teaches
+  people to ignore it.
+- **The file count comes from a log line**, because no request reports it: the INFO line
+  `indexed N files in T` from `Analysis::index_workspace`. That format string is a contract. If it
+  changes, the driver fails with `LOG SHAPE`.
+- **Diagnostics are state, not events.** The last publish per URI wins, and an empty list clears
+  it. Counting notifications would double-count.
+- **Gems are not covered.** CI does not `bundle install`, and nothing asserted depends on gems:
+  `collect_diagnostics` keeps only the project's own files, and the index line is written before
+  gems are indexed.
+
+## Settled
+
+- **Only `parse-error` and `parse-warning` ship on.** Turning `dynamic-ancestor` on here produces
+  hundreds of warnings on working code.
+- **Clone lobsters; never vendor it.** It is BSD-3-Clause. Copying one file into this repo would
+  create a notice obligation (`licensing.md`).
+- **`make canary` is not in `make ci`.** `ci` must be hermetic. The canary runs as its own CI job.

@@ -1,34 +1,39 @@
 //! Which variable is which, for the variables rubydex does not model.
 //!
-//! The graph knows about constants and methods. It knows nothing about local variables —
-//! `LocalVariable` appears nowhere in rubydex's source — and while it records an instance
-//! variable's *assignment* as a declaration it records no references to one, so a bare `@name` is
-//! invisible to it. Both are ordinary things to put a cursor on, so answering for them means
-//! owning the scope rules: this is the third direct use of Prism, after `cursor` and `requires`.
+//! The graph knows constants and methods. It does not model local variables at all. It records an
+//! instance variable's *assignment* as a declaration but no references to one, so a bare `@name` is
+//! invisible to it. Both are ordinary cursor targets, so this module owns their scope rules, using
+//! Prism directly.
 //!
 //! # Why the scopes are Prism's rather than ours
 //!
-//! Deciding which `x` is which by hand means reimplementing Ruby's scoping: a block sees the
-//! locals around it and a `def` does not, a block parameter shadows the local it is spelled like,
-//! `for` declares into the enclosing scope while `->() {}` does not. Prism has already done it.
-//! Every local-variable node carries a **`depth`** — how many scopes out the name was resolved to
-//! — so two occurrences are the same variable exactly when they have the same name and land on
-//! the same entry of the scope stack. Nothing here re-derives that, which is why
-//! `x = 1; [1].each { |x| x }` separates correctly with no rule about shadowing written down.
+//! Deciding which `x` is which by hand means reimplementing Ruby's scoping:
+//! - a block sees the locals around it, a `def` does not;
+//! - a block parameter shadows the local it is spelled like;
+//! - `for` declares into the enclosing scope, `->() {}` does not.
 //!
-//! It also means the awkward spellings arrive already reduced: `rescue => e` and `in [a, b]` are
-//! both `LocalVariableTargetNode`, `def f(a, (b, c))` destructures into plain parameters, and
-//! `_1` is a read of a local the block declares. None needs a case here.
+//! Prism has already done it. Every local-variable node carries a **`depth`**: how many scopes out
+//! the name resolved to. Two occurrences are the same variable exactly when they share a name and
+//! land on the same scope-stack entry. So `x = 1; [1].each { |x| x }` separates correctly with no
+//! shadowing rule written here.
+//!
+//! The awkward spellings arrive already reduced: `rescue => e` and `in [a, b]` are both
+//! `LocalVariableTargetNode`, `def f(a, (b, c))` destructures into plain parameters, and `_1` reads
+//! a local the block declares. None needs a case.
 //!
 //! # Instance variables are scoped by what `self` is
 //!
-//! `@v` in `def a` and `@v` in `def self.b` are different variables — one belongs to an instance
-//! of the class and the other to the class object — and a highlight that joins them is wrong in a
-//! way the user can see. There is no depth to read for these, so [`SelfContext`] tracks it: a
-//! namespace body *is* the class object, `class << self` is the object one singleton step above
-//! it, and a `def` with no receiver is an instance of whatever `self` is where it is written.
-//! That last rule is what makes `def c` inside `class << self` land back on the class, and so
-//! share its `@v` with `def self.b`.
+//! `@v` in `def a` and `@v` in `def self.b` are different variables: one belongs to an instance,
+//! the other to the class object. A highlight that joins them is visibly wrong. There is no depth
+//! to read, so [`SelfContext`] tracks `self`:
+//! - a namespace body *is* the class object;
+//! - `class << self` is one singleton step above it;
+//! - a `def` with no receiver is an instance of whatever `self` is where it is written.
+//!
+//! The last rule makes `def c` inside `class << self` land back on the class, sharing its `@v` with
+//! `def self.b`.
+
+use std::{cell::RefCell, rc::Rc};
 
 use ruby_prism::{
     BlockLocalVariableNode, BlockNode, BlockParameterNode, ClassNode, ConstantId, DefNode,
@@ -48,15 +53,15 @@ pub struct Occurrence {
     pub end: u32,
     /// `true` where the variable is assigned, or declared as a parameter.
     ///
-    /// An operator assignment (`x += 1`, `@v ||= []`) is a write: it reads too, but the thing
-    /// the reader of a highlighted file is looking for is where the value comes from.
+    /// An operator assignment (`x += 1`, `@v ||= []`) is a write. It reads too, but a reader
+    /// scanning a highlighted file wants to see where the value comes from.
     pub write: bool,
 }
 
 /// Every occurrence of the variable under `offset`, or `None` when the cursor is not on one.
 ///
-/// `None` is the answer for everything else in a Ruby file — a method call, a constant, a
-/// comment, the inside of a string — and it is what lets the caller fall through to the graph.
+/// `None` covers everything else in a Ruby file (a method call, a constant, a comment, the inside
+/// of a string) and lets the caller fall through to the graph.
 #[must_use]
 pub fn occurrences(source: &str, offset: u32) -> Option<Vec<Occurrence>> {
     variable(source, offset).map(|(_, occurrences)| occurrences)
@@ -64,56 +69,50 @@ pub fn occurrences(source: &str, offset: u32) -> Option<Vec<Occurrence>> {
 
 /// The variable under `offset`: its name as Ruby spells it, and every place it appears.
 ///
-/// The name comes back from here rather than being cut out of the source at the first span,
-/// because the identity a set of occurrences shares already *is* the name — so a caller that
-/// needs it has no reason to re-derive it, and no absent case to handle if it does not. An
-/// instance variable's name carries its `@`, which is how [`rename`](super::rename) knows one
-/// without looking at the syntax again.
+/// The name comes from here, not cut out of the source, because the identity the occurrences share
+/// already *is* the name. A caller has nothing to re-derive and no absent case. An instance
+/// variable's name carries its `@`, which is how [`rename`](super::rename) recognises one without
+/// re-reading the syntax.
 #[must_use]
 pub fn variable(source: &str, offset: u32) -> Option<(String, Vec<Occurrence>)> {
-    let result = ruby_prism::parse(source.as_bytes());
-    let mut walk = Walk::new(source);
-    walk.visit(&result.node());
-    walk.under(offset)
+    scoped(source).under(offset)
 }
 
 /// Every write to `@name` on an *instance* of the class written as `path`.
 ///
-/// [`variable`] answers "which occurrences share the one under this cursor", and there is one
-/// caller with no cursor in the file it has to ask about: a template's instance variables are
-/// assigned in a controller, and the question is asked from the view. Same algebra, entered by
-/// name instead of by offset — `path` is the namespace as the file spells it, and an instance
-/// is `level` 0, so a `def self.` and a `class << self` are excluded here exactly as they are
-/// for a cursor. A second copy of that algebra in the caller is the one thing certain to drift.
+/// [`variable`] asks "which occurrences share the one under this cursor?". One caller has no cursor
+/// in the file: a template's instance variables are assigned in a controller, and the question
+/// comes from the view. So this is the same algebra entered by name:
+/// - `path` is the namespace as the file spells it;
+/// - an instance is `level` 0, so `def self.` and `class << self` are excluded exactly as for a
+///   cursor.
 ///
-/// Writes only: what types a variable is what was assigned to it, and a read has no value to
-/// look at. Ordered by offset, so "the textually last one" is the caller's to take.
+/// A second copy of that algebra in the caller would be certain to drift.
+///
+/// Writes only: a variable's type is what was assigned to it, and a read has no value to look at.
+/// Ordered by offset, so the caller takes "the textually last one" itself.
 #[must_use]
 pub fn writes_to(source: &str, path: &str, name: &str) -> Vec<Occurrence> {
-    let result = ruby_prism::parse(source.as_bytes());
-    let mut walk = Walk::new(source);
-    walk.visit(&result.node());
-    walk.written(path, name)
+    scoped(source).written(path, name)
 }
 
 /// Which locals a byte range borrows from around it, and whether anything it writes escapes.
 ///
-/// The question [`code_actions`](super::code_actions) has to ask before it may lift a run of
-/// statements into a method of its own, and it is asked here because the answer is the scope
-/// stack: two `x`s that Prism resolved to different scopes are two variables, and an extraction
-/// that passed one and left the other would compile and be wrong.
+/// [`code_actions`](super::code_actions) asks this before lifting statements into a method of their
+/// own. It is answered here because the answer is the scope stack: two `x`s Prism resolved to
+/// different scopes are two variables, and an extraction that passed one and left the other would
+/// compile and be wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Crossing {
-    /// Locals the range reads before it writes them — the parameters an extracted method needs,
-    /// in the order the range first reaches for them.
+    /// Locals the range reads before it writes them: the parameters an extracted method needs, in
+    /// the order the range first reaches for them.
     pub reads: Vec<String>,
     /// `true` when the range writes a local that is touched again after it.
     ///
-    /// There is no single value an extracted method could hand back for that, so the caller
-    /// declines rather than approximating. Any occurrence after the range counts, read or
-    /// write: [`Occurrence`] records `x = 1` and `x += 1` both as writes, and telling the one
-    /// that needs the old value from the one that does not is a distinction this does not have
-    /// and would be wrong about.
+    /// An extracted method has no single value to hand back for that, so the caller declines
+    /// instead of approximating. Any later occurrence counts, read or write: [`Occurrence`] records
+    /// `x = 1` and `x += 1` both as writes, and cannot tell the one needing the old value from the
+    /// one that does not.
     pub escapes: bool,
 }
 
@@ -121,105 +120,142 @@ pub struct Crossing {
 /// it.
 #[must_use]
 pub fn crossing(source: &str, start: u32, end: u32) -> Crossing {
-    let result = ruby_prism::parse(source.as_bytes());
-    let mut walk = Walk::new(source);
-    walk.visit(&result.node());
-    walk.crossing(start, end)
+    scoped(source).crossing(start, end)
 }
 
-/// The instance variable at `offset` and where an accessor for it would have to be declared, or
-/// `None` when there is no such place.
+/// The instance variable at `offset` and where an accessor for it would be declared, or `None` when
+/// there is no such place.
 ///
-/// `Some` only where the variable belongs to an **instance** of a namespace written in this
-/// file, and that condition is the whole point of answering from here. `attr_reader :count`
-/// declares an instance method reading an *instance's* `@count`, so offering it for the
-/// `@count` inside `def self.count` or a `class << self` writes an accessor that reads a
-/// different variable — code that runs, returns `nil`, and looks right. [`SelfContext`]'s level
-/// already knows the difference; a second copy of that algebra in the caller is the one thing
-/// certain to drift.
+/// `Some` only where the variable belongs to an **instance** of a namespace written in this file.
+/// That condition is the point. `attr_reader :count` reads an *instance's* `@count`, so offering it
+/// for the `@count` in `def self.count` or `class << self` writes an accessor for a different
+/// variable: code that runs, returns `nil`, and looks right. [`SelfContext`]'s level already knows
+/// the difference; a copy of that algebra in the caller would drift.
 ///
 /// The offset is where the namespace's body begins, which is where the declaration goes.
 #[must_use]
 pub fn accessor_site(source: &str, offset: u32) -> Option<(String, u32)> {
-    let result = ruby_prism::parse(source.as_bytes());
-    let mut walk = Walk::new(source);
-    walk.visit(&result.node());
-    walk.accessor(offset)
+    scoped(source).accessor(offset)
 }
 
-/// What `self` is at a point in the file, which is what an instance variable belongs to.
+/// The walk's answers for one source text. All four questions above are asked of it.
 ///
-/// `level` counts singleton steps above an *instance* of `path`: 0 is an instance, 1 is the
-/// class object itself, 2 is its singleton class. Entering `class << self` adds a step and a
-/// receiverless `def` takes one away, so `def self.b` and a `def c` inside `class << self`
-/// arrive at the same context — which is what Ruby does.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SelfContext {
-    /// The lexical namespace path as written, so that a class reopened in the same file under
-    /// the same spelling keeps its instance variables together.
-    path: String,
-    level: i32,
-}
-
-/// The identity two occurrences must share to be the same variable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Variable {
-    /// A local, parameter or block-local, keyed by the scope Prism resolved it to.
-    Local { name: String, scope: u32 },
-    /// An instance variable, keyed by the object it hangs off.
-    Instance { name: String, owner: SelfContext },
-}
-
-struct Walk<'s> {
-    source: &'s str,
-    /// The scope stack, innermost last. A local at `depth` was declared in the entry `depth`
-    /// places from the end — that indexing is the whole of the scoping logic.
-    scopes: Vec<u32>,
-    next_scope: u32,
-    this: SelfContext,
+/// **It holds no borrow of the text.** A [`Variable`] carries its name as a `String` and an
+/// [`Occurrence`] is four numbers, so the visitor's `&str` is never read after the visit. That is
+/// why the memo below can exist. Keep it so if a new question wants to cut text out of the source.
+struct Scoped {
+    /// Every occurrence in the file with the identity it shares, sorted by offset **once**.
+    ///
+    /// Sorted here, not in each question: "the first one covering the cursor" is a fact about the
+    /// file, not about the order the visitor recorded writes in.
     found: Vec<(Variable, Occurrence)>,
-    /// Where the body of the namespace `self` belongs to begins, or `None` when there is no
-    /// such namespace written in this file — the top level, and either island.
-    body: Option<u32>,
     /// Every instance-variable occurrence that belongs to an instance of a namespace, with the
     /// name and the offset an accessor for it would be declared at.
-    ///
-    /// Kept beside [`Self::found`] rather than inside it because it is a different question:
-    /// `found` is "which occurrences are the same variable", which is what identity is for, and
-    /// putting a body offset into [`Variable`] would make a class reopened twice in one file
-    /// into two variables.
     sites: Vec<(Occurrence, String, u32)>,
 }
 
-impl<'s> Walk<'s> {
-    fn new(source: &'s str) -> Self {
+/// How many source texts the memo holds at once.
+///
+/// **Two: that is how many are in play at a time.**
+/// - A request asks about the buffer under the cursor.
+/// - The one caller with a second text is [`cursor`](super::cursor)'s `type_the_instance_variable`.
+///   It walks a *repaired* copy of that buffer (the half-typed call removed), alternating with the
+///   real one in a loop.
+///
+/// One slot would thrash between the two. A map keyed by document would need a bound, an eviction
+/// rule and a reason to trust both; decide that when a third text turns up.
+///
+/// More slots do not help. Almost every remaining miss is **compulsory**: a sweep asks about
+/// thousands of distinct files, and nearly every walk is the first anyone asked of that text. No
+/// cache size skips that.
+const SOURCES_HELD: usize = 2;
+
+thread_local! {
+    /// The walks already done, most recently walked first.
+    ///
+    /// **Keyed by the text itself, compared for equality, not hashed.**
+    /// - The four questions are pure in `source`, so identical text has identical answers. No
+    ///   second input, no stamp, no invalidation rule to get wrong; the argument
+    ///   [`Knowledge::refresh`](crate::knowledge::Knowledge::refresh) makes for memoising a parse.
+    /// - Equality has no collision class. A hash would risk answering about a different file, at
+    ///   the tier a reader can least check.
+    /// - A `memcmp` over a document is far cheaper than the parse.
+    ///
+    /// **Thread-local, so nothing is shared or locked.** A second thread gets its own, which is
+    /// right: this is a cache, and every entry is reproducible from its key.
+    ///
+    /// A hit does not reorder. With two slots, reordering could only decide which of two live texts
+    /// survives a third, and the alternating pair above is the only pattern there is.
+    static WALKED: RefCell<Vec<(Box<str>, Rc<Scoped>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The walk for `source`, done once per text instead of once per question.
+///
+/// The parse is Prism's own work, so there is nothing to make faster here, only a reason not to
+/// repeat it. Most calls arrive through [`locator::variable_at`](super::locator::variable_at):
+/// `definition`, `hover` and `documentHighlight` all ask about the same cursor in a document the
+/// settle just parsed, and `documentHighlight` fires on every cursor move.
+fn scoped(source: &str) -> Rc<Scoped> {
+    // Looked up and released before the walk, not held across it. `Scoped::of` runs with no borrow
+    // of `WALKED` outstanding, so a future question that reached back in here could not panic on
+    // the `RefCell`.
+    let held = WALKED.with_borrow(|walked| {
+        walked
+            .iter()
+            .find(|(text, _)| &**text == source)
+            .map(|(_, scoped)| Rc::clone(scoped))
+    });
+    if let Some(scoped) = held {
+        return scoped;
+    }
+    let fresh = Rc::new(Scoped::of(source));
+    WALKED.with_borrow_mut(|walked| {
+        if walked.len() == SOURCES_HELD {
+            walked.pop();
+        }
+        walked.insert(0, (Box::from(source), Rc::clone(&fresh)));
+    });
+    fresh
+}
+
+/// The texts the memo holds, most recently walked first.
+///
+/// Test-only. A test cannot otherwise see a walk that did not happen: the answers are identical
+/// either way, which is the point.
+#[cfg(test)]
+fn walked() -> Vec<String> {
+    WALKED.with_borrow(|walked| walked.iter().map(|(text, _)| text.to_string()).collect())
+}
+
+/// Drop everything the memo holds, so a test about the memo starts from a known state.
+///
+/// Test-only. `cargo test --test-threads=1` runs every test on one thread and so on one `WALKED`; a
+/// test asserting about its contents must say where it starts.
+#[cfg(test)]
+fn forget() {
+    WALKED.with_borrow_mut(Vec::clear);
+}
+
+impl Scoped {
+    /// Parse, walk and sort: the work the memo exists to do once.
+    fn of(source: &str) -> Self {
+        let result = ruby_prism::parse(source.as_bytes());
+        let mut walk = Walk::new(source);
+        walk.visit(&result.node());
+        walk.found.sort_by_key(|(_, occurrence)| occurrence.start);
         Self {
-            source,
-            // The file's own scope, pushed before the walk rather than by a visit, so that the
-            // stack is never empty and neither of the lookups below has an absent case.
-            scopes: vec![0],
-            next_scope: 1,
-            // The top level: `self` is `main`, an ordinary object, under the empty path.
-            this: SelfContext {
-                path: String::new(),
-                level: 1,
-            },
-            found: Vec::new(),
-            body: None,
-            sites: Vec::new(),
+            found: walk.found,
+            sites: walk.sites,
         }
     }
 
     /// The name of the variable the cursor is on, and the occurrences sharing it.
-    fn under(mut self, offset: u32) -> Option<(String, Vec<Occurrence>)> {
-        // Sorted before the search so that "the first one covering the cursor" is a fact about
-        // the file rather than about the order a visitor happened to record writes in.
-        self.found.sort_by_key(|(_, occurrence)| occurrence.start);
+    fn under(&self, offset: u32) -> Option<(String, Vec<Occurrence>)> {
         let (variable, _) = self
             .found
             .iter()
-            // Inclusive of the end, as `locator::covers` is: a cursor parked just past the last
-            // character of a name is still on it.
+            // Inclusive of the end, as in `locator::covers`: a cursor just past a name's last
+            // character is still on it.
             .find(|(_, at)| at.start <= offset && offset <= at.end)?;
 
         let name = match variable {
@@ -236,10 +272,9 @@ impl<'s> Walk<'s> {
     }
 
     /// Every write to `@name` on an instance of `path`, in the order the file writes them.
-    fn written(mut self, path: &str, name: &str) -> Vec<Occurrence> {
-        self.found.sort_by_key(|(_, occurrence)| occurrence.start);
+    fn written(&self, path: &str, name: &str) -> Vec<Occurrence> {
         self.found
-            .into_iter()
+            .iter()
             .filter(|(variable, occurrence)| {
                 occurrence.write
                     && matches!(
@@ -248,15 +283,12 @@ impl<'s> Walk<'s> {
                             if spelled == name && owner.path == path && owner.level == 0
                     )
             })
-            .map(|(_, occurrence)| occurrence)
+            .map(|(_, occurrence)| occurrence.clone())
             .collect()
     }
 
     /// The parameters a range would need, and whether anything it writes outlives it.
-    fn crossing(mut self, start: u32, end: u32) -> Crossing {
-        // Sorted so that "the first occurrence inside the range" is a fact about the file, and
-        // so that the parameters come out in the order the range reaches for them.
-        self.found.sort_by_key(|(_, occurrence)| occurrence.start);
+    fn crossing(&self, start: u32, end: u32) -> Crossing {
         let inside = |at: &Occurrence| start <= at.start && at.end <= end;
 
         let mut crossing = Crossing {
@@ -264,9 +296,8 @@ impl<'s> Walk<'s> {
             escapes: false,
         };
         let mut seen: Vec<&Variable> = Vec::new();
-        // Walked over what is *inside* the range, in order, so that the first occurrence of a
-        // variable reached here is the first one the range makes — which is both what decides
-        // the answer and the order the parameters come out in.
+        // Walked over what is *inside* the range, in order. The first occurrence of a variable
+        // reached here is the range's first, which decides the answer and the parameter order.
         for (variable, at) in &self.found {
             let Variable::Local { name, .. } = variable else {
                 continue;
@@ -275,8 +306,8 @@ impl<'s> Walk<'s> {
                 continue;
             }
             seen.push(variable);
-            // A read means the value came from outside and has to be passed in; a write means
-            // the range declares the variable itself, so an extracted method would declare it.
+            // A read means the value came from outside and must be passed in. A write means the
+            // range declares the variable, so an extracted method would declare it.
             if !at.write {
                 crossing.reads.push(name.clone());
             }
@@ -293,13 +324,79 @@ impl<'s> Walk<'s> {
     }
 
     /// The instance variable at `offset`, and where its accessor would be declared.
-    fn accessor(self, offset: u32) -> Option<(String, u32)> {
+    fn accessor(&self, offset: u32) -> Option<(String, u32)> {
         self.sites
-            .into_iter()
-            // Inclusive of the end, as `under` is: a cursor parked just past the last character
-            // of a name is still on it.
+            .iter()
+            // Inclusive of the end, as in `under`: a cursor just past a name's last character is
+            // still on it.
             .find(|(at, _, _)| at.start <= offset && offset <= at.end)
-            .map(|(_, name, body)| (name, body))
+            .map(|(_, name, body)| (name.clone(), *body))
+    }
+}
+
+/// What `self` is at a point in the file, which is what an instance variable belongs to.
+///
+/// `level` counts singleton steps above an *instance* of `path`:
+/// - 0 is an instance;
+/// - 1 is the class object;
+/// - 2 is its singleton class.
+///
+/// Entering `class << self` adds a step and a receiverless `def` takes one away. So `def self.b`
+/// and a `def c` inside `class << self` arrive at the same context, as in Ruby.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelfContext {
+    /// The lexical namespace path as written, so a class reopened in the same file under the same
+    /// spelling keeps its instance variables together.
+    path: String,
+    level: i32,
+}
+
+/// The identity two occurrences must share to be the same variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Variable {
+    /// A local, parameter or block-local, keyed by the scope Prism resolved it to.
+    Local { name: String, scope: u32 },
+    /// An instance variable, keyed by the object it hangs off.
+    Instance { name: String, owner: SelfContext },
+}
+
+struct Walk<'s> {
+    source: &'s str,
+    /// The scope stack, innermost last. A local at `depth` was declared in the entry `depth` places
+    /// from the end; that indexing is the whole scoping logic.
+    scopes: Vec<u32>,
+    next_scope: u32,
+    this: SelfContext,
+    found: Vec<(Variable, Occurrence)>,
+    /// Where the body of the namespace `self` belongs to begins. `None` when no such namespace is
+    /// written in this file: the top level, and either island.
+    body: Option<u32>,
+    /// Every instance-variable occurrence that belongs to an instance of a namespace, with the name
+    /// and the offset an accessor for it would be declared at.
+    ///
+    /// Kept beside [`Self::found`], not inside it, because it answers a different question. `found`
+    /// is "which occurrences are the same variable"; a body offset in [`Variable`] would split a
+    /// class reopened in one file into two variables.
+    sites: Vec<(Occurrence, String, u32)>,
+}
+
+impl<'s> Walk<'s> {
+    fn new(source: &'s str) -> Self {
+        Self {
+            source,
+            // The file's own scope, pushed before the walk so the stack is never empty and neither
+            // lookup below has an absent case.
+            scopes: vec![0],
+            next_scope: 1,
+            // The top level: `self` is `main`, an ordinary object, under the empty path.
+            this: SelfContext {
+                path: String::new(),
+                level: 1,
+            },
+            found: Vec::new(),
+            body: None,
+            sites: Vec::new(),
+        }
     }
 
     /// Run `body` inside a freshly numbered local scope.
@@ -310,12 +407,12 @@ impl<'s> Walk<'s> {
         self.scopes.pop();
     }
 
-    /// Run `run` with `self` bound to `this`, and with `site` as the place an accessor for an
-    /// instance of it would be declared.
+    /// Run `run` with `self` bound to `this`, and `site` as where an accessor for an instance of it
+    /// would be declared.
     ///
-    /// The two travel together because they are decided together: every construct that changes
-    /// what `self` is either opens a namespace body, keeps the one around it, or is an island
-    /// with no body at all, and separating them is how one of the three would come to be missed.
+    /// The two travel together because they are decided together. Every construct that changes
+    /// `self` either opens a namespace body, keeps the one around it, or is an island with no body.
+    /// Separating them is how one of the three would get missed.
     fn as_self(&mut self, this: SelfContext, site: Option<u32>, run: impl FnOnce(&mut Self)) {
         let outer = std::mem::replace(&mut self.this, this);
         let outside = std::mem::replace(&mut self.body, site);
@@ -326,9 +423,8 @@ impl<'s> Walk<'s> {
 
     /// The scope a local resolved `depth` steps out from the innermost one.
     ///
-    /// Total, and deliberately: the file's scope is on the stack before the walk starts, and
-    /// Prism never resolves a name to a scope it did not parse. A depth past the outermost one
-    /// lands on the file rather than being a case with anything to do about it.
+    /// Total on purpose: the file's scope is on the stack before the walk, and Prism never resolves
+    /// a name to a scope it did not parse. A depth past the outermost lands on the file.
     fn scope_at(&self, depth: u32) -> u32 {
         self.scopes[self.scopes.len().saturating_sub(1 + depth as usize)]
     }
@@ -345,8 +441,8 @@ impl<'s> Walk<'s> {
         );
     }
 
-    /// A parameter, a block-local or `it`: declared in the innermost scope, with no depth of
-    /// its own to read because there is nowhere else it could have come from.
+    /// A parameter, a block-local or `it`: declared in the innermost scope, with no depth to read
+    /// because it could come from nowhere else.
     fn here(&mut self, name: String, at: &Location<'_>, write: bool) {
         let scope = self.scope_at(0);
         self.record(Variable::Local { name, scope }, at, write);
@@ -354,10 +450,9 @@ impl<'s> Walk<'s> {
 
     fn instance(&mut self, name: &ConstantId<'_>, at: &Location<'_>, write: bool) {
         let spelling = spelled(name);
-        // Level 0 is an instance, and it is the only level an `attr_` accessor can read. A
-        // namespace body is the class object and `class << self` is a step above that, so both
-        // are excluded here rather than by a rule of their own — and so is the top level, which
-        // has no body to declare into.
+        // Level 0 is an instance, the only level an `attr_` accessor can read. A namespace body is
+        // the class object and `class << self` is a step above it, so both drop out here with no
+        // rule of their own. So does the top level, which has no body to declare into.
         if let (0, Some(body)) = (self.this.level, self.body) {
             let start = at.start_offset() as u32;
             self.sites.push((
@@ -381,9 +476,9 @@ impl<'s> Walk<'s> {
     }
 
     fn record(&mut self, variable: Variable, at: &Location<'_>, write: bool) {
-        // A keyword parameter's name span carries its colon (`d:`), and the colon is not part
-        // of the name anywhere else it is written. Trimmed here rather than at each call site
-        // so that the four keyword spellings cannot disagree.
+        // A keyword parameter's name span carries its colon (`d:`), and no other spelling of the
+        // name does. Trimmed here, not at each call site, so the four keyword spellings cannot
+        // disagree.
         let start = at.start_offset() as u32;
         let end = at.end_offset() as u32;
         let end = if self.source[start as usize..end as usize].ends_with(':') {
@@ -408,10 +503,10 @@ impl<'s> Walk<'s> {
         }
     }
 
-    /// A singleton or definee that is some object rather than `self`: `class << obj`,
-    /// `def obj.f`. What it is cannot be known without types, so it gets an island of its own
-    /// named by where it is written — two of them never share an instance variable, which
-    /// highlights too little rather than joining two unrelated ones.
+    /// A singleton or definee that is some object other than `self`: `class << obj`, `def obj.f`.
+    /// What it is needs types, so it gets its own island named by where it is written. Two islands
+    /// never share an instance variable: better to highlight too little than to join two unrelated
+    /// ones.
     fn island(&self, at: &Location<'_>) -> SelfContext {
         SelfContext {
             path: format!("{}<{}>", self.this.path, at.start_offset()),
@@ -421,11 +516,11 @@ impl<'s> Walk<'s> {
 }
 
 impl<'pr> Visit<'pr> for Walk<'_> {
-    // The four scope openers below hand-visit their children rather than deferring to the
-    // default walk, because **a superclass, a singleton's receiver and a definee are written
-    // outside the scope they open**. `class Foo < v` reads the enclosing scope's `v` and Prism
-    // numbers its depth from there, so visiting it after the push would resolve it against the
-    // class body and split one variable in two.
+    // The four scope openers below visit their children by hand, not through the default walk,
+    // because **a superclass, a singleton's receiver and a definee are written outside the scope
+    // they open**. `class Foo < v` reads the enclosing scope's `v`, and Prism numbers its depth
+    // from there. Visiting it after the push would resolve it against the class body and split one
+    // variable in two.
 
     fn visit_class_node(&mut self, node: &ClassNode<'pr>) {
         if let Some(superclass) = node.superclass() {
@@ -455,8 +550,8 @@ impl<'pr> Visit<'pr> for Walk<'_> {
     fn visit_singleton_class_node(&mut self, node: &SingletonClassNode<'pr>) {
         let expression = node.expression();
         self.visit(&expression);
-        // `class << self` is a step above the namespace around it and keeps its body; `class <<
-        // obj` is an island, and an island has no body an accessor could be written into.
+        // `class << self` is a step above the namespace around it and keeps its body.
+        // `class << obj` is an island, with no body an accessor could go in.
         let (this, site) = if matches!(expression, Node::SelfNode { .. }) {
             (
                 SelfContext {
@@ -507,8 +602,8 @@ impl<'pr> Visit<'pr> for Walk<'_> {
         });
     }
 
-    // A block and a lambda open a scope but not a `self`: what `self` is inside one is what it
-    // was outside, which is why `@v` in a block belongs to the enclosing method's object.
+    // A block and a lambda open a scope but not a `self`: `self` inside is what it was outside. So
+    // `@v` in a block belongs to the enclosing method's object.
 
     fn visit_block_node(&mut self, node: &BlockNode<'pr>) {
         self.scoped(|walk| ruby_prism::visit_block_node(walk, node));
@@ -551,7 +646,8 @@ impl<'pr> Visit<'pr> for Walk<'_> {
         ruby_prism::visit_local_variable_operator_write_node(self, node);
     }
 
-    // Parameters and block-locals: declared in the scope being visited, so no depth to read.
+    // Parameters and block-locals: declared in the scope being visited, so there is no depth to
+    // read.
 
     fn visit_required_parameter_node(&mut self, node: &RequiredParameterNode<'pr>) {
         self.here(spelled(&node.name()), &node.location(), true);
@@ -572,8 +668,8 @@ impl<'pr> Visit<'pr> for Walk<'_> {
     }
 
     fn visit_rest_parameter_node(&mut self, node: &RestParameterNode<'pr>) {
-        // An anonymous `*` or `**` has no name and nothing to highlight; rubydex records those
-        // under the sigil itself, and here they are simply not a variable.
+        // An anonymous `*` or `**` has no name and nothing to highlight. rubydex records those
+        // under the sigil; here they are not a variable.
         if let (Some(name), Some(at)) = (node.name(), node.name_loc()) {
             self.here(spelled(&name), &at, true);
         }
@@ -596,8 +692,8 @@ impl<'pr> Visit<'pr> for Walk<'_> {
     }
 
     fn visit_it_local_variable_read_node(&mut self, node: &ItLocalVariableReadNode<'pr>) {
-        // `it` names no variable Prism resolves, so it is keyed by the block it reads in — the
-        // same scope `_1` would be declared in, which is what makes the two behave alike.
+        // `it` names no variable Prism resolves, so it is keyed by the block it reads in: the scope
+        // `_1` would be declared in, so the two behave alike.
         self.here("it".to_owned(), &node.location(), false);
     }
 
@@ -635,12 +731,12 @@ impl<'pr> Visit<'pr> for Walk<'_> {
     }
 }
 
-/// A name as Prism interned it. Source is `&str`, so the bytes are always valid UTF-8.
 /// Where a declaration added to the top of a namespace body would go.
 fn opens(body: Option<&Node<'_>>) -> Option<u32> {
     body.map(|body| body.location().start_offset() as u32)
 }
 
+/// A name as Prism interned it. Source is `&str`, so the bytes are always valid UTF-8.
 fn spelled(name: &ConstantId<'_>) -> String {
     String::from_utf8_lossy(name.as_slice()).into_owned()
 }
@@ -650,13 +746,95 @@ fn spelled(name: &ConstantId<'_>) -> String {
 mod tests {
     use super::*;
 
+    /// What the memo holds, and that holding it changes no answer.
+    ///
+    /// The memo is invisible in every answer, so this test reaches for [`walked`] to see it. Two
+    /// properties:
+    /// 1. A text already walked is not walked again.
+    /// 2. A third text evicts the older of the two held: [`SOURCES_HELD`] is the alternating pair
+    ///    `cursor` asks about, nothing wider.
+    #[test]
+    fn a_text_is_walked_once_and_a_third_evicts_the_older_of_two() {
+        forget();
+        let a = "class A\n  def a\n    @v = 1\n    @v\n  end\nend\n";
+        let b = "class B\n  def b\n    @w = 2\n  end\nend\n";
+        let c = "class C\n  def c\n    @x = 3\n  end\nend\n";
+        let at = |source: &str, name: &str| source.find(name).expect("the variable") as u32;
+
+        let cold = variable(a, at(a, "@v"));
+        assert!(
+            cold.is_some(),
+            "the fixture has a variable under the cursor"
+        );
+        assert_eq!(walked(), vec![a.to_owned()]);
+
+        // The same text again is answered from the memo: nothing added, and the answer is the
+        // walk's.
+        assert_eq!(variable(a, at(a, "@v")), cold);
+        assert_eq!(walked(), vec![a.to_owned()]);
+
+        // A second text joins it instead of replacing it: the reason for two slots.
+        // `cursor::Finder::type_the_instance_variable` alternates a buffer with a repaired copy of
+        // itself, and one slot would hold neither.
+        assert_eq!(
+            writes_to(b, "B", "@w").len(),
+            1,
+            "the fixture writes @w once"
+        );
+        assert_eq!(walked(), vec![b.to_owned(), a.to_owned()]);
+        assert_eq!(
+            variable(a, at(a, "@v")),
+            cold,
+            "the first is still there to answer"
+        );
+        assert_eq!(walked(), vec![b.to_owned(), a.to_owned()]);
+
+        // A third evicts the older of the two.
+        assert!(
+            accessor_site(c, at(c, "@x")).is_some(),
+            "the fixture has a site"
+        );
+        assert_eq!(walked(), vec![c.to_owned(), b.to_owned()]);
+    }
+
+    /// Every question answers the same warm as cold: what a memo owes.
+    ///
+    /// All four are asked, not only [`variable`], because they share one [`Scoped`]. A question
+    /// reading something the memo does not carry would be wrong only on the second call, and only
+    /// for that question.
+    #[test]
+    fn every_question_answers_the_same_warm_as_cold() {
+        let source = "class Story\n  def bump(n)\n    @views = n\n    total = @views + 1\n    total\n  end\nend\n";
+        let offset = source.find("@views").expect("the variable") as u32;
+        let range = (
+            source.find("total = ").expect("the range") as u32,
+            source.find("    total\n").expect("the range") as u32,
+        );
+
+        forget();
+        let cold = (
+            variable(source, offset),
+            writes_to(source, "Story", "@views"),
+            crossing(source, range.0, range.1),
+            accessor_site(source, offset),
+        );
+        // Cold again, so two walks are compared instead of a walk with itself.
+        forget();
+        assert_eq!(variable(source, offset), cold.0);
+        // Now warm: the three below are answered off the walk the line above stored.
+        assert_eq!(writes_to(source, "Story", "@views"), cold.1);
+        assert_eq!(crossing(source, range.0, range.1), cold.2);
+        assert_eq!(accessor_site(source, offset), cold.3);
+        assert_eq!(walked().len(), 1, "one text, one walk");
+    }
+
     /// The occurrences at the `~`, drawn over the source: `w` under a write, `r` under a read.
     ///
-    /// Drawn rather than asserted as offsets for the reason the signature card is: a span one
-    /// character out lands under the wrong text, which reads as the bug it is, and a list of
-    /// numbers reads as nothing. Lines with nothing marked are dropped, so what an assertion
-    /// shows is what lit up — and the lines that remain carry their own text, which is what
-    /// makes "and not that other one" something the fixture shows rather than claims.
+    /// Drawn, not asserted as offsets, for the same reason as the signature card: a span one
+    /// character out lands under the wrong text and reads as the bug it is, while a list of numbers
+    /// reads as nothing. Lines with nothing marked are dropped, so the assertion shows what lit up,
+    /// and the remaining lines carry their own text. That lets "and not that other one" be shown,
+    /// not claimed.
     fn drawn(marked: &str) -> String {
         let offset = marked.find('~').expect("a ~ marking the cursor") as u32;
         let source = marked.replace('~', "");
@@ -664,8 +842,8 @@ mod tests {
             return "none".to_owned();
         };
 
-        // Indexed in bytes, because that is what an `Occurrence` is measured in; the line
-        // breaks are kept so the mask lines up with the source line for line.
+        // Indexed in bytes, as an `Occurrence` is. Line breaks are kept so the mask lines up with
+        // the source line for line.
         let mut mask: Vec<u8> = source
             .bytes()
             .map(|byte| if byte == b'\n' { b'\n' } else { b' ' })
@@ -690,10 +868,10 @@ mod tests {
 
     #[test]
     fn a_superclass_is_written_outside_the_class_it_opens() {
-        // The trap this module is shaped around. `class Foo < v` reads the *enclosing* scope's
-        // `v` and Prism numbers its depth from there, so visiting it after pushing the class
-        // scope resolves it against the body and splits one variable into two. Nothing about
-        // this is visible in a fixture that never inherits from an expression.
+        // The trap this module is shaped around. `class Foo < v` reads the *enclosing* scope's `v`,
+        // and Prism numbers its depth from there. Visiting it after pushing the class scope
+        // resolves it against the body and splits one variable in two. A fixture that never
+        // inherits from an expression cannot show this.
         assert_eq!(
             drawn("v~ = Object\nclass Foo < v\nend\n"),
             "v = Object\n\
@@ -705,8 +883,8 @@ mod tests {
 
     #[test]
     fn a_singleton_receiver_and_a_definee_are_written_outside_too() {
-        // The same rule, in the two other places Prism puts an expression beside a scope it is
-        // not inside.
+        // The same rule in the two other places Prism puts an expression beside a scope it is not
+        // inside.
         assert_eq!(
             drawn("o~ = Object.new\nclass << o\nend\ndef o.f; end\n"),
             "o = Object.new\n\
@@ -720,10 +898,10 @@ mod tests {
 
     #[test]
     fn a_block_sees_the_locals_around_it_and_a_def_does_not() {
-        // Two rules of Ruby scoping in one assertion, and neither is written down anywhere in
-        // this module: the block's read is the same variable at depth 1, and the `def` opens a
-        // scope the name cannot reach out of, so its own `total` is a different variable that
-        // happens to be spelled the same.
+        // Two Ruby scoping rules in one assertion, neither written down in this module:
+        // - the block's read is the same variable, at depth 1;
+        // - the `def` opens a scope the name cannot reach out of, so its `total` is a different
+        //   variable spelled the same.
         assert_eq!(
             drawn(
                 "total~ = 0\n[1].each { |n| total += n }\ndef other\n  total = 1\n  total\nend\n"
@@ -746,9 +924,9 @@ mod tests {
 
     #[test]
     fn the_awkward_spellings_arrive_as_ordinary_targets() {
-        // `rescue => e`, a pattern capture and a destructured parameter are all reduced by
-        // Prism to nodes this module already handles. There is a test rather than a comment
-        // because each of them *looks* like it would need a case of its own.
+        // `rescue => e`, a pattern capture and a destructured parameter all reduce to nodes this
+        // module already handles. A test, not a comment, because each *looks* like it needs its own
+        // case.
         assert_eq!(
             drawn("begin\nrescue => e~\n  e\nend\n"),
             "rescue => e\n\
@@ -772,8 +950,8 @@ mod tests {
 
     #[test]
     fn every_parameter_kind_is_a_variable_and_an_anonymous_one_is_not() {
-        // A keyword parameter's name span carries its colon and no other spelling of the name
-        // does, so highlighting `d:` where the name is `d` would draw over the punctuation.
+        // A keyword parameter's name span carries its colon and no other spelling does, so
+        // highlighting `d:` for `d` would draw over the punctuation.
         assert_eq!(
             drawn("def f(a, b = 1, *c, d~:, e: 2, **f, &g)\n  [a, b, c, d, e, f, g]\nend\n"),
             "def f(a, b = 1, *c, d:, e: 2, **f, &g)\n\
@@ -781,8 +959,8 @@ mod tests {
              \u{20} [a, b, c, d, e, f, g]\n\
              \u{20}           r"
         );
-        // An anonymous `*`, `**` or `&` names nothing, so the cursor on one finds no variable
-        // and the caller falls through to the graph rather than highlighting a lone sigil.
+        // An anonymous `*`, `**` or `&` names nothing. The cursor finds no variable and the caller
+        // falls through to the graph instead of highlighting a lone sigil.
         assert_eq!(drawn("def f(*~, **, &)\nend\n"), "none");
     }
 
@@ -797,8 +975,8 @@ mod tests {
 
     #[test]
     fn an_operator_assignment_is_a_write() {
-        // It reads as well as writes, and the write is what a reader scanning for where a value
-        // comes from is looking for.
+        // It reads as well as writes, and the write is what a reader looking for a value's source
+        // wants.
         assert_eq!(
             drawn("count = 0\ncount~ += 1\ncount ||= 2\ncount &&= 3\ncount\n"),
             "count = 0\n\
@@ -830,9 +1008,8 @@ mod tests {
 
     #[test]
     fn a_lambda_opens_a_scope_and_a_parameter_of_its_own() {
-        // A lambda closes over the locals around it exactly as a block does, and its parameter
-        // shadows exactly as a block's does. It is a node of its own in Prism, so it is a case
-        // of its own here.
+        // A lambda closes over surrounding locals exactly as a block does, and its parameter
+        // shadows the same way. It is a separate node in Prism, so it is a separate case here.
         assert_eq!(
             drawn("n = 1\nadd = ->(n~) { n + 1 }\nn\n"),
             "add = ->(n) { n + 1 }\n\
@@ -851,8 +1028,8 @@ mod tests {
 
     #[test]
     fn an_instance_variable_is_written_however_the_assignment_is_spelled() {
-        // Four spellings of the same write, each a node of its own: the plain assignment, the
-        // three operator forms, and the target form a multiple assignment and a `rescue` use.
+        // Four spellings of the same write, each its own node: the plain assignment, the three
+        // operator forms, and the target form used by multiple assignment and `rescue`.
         assert_eq!(
             drawn(
                 "class Foo\n  def a\n    @v~ = 1\n    @v ||= 2\n    @v &&= 3\n    @v += 4\n    @v, @w = 5, 6\n    @v\n  end\nend\n"
@@ -881,10 +1058,10 @@ mod tests {
 
     #[test]
     fn an_instance_variable_belongs_to_the_object_self_is() {
-        // The whole `SelfContext` algebra in one file. The class body, `def self.b` and the
-        // `def c` inside `class << self` are all the same object — Ruby says so, and a reader
-        // who has ever debugged a class-level `@cache` knows it — while `def a` is an instance
-        // and `def self.b`'s singleton body is one step further up again.
+        // The whole `SelfContext` algebra in one file. The class body, `def self.b` and the `def c`
+        // inside `class << self` are all the same object, as Ruby says and anyone who debugged a
+        // class-level `@cache` knows. `def a` is an instance, and the body of `class << self` is
+        // one step further up.
         let source = "class Foo\n  @v = 1\n  def a; @v; end\n  def self.b; @v; end\n  class << self\n    def c; @v; end\n    @v = 2\n  end\nend\n";
         assert_eq!(
             drawn(&source.replace("@v = 1", "@v~ = 1")),
@@ -911,8 +1088,8 @@ mod tests {
 
     #[test]
     fn a_class_reopened_under_the_same_spelling_keeps_its_instance_variables_together() {
-        // Keyed by the path as written rather than by a counter, so the two bodies are one
-        // object — which they are.
+        // Keyed by the path as written, not by a counter, so the two bodies are one object, as they
+        // are.
         assert_eq!(
             drawn(
                 "class Foo\n  @v~ = 1\nend\nclass Foo\n  @v\nend\nmodule Bar\n  class Foo\n    @v\n  end\nend\n"
@@ -937,10 +1114,9 @@ mod tests {
 
     /// Every write `writes_to` is offered, drawn as what it kept.
     ///
-    /// The four rejections are the test. Asking by name instead of by offset means the caller
-    /// has no cursor to prove which variable it meant, so every part of the identity — the
-    /// spelling, the class, and how many singleton steps above an instance it is — has to be
-    /// re-checked here rather than assumed.
+    /// The four rejections are the test. Asked by name, the caller has no cursor to prove which
+    /// variable it meant, so every part of the identity is re-checked here: the spelling, the
+    /// class, and how many singleton steps above an instance it is.
     #[test]
     fn the_writes_a_class_makes_to_one_of_its_instance_variables() {
         let source = "\
@@ -996,8 +1172,8 @@ end
 
     #[test]
     fn the_cursor_on_anything_else_finds_no_variable() {
-        // Every one of these is a position the caller has to be able to fall through from: a
-        // method call, a constant, a comment, a string, and past the end of the file.
+        // Positions the caller must be able to fall through from: a method call, a constant, a
+        // comment, a string, and past the end of the file.
         for marked in [
             "foo~\n",
             "Foo~\n",
@@ -1024,10 +1200,11 @@ end
 
     #[test]
     fn a_range_borrows_the_locals_it_reads_before_it_writes_them() {
-        // The first occurrence inside decides, and every line here is a different answer from
-        // it: `a` is read before the range writes anything, `b` is read and never written at
-        // all, `c` is the range's own because the range assigns it first, and `d` is never
-        // touched inside.
+        // The first occurrence inside decides, and each line is a different answer:
+        // - `a` is read before the range writes anything;
+        // - `b` is read and never written;
+        // - `c` is the range's own, because the range assigns it first;
+        // - `d` is never touched inside.
         assert_eq!(
             borrowed(
                 "\
@@ -1046,7 +1223,7 @@ puts d
                 escapes: false,
             }
         );
-        // In the order the range reaches for them, which is the order the parameters go in.
+        // In the order the range reaches for them: the parameter order.
         assert_eq!(
             borrowed("x = 1\ny = 2\n~puts y\nputs x~\n").reads,
             ["y", "x"]
@@ -1055,9 +1232,8 @@ puts d
 
     #[test]
     fn a_local_the_range_writes_and_something_after_it_touches_escapes() {
-        // A read after the range and a write after it both count, and the second is why:
-        // `Occurrence` records `y = 1` and `y += 1` the same way, so telling the one that needs
-        // the old value from the one that does not is a distinction this does not have.
+        // A read after the range and a write after it both count. The second is why: `Occurrence`
+        // records `y = 1` and `y += 1` the same way, so it cannot tell which needs the old value.
         assert!(borrowed("~y = 1~\nputs y\n").escapes);
         assert!(borrowed("~y = 1~\ny += 1\n").escapes);
         assert!(borrowed("y = 0\n~y = 1~\nputs y\n").escapes);
@@ -1069,8 +1245,8 @@ puts d
 
     #[test]
     fn which_variable_a_range_borrows_is_the_scope_stack_and_not_the_name() {
-        // Two `n`s: the block's own, which the range writes before it reads, and the method's,
-        // which the range never mentions. A name-based answer would pass one of them.
+        // Two `n`s: the block's own, which the range writes before reading, and the method's, which
+        // the range never mentions. A name-based answer would pass one of them.
         assert_eq!(
             borrowed("n = 1\n~[2].each { |n| puts n }~\nputs n\n"),
             Crossing {
@@ -1078,8 +1254,8 @@ puts d
                 escapes: false,
             }
         );
-        // An instance variable is not a local and is never a parameter: it travels with `self`,
-        // which an extracted method in the same class keeps.
+        // An instance variable is not a local and never a parameter. It travels with `self`, which
+        // an extracted method in the same class keeps.
         assert_eq!(borrowed("~puts @count~\n").reads, Vec::<String>::new());
     }
 
@@ -1102,11 +1278,11 @@ puts d
 
     #[test]
     fn nothing_that_is_not_an_instances_variable_has_an_accessor_site() {
-        // The whole of what the caller cannot work out for itself. Every one of these is an
-        // `@count` written inside a class, and for none of them would `attr_reader :count` read
-        // the variable being looked at: the first three are the class object's rather than an
-        // instance's, the fourth hangs off an object nobody can name without types, and the
-        // last has no class body to declare into at all.
+        // What the caller cannot work out alone. Each is an `@count` inside a class, and for none
+        // would `attr_reader :count` read that variable:
+        // - the first three belong to the class object, not an instance;
+        // - the fourth hangs off an object nobody can name without types;
+        // - the last has no class body to declare into.
         for marked in [
             "class Foo\n  def self.count\n    @count~\n  end\nend\n",
             "class Foo\n  class << self\n    def count\n      @count~\n    end\n  end\nend\n",
@@ -1117,8 +1293,8 @@ puts d
             "class Empty\nend\nclass Foo\n  def count\n    @other\n  end\nend\n@count~ = 1\n",
             // A local is not an instance variable.
             "class Foo\n  def count\n    count~ = 1\n  end\nend\n",
-            // A cursor *before* every site in the file, which is the other way the lookup can
-            // miss: the file has one and it is not this.
+            // A cursor *before* every site in the file: the other way the lookup can miss. The file
+            // has a site, just not this one.
             "~class Foo\n  def count\n    @count\n  end\nend\n",
         ] {
             let offset = marked.find('~').expect("a ~ marking the cursor") as u32;

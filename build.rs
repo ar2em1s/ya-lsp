@@ -1,13 +1,13 @@
 //! Embeds the vendored RBS signatures into the binary.
 //!
-//! `workspace::rbs` prefers an `rbs` gem found on disk. This is the rung below that: on a
-//! machine with no Ruby installed there is no other source of built-in signatures, and a server
-//! whose whole claim is "works without Ruby" cannot have `String` disappear there.
+//! `workspace::rbs` prefers an `rbs` gem found on disk. This is the rung below: on a machine with
+//! no Ruby installed there is no other source of built-in signatures, and a server whose whole
+//! claim is "works without Ruby" cannot have `String` disappear there.
 //!
-//! The generated file is a list of `(relative path, contents)`, one `include_str!` per
-//! signature. Packing them into a single blob with a hand-rolled index would save the compiler
-//! some work and cost a format nobody can read; `include_str!` also fails the build loudly if a
-//! vendored file stops being UTF-8, which is the only validation this stage can usefully do.
+//! The generated file is a list of `(relative path, contents)`, one `include_str!` per signature.
+//! Packing them into one blob with a hand-rolled index would save the compiler some work and cost a
+//! format nobody can read. `include_str!` also fails the build loudly if a vendored file stops
+//! being UTF-8, the only validation this stage can usefully do.
 
 use std::{
     env, fs,
@@ -29,8 +29,8 @@ fn main() {
 
     let mut files = Vec::new();
     collect(&vendor, &vendor, &mut files);
-    // Sorted so the generated file is stable: an unsorted `read_dir` order would make every
-    // rebuild on a different machine produce a different binary.
+    // Sorted so the generated file is stable: an unsorted `read_dir` order would make every rebuild
+    // on a different machine produce a different binary.
     files.sort();
     assert!(
         !files.is_empty(),
@@ -46,8 +46,8 @@ fn main() {
         let absolute = vendor.join(relative);
         println!("cargo:rerun-if-changed={}", absolute.display());
         // Forward slashes in the key on every platform: it becomes a path component below the
-        // extraction directory, and a literal backslash in a file name is not what Windows
-        // wants either.
+        // extraction directory, and Windows does not want a literal backslash in a file name
+        // either.
         let key = relative.to_string_lossy().replace('\\', "/");
         generated.push_str(&format!(
             "    ({:?}, include_str!({:?})),\n",

@@ -1,18 +1,17 @@
-"""Lane 3 — the adjudicated residue: a position no rule decides.
+"""Lane 3: the adjudicated residue, the positions no rule decides.
 
 Lane 1 says *wrong* against the source; lane 2 says *inconsistent* against the server's other
-answers. Everything they both stay silent about is this lane, and the only thing that can settle
-it is a person. So the lane's whole job is to make that work **cost once**: a verdict already in
-`audit/ledger.json` is reused, and only a new position asks anybody anything.
+answers. Whatever both are silent about lands here, and only a person can settle it. So the lane's
+job is to make that work **cost once**: a verdict already in `audit/ledger.json` is reused, and only
+a new position asks anyone anything.
 
-**There is no cap on how many positions this lane may hold.** A limit would be a number invented
-here rather than measured, and how much residue is worth adjudicating in a given release is a
-judgement about that release. What the report owes instead is the count, per corpus, so the size
-of the residue is visible before anyone commits to reading it.
+**No cap on how many positions this lane holds.** A limit would be an invented number, and how much
+residue is worth adjudicating is a judgement per release. The report shows the count per corpus
+instead, so the residue's size is visible before anyone commits to reading it.
 
-**A position whose line hash changed is dropped rather than re-scored.** That is the one rule in
-the lane that is not bookkeeping: a corpus edit shifts offsets, and a stale verdict carried
-forward reads as a regression that never happened.
+**A position whose line hash changed is dropped, not re-scored.** The one rule here that is not
+bookkeeping: a corpus edit shifts offsets, and a stale verdict carried forward reads as a regression
+that never happened.
 """
 
 from audit import site
@@ -28,9 +27,9 @@ def counters():
             "verdicts": {}, "residue-shapes": {}, "residue-signatures": {}}
 
 
-# How many places an answer named, as four buckets. Coarse on purpose: the question a signature
-# has to answer is "has a kind of position appeared that nobody has looked at", and a bucket per
-# integer would report the name list growing by one as a new kind.
+# How many places an answer named, as four buckets. Coarse on purpose: a signature asks "has a kind
+# of position appeared that nobody has looked at?", and a bucket per integer would report the name
+# list growing by one as a new kind.
 def places(count):
     return "0" if not count else "1" if count == 1 else "2-5" if count <= 5 else "6+"
 
@@ -38,13 +37,12 @@ def places(count):
 def signature(shape, card, found):
     """What a person would see at a position, as one string: shape, tier, how many places.
 
-    **A signature is a measurement and never a verdict.** Lane 3 cannot say whether a position is
-    right — that is what the ledger and a person are for. What it can say is which kinds of
-    position the residue holds, and the baseline then reports a **new** signature the same way it
-    reports a new finding. That is the honest form of "has anything appeared nobody has ruled on":
-    it names the shape of the gap and leaves the ruling where the ruling belongs.
+    **A measurement, never a verdict.** Lane 3 cannot say whether a position is right; the ledger
+    and a person do that. It can say which kinds of position the residue holds, and the baseline
+    reports a **new** signature the way it reports a new finding. That names the shape of the gap
+    and leaves the ruling to a person.
 
-    It carries no corpus text — a shape name, a tier name and a bucket — so it is safe to commit.
+    It carries no corpus text (a shape name, a tier name, a bucket), so it is safe to commit.
     """
     return f"{shape}/{tier(card) if card else 'no-card'}/{places(len(found))}"
 
@@ -52,20 +50,18 @@ def signature(shape, card, found):
 def run(corpus, drawn, answers, counts, findings, held):
     """Classify every drawn position. Returns `(counts, findings, residue)`.
 
-    `residue` is `[(index, path, line, offset, shape, hash)]` — what `ledger pending` would have
-    to ask a person about — and it is returned rather than written, because this lane reports a
-    size and the file records human work. A run that dumped its residue into the ledger would
-    commit thousands of rows nobody adjudicated and call them a ledger.
+    `residue` is `[(index, path, line, offset, shape, hash)]`: what `ledger pending` would ask a
+    person about. Returned, not written, because this lane reports a size and the file records human
+    work. Dumping the residue into the ledger would commit thousands of unadjudicated rows and call
+    them a ledger.
 
-    The draw index leads the tuple because a person cannot adjudicate a position from a path and
-    an offset: `adjudicate` needs the replies this run already collected, and the index is how it
-    finds them.
+    The draw index leads the tuple because nobody can adjudicate from a path and an offset:
+    `adjudicate` needs the replies this run collected, and the index finds them.
     """
     cell = counters()
-    # **One namespace, and it has to be `audit.site`.** Both halves of this union used to be draw
-    # indices — but the Rails key draws its own rows, so its findings numbered a different list,
-    # and every `rails-wrong` struck the sampled position that happened to share its number off
-    # the residue. Eleven of them on the last five-corpus sweep. A site cannot collide that way.
+    # **One namespace, and it must be `audit.site`.** The Rails key draws its own rows, so its
+    # findings index a different list than the sample's. As draw indices, every `rails-wrong` would
+    # strike off whichever sampled position shared its number. A site cannot collide that way.
     decided = {where for _, where, _ in findings}
     for key in counts.get("keys") or {}:
         decided |= (counts["keys"][key].get("covered") or set())
@@ -125,8 +121,8 @@ def under(counts):
     shapes = "  ".join(f"{k} {v}" for k, v in
                        sorted(counts["residue-shapes"].items(), key=lambda kv: -kv[1]))
     out = [f"residue   {shapes}"] if shapes else []
-    # The six widest signatures, because the tail is long and the terminal is not where a reader
-    # goes through it — `audit report` names the ones that moved, which is the useful half.
+    # The six widest signatures. The tail is long and the terminal is not where anyone reads it;
+    # `audit report` names the ones that moved, which is the useful half.
     top = sorted(counts["residue-signatures"].items(), key=lambda kv: -kv[1])[:6]
     if top:
         out.append("residue   " + "  ".join(f"{k} {v}" for k, v in top)

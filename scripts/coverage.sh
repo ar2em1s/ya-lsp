@@ -1,38 +1,37 @@
 #!/bin/sh
 # Gate line *and* branch coverage, and name the branch arms no test ever took.
 #
-# `cargo llvm-cov` can fail a build on lines, regions, functions and per-file lines. It cannot
-# fail one on branches — there is no `--fail-under-branches` — and branches are the number that
-# tells the truth about this suite, running well below lines. This script is the missing gate.
+# `cargo llvm-cov` can fail a build on lines, regions, functions and per-file lines, but not on
+# branches: there is no `--fail-under-branches`. Branches are the honest number for this suite
+# (they run well below lines), so this script is the missing gate.
 #
-# It reads llvm-cov's own report on stdin rather than recomputing anything, so the figures here
-# and the ones in the text report are the same figures. Nothing but `sh`, `awk` and `sort` is
-# used: a coverage gate that needs its own toolchain installed is one CI skips.
+# - **It reads llvm-cov's own report on stdin** and recomputes nothing, so its figures are the text
+#   report's figures.
+# - **It needs only `sh`, `awk` and `sort`.** A coverage gate that needs its own toolchain is one
+#   CI skips.
 #
 #   cargo +nightly llvm-cov report --branch --summary-only | scripts/coverage.sh --min-lines 95
 #   cargo +nightly llvm-cov report --branch --text          | scripts/coverage.sh --branches
 #
-# Three bars, with three different jobs. The **project** bar is the headline and catches aggregate
-# regression. The **per-file** bar (`--min-file-lines`) is lower on purpose: its job is that no
-# single file rots or lands uncovered, not to push every file to the project number — a 36-line
-# file is one uncovered line away from a five-point swing, so a high uniform bar is noise at that
-# scale rather than rigour. The **named floors** are where "this one has to be complete" gets said
-# explicitly, one reason per entry.
+# Three bars, three jobs:
+# - **Project** (`--min-lines`, `--min-branches`): the headline; catches aggregate regression.
+# - **Per file** (`--min-file-lines`): lower on purpose. Its job is that no single file rots or
+#   lands uncovered. A 36-line file swings five points per uncovered line, so a high uniform bar
+#   is noise at that scale.
+# - **Named floors** (`--floors`): where "this one must be complete" is said, one reason per entry.
 #
-# There is deliberately no uniform per-file *branch* bar: the smallest files here carry ten to
-# fourteen branches in total, which makes one untaken arm worth seven to ten points.
+# **No per-file *branch* bar**, on purpose: the smallest files have ten to fourteen branches, so
+# one untaken arm is worth seven to ten points.
 #
-# `--floors` raises the bar on named files past the project-wide one. `cargo-llvm-cov` has
-# `--fail-under-file-lines`, but it applies one number to *every* file, which in practice means
-# the number the weakest file can pass — the opposite of what a floor on a critical module is
-# for. Here each entry is `path=lines[:branches]`, and **a path that is not in the report is an
-# error**: a floor whose file was renamed away would otherwise pass forever while measuring
-# nothing.
+# **Why `--floors` and not `--fail-under-file-lines`:** cargo-llvm-cov's flag applies one number
+# to *every* file, which in practice is the number the weakest file can pass: the opposite of a
+# floor on a critical module. Here each entry is `path=lines[:branches]`, and **a path missing
+# from the report is an error**; otherwise a floor whose file was renamed would pass forever,
+# measuring nothing.
 #
-# In `--branches` mode the same branch is annotated once per instantiation, so an arm counts as
-# untaken only when every copy of it reads zero — which is why the counts are folded together
-# before anything is reported. Those totals are a pointer to the work, not the gate: llvm's own
-# summary skips folded regions and is the number that decides pass or fail.
+# **`--branches` folds instantiations.** The same branch is annotated once per instantiation, so
+# an arm counts as untaken only when every copy reads zero. These totals point at the work; they
+# are not the gate. llvm's own summary skips folded regions and decides pass or fail.
 
 set -eu
 
@@ -132,12 +131,12 @@ fi
 # ------------------------------------------------------------------ the table and the bars
 #
 # `--summary-only` prints one fixed set of columns per file, and no path in this crate has a
-# space in it:
+# space:
 #   1 file  2 regions 3 missed 4 cover  5 funcs 6 missed 7 executed
 #   8 lines 9 missed 10 cover  11 branches 12 missed 13 cover
 #
-# A file with no branches in it prints "-" for the last column. That is not 0%: it has taken
-# every branch it has, and scoring it zero would make such a file impossible to pass.
+# A file with no branches prints "-" in the last column. That is not 0%: it took every branch it
+# has, and scoring it zero would make it impossible to pass.
 
 body=$(mktemp) || exit 2
 trap 'rm -f "$report" "$body"' EXIT INT HUP TERM

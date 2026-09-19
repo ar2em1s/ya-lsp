@@ -6,7 +6,6 @@ use rubydex::model::{
 };
 
 use super::{
-    environment,
     locator::{self, Resolution},
     render,
     synthesized::Synthesized,
@@ -20,44 +19,50 @@ const MAX_CANDIDATES: usize = 10;
 ///
 /// # The shape of a card
 ///
-/// Every hover reads the same way, and the order is the point: **the answer, then what ya-lsp
-/// knows about the answer.** A fenced signature, a rule, RDoc's prose, and then the footnotes —
-/// one italic line each, at the bottom, never woven into the text above. A reader who trusts
-/// the answer stops at the fence; a reader who does not gets told why in the same place every
-/// time.
+/// Every card reads in the same order, and the order is the point: **the answer, then what ya-lsp
+/// knows about the answer.**
+/// 1. A fenced signature.
+/// 2. A rule.
+/// 3. RDoc's prose.
+/// 4. The footnotes: one italic line each, at the bottom, never woven into the text above.
 ///
-/// Everything a footnote says is about ya-lsp's confidence rather than about the code: the
-/// receiver's type was not known, or was derived rather than stated, or the class is reopened
-/// somewhere this card cannot show. That is the test for whether a new line belongs in one.
+/// A reader who trusts the answer stops at the fence; one who does not finds the reason in the same
+/// place every time.
+///
+/// A footnote is about ya-lsp's confidence, not the code: the receiver's type was unknown, or
+/// derived rather than stated, or the class is reopened somewhere this card cannot show. That is
+/// the test for whether a new line belongs there.
 ///
 /// # The three tiers, and why they are said out loud
 ///
-/// There are three answers rather than two, and a reader who cannot tell them
-/// apart has lost the property that makes this server different from one that guesses well:
+/// A reader who cannot tell the three apart loses what makes this server different from one that
+/// guesses well:
+/// - **resolved**: the code names the type. No footnote; nothing to doubt.
+/// - **derived**: ya-lsp followed something, like a return type RBS declares or an assignment in
+///   the same class. Correct if the signature is correct and that assignment is the one that ran.
+///   The footnote names what was followed, so a reader can check it.
+/// - **guessed**: matched on the method name alone. Always footnoted.
 ///
-/// - **resolved** — the code names the type. No footnote; there is nothing to doubt.
-/// - **derived** — ya-lsp followed something: a return type RBS declares, an assignment in the
-///   same class. Correct if the signature is correct and if that assignment is the one that
-///   ran. The footnote names what was followed, so a reader can go and check it.
-/// - **guessed** — matched on the method name alone. The footnote it always had.
-///
-/// `assignment_line` is the line an instance variable's assignment is on, one-based, because a
-/// card names a place a person can go to. It arrives already converted: the offset is turned
-/// into a line where the document's text is, which is not here.
+/// `assignment_line` is the one-based line of an instance variable's assignment, because a card
+/// names a place a person can go to. It arrives converted: offsets become lines where the
+/// document's text is, which is not here.
 #[must_use]
 pub fn markdown(
-    graph: &Graph,
     synthesized: &Synthesized,
-    layout: environment::Layout<'_>,
     modifiers: &locator::Modifiers<'_>,
+    sources: &types::Sources<'_>,
     resolution: &Resolution,
     assignment_line: Option<u32>,
     cursor: Option<&str>,
 ) -> Option<String> {
+    // The graph and the layout are read off `sources`, not passed again: they are two of its
+    // fields, and this signature should make it impossible to build a card from one graph with
+    // types from another.
+    let graph: &Graph = sources.graph;
     match resolution.declarations.as_slice() {
         [] => None,
         [only] => {
-            let mut card = card(graph, synthesized, layout, modifiers, *only, cursor)?;
+            let mut card = card(synthesized, modifiers, sources, *only, cursor)?;
             if !resolution.precise {
                 card.push_str(&footnote(&why_guessed(resolution.missed.as_ref())));
             }
@@ -66,27 +71,24 @@ pub fn markdown(
             }
             Some(card)
         }
-        // Only the name-based fallback can produce more than one, and picking one of them
-        // arbitrarily would be presenting a coin flip as an answer.
+        // Only the name-based fallback can produce more than one, and picking one arbitrarily would
+        // present a coin flip as an answer.
         many => Some(candidate_list(graph, many, resolution.missed.as_ref())),
     }
 }
 
 const GUESS: &str = "Matched on the method name alone — the receiver's type is unknown.";
 
-/// Why a guessed answer is a guess, which is not the same sentence every time.
+/// Why a guessed answer is a guess. Not the same sentence every time.
 ///
-/// **The receiver having no type and the receiver having no such member are different facts,
-/// and for two releases this card printed the first for both.** `completion` at the identical
-/// cursor never reaches a member lookup, so it goes on offering that class's members — which
-/// made *the receiver's type is unknown* a contradiction a user could see by pressing one more
-/// key. Measured over six corpora before the split, as cards saying the type was unknown while
-/// the list at that cursor was a class's members: **207 of 1,506** at an instance variable and
-/// **180 of 209** at a class object.
+/// **"The receiver has no type" and "the receiver has no such member" are different facts.**
+/// `completion` at the same cursor never reaches a member lookup, so it keeps offering that class's
+/// members. Saying *the receiver's type is unknown* there is a contradiction the user sees one
+/// keystroke later.
 ///
-/// The tier is untouched and so is the answer. A list matched on a name is a guess whichever
-/// of the two put it there, and [`Tier::Guessed`](types::Tier) is what a reader acts on; this
-/// only says which, so that the half with a class in it can be checked.
+/// The tier and the answer are untouched. A list matched on a name is a guess either way, and
+/// [`Tier::Guessed`](types::Tier) is what a reader acts on. This only says which case it is, so the
+/// half with a class in it can be checked.
 fn why_guessed(missed: Option<&locator::Missed>) -> String {
     let Some(missed) = missed else {
         return GUESS.to_owned();
@@ -96,14 +98,17 @@ fn why_guessed(missed: Option<&locator::Missed>) -> String {
     } else {
         format!("a `{}`", missed.class)
     };
-    // **What the class did with the member, and the two are not the same fact.** A lookup that
-    // came back empty means the class has no such method; a lookup the privacy gate refused
-    // means it has one and Ruby will not let it be called through a receiver that is written.
-    // Printing the first sentence for the second was the shape of defect this whole gate exists
-    // to remove, so it is not introduced here on the way out. See `locator::Missed::private`.
-    // **"keeps" and not "declares", because the member is usually inherited.** `RSpec.describe`
-    // is `Kernel`'s, reached through `Object`; `RSpec` does not declare it and does keep it
-    // private, which is the fact a reader needs and the only one of the two that is true.
+    // **What the class did with the member: two different facts.**
+    // - An empty lookup means the class has no such method.
+    // - A lookup the privacy gate refused means the method exists, but Ruby will not let a written
+    //   receiver call it.
+    //
+    // Printing the first sentence for the second is the defect this gate exists to remove. See
+    // `locator::Missed::private`.
+    //
+    // **"keeps", not "declares", because the member is usually inherited.** `RSpec.describe` is
+    // `Kernel`'s, reached through `Object`. `RSpec` does not declare it but does keep it private,
+    // and that is the true fact a reader needs.
     let outcome = if missed.private {
         "which keeps it private"
     } else {
@@ -122,54 +127,58 @@ fn why_guessed(missed: Option<&locator::Missed>) -> String {
 
 /// What ya-lsp followed to type the receiver, as the lines that go under the answer.
 ///
-/// One line per *kind* of thing followed rather than one per step: a chain of three signatures
-/// is one fact about this answer, not three, and three italic lines would read as three
-/// separate doubts. The signatures are named the way rubydex names them — `Kernel#tap()` and
-/// not `Array#tap()` — because that is the declaration the type actually came from and the one
-/// a reader would have to open.
+/// One line per *kind* of thing followed, not per step. A chain of three signatures is one fact,
+/// and three italic lines would read as three doubts. Signatures are named the way rubydex names
+/// them (`Kernel#tap()`, not `Array#tap()`), because that is the declaration the type came from and
+/// the one a reader would open.
 ///
-/// **The line deliberately does not say where a signature came from.** A signature may be
-/// `vendor/rbs`, a gem's own `sig/`, or text this crate generated, and telling them apart costs
-/// a lookup this line does not do. What it can say without checking anything is the useful
-/// half: the type was read off a declaration rather than off the expression under the cursor.
-/// Where *that* declaration came from is a question the card answers by hovering it, through
-/// the comment its generator wrote above it.
+/// **A run of one signature is named once, however long.** `Kernel#clone()` returns its receiver,
+/// so a chain of aliases through it (`@edit_user = @user.clone`) reads that declaration once per
+/// hop. [`types::Derivation`] still records every hop; only the sentence collapses. **Consecutive,
+/// never global**: `A#foo` → `B#bar` → `A#foo` is an alternation a reader can follow, not a repeat.
 ///
-/// **Shared with [`hints`](super::hints) rather than copied**, and that is the whole reason it
-/// is not private. An inlay hint's tooltip is this card's footnote in the only room a hint has,
-/// so the two saying different things about one derived answer would be a difference nobody
-/// could see — the card and the margin are never on screen at the same moment.
+/// **The line does not say where a signature came from.** It may be `vendor/rbs`, a gem's `sig/`,
+/// or text this crate generated; telling them apart costs a lookup. The useful half needs no check:
+/// the type was read off a declaration, not off the expression under the cursor. Hovering that
+/// declaration shows its source, through the comment its generator wrote.
+///
+/// **Shared with [`hints`](super::hints), not copied**, which is why it is not private. An inlay
+/// hint's tooltip is this card's footnote in the room a hint has. The card and the margin are never
+/// on screen together, so a difference between them would go unnoticed.
 pub(super) fn provenance(
     derivation: &types::Derivation,
     assignment_line: Option<u32>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
     if !derivation.signatures.is_empty() {
+        // `Vec::dedup` is exactly the rule above: it drops a run and keeps an alternation.
+        let mut walked = derivation.signatures.clone();
+        walked.dedup();
         notes.push(format!(
             "Type derived through {} — from what those methods declare, not from this expression.",
-            derivation
-                .signatures
+            walked
                 .iter()
                 .map(|name| format!("`{name}`"))
                 .collect::<Vec<_>>()
                 .join(" → ")
         ));
     }
-    // Beside the signatures rather than among them, because the line above says "those
-    // methods" and a constant is not one. The same strength of evidence and the same tier: the
-    // type is written down in a signature rather than read off the expression.
+    // Beside the signatures, not among them: the line above says "those methods", and a constant is
+    // not one. Same evidence, same tier: the type is written in a signature, not read off the
+    // expression.
     if let Some(constant) = &derivation.constant {
         notes.push(format!(
             "Type taken from the signature for `{constant}` — what it declares the constant \
              holds, not what this expression says."
         ));
     }
-    // The same fact as the note above it, written in Ruby rather than in RBS, and said
-    // differently for that reason: one names a signature a reader can go and read, the other
-    // names a line that will have run. Naming the file is what makes the second actionable —
-    // the constant is on screen already and the initializer that builds it is not.
-    // One shape and not two: `types::where_written` never answers empty, so there is no case
-    // here where the file has to be left out of the sentence.
+    // The same fact as the note above, written in Ruby instead of RBS, so said differently: one
+    // names a signature a reader can read, the other a line that will have run. Naming the file
+    // makes the second actionable: the constant is on screen, the initializer that builds it is
+    // not.
+    //
+    // One shape, not two: `types::where_written` never answers empty, so the file is never left
+    // out.
     if let Some(from) = &derivation.assigned_constant {
         notes.push(format!(
             "Type taken from where `{}` is assigned — `{}` line {} — and not from what this \
@@ -177,22 +186,33 @@ pub(super) fn provenance(
             from.constant, from.file, from.line
         ));
     }
+    // Same shape as the two above, one rung down: no signature said what the method returns, so the
+    // Ruby in its body answered. Naming the file and line makes it checkable. The body is, by
+    // construction, not the code on screen, and a reader who thinks another branch runs can go and
+    // look.
+    if let Some(from) = &derivation.body {
+        notes.push(format!(
+            "Type read out of `{}`'s body — `{}` line {} — because nothing declares what it \
+             returns.",
+            from.method, from.file, from.line
+        ));
+    }
     if let Some(line) = assignment_line {
         notes.push(format!(
             "Type taken from the assignment on line {line}, which may not be the one that ran."
         ));
     }
-    // A convention rather than a fact about this file, so the line it names is in another one.
-    // Naming both is the whole of what makes the convention shippable: a reader who thinks Rails
-    // renders this template from somewhere else can go and look.
+    // A convention, not a fact about this file, so the line it names is in another file. Naming
+    // both is what makes the convention shippable: a reader who thinks Rails renders this template
+    // from elsewhere can go and look.
     if let Some(from) = &derivation.renderer {
         notes.push(format!(
             "Type taken from `{}`, line {} — the {} Rails renders this template from.",
             from.renderer,
             from.line,
-            // A mailer is not a controller, and this footnote is read as a claim about the one
-            // class it names. `views::RenderedBy` carries which convention answered for exactly
-            // this sentence.
+            // A mailer is not a controller, and this footnote reads as a claim about the one class
+            // it names. `views::RenderedBy` carries which convention answered, for exactly this
+            // sentence.
             if from.controller {
                 "controller"
             } else {
@@ -200,9 +220,26 @@ pub(super) fn provenance(
             }
         ));
     }
-    // The view context, and it is a convention for the same reason the line above is: the template
-    // does not say which class renders it, and it does not say that `app/helpers` is in scope
-    // either. Both name what a reader would have to go and check.
+    // The other file an instance variable can be written in. Here the class is the reason, not a
+    // convention: the code's own `<` or `include` put it above this one. Name the file as well as
+    // the class: a concern is usually a file the reader never opened, and `AccountOwnedConcern`
+    // alone does not say where to look.
+    if let Some(from) = &derivation.ancestor {
+        notes.push(format!(
+            "Type taken from `{}` — `{}` line {} — which is above this class in its ancestry; \
+             nothing in this file assigns it.",
+            from.class, from.file, from.line
+        ));
+    }
+    // Which method `super` climbed to: the one thing the body note beside it cannot say, since it
+    // names the `def` the reader stands in, which is a bare `super`. A name, not a place: the note
+    // above already gave a place, and the name is what a reader types into the jump box next.
+    if let Some(reached) = &derivation.superclass {
+        notes.push(climbed_to(reached));
+    }
+    // The view context: a convention for the same reason as the line above. The template says
+    // neither which class renders it nor that `app/helpers` is in scope. Both name what a reader
+    // would have to check.
     if let Some(reached) = &derivation.view {
         notes.push(match reached {
             views::InView::Helper => "Reached through the view context — Rails includes every \
@@ -217,11 +254,10 @@ pub(super) fn provenance(
                 .to_owned(),
         });
     }
-    // A block in a class body is the one place `self` is not what the file says it is: the
-    // block is a value, and whoever takes it may run it against something else. So the line
-    // states the evidence rather than the conclusion — the name is not on the class object and
-    // is on an instance — and names the class, which is what a reader would have to go and
-    // check.
+    // A block in a class body is the one place `self` is not what the file says: the block is a
+    // value, and whoever takes it may run it against something else. So the line states the
+    // evidence, not the conclusion (the name is not on the class object but is on an instance), and
+    // names the class a reader would have to check.
     if let Some(class) = &derivation.closure {
         notes.push(format!(
             "Found on an instance of `{class}` — `self` in a block written into a class \
@@ -229,15 +265,15 @@ pub(super) fn provenance(
              name is only on an instance."
         ));
     }
-    // The symbol's own line, and the only one of these that is about what the cursor is rather
-    // than about what a receiver turned out to be.
+    // The symbol's own line: the only one of these about what the cursor is, not what a receiver
+    // turned out to be.
     if let Some(macro_name) = &derivation.named_by {
         notes.push(format!(
             "Named by `{macro_name}` — the symbol is a method name because the macro says so, \
              not because the code spells it as a call."
         ));
     }
-    // Last, because it is the largest caveat on the card and the one a reader must not miss.
+    // Last: it is the largest caveat on the card and the one a reader must not miss.
     if let Some(name) = &derivation.guess {
         notes.push(format!(
             "Type guessed from the name `{name}` alone — nothing in the code says so."
@@ -248,35 +284,56 @@ pub(super) fn provenance(
 
 /// What ya-lsp knows about an answer, as one italic line under it.
 ///
-/// The single place the convention lives, because it was two before: a guessed single match
-/// carried it as a trailing italic and a guessed *list* carried the same sentence inline after
-/// an em dash, in bold, at the top. Same fact, same uncertainty, two shapes.
+/// The one place this convention lives, so a single guessed match and a guessed list carry the same
+/// fact in the same shape.
 fn footnote(note: &str) -> String {
     format!("\n\n*{note}*")
 }
 
 fn card(
-    graph: &Graph,
     synthesized: &Synthesized,
-    layout: environment::Layout<'_>,
     modifiers: &locator::Modifiers<'_>,
+    sources: &types::Sources<'_>,
     declaration_id: DeclarationId,
     cursor: Option<&str>,
 ) -> Option<String> {
+    let graph: &Graph = sources.graph;
+    let layout = sources.layout;
     let declaration = graph.declarations().get(&declaration_id)?;
     let definitions = locator::definitions_of(graph, declaration_id);
-    // What a person wrote, and what ya-lsp wrote about it. The split is the whole of this
-    // function's rule: prose from a file goes in the body, and prose this crate generated goes
-    // in a footnote, because a footnote is already defined as "what ya-lsp knows about the
-    // answer" and a generated comment is nothing else.
+    // What a person wrote, and what ya-lsp wrote about it. That split is this function's rule:
+    // prose from a file goes in the body, and prose this crate generated goes in a footnote. A
+    // footnote is defined as "what ya-lsp knows about the answer", and a generated comment is
+    // exactly that.
     let (generated, written): (Vec<&Definition>, Vec<&Definition>) = definitions
         .iter()
         .copied()
         .partition(|definition| synthesized.is_generated(definition.uri_id()));
 
+    // **The half about the method, not the receiver**: show types even on methods that do not
+    // declare them. A `def` whose return **is** declared draws nothing here. Showing a declared
+    // return is a separate decision about the card's shape; the body rung only adds what it
+    // answered.
+    let returns = matches!(declaration, Declaration::Method(_))
+        .then(|| {
+            sources
+                .types
+                .declared_return(declaration_id)
+                .is_none()
+                .then(|| types::body_return(sources, declaration_id))
+                .flatten()
+        })
+        .flatten();
     let mut card = format!(
-        "```ruby\n{}\n```",
-        signature(graph, modifiers, declaration_id, declaration, &definitions)
+        "```ruby\n{}{}\n```",
+        signature(graph, modifiers, declaration_id, declaration, &definitions),
+        // Through `render`, not off the declaration: a class nothing named is keyed
+        // `<id>:<offset><anonymous>`, and a key must never be printed at a reader, just as for the
+        // receiver half.
+        returns
+            .as_ref()
+            .map_or_else(String::new, |typed| render::typed(graph, typed)
+                .map_or_else(String::new, |spelled| format!(" -> {spelled}")))
     );
 
     if let Some(documentation) = written
@@ -287,23 +344,24 @@ fn card(
         card.push_str(&documentation);
     }
 
-    // Reopened classes and monkey-patched methods are the norm in Ruby, and the one thing a
-    // hover cannot show is the code that is somewhere else. **The count is the list**, asked of
-    // the one function `definition` answers from: a generated declaration that maps to a line is
-    // a place and one that maps to nothing is not, an annotation that types a method the user
-    // already wrote is the same place twice rather than two of them, and a signature or a copy
-    // the project would not load is not a place at all. A second arithmetic here is how a card
-    // comes to claim a number no jump can produce — which is why the cursor travels this far:
-    // `places` fences a copy only the suite loads, and a count that did not would disagree with
-    // the jump the reader takes from the same position.
+    // Reopened classes and monkey-patched methods are the norm in Ruby, and a hover cannot show
+    // code that is elsewhere.
+    //
+    // **The count is the list**, asked of the function `definition` answers from:
+    // - a generated declaration that maps to a line is a place; one that maps to nothing is not;
+    // - an annotation typing a method the user wrote is the same place, not two;
+    // - a signature, or a copy the project would not load, is not a place.
+    //
+    // A second arithmetic here would let a card claim a number no jump can produce. That is why the
+    // cursor travels this far: `places` fences a copy only the suite loads, and a count that did
+    // not would disagree with the jump from the same position.
     let places = locator::places(graph, synthesized, layout, declaration_id, cursor).len();
     if places > 1 {
         card.push_str(&footnote(&format!("Defined in {places} places.")));
     }
 
-    // One line per generated definition that explains itself, deduplicated, because two
-    // generators writing the same sentence about one member is a bug in them and not a fact a
-    // reader should be shown twice.
+    // One line per self-explaining generated definition, deduplicated. Two generators writing the
+    // same sentence about one member is their bug, not a fact to show twice.
     let mut said: Vec<String> = Vec::new();
     for documentation in generated
         .iter()
@@ -315,7 +373,35 @@ fn card(
         }
     }
 
+    // Last, under everything the file said: the one line on this card that is ya-lsp's inference,
+    // not the source's.
+    if let Some(from) = returns
+        .as_ref()
+        .and_then(|typed| typed.derivation.body.as_ref())
+    {
+        card.push_str(&footnote(&format!(
+            "Return type read out of the body — `{}` line {} — because nothing declares it.",
+            from.file, from.line
+        )));
+    }
+    // Under that, where the body went. The line above names the `def` a reader can open. When that
+    // `def` is a bare `super` it says nothing alone, so this names what the keyword reached.
+    if let Some(reached) = returns
+        .as_ref()
+        .and_then(|typed| typed.derivation.superclass.as_ref())
+    {
+        card.push_str(&footnote(&climbed_to(reached)));
+    }
+
     Some(card)
+}
+
+/// The one sentence `super` earns, written once for the two cards that print it.
+///
+/// A member's own card and a receiver's chain both reach this rung. Two wordings would make a
+/// reader wonder whether they meant the same thing.
+fn climbed_to(reached: &str) -> String {
+    format!("`super` here reaches `{reached}`, which is where the type was read from.")
 }
 
 fn signature(
@@ -328,8 +414,8 @@ fn signature(
     let name = declaration.name();
     match declaration {
         Declaration::Namespace(namespace) => match namespace {
-            // `Class.new` is the whole construct — there is no `class Foo` line to echo back,
-            // so the call stands on its own the way `class << Book` does below.
+            // `Class.new` is the whole construct. There is no `class Foo` line to echo, so the call
+            // stands alone, as `class << Book` does below.
             rubydex::model::declaration::Namespace::Class(_)
             | rubydex::model::declaration::Namespace::Module(_)
                 if render::is_anonymous(name) =>
@@ -338,8 +424,8 @@ fn signature(
             }
             rubydex::model::declaration::Namespace::Class(_) => format!("class {name}"),
             rubydex::model::declaration::Namespace::Module(_) => format!("module {name}"),
-            // `Person::<Person>` is rubydex's name for what the source writes as
-            // `class << self` inside `class Person`.
+            // `Person::<Person>` is rubydex's name for what the source writes as `class << self`
+            // inside `class Person`.
             rubydex::model::declaration::Namespace::SingletonClass(_) => {
                 format!("class << {}", attached_name(name))
             }
@@ -355,10 +441,10 @@ fn signature(
             });
             let visibility = match method.map(|method| method.visibility()) {
                 Some(Visibility::Public) | None => String::new(),
-                // **The record is reread before the word is printed.** A bare `private` written
-                // inside a block is recorded against every `def` below the block, so this line
-                // printed *private* over a public method — the same false sentence the gate
-                // refuses to jump on, arriving in the card instead. See `locator::Modifiers`.
+                // **The record is reread before the word is printed.** A bare `private` inside a
+                // block is recorded against every `def` below the block. Trusting it would print
+                // *private* over a public method: the false sentence the gate refuses to jump on,
+                // arriving in the card instead. See `locator::Modifiers`.
                 Some(Visibility::Private | Visibility::ModuleFunction)
                     if !modifiers.confirm(graph, declaration_id) =>
                 {
@@ -375,14 +461,12 @@ fn signature(
     }
 }
 
-/// `Person::<Person>` -> `Person`, `Shelf::Book::<Book>` -> `Shelf::Book`, `<Person>` ->
-/// `Person`.
+/// `Person::<Person>` -> `Person`, `Shelf::Book::<Book>` -> `Shelf::Book`, `<Person>` -> `Person`.
 ///
-/// The part *before* the `::<`, not the part inside it: rubydex writes the attached name
-/// unqualified there, so reading it out of the brackets gives `class << Book` for a class every
-/// other card on the same page calls `Shelf::Book`. Nothing was wrong with the old spelling
-/// until a fixture put the cards side by side — the one test that covered this construct used a
-/// top-level module, where the two spellings are the same string.
+/// The part *before* the `::<`, not inside it. rubydex writes the attached name unqualified in the
+/// brackets, so reading it there would give `class << Book` for a class every other card calls
+/// `Shelf::Book`. A top-level module hides the difference, since both spellings are the same
+/// string.
 fn attached_name(name: &str) -> &str {
     match name.rsplit_once("::<") {
         Some((attached, _)) => attached,
@@ -395,11 +479,10 @@ fn candidate_list(
     declarations: &[DeclarationId],
     missed: Option<&locator::Missed>,
 ) -> String {
-    // Paired with whether Ruby named it, which sorts `false` first: a `Class.new` nothing
-    // bound to a constant is a row the reader cannot look up, so it goes below every row they
-    // can — the list has ten places and the alphabet was handing them to whatever sorted
-    // first. The pair is what deduplicates, so two of them collapse into one row and the
-    // count says what the list says.
+    // Paired with whether Ruby named it, which sorts `false` first. A `Class.new` bound to no
+    // constant is a row the reader cannot look up, so it goes below every row they can; the list
+    // has ten places. The pair also deduplicates, so two such rows collapse into one and the count
+    // matches the list.
     let mut names: Vec<(bool, String)> = declarations
         .iter()
         .filter_map(|id| graph.declarations().get(id))
@@ -422,9 +505,9 @@ fn candidate_list(
     if total > MAX_CANDIDATES {
         listing.push_str(&format!("\n- …and {} more", total - MAX_CANDIDATES));
     }
-    // The list is the answer; why it is a list is the footnote, in the place every other card
-    // puts one — and it is the same sentence the single-match card above draws, because a
-    // reader seeing eleven candidates needs the reason more than one seeing a single row does.
+    // The list is the answer; why it is a list is the footnote, where every other card puts one. It
+    // is the same sentence as the single-match card above: a reader facing eleven candidates needs
+    // the reason more than one facing a single row.
     listing.push_str(&footnote(&why_guessed(missed)));
     listing
 }
@@ -435,9 +518,62 @@ mod tests {
     use super::*;
     use crate::analysis::testing::*;
 
-    // `hover::card` is a different function with the same name; the tests here want the
-    // harness helper, and an explicit import outranks both globs.
+    // `hover::card` is a different function with the same name. The tests want the harness helper,
+    // and an explicit import outranks both globs.
     use crate::analysis::testing::card;
+
+    #[test]
+    fn a_run_of_one_signature_is_one_hop_in_the_footnote() {
+        /// The note [`provenance`] writes for a chain that walked these declarations.
+        fn through(walked: &[&str]) -> String {
+            let derivation = types::Derivation {
+                signatures: walked.iter().map(|name| (*name).to_owned()).collect(),
+                ..types::Derivation::default()
+            };
+            provenance(&derivation, None).join("\n")
+        }
+        // The motivating shape: `Kernel#clone` returns its own receiver, so a chain of aliases
+        // through it reads one declaration per hop. Nine hops, one fact.
+        assert!(
+            through(&["Kernel#clone()"; 9])
+                .contains("through `Kernel#clone()` — from what those methods declare"),
+            "{}",
+            through(&["Kernel#clone()"; 9])
+        );
+        // A real chain is still a chain, and the arrows are what make it readable.
+        assert!(
+            through(&["String#upcase()", "String#length()"])
+                .contains("through `String#upcase()` → `String#length()` —"),
+            "{}",
+            through(&["String#upcase()", "String#length()"])
+        );
+        // Consecutive, never global. An alternation is a walk a reader can follow; collapsing the
+        // second `A#foo` into the first would claim a shorter chain.
+        assert!(
+            through(&["A#foo()", "B#bar()", "A#foo()"])
+                .contains("through `A#foo()` → `B#bar()` → `A#foo()` —"),
+            "{}",
+            through(&["A#foo()", "B#bar()", "A#foo()"])
+        );
+    }
+
+    #[test]
+    fn a_type_read_through_super_names_the_method_super_reached() {
+        // The one thing the body note beside it cannot say. That note names the `def` the reader
+        // stands in, which is a bare `super`. Without this, the card says a type was read out of a
+        // body whose whole text is `super`.
+        let derivation = types::Derivation {
+            superclass: Some("Base#name()".to_owned()),
+            ..types::Derivation::default()
+        };
+        let notes = provenance(&derivation, None).join("\n");
+        assert!(
+            notes.contains("`super` here reaches `Base#name()`"),
+            "{notes}"
+        );
+        // A name, not a place: it is what a reader types into the jump box next.
+        assert!(!notes.contains("line"), "{notes}");
+    }
 
     #[test]
     fn a_singleton_class_hovers_as_the_source_wrote_it() {
@@ -462,10 +598,9 @@ mod tests {
 
     #[test]
     fn an_anonymous_rest_parameter_hovers_as_ruby_wrote_it() {
-        // rubydex records an anonymous `*`, `**` or `&` under the sigil itself rather than
-        // under an empty name, so prepending a second sigil in `render` would spell `**` as
-        // `****`. The pure test in `render` pins the spelling; this pins the convention it is
-        // written against, which is rubydex's to change.
+        // rubydex records an anonymous `*`, `**` or `&` under the sigil itself, not an empty name,
+        // so adding a sigil in `render` would spell `**` as `****`. The pure test in `render` pins
+        // the spelling; this pins rubydex's convention, which rubydex may change.
         let mut harness = Harness::new();
         let source = "class Relay\n  def send_on(one, *, k:, **, &)\n  end\nend\n";
         let uri = harness.write("lib/relay.rb", source);
@@ -483,10 +618,10 @@ mod tests {
 
     #[test]
     fn every_kind_of_parameter_ruby_has_is_spelled_the_way_it_was_written() {
-        // `render::parameter_list` has an arm per `Parameter` variant and two had never been
-        // asked for — an optional keyword and a forwarding `...`. `def call(retries: 3)` is
-        // ordinary Ruby, and its hover is the only place a reader learns the argument is
-        // optional at all: `retries:` and `retries: ...` say different things.
+        // `render::parameter_list` has an arm per `Parameter` variant, including an optional
+        // keyword and a forwarding `...`. `def call(retries: 3)` is ordinary Ruby, and hover is the
+        // only place a reader learns the argument is optional: `retries:` and `retries: ...` say
+        // different things.
         let mut harness = Harness::new();
         let source = "class Job\n  def call(one, two = 1, *rest, key:, opt: 2, **kw, &blk)\n                        end\n\n  def forward(...)\n  end\nend\n";
         let uri = harness.write("lib/job.rb", source);
@@ -510,8 +645,8 @@ mod tests {
 
     #[test]
     fn a_singleton_method_hovers_as_ruby_spells_it() {
-        // rubydex calls this `Person::<Person>#build()`. Showing that to a user would be
-        // showing them the index's internals.
+        // rubydex calls this `Person::<Person>#build()`. Showing that would show the user the
+        // index's internals.
         let (mut harness, uri) = library();
         let markdown = harness.hover_at(&uri, LIBRARY, "build(name)")["contents"]["value"]
             .as_str()
@@ -522,10 +657,9 @@ mod tests {
 
     #[test]
     fn hover_names_every_construct_the_way_ruby_writes_it() {
-        // `hover::signature` has an arm per kind of declaration and only two of them — a class
-        // and a public method — had ever been asked for. The rest were reachable, rendered, and
-        // asserted nowhere: a module hovering as `class`, or a private method hovering without
-        // its visibility, would have gone out under a green suite.
+        // `hover::signature` has an arm per kind of declaration, and each must be asserted.
+        // Otherwise a module hovering as `class`, or a private method without its visibility, would
+        // ship under a green suite.
         let mut harness = Harness::new();
         let source = "\
 # A place to keep things.
@@ -560,15 +694,15 @@ end
         assert!(module.contains("module Storage"), "{module}");
         assert!(module.contains("A place to keep things."), "{module}");
 
-        // rubydex spells this `Storage::<Storage>`, which is not what the file says.
-        // On `self`, not on the keyword: a definition matches its *name* span, which for
-        // `class << self` is the receiver, so hover does not fire over the `class` either.
+        // rubydex spells this `Storage::<Storage>`, which is not what the file says. The cursor is
+        // on `self`, not the keyword: a definition matches its *name* span, which for
+        // `class << self` is the receiver, so hover does not fire over `class` either.
         assert!(harness.hover_at(&uri, source, "class << self").is_null());
         let singleton = markdown(&mut harness, "self");
         assert!(singleton.contains("class << Storage"), "{singleton}");
 
-        // The visibility prefix, which is the whole reason a reader hovers a method they did
-        // not write: `stash` is callable from inside `Storage` and nowhere else.
+        // The visibility prefix, the main reason to hover a method you did not write: `stash` is
+        // callable from inside `Storage` and nowhere else.
         let private = markdown(&mut harness, "stash(thing)");
         assert!(private.contains("private "), "{private}");
         assert!(private.contains("Storage#stash(thing)"), "{private}");
@@ -622,15 +756,12 @@ end
     #[test]
     fn every_hover_card_in_one_file_drawn_side_by_side() {
         // The first-ten treatment, for an answer that is not a list. `ANCESTRY` pins ten rows
-        // because a ranking is composition rather than a feature; a hover card is the same kind
-        // of object, and until this existed every construct was checked by a `contains`
-        // somewhere and no two were ever read next to each other. Which is how the singleton
-        // card came to be the only one on this page that drops its namespace — `class << Book`
-        // above a `private Shelf::Book#hide` — through a test that covered the construct, on a
-        // top-level module where the two spellings are the same string.
+        // because a ranking is a composition; a hover card is too. Checked one `contains` at a
+        // time, no two cards are read side by side, and one card can drift (say, the singleton card
+        // dropping its namespace: `class << Book` above `private Shelf::Book#hide`) unnoticed.
         //
-        // Pinned whole, and pinned *together*: the failure this shape catches is one card
-        // drifting away from the others, which every card asserted on its own is blind to.
+        // Pinned whole, and pinned *together*: this catches one card drifting from the others,
+        // which per-card assertions cannot see.
         let mut harness = Harness::new();
         let uri = harness.write("app/shelf.rb", GALLERY);
         harness.index();
@@ -743,11 +874,10 @@ anything.hop(1)
 
     #[test]
     fn a_class_ruby_never_named_hovers_as_the_call_that_built_it() {
-        // `Class.new` is an expression, so what it builds has no name until something binds it
-        // to a constant — and where nothing does, rubydex keys it by document and offset.
-        // Every card that reached one was printing that key at the user, and a key is not a
-        // name: measured over the five corpora, 571 of these own a method and so can be
-        // reached, and not one is bound to a constant that would name it.
+        // `Class.new` is an expression, so what it builds has no name until something binds it to a
+        // constant. Where nothing does, rubydex keys it by document and offset. A key is not a
+        // name, and no card may print one at the user. Such classes are common in real apps, and
+        // they often own methods a cursor can reach.
         let mut harness = Harness::new();
         let uri = harness.write("app/unnamed.rb", UNNAMED);
         harness.index();
@@ -757,14 +887,16 @@ anything.hop(1)
             card(&mut harness, &uri, UNNAMED, "self\n"),
             "```ruby\nClass.new\n```"
         );
-        // The method, from its own `def`.
+        // The method, from its own `def`, and its return, which the body rung reads from the `self`
+        // in it. That return is the anonymous class too, so the label goes through `render` as
+        // well, or the key would appear twice on one line.
         assert_eq!(
             card(&mut harness, &uri, UNNAMED, "hop(a)\n    self"),
-            "```ruby\nClass.new#hop(a)\n```"
+            "```ruby\nClass.new#hop(a) -> Class.new\n```\n\n*Return type read out of the \
+             body — `app/unnamed.rb` line 2 — because nothing declares it.*"
         );
-        // And a module, which rubydex spells exactly as it spells the class — so the
-        // declaration is asked rather than assumed. Over the five corpora 365 of those 571 are
-        // modules, which is the majority a guess would have got wrong.
+        // And a module, which rubydex spells exactly like the class, so the declaration is asked,
+        // not assumed. In real apps most of these are modules, so a guess would usually be wrong.
         assert_eq!(
             card(
                 &mut harness,
@@ -778,11 +910,11 @@ anything.hop(1)
 
     #[test]
     fn a_list_of_candidates_spends_its_rows_on_the_names_a_reader_can_look_up() {
-        // Five declarations of `hop`, three of them in namespaces Ruby never named. Sorting
-        // the keys alphabetically put those first — a digit sorts below every letter — so a
-        // card with forty candidates spent all ten of its rows on numbers. They rank last now,
-        // and the two `Class.new`s collapse into one row because they spell the same thing,
-        // which is what the count above the list counts.
+        // Five declarations of `hop`, three in namespaces Ruby never named. Sorted by key alone,
+        // those come first (a digit sorts below every letter), so a card with forty candidates
+        // would spend all ten rows on numbers. They rank last, and the two `Class.new`s collapse
+        // into one row because they spell the same thing, which is what the count above the list
+        // counts.
         let mut harness = Harness::new();
         let uri = harness.write("app/unnamed.rb", UNNAMED);
         harness.index();
@@ -810,26 +942,26 @@ anything.hop(1)
             .to_owned();
         assert!(markdown.contains("class Person"), "{markdown}");
         assert!(markdown.contains("Someone with a name."), "{markdown}");
-        // The whole point: the rest of the class is in a place this hover cannot show.
+        // The point: the rest of the class is somewhere this hover cannot show.
         assert!(markdown.contains("Defined in 2 places"), "{markdown}");
     }
 
     #[test]
     fn a_core_method_hovers_as_rdoc_written_in_markdown() {
-        // The whole card, not a `contains`. A hover card is a composition, so asserting its
-        // parts one `contains` at a time is how the two shapes of one answer — a guessed single
-        // match and a guessed list — drift apart.
+        // The whole card, not a `contains`. A hover card is a composition, and asserting parts one
+        // `contains` at a time is how the two shapes of one answer (a guessed single match and a
+        // guessed list) drift apart.
         //
-        // What this pins on the way past: `<code>self</code>` reaching the user as markdown
-        // rather than as a span a client silently eats, `[Case Mapping](rdoc-ref:…)` losing a
-        // link that goes nowhere while keeping its words, the call-seq lifted out of RDoc's HTML
-        // header as Ruby, and the indented example surviving untouched.
+        // Pinned along the way:
+        // - `<code>self</code>` reaches the user as markdown, not a span a client silently eats;
+        // - `[Case Mapping](rdoc-ref:…)` loses a link that goes nowhere but keeps its words;
+        // - the call-seq is lifted out of RDoc's HTML header as Ruby;
+        // - the indented example survives untouched.
         //
-        // **No footnote at all.** `greeting` is a local assigned a string literal, which
-        // completion types exactly and which hover would otherwise match on the name. Both go
-        // through `types::method_receiver`, so a card that would carry "matched on the method
-        // name alone" carries nothing instead — there is nothing to doubt, and it is not a
-        // *derived* answer either: a literal assigned one line up is code the reader can see.
+        // **No footnote at all.** `greeting` is a local assigned a string literal. Completion types
+        // it exactly, and so does hover, through the same `types::method_receiver`, instead of
+        // matching on the name. It is not *derived* either: a literal assigned one line up is code
+        // the reader can see.
         let source = "greeting = \"hello\"\ngreeting.upcase\n";
         let (mut harness, uri) = with_signatures(source);
         assert_eq!(
@@ -854,10 +986,10 @@ anything.hop(1)
 
     #[test]
     fn a_stdlib_method_hovers_the_same_way_a_core_one_does() {
-        // Different directory under the rbs root, same card. `<tt>` is RDoc's other spelling of
-        // `<code>` and appears 22 times in the vendored signatures; it must not be the one that
-        // still leaks. The footnote went the same way it did above, and for the same reason:
-        // `parser = OptionParser.new` is a receiver the code names.
+        // A different directory under the rbs root, same card. `<tt>` is RDoc's other spelling of
+        // `<code>` and appears throughout the vendored signatures; it must not leak either. No
+        // footnote, for the same reason as above: `parser = OptionParser.new` is a receiver the
+        // code names.
         let source = "parser = OptionParser.new\nparser.parse!\n";
         let (mut harness, uri) = with_signatures(source);
         assert_eq!(
@@ -878,22 +1010,26 @@ anything.hop(1)
 
     #[test]
     fn every_shape_of_card_puts_what_it_knows_in_the_same_place() {
-        // The four cards side by side, which is the only way the convention is visible: answer
-        // first, then one italic line per thing ya-lsp knows *about* the answer. A precise hit
-        // says nothing extra; a reopened class says where else it lives; a guess says it is a
-        // guess; and a guess with more than one candidate says the same sentence in the same
-        // place, rather than in bold at the top after an em dash.
+        // The four cards side by side: the only way to see the convention. Answer first, then one
+        // italic line per thing ya-lsp knows *about* the answer.
+        // - A precise hit says nothing extra.
+        // - A reopened class says where else it lives.
+        // - A guess says it is a guess.
+        // - A guess with several candidates says the same sentence in the same place.
         let source =
             "class Radio\n  def shout; end\nend\n\nPerson.build(\"x\")\nthing.shout\nthing.extra\n";
         let (mut harness, uri) = with_signatures(source);
 
-        // Precise: a constant receiver is the one thing rubydex can name without inference.
+        // Precise: a constant receiver is the one thing rubydex names without inference. The return
+        // is the body rung's, and its footnote is the last line: documentation first, then what
+        // ya-lsp knows *about* the answer.
         assert_eq!(
             card(&mut harness, &uri, source, "build("),
-            "```ruby\nPerson.build(name)\n```\n\n---\n\nBuild one."
+            "```ruby\nPerson.build(name) -> Person\n```\n\n---\n\nBuild one.\n\n*Return \
+             type read out of the body — `lib/person.rb` line 10 — because nothing declares it.*"
         );
 
-        // Reopened, and the one thing a hover cannot show is the half that is elsewhere.
+        // Reopened: a hover cannot show the half that is elsewhere.
         assert_eq!(
             card(&mut harness, &uri, source, "Person.build"),
             "```ruby\nclass Person\n```\n\n---\n\nSomeone with a name.\n\nReopened \
@@ -907,8 +1043,8 @@ anything.hop(1)
              receiver's type is unknown.*"
         );
 
-        // Several: a list, and the same caveat in the same place. Naming one of them would be
-        // presenting a coin flip as an answer.
+        // Several: a list, with the same caveat in the same place. Naming one would present a coin
+        // flip as an answer.
         assert_eq!(
             card(&mut harness, &uri, source, "shout\n"),
             "**2 possible definitions**\n\n- `Person#shout`\n- `Radio#shout`\n\n*Matched on \
@@ -918,28 +1054,25 @@ anything.hop(1)
 
     #[test]
     fn an_anonymous_class_is_named_by_the_call_that_built_it() {
-        // **A type that cannot be *opened* is not a type that cannot be *said*, and this card
-        // collapsed the two.** rubydex keys a `Class.new` nothing binds to a constant by
-        // document and offset, `render::spelled` replaces that key with the call that built it
-        // on five other surfaces — the candidate list on this very card among them — and
-        // `locator::missed` was the one place that read the key raw, failed `is_nameable` and
-        // fell back to *the receiver's type is unknown*. The type is known. It has no name to
-        // open, which is a different sentence.
+        // **A type that cannot be *opened* is still a type that can be *said*.** rubydex keys a
+        // `Class.new` bound to no constant by document and offset. `render::spelled` replaces that
+        // key with the call that built it on every surface, this card's candidate list included.
+        // `locator::missed` must do the same instead of reading the raw key, failing `is_nameable`,
+        // and falling back to *the receiver's type is unknown*. The type is known; it just has no
+        // name to open.
         //
-        // It is also the sentence `completion` contradicts: a cursor here is offered that
-        // class's own members, which is what the audit's check 6 holds a card against. Defect
-        // 34 was the other half of this — a `self` captured *outside* such a block, where the
-        // answer was wrong as well as the sentence.
+        // That sentence would also contradict `completion`, which offers this class's own members
+        // at the same cursor.
         let source = "class Radio\n  def ping; end\nend\n\nClass.new do\n  self.ping\nend\n";
         let (mut harness, uri) = with_signatures(source);
 
-        // **The class object, and that half is the ordering.** `self` in a class body is the
-        // singleton, which rubydex spells `<key><anonymous>::<<key><anonymous>>` — a shape
-        // `class_object_of` cannot recognise, because its `prefix.ends_with(singleton)` test
-        // fails on the raw key. Spelled first it reads `Class.new::<Class.new>`, which it
-        // recognises exactly, so the sentence gets both facts rather than neither.
+        // **The class object, and that half depends on the ordering.** `self` in a class body is
+        // the singleton, which rubydex spells `<key><anonymous>::<<key><anonymous>>`.
+        // `class_object_of` cannot recognise that: its `prefix.ends_with(singleton)` test fails on
+        // the raw key. Spelled first, it reads `Class.new::<Class.new>`, which it recognises
+        // exactly, so the sentence gets both facts.
         //
-        // `"ping\n"` finds the call and not the `def ping; end` above it, which has a `;`.
+        // `"ping\n"` finds the call, not the `def ping; end` above it, which has a `;`.
         assert_eq!(
             card(&mut harness, &uri, source, "ping\n"),
             "```ruby\nRadio#ping\n```\n\n*Matched on the method name alone — the receiver is the \
@@ -949,55 +1082,49 @@ anything.hop(1)
 
     #[test]
     fn a_guessed_card_says_which_of_the_two_guesses_it_is() {
-        // **The receiver having no type and the receiver having no such member are different
-        // facts, and this card printed the first for both.** Measured over six corpora as
-        // cards saying the type was unknown while `completion` at the identical cursor
-        // answered from a class: 207 of 1,506 at an instance variable and 180 of 209 at a
-        // class object. That second number is what makes it a contradiction rather than
-        // merely a thin sentence — nearly every class-object card that said *unknown* sat
-        // over a list of that class's own members.
+        // **"The receiver has no type" and "the receiver has no such member" are different facts.**
+        // Printing the first for both contradicts `completion`, which at the same cursor answers
+        // from the class. At a class object that is nearly always the case: the card would say
+        // *unknown* over a list of that class's own members.
         let source = "class Radio\n  def tune; end\n  def dial; end\n  def amp; end\n  \
                       def hum; end\nend\n\n\
                       person = Person.new(\"x\")\nperson.tune\nPerson.dial\n@person.amp\n\
                       gadget = Unknown.new\ngadget.hum\n";
         let (mut harness, uri) = with_signatures(source);
 
-        // Typed outright: the class is named, because a reader can open it and see for
-        // themselves that it has no `tune`.
+        // Typed outright: the class is named, so a reader can open it and see it has no `tune`.
         assert_eq!(
             card(&mut harness, &uri, source, "tune\nPerson"),
             "```ruby\nRadio#tune\n```\n\n*Matched on the method name alone — the receiver is a \
              `Person`, which has no such method.*"
         );
 
-        // A class object is a type Ruby cannot spell, so the sentence says what it is rather
-        // than printing rubydex's `Person::<Person>` at somebody who cannot go and look at it.
+        // A class object is a type Ruby cannot spell, so the sentence says what it is instead of
+        // printing rubydex's `Person::<Person>` at someone who cannot look it up.
         assert_eq!(
             card(&mut harness, &uri, source, "dial\n@person"),
             "```ruby\nRadio#dial\n```\n\n*Matched on the method name alone — the receiver is the \
              class object `Person`, which has no such method.*"
         );
 
-        // And the guess, which is the one the corpora are full of: two weak claims, and the
-        // card has to make both of them rather than the stronger one.
+        // The guess, the case real code is full of: two weak claims, and the card must make both,
+        // not just the stronger one.
         assert_eq!(
             card(&mut harness, &uri, source, "amp\n"),
             "```ruby\nRadio#amp\n```\n\n*Matched on the method name alone — the receiver was \
              guessed from the name `@person` to be a `Person`, which has no such method.*"
         );
 
-        // And the one type that is not a name: `Unknown` is a constant no file defines, so
-        // rubydex promotes it to a `Namespace::Todo` whose every lookup misses by construction.
-        // Naming it would put a class on the card that nothing declares, so the sentence falls
-        // back to the one that was always true.
+        // The one type that is not a name. `Unknown` is a constant no file defines, so rubydex
+        // promotes it to a `Namespace::Todo` whose every lookup misses. Naming it would put an
+        // undeclared class on the card, so the sentence falls back to the one that is always true.
         assert_eq!(
             card(&mut harness, &uri, source, "hum\n"),
             "```ruby\nRadio#hum\n```\n\n*Matched on the method name alone — the receiver's type \
              is unknown.*"
         );
 
-        // The other half of the sentence, which is the contradiction it was measured by: the
-        // list at that same cursor is `Person`'s members and always was.
+        // The other half of the contradiction: the list at that same cursor is `Person`'s members.
         let offered = harness.complete(&uri, &source.replace("person.tune", "person.t~une"));
         let owners: Vec<&str> = offered["items"]
             .as_array()
@@ -1013,10 +1140,10 @@ anything.hop(1)
 
     #[test]
     fn hover_reads_a_method_that_no_def_wrote() {
-        // `attr_reader :name` declares a method whose definition is not a `Definition::Method`,
-        // so the signature lookup finds nothing to read parameters or visibility from. It still
-        // has to name the method rather than fall through to a bare string — and `attr_reader`
-        // is how a large share of a Rails app's methods are declared.
+        // `attr_reader :name` declares a method whose definition is not a `Definition::Method`, so
+        // the signature lookup finds no parameters or visibility. It must still name the method
+        // instead of falling through to a bare string: `attr_reader` declares a large share of a
+        // Rails app's methods.
         let (mut harness, uri) = library();
         let markdown = harness.hover_at(&uri, LIBRARY, "name\n\n  # Build")["contents"]["value"]
             .as_str()

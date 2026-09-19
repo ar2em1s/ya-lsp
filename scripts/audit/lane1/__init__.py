@@ -1,29 +1,31 @@
-"""Lane 1 — the keys that are **machine-decidable**: a right answer the corpus itself writes down.
+"""Lane 1: the keys that are **machine-decidable**, where the corpus itself writes the right answer
+down.
 
-Lane 2 compares the server against itself; lane 1 compares it against the source, and the
-difference is that lane 1 can say *wrong* rather than only *inconsistent*.
+Lane 2 compares the server with itself; lane 1 compares it with the source, so lane 1 can say
+*wrong*, not only *inconsistent*.
 
-Every filter in a key throws positions away rather than adjudicating them, and each one is there
-because a run got it wrong — so the reasons travel with the code. **Over-blocking is safe here
-and only here**: in a key it removes a question from the denominator, where in a filter on the
-draw it removes the question from the sample. `routes.non_helpers` is the same idea on the other
-side of that line and is deliberately weaker for it.
+Every filter in a key throws positions away instead of adjudicating them, and each exists because a
+run got it wrong, so the reasons sit with the code. **Over-blocking is safe here and only here:** in
+a key it removes a question from the denominator; in a filter on the draw it removes the question
+from the sample. `routes.non_helpers` is the same idea on the other side of that line, and
+deliberately weaker for it.
 
-**One module per key.** A key is one of two kinds and says which with `ASKS`, because the two
-run at different moments and the reason is not a preference:
+**One module per key.** `ASKS` says which of two kinds a key is, because the two run at different
+moments:
 
-    ASKS = False  `grade(corpus, drawn, answers)` — it reads replies lane 2 already collected,
-                  so it needs no server and may run against a recorded transcript. `neutral`.
-    ASKS = True   `ask(corpus, client, seed, opened, drawn, answers)` — it poses its own
-                  questions, needs a live server **and must run before `ask_rebased`**, which
-                  inserts a line into every sampled document and would move every one of its
-                  cursors. `rails` and `completion`.
+    ASKS = False  `grade(corpus, drawn, answers)`: reads replies lane 2 already collected, so
+                  it needs no server and may run against a recorded transcript. `neutral`.
+    ASKS = True   `ask(corpus, client, seed, opened, drawn, answers)`: poses its own questions,
+                  so it needs a live server **and must run before `ask_rebased`**, which
+                  inserts a line into every sampled document and would move its cursors.
+                  Every other key.
 
-An asking key is handed the run's `drawn` and `answers` as well as the client, and the two keys
-use that differently on purpose. `rails` ignores both and draws its own cursors, because the
-macro positions it scores are a shape the sample does not target. `completion` takes both, because
-it asks a *second question at the sample's own cursors* and the hover reply already collected for
-each one is what lets it say which tier the server had claimed before it lost the member.
+An asking key gets the run's `drawn` and `answers` as well as the client, and keys use them
+differently on purpose:
+- `rails` ignores both and draws its own cursors: the macro positions it scores are a shape the
+  sample does not target.
+- `completion` takes both: it asks a *second question at the sample's own cursors*, and the hover
+  reply already collected there says which tier the server claimed before it lost the member.
 
 Both kinds also carry:
 
@@ -32,27 +34,26 @@ Both kinds also carry:
     line(counts) / summary(counts) / under(counts)
     FINDINGS      the finding kinds it raises
 
-A finding is `(kind, site, detail)` in both lanes, and the `site` is `audit.site` rather than an
-index into anything: a key that draws its own rows — `rails` does — numbers a list nobody else
-holds, and lane 3 unions the two lanes' findings.
+A finding is `(kind, site, detail)` in both lanes, and `site` is `audit.site`, not an index: a key
+that draws its own rows numbers a list nobody else holds, and lane 3 unions both lanes' findings.
 
-The two lanes divide by what a violation *means*, not by what it costs. A key that needed no
-server would be nicer to have; `rails` cannot be one, because the positions it scores are a shape
-the draw does not target and no amount of reading lane 2's replies will produce them.
+The lanes divide by what a violation *means*, not by cost. `rails` cannot be a server-free key: the
+positions it scores are a shape the draw does not target, and no reading of lane 2's replies
+produces them.
 """
 
-from audit.lane1 import calls, closures, completion, neutral, rails
+from audit.lane1 import calls, closures, completion, neutral, outline, rails
 
-KEYS = (neutral, rails, completion, calls, closures)
+KEYS = (neutral, rails, completion, calls, closures, outline)
 
 
 def asked(corpus, client, seed, opened=None, drawn=None, answers=None):
     """Every key that poses its own questions. Call before `ask_rebased` edits the buffers.
 
-    `opened` is the caller's set of already-`didOpen`ed paths, shared so that a document the
-    sample and a key both reach is opened once — see `client.ask_all`. `drawn` and `answers` are
-    the run's own draw and the replies to it, for a key that asks a second question at those same
-    cursors rather than at cursors of its own.
+    - `opened` is the caller's set of already-`didOpen`ed paths, shared so a document the sample and
+      a key both reach is opened once (see `client.ask_all`).
+    - `drawn` and `answers` are the run's draw and its replies, for a key that asks a second
+      question at those same cursors.
     """
     return _run([key for key in KEYS if getattr(key, "ASKS", False)],
                 lambda key: key.ask(corpus, client, seed, opened, drawn, answers))

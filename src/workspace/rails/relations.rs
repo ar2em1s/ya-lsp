@@ -1,72 +1,67 @@
-//! The relation class every model gets, and the query interface both sides of it share.
+//! The relation class every model gets, and the query interface both sides share.
 //!
-//! Nothing here reads a macro — [`models`](super::models) does that. This is what a collection
-//! *is* once one has been read: `Comment::Relation`, a class this crate writes and no file
-//! declares, and the vocabulary ActiveRecord puts on it and on the model's class object.
+//! Nothing here reads a macro; [`models`](super::models) does that. This is what a collection *is*
+//! once read: `Comment::Relation`, a class this crate writes and no file declares, plus the
+//! vocabulary ActiveRecord puts on it and on the model's class object.
 //!
-//! The two halves are one module because they are one argument. **A relation class is empty.**
-//! Every name on one comes from [`RELATION_BASE`], which is written once for the whole project
-//! — the difference between 77,128 generated members on discourse and a number that does not
-//! grow with the model count. The class side is that same list on the model's own **base**, and
-//! what lets the two share it is [`query_interface`], which knows what each name returns
-//! without knowing which model asked. The only member of a relation class with a place of its
-//! own is a `scope`, which is why [`Chained`] is here rather than beside the macro it is read
-//! from.
+//! One module, because it is one argument:
+//!
+//! - **A relation class is empty.** Every name on it comes from [`RELATION_BASE`], written once per
+//!   project, so the member count does not grow with the model count.
+//! - **The class side is the same list on the model's own base.** [`query_interface`] makes the
+//!   sharing possible: it knows what each name returns without knowing which model asked.
+//! - **The only relation member with its own place is a `scope`**, which is why [`Chained`] lives
+//!   here and not beside the macro it is read from.
 
 use crate::analysis::types::{COLLECTION, ELEMENT};
 use crate::generated::{Declared, Facts, Owner, Source};
 
 /// The class ya-lsp writes for a collection of `class`.
 ///
-/// Nested under the model rather than beside it — `Comment::Relation`, not `CommentRelation` —
-/// Three reasons, in the order they
-/// matter: the name is *scoped*, so it cannot collide with an unrelated top-level constant the
-/// way a made-up top-level name can; it reads correctly in the one place a user meets it, a
-/// hover card saying `Comment::Relation#first`; and a project that already has a
-/// `Comment::Relation` is exactly the project that meant something by it, which is why a
-/// collision makes the pass emit nothing rather than shadow it.
+/// Nested under the model (`Comment::Relation`, not `CommentRelation`), for three reasons, most
+/// important first:
+///
+/// 1. The name is *scoped*, so it cannot collide with an unrelated top-level constant.
+/// 2. It reads right where a user meets it: a hover card saying `Comment::Relation#first`.
+/// 3. A project that already has a `Comment::Relation` meant something by it, so a collision makes
+///    the pass emit nothing instead of shadowing it.
 #[must_use]
 pub fn relation_of(class: &str) -> String {
     format!("{class}::{RELATION}")
 }
 
-/// The relation-side half of every `scope` one document writes, held back until the end of it.
+/// The relation-side half of every `scope` one document writes, held back until the document ends.
 ///
-/// # A scope is a class method and it is also a relation method
+/// # A scope is a class method and also a relation method
 ///
-/// The second half is not a detail. `ActiveRecord::Delegation` builds a module per relation class
-/// holding every scope the model defines, which is what makes `Story.recent.visible.limit(10)` the
-/// ordinary spelling of a query rather than a clever one. A declaration on the model's singleton
-/// alone answers the **first** call of such a chain and nothing after it, so the word *after* a
-/// name that resolved falls back to the name-based list — the one place a chain gets worse the
-/// further the code has already got.
+/// `ActiveRecord::Delegation` builds a module per relation class holding every scope the model
+/// defines, which is what makes `Story.recent.visible.limit(10)` ordinary Ruby. Declared on the
+/// model's singleton alone, a scope answers only the **first** call of a chain, and every word
+/// after it falls to the name-based list.
 ///
-/// The relation copy carries the same span, so `Story.recent.visible` jumps to the `scope
-/// :visible` line exactly as `Story.visible` does. It is the only member of a relation class with
-/// a place: everything else on one is the query interface, which no file declares — see
-/// [`relation`].
+/// The relation copy carries the same span, so `Story.recent.visible` jumps to the `scope :visible`
+/// line just as `Story.visible` does. It is the only member of a relation class with a place;
+/// everything else is the query interface, which no file declares (see [`relation`]).
 ///
-/// # Why it is held back rather than written beside its twin
+/// # Why it is held back
 ///
-/// [`Facts`] renders in the order it was told things and reopens a body every time the owner
-/// changes, so declaring `Story.recent` and `Story::Relation#recent` alternately writes one
-/// `class Story::Relation ... end` per scope. Held to the end of the document, each relation class
-/// is opened once — and where this document also writes that class' superclass line, the members
-/// land in that same body.
+/// [`Facts`] renders in the order it was told and reopens a body each time the owner changes.
+/// Declaring `Story.recent` and `Story::Relation#recent` alternately would write one
+/// `class Story::Relation ... end` per scope. Held to the end, each relation class opens once, in
+/// the same body as its superclass line if this document writes one.
 ///
-/// [`flush`](Self::flush) sorts by owner, which is what makes one run per relation class out of a
-/// concern whose scopes fan onto several includers in turn. The sort is **stable**, so within one
-/// relation class the order is still the order the macros were written in — which is what
-/// [`Facts`]' own collision rule reads.
+/// [`flush`](Self::flush) sorts by owner, so a concern whose scopes fan onto several includers
+/// still makes one run per relation class. The sort is **stable**, so within a class the macros
+/// keep their written order, which [`Facts`]' collision rule reads.
 #[derive(Default)]
 pub(super) struct Chained(Vec<Declared>);
 
 impl Chained {
     /// Say one `scope` on the class object now, and hold its relation copy back.
     ///
-    /// Every caller goes through here — a `scope` on a class, the same `scope` fanned onto a
+    /// Every caller goes through here (a `scope` on a class, the same `scope` fanned onto a
     /// concern's includers, and an `enum`'s class-side pair, which is a `scope` Rails writes
-    /// itself — so no one of them can come apart from the others.
+    /// itself), so none can drift from the others.
     pub(super) fn declare(&mut self, facts: &mut Facts, class: &str, declared: Declared) {
         self.0.push(Declared {
             owner: Owner::Instance(relation_of(class)),
@@ -85,16 +80,14 @@ impl Chained {
     }
 }
 
-/// The class a relation is a collection of — [`relation_of`] read backwards.
+/// The class a relation is a collection of: [`relation_of`] read backwards.
 ///
-/// The inverse exists because the query interface needs it at *lookup* time and not at generation time:
-/// `Story::Relation#first` is declared once for the whole project, so the only thing that says
-/// which model the answer is about is the receiver's own name. See
+/// Needed at *lookup* time, not generation time: `Story::Relation#first` is declared once for the
+/// whole project, so only the receiver's name says which model the answer is about. See
 /// [`Return::Element`](crate::analysis::types::Return::Element).
 ///
-/// A name that is not a relation answers `None` rather than itself, because the caller's next
-/// question is "and what is that model's relation" and a wrong answer to this one would invent
-/// a class.
+/// A name that is not a relation answers `None`, not itself: the caller's next question is "what is
+/// that model's relation", and a wrong answer here would invent a class.
 #[must_use]
 pub fn element_of(relation: &str) -> Option<&str> {
     relation.strip_suffix(RELATION)?.strip_suffix("::")
@@ -105,69 +98,58 @@ const RELATION: &str = "Relation";
 
 /// The class every relation ya-lsp writes inherits from, and where the query interface lives.
 ///
-/// One copy for the project, and the whole of it. Spelled once per
-/// element type — 46 names on `Story::Relation`, 46 more on `Comment::Relation` — because four
-/// dozen of its signatures name what the collection holds. Two receiver-relative return types
-/// take that dependency out of the text: [`Return::Element`](crate::analysis::types::Return::Element)
-/// means "the model this receiver is about" and
-/// [`Return::Collection`](crate::analysis::types::Return::Collection) means "that model's
-/// relation", so `def first: () -> ActiveRecordElement?` written **once** answers `Story` on
-/// `Story::Relation` and `Comment` on `Comment::Relation`. What each model's document then
-/// holds is one line — `class Story::Relation < ActiveRecordRelation end`.
+/// **One copy for the project.** Many signatures name what the collection holds, which would force
+/// one copy per element type. Two receiver-relative return types remove that:
+/// [`Return::Element`](crate::analysis::types::Return::Element) means "the model this receiver is
+/// about" and [`Return::Collection`](crate::analysis::types::Return::Collection) means "that
+/// model's relation". So `def first: () -> ActiveRecordElement?`, written **once**, answers `Story`
+/// on `Story::Relation` and `Comment` on `Comment::Relation`. Each model's document then holds one
+/// line: `class Story::Relation < ActiveRecordRelation end`.
 ///
-/// **A superclass and not an `include`**, which is a correction to the obvious shape rather
-/// than a preference: the shared half was a module because a module is what an `include` can
-/// name, and the class side could not use it at all. A superclass carries both sides — a class
-/// object's singleton chain follows the class chain — and it is the only spelling that does.
+/// **A superclass, not an `include`.** A superclass carries both sides, because a class object's
+/// singleton chain follows the class chain. A module could serve only the instance side.
 ///
-/// **It works because nothing else declares `Story::Relation`.** A generated superclass on a
-/// class the user's own file already gives one is **silently ignored**: measured, a `class
-/// Widget < SpikeBase` in RBS beside a `class Widget < ApplicationRecord` in Ruby leaves
-/// `SpikeBase`'s members unreachable, with no error and no diagnostic. That is why the class
-/// side inherits through the model's **own** base class — see [`class_side`] — instead of
-/// through one this crate invents.
+/// **It works because nothing else declares `Story::Relation`.** A generated superclass on a class
+/// whose own file already names one is **silently ignored**: an RBS `class Widget < SpikeBase`
+/// beside a Ruby `class Widget < ApplicationRecord` leaves `SpikeBase`'s members unreachable, with
+/// no error. That is why the class side inherits through the model's **own** base (see
+/// [`class_side`]), not through one this crate invents.
 ///
-/// Top-level for [`ROUTE_HELPERS`](crate::workspace::rails::ROUTE_HELPERS)' reason, and the
-/// same collision rule: a project that already declares this name means something by it, and
-/// the pass writes nothing rather than shadowing it.
+/// Top-level for [`ROUTE_HELPERS`](crate::workspace::rails::ROUTE_HELPERS)' reason, with the same
+/// collision rule: a project that already declares this name means something by it, and the pass
+/// writes nothing.
 ///
-/// **What it costs is the hover card.** `story.comments.where(...)` prints
-/// `ActiveRecordRelation#where` rather than `Comment::Relation#where`, for every name in the
-/// interface. The element is gone from the card and still in the *answer*, which is the half a
-/// reader chains off.
+/// **The cost is the hover card.** `story.comments.where(...)` shows `ActiveRecordRelation#where`,
+/// not `Comment::Relation#where`. The element is gone from the card but still in the *answer*,
+/// which is what a reader chains off.
 pub const RELATION_BASE: &str = "ActiveRecordRelation";
 
 /// Where Rails itself writes the relation half of the query interface.
 ///
-/// **One name and not ten.** `relation.rb` writes
-/// `include FinderMethods, Calculations, SpawnMethods, QueryMethods, Batches, Explain, Delegation`
-/// and rubydex has already walked it, so an ancestor walk from this one class *is* Ruby's own
-/// method lookup and the answer it gives is `Method#owner`'s. Checked against
-/// `Method#source_location` under activerecord 7.2, 8.0 and 8.1: of the 127 names this file
-/// declares, **125 resolve and all 125 land on the line Ruby names** — the two that do not are
-/// `instantiate`, which is the class side's alone, and `default_order`, which is in Rails' main
-/// branch and in no released version.
+/// **One name, not ten.** `relation.rb` writes
+/// `include FinderMethods, Calculations, SpawnMethods, QueryMethods, Batches, Explain, Delegation`,
+/// and rubydex has walked it, so an ancestor walk from this class *is* Ruby's method lookup and
+/// gives `Method#owner`'s answer. Checked against `Method#source_location`: every name this file
+/// declares that resolves lands on the line Ruby names. The exceptions are `instantiate` (class
+/// side only) and `default_order` (not in a released Rails).
 ///
-/// The list is ordered and searched in order for [`RAILS_CLASS_SIDE`]'s sake, which needs three
-/// names before this one.
+/// Ordered and searched in order for [`RAILS_CLASS_SIDE`]'s sake, which needs three names before
+/// this one.
 pub const RAILS_RELATION: [&str; 1] = ["ActiveRecord::Relation"];
 
-/// And the class half, which Ruby answers for nearly all of with a single line.
+/// The class half, which Ruby answers almost entirely with one line.
 ///
-/// `Story.where` is `delegate(*QUERYING_METHODS, to: :all)` — `querying.rb:24` — and **no reader
-/// can expand a splatted constant into ninety method names**, so `ActiveRecord::Querying` holds
-/// no `def` for the graph to find. What is left is the ten names Rails does write a class-side
-/// `def` for, which the three modules here own, and the rest, which take the relation's because
-/// that is exactly what the `delegate` line says they are: `Story.where` is `Story.all.where`.
+/// `Story.where` is `delegate(*QUERYING_METHODS, to: :all)` in `querying.rb`, and **no reader can
+/// expand a splatted constant into ninety method names**, so `ActiveRecord::Querying` holds no
+/// `def` for the graph to find. What remains: the ten names Rails does write a class-side `def`
+/// for, owned by the three modules here, and the rest, which take the relation's because that is
+/// exactly what the `delegate` line says (`Story.where` is `Story.all.where`). All ten class-side
+/// `def`s land where `Method#source_location` says.
 ///
-/// Measured the same way as [`RAILS_RELATION`] and across the same three activerecord versions:
-/// **10 of the 10 class-side `def`s land where `Method#source_location` says**, and the other 110
-/// are the delegated names.
-///
-/// `ActiveRecord::Base`'s own singleton is deliberately **not** on this list, although Ruby would
-/// search it first. ya-lsp writes the class side onto that very singleton, so looking there would
-/// find this crate's own declaration, which has no place, and stop — and the ten names that do
-/// have one would lose it to the fall-through.
+/// `ActiveRecord::Base`'s own singleton is deliberately **not** on this list, although Ruby
+/// searches it first. ya-lsp writes the class side onto that singleton, so looking there would find
+/// this crate's own place-less declaration and stop, and the ten names that have a place would lose
+/// it.
 pub const RAILS_CLASS_SIDE: [&str; 4] = [
     "ActiveRecord::Persistence::ClassMethods",
     "ActiveRecord::Core::ClassMethods",
@@ -188,42 +170,35 @@ struct Query {
     side: Side,
 }
 
-/// Where ActiveRecord puts a name, which is the whole of what [`Query`] carries a side for.
+/// Where ActiveRecord puts a name: the whole reason [`Query`] carries a side.
 ///
-/// `ActiveRecord::Querying::QUERYING_METHODS` is the class side **by construction** —
-/// `delegate(*QUERYING_METHODS, to: :all)` is the single line that makes `Story.where` mean
-/// `Story.all.where` — so which names it holds is read out of Rails rather than assumed, for
-/// the `enum`'s reason. A name it does not hold exists on the relation and **raises on the
-/// model**, measured at 64 lobsters positions; and the traffic runs the other way too:
-/// `create!` is a class method every application
-/// writes and no relation answers.
+/// `ActiveRecord::Querying::QUERYING_METHODS` is the class side **by construction**:
+/// `delegate(*QUERYING_METHODS, to: :all)` is the line that makes `Story.where` mean
+/// `Story.all.where`. So membership is read out of Rails, not assumed. A name it does not hold
+/// exists on the relation and **raises on the model**. It also runs the other way: `instantiate` is
+/// a class method no relation answers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
     /// In `QUERYING_METHODS`: the relation defines it and the model delegates to `all`.
     Both,
-    /// `Relation`'s own, and either a `NoMethodError` on the model or somebody else's method
-    /// there. `size`, `length`, `empty?`, `to_a` and `each` are relation-only, which takes the
-    /// last two off the singleton; `new` is the sixth and is here for the other reason — a model
-    /// really does answer it, from `Class`, and a declaration on the class side would shadow it.
+    /// `Relation`'s own: on the model it is a `NoMethodError` or somebody else's method. `size`,
+    /// `length`, `empty?`, `to_a` and `each` are relation-only, which keeps the last two off the
+    /// singleton. `new` is the sixth, for another reason: a model answers it from `Class`, and a
+    /// class-side declaration would shadow that.
     Relation,
     /// `Persistence::ClassMethods`', and nothing on a relation answers it.
     ///
-    /// **One name**, and a list of six is easy to arrive at: a completion sweep catches the
-    /// other five: `activerecord/lib/active_record/relation.rb` defines `new` at 126, `build`
-    /// as an alias of it at 134, `create` at 155, `create!` at 170, `update` at 640 and
-    /// `update!` at 664 — so `story.comments.create!` really is a call, and declaring those
-    /// class-only took the name-matched offer away from it and gave nothing back.
-    /// `instantiate` is the one `Relation` genuinely does not define.
+    /// **One name.** It is easy to arrive at six, but `relation.rb` also defines `create`,
+    /// `create!`, `update`, `update!` and `build` (an alias of `new`), so `story.comments.create!`
+    /// really is a call. `instantiate` is the one `Relation` does not define.
     Class,
 }
 
 /// Every name in `ActiveRecord::Querying::QUERYING_METHODS` that hands back a relation.
 ///
-/// One list rather than one entry each, because the whole content of the row is the name: they
-/// take anything and they return the relation, which is what makes a query chainable at all.
-/// `with` is the odd one and is here for the same reason it is anywhere — `QueryMethods#with`
-/// is on the relation and `Querying#with` is a `def` beside the list rather than a member of it,
-/// so it is on both sides exactly as the delegated names are.
+/// One list, not one entry each, because the name is the whole row: these take anything and return
+/// the relation, which is what makes a query chainable. `with` is on both sides like the delegated
+/// names: `QueryMethods#with` is on the relation and `Querying#with` is a `def` beside the list.
 const RELATIONAL: [&str; 40] = [
     "reselect",
     "order",
@@ -269,11 +244,10 @@ const RELATIONAL: [&str; 40] = [
 
 /// The ordinal finders that answer a record or nothing, and their bang twins that raise.
 ///
-/// Rails writes them out one by one in `FinderMethods` and so does this: `second` through
-/// `fifth`, `forty_two` — which is a joke that has been in ActiveRecord since 2013 and is a real
-/// method — and the two counted from the other end. `first`, `last` and `take` are **not** here,
-/// because each of them takes an optional count that changes what it hands back, which is
-/// [`Query::overloads`]'.
+/// Rails writes them one by one in `FinderMethods`, and so does this: `second` through `fifth`,
+/// `forty_two` (a long-standing joke, and a real method) and the two counted from the end. `first`,
+/// `last` and `take` are **not** here: each takes an optional count that changes what it returns,
+/// which is [`Query::overloads`]' job.
 const ORDINALS: [&str; 7] = [
     "second",
     "third",
@@ -296,15 +270,14 @@ const CREATORS: [&str; 8] = [
     "create_or_find_by!",
 ];
 
-/// The names that hand back a `Promise` and nothing else — `ActiveRecord::Promise`, which is
-/// resolved by `#value` and is a class no generator here writes.
+/// The names that return a `Promise` and nothing else: `ActiveRecord::Promise`, resolved by
+/// `#value`, a class no generator here writes.
 ///
-/// Declared anyway, `untyped`, which is `delegate`'s inversion applied to a *name*: eight of them
-/// are in `QUERYING_METHODS` and this table's bound is that list rather than a judgement about
-/// which of its names deserve to be in it. The type declines and
-/// [`Types::harvest`](crate::analysis::types::Types::harvest) drops an `untyped`, so what they
-/// cost is a completion entry each and what they buy is that `Story.async_count` resolves to
-/// something instead of to the name rung.
+/// Declared anyway, as `untyped`, because this table's bound is `QUERYING_METHODS`, not a judgement
+/// about which of its names deserve a place. The type declines and
+/// [`Types::harvest`](crate::analysis::types::Types::harvest) drops an `untyped`. Each costs a
+/// completion entry, and each buys `Story.async_count` resolving instead of falling to the name
+/// rung.
 const ASYNC: [&str; 8] = [
     "async_ids",
     "async_count",
@@ -328,49 +301,69 @@ const WRITES: [&str; 6] = [
 
 /// The query interface ActiveRecord installs, written once and declared on the sides it is on.
 ///
-/// Each entry is a signature *without* its `def`, because most of these facts are true twice: on
-/// the relation class as instance methods, and on the model's own singleton as class methods.
-/// Writing the list once is what makes "the singleton and the relation cannot disagree about what
-/// `where` returns" a property of this file rather than of somebody remembering.
+/// Each entry is a signature *without* its `def`, because most facts are true twice: as instance
+/// methods on the relation class and as class methods on the model's singleton. One list makes "the
+/// singleton and the relation agree on what `where` returns" a property of this file, not of
+/// memory.
 ///
 /// # The bound is Rails' own list
 ///
 /// A table chosen for being *typeable* is a bound nobody can check. **The list is
-/// `QUERYING_METHODS`**, plus the two places Rails puts a class method that is not in it:
-/// `Persistence::ClassMethods`, where `create!` lives, and `Querying#with`, a `def` beside the
-/// constant rather than an entry in it. A name is in this table because Rails put it on a model,
-/// not because ya-lsp could think of a type for it — which is why the async family and the bulk
-/// writers are here at all.
+/// `QUERYING_METHODS`**, plus the two places Rails puts a class method outside it:
+/// `Persistence::ClassMethods` (where `create!` lives) and `Querying#with`. A name is here because
+/// Rails put it on a model, not because ya-lsp could type it; that is why the async family and the
+/// bulk writers are here.
 ///
-/// **What can still be refused is the type**, which is `delegate`'s inversion and why the width is
-/// safe. `pick`, `calculate`, `minimum`, `maximum`, every `async_*` and every bulk writer return
-/// `untyped`: the name resolves, the chain stops, and
-/// [`Types::harvest`](crate::analysis::types::Types::harvest) drops the claim rather than carrying
-/// a wrong one.
+/// **The type can still be refused**, which keeps the width safe. `pick`, `calculate`, `minimum`,
+/// `maximum`, every `async_*` and every bulk writer return `untyped`: the name resolves, the chain
+/// stops, and [`Types::harvest`](crate::analysis::types::Types::harvest) drops the claim instead of
+/// carrying a wrong one.
 ///
-/// # The approximations, stated rather than hidden
+/// # `Enumerable`'s names, instantiated
+///
+/// [`relation_base`] writes Rails' own `include Enumerable`, so every name in that module **already
+/// resolves** on a relation. But its signatures are written in `E`, a type variable, and `class_of`
+/// refuses a type variable, so the block a reader just wrote gets nothing.
+/// `story.comments.map { |row| ... }` is the shape.
+///
+/// So the second half of this table is `Enumerable`'s list with the element in `E`'s place, read
+/// off `vendor/rbs/core/enumerable.rbs`. A row exists **only where instantiating changes the
+/// answer**:
+///
+/// - **A block handed an element**: `map`, `reject`, `sort_by`, `each_with_object`, `group_by` and
+///   the rest.
+/// - **A return that is the element itself**: `detect`, `min_by`, `max`.
+///
+/// **`Array[E]` is not one of them.** `Array[E]` and `Array[ActiveRecordElement]` both answer
+/// `Array`, so `entries`, `compact`, `drop` and `tally` are left to the `include`; copying them
+/// would shadow a declaration that has a place with one that does not. The nine names ActiveRecord
+/// defines itself (`count`, `find`, `first`, `take`, `to_a`, `sum`, `any?`, `none?`, `one?`) are
+/// above and not copied: Ruby's lookup prefers the class's own over the module's, and so does this
+/// table.
+///
+/// Every row is [`Side::Relation`]: a model's class object reaches `Class` and `Object` but no
+/// `Enumerable`, so `Story.map` raises where `Story.all.map` does not.
+///
+/// # The approximations
 ///
 /// - **A scalar or an array in one argument.** `find`, `create`, `create!`, `build`, `instantiate`
-///   and `destroy` hand back a record for a scalar and an `Array` for an array, and both calls
-///   write **one** positional argument, so [`Arity`](crate::analysis::cursor::Arity) cannot tell
-///   them apart. Each types the singular. `update` and `update!` are the exception and return
-///   `untyped`: their first parameter *defaults to `:all`*, so the array is not even the unlikely
-///   answer.
-/// - **`count` after a `group` is a `Hash`** and this says `Integer` unconditionally — the same
-///   order of inexactness as `where` always returning a relation.
+///   and `destroy` return a record for a scalar and an `Array` for an array, both with **one**
+///   positional argument, so [`Arity`](crate::analysis::cursor::Arity) cannot tell them apart. Each
+///   types the singular. `update` and `update!` return `untyped`: their first parameter *defaults
+///   to `:all`*, so the array is not even unlikely.
+/// - **`count` after a `group` is a `Hash`**, but this always says `Integer`: the same inexactness
+///   as `where` always returning a relation.
 /// - **`pluck` and `ids` are `Array[untyped]`**, not `Array[Element]`: `Story.pluck(:title)` is an
-///   array of *columns*, and all this module knows is that it is an `Array`.
+///   array of *columns*.
 ///
 /// # What `where` cannot say
 ///
-/// `where` with **no argument** returns a `QueryMethods::WhereChain`, which is where `not`,
-/// `missing` and `associated` live. An arity split beside `first`'s is **not expressible** for it:
-/// `arity_of` deliberately does not count a keyword hash as a positional argument, so that
-/// `3.7.round(half: :up)` reaches the zero-argument arm — which makes `where()` and
-/// `where(title: "x")` the same call to this machinery. An arm answering `WhereChain` at arity 0
-/// would answer it for the commonest call in Rails. So `where` returns a relation on every arm,
-/// `WhereChain` is not generated, and `where.not` stays on the name rung: a bound on the arity
-/// partition rather than a missing table.
+/// `where` with **no argument** returns a `QueryMethods::WhereChain` (home of `not`, `missing` and
+/// `associated`). An arity split like `first`'s **cannot express** this: `arity_of` does not count
+/// a keyword hash as a positional argument (so `3.7.round(half: :up)` reaches the zero-argument
+/// arm), which makes `where()` and `where(title: "x")` the same call here. A `WhereChain` arm at
+/// arity 0 would answer the commonest call in Rails. So `where` returns a relation on every arm,
+/// `WhereChain` is not generated, and `where.not` stays on the name rung.
 fn query_interface() -> Vec<Query> {
     let element = ELEMENT;
     let relation = COLLECTION.to_owned();
@@ -403,9 +396,9 @@ fn query_interface() -> Vec<Query> {
         name: "select",
         parameters: "(*untyped)".to_owned(),
         returns: relation.clone(),
-        // `Enumerable#select` reached through `super`, so the block is handed an element and the
-        // result is an `Array` of them rather than a relation. A *required* block, which is what
-        // puts this arm on the other side of the partition from the one above it.
+        // `Enumerable#select` reached through `super`: the block is handed an element and the
+        // result is an `Array` of them, not a relation. The block is *required*, which puts this
+        // arm on the other side of the partition from the one above.
         overloads: vec![(format!("() {{ ({element}) -> untyped }}"), records.clone())],
         side: Side::Both,
     });
@@ -501,9 +494,9 @@ fn query_interface() -> Vec<Query> {
         "(untyped)".to_owned(),
         "Numeric?".to_owned(),
     ));
-    // No block arm: `Enumerable#sum` with one hands back whatever the block summed, and a
-    // relation's own `sum` is a number. Stating only the blockless arm is what makes
-    // `Story.sum { ... }` answer nothing rather than answer wrongly.
+    // No block arm: `Enumerable#sum` with a block returns whatever the block summed, while a
+    // relation's own `sum` is a number. Stating only the blockless arm makes `Story.sum { ... }`
+    // answer nothing instead of something wrong.
     queries.push(both("sum", "(*untyped)".to_owned(), "Numeric".to_owned()));
     for (name, parameters) in [
         ("minimum", "(untyped)"),
@@ -530,8 +523,8 @@ fn query_interface() -> Vec<Query> {
         queries.push(both(name, "(*untyped)".to_owned(), "untyped".to_owned()));
     }
 
-    // `Relation`'s own, which raise on the model — the reason [`Side`]
-    // exists rather than a `delegated` flag that only ever subtracted.
+    // `Relation`'s own, which raise on the model. This is why [`Side`] exists instead of a flag
+    // that could only subtract.
     queries.push(plain(
         "to_a",
         "()".to_owned(),
@@ -559,12 +552,10 @@ fn query_interface() -> Vec<Query> {
         Side::Relation,
     ));
 
-    // `relation.rb:1209` is `def reload; reset; load; end` and `load` hands back `self`, so a
-    // reloaded relation is the relation. It is [`Side::Relation`] like the four above it —
-    // `ActiveRecord::Base#reload` is an *instance* method, so `Story.reload` reaches `Class`,
-    // finds nothing and raises. `CollectionProxy` overrides it and also returns the receiver,
-    // which is what makes one row right for both. Measured over six corpora on a receiver
-    // naming a declared `has_many`: **66** call sites.
+    // `relation.rb` has `def reload; reset; load; end`, and `load` returns `self`, so a reloaded
+    // relation is the relation. [`Side::Relation`] like the four above: `ActiveRecord::Base#reload`
+    // is an *instance* method, so `Story.reload` reaches `Class`, finds nothing and raises.
+    // `CollectionProxy` overrides it and also returns the receiver, so one row is right for both.
     queries.push(plain(
         "reload",
         "()".to_owned(),
@@ -572,17 +563,14 @@ fn query_interface() -> Vec<Query> {
         Side::Relation,
     ));
 
-    // `Persistence::ClassMethods`: the names that are not in `QUERYING_METHODS` at all, which
-    // is why `create!` was missing from a table built out of that constant alone. **Five of
-    // these six are on the relation too** and `relation.rb` is what says so — see [`Side::Class`].
+    // `Persistence::ClassMethods`: names not in `QUERYING_METHODS` at all. **Five of these six are
+    // on the relation too**, per `relation.rb`; see [`Side::Class`].
     for name in ["create", "create!", "build"] {
         queries.push(both(name, taking_element(), element.to_owned()));
     }
-    // `relation.rb:134` is `alias build new` — the *same method* — so declaring one and not the
-    // other was an incoherence rather than a bound. It is the relation's alone because a model
-    // gets `new` from `Class`, which is where the class side would have shadowed something real.
-    // Measured over six corpora on a receiver naming a declared `has_many`: `.new` 174 sites
-    // against `.build`'s 178.
+    // `relation.rb` has `alias build new`, the *same method*, so declaring one without the other
+    // would be incoherent. It is the relation's alone because a model gets `new` from `Class`,
+    // which a class-side declaration would shadow.
     queries.push(plain(
         "new",
         taking_element(),
@@ -599,13 +587,145 @@ fn query_interface() -> Vec<Query> {
         Side::Class,
     ));
 
+    // `Enumerable`, instantiated — and every row here is [`Side::Relation`], because a model's
+    // class object reaches `Class` and `Object` and no `Enumerable` at all.
+    let on_relation = |name, parameters: String, returns: String| {
+        plain(name, parameters, returns, Side::Relation)
+    };
+    let yielding = || format!("() {{ ({element}) -> untyped }}");
+    let maybe_yielding = || format!("() ?{{ ({element}) -> untyped }}");
+    let comparing = || format!("() ?{{ ({element}, {element}) -> untyped }}");
+    let grouped = format!("Enumerator[Array[{element}]]");
+    let ends = format!("[{nilable}, {nilable}]");
+
+    // What the block made, one per element.
+    for name in ["map", "collect", "flat_map", "collect_concat", "filter_map"] {
+        queries.push(on_relation(name, yielding(), "Array[untyped]".to_owned()));
+    }
+    // The ones that hand back some of the elements they were given. `select` is not here: it is
+    // ActiveRecord's own above, declared with this exact block arm, and `filter` is the alias
+    // Rails does not override.
+    for name in [
+        "find_all",
+        "filter",
+        "reject",
+        "drop_while",
+        "take_while",
+        "sort_by",
+    ] {
+        queries.push(on_relation(name, yielding(), records.clone()));
+    }
+    queries.push(on_relation("uniq", maybe_yielding(), records.clone()));
+    queries.push(on_relation("sort", comparing(), records.clone()));
+
+    // One element, or none.
+    queries.push(on_relation(
+        "detect",
+        format!("(*untyped) {{ ({element}) -> untyped }}"),
+        nilable.clone(),
+    ));
+    for name in ["min_by", "max_by"] {
+        queries.push(on_relation(name, yielding(), nilable.clone()));
+    }
+    for name in ["min", "max"] {
+        queries.push(on_relation(name, comparing(), nilable.clone()));
+    }
+    queries.push(on_relation("minmax", comparing(), ends.clone()));
+    queries.push(on_relation("minmax_by", maybe_yielding(), ends));
+
+    // The blocks handed an element that hand something else back.
+    queries.push(on_relation(
+        "group_by",
+        yielding(),
+        format!("Hash[untyped, Array[{element}]]"),
+    ));
+    queries.push(on_relation(
+        "partition",
+        yielding(),
+        format!("[{records}, {records}]"),
+    ));
+    queries.push(on_relation(
+        "to_h",
+        maybe_yielding(),
+        "Hash[untyped, untyped]".to_owned(),
+    ));
+    queries.push(on_relation("all?", taking_element(), "bool".to_owned()));
+    queries.push(on_relation(
+        "find_index",
+        format!("(*untyped) ?{{ ({element}) -> untyped }}"),
+        "Integer?".to_owned(),
+    ));
+    for name in ["grep", "grep_v"] {
+        queries.push(on_relation(
+            name,
+            format!("(untyped) ?{{ ({element}) -> untyped }}"),
+            "Array[untyped]".to_owned(),
+        ));
+    }
+    // The memo comes first and the element second: the one row whose element is not at position
+    // zero. Stated as the arm with an initial value: the arm without one hands the block two
+    // elements, and two arms that disagree about a block are refused together, so this states only
+    // the position that is an element in both.
+    for name in ["inject", "reduce"] {
+        queries.push(on_relation(
+            name,
+            format!("(*untyped) {{ (untyped, {element}) -> untyped }}"),
+            "untyped".to_owned(),
+        ));
+    }
+    queries.push(on_relation(
+        "each_with_object",
+        format!("(untyped) {{ ({element}, untyped) -> untyped }}"),
+        "untyped".to_owned(),
+    ));
+
+    // And the walks, which hand back what they walked over.
+    queries.push(on_relation(
+        "each_with_index",
+        format!("() {{ ({element}, Integer) -> untyped }}"),
+        relation.clone(),
+    ));
+    queries.push(on_relation(
+        "each_entry",
+        maybe_yielding(),
+        relation.clone(),
+    ));
+    queries.push(on_relation("reverse_each", yielding(), "void".to_owned()));
+    queries.push(on_relation(
+        "cycle",
+        format!("(*untyped) {{ ({element}) -> untyped }}"),
+        "NilClass".to_owned(),
+    ));
+
+    // The four that cut the walk into runs. Two are handed a pair and two a single element,
+    // and all four hand back an enumerator of arrays however they were called.
+    for name in ["chunk_while", "slice_when"] {
+        queries.push(on_relation(
+            name,
+            format!("() {{ ({element}, {element}) -> untyped }}"),
+            grouped.clone(),
+        ));
+    }
+    for name in ["slice_after", "slice_before"] {
+        queries.push(on_relation(
+            name,
+            format!("(*untyped) ?{{ ({element}) -> untyped }}"),
+            grouped.clone(),
+        ));
+    }
+    queries.push(on_relation(
+        "chunk",
+        yielding(),
+        format!("Enumerator[[untyped, Array[{element}]]]"),
+    ));
+
     queries
 }
 
 /// Where each of [`callback_names`]' four groups comes from, for the provenance line.
 ///
-/// Named rather than described, because "which callbacks exist" is a question with a file that
-/// answers it and the card should say which file.
+/// Named, not described: "which callbacks exist" has a file that answers it, and the card should
+/// name that file.
 const ONLY_AFTER: &str = "`define_model_callbacks :initialize, :find, :touch, only: :after`";
 const EVERY_PREFIX: &str = "`define_model_callbacks :save, :create, :update, :destroy`";
 const VALIDATION: &str = "`ActiveModel::Validations::Callbacks`";
@@ -613,21 +733,19 @@ const TRANSACTION: &str = "`ActiveRecord::Transactions`";
 
 /// Every class-side callback registrar ActiveRecord installs on a model, and what installed it.
 ///
-/// A convention with **no macro
-/// behind it at all**. `before_create` is a `def` in activesupport that
-/// `define_model_callbacks` wrote at boot, so no file in the workspace declares it and the graph
-/// correctly found nothing — which left the name rung answering, and the name rung found
-/// `Fabrication::Schematic::Evaluator#before_create` in a gem.
+/// A convention with **no macro behind it**. `before_create` is a `def` that activesupport's
+/// `define_model_callbacks` writes at boot, so no workspace file declares it and the graph finds
+/// nothing. Without this, the name rung answers with an unrelated gem's `before_create`.
 ///
-/// **The four groups are Rails' own four call sites**, walked rather than remembered, for the
-/// usual reason: a table this crate writes from a reading of the docs is a table that goes stale
-/// silently. That is also what makes this **twenty-three** names rather than the thirty
-/// a `before`/`around`/`after` × ten events product rule would give. Seven of those thirty do
-/// not exist and Ruby raises on each: `initialize`, `find` and `touch` are declared `only:
-/// :after`; `ActiveModel::Validations::Callbacks` writes `before_validation` and
-/// `after_validation` by hand and there is no `around_validation`; and `commit` and `rollback`
-/// are not `define_model_callbacks` calls at all — `ActiveRecord::Transactions` writes six
-/// `def`s, of which four are the `after_*_commit` shortcuts.
+/// **Rails' own four call sites, walked, not remembered**: a table written from the docs goes stale
+/// silently. That gives **twenty-three** names, not the thirty a `before`/`around`/`after` × ten
+/// events rule would give. Seven of those thirty do not exist, and Ruby raises on each:
+///
+/// - `initialize`, `find` and `touch` are `only: :after`.
+/// - `ActiveModel::Validations::Callbacks` writes `before_validation` and `after_validation` by
+///   hand; there is no `around_validation`.
+/// - `commit` and `rollback` are not `define_model_callbacks` calls: `ActiveRecord::Transactions`
+///   writes six `def`s, four of them the `after_*_commit` shortcuts.
 fn callback_names() -> Vec<(String, &'static str)> {
     let mut names = Vec::new();
     for event in ["initialize", "find", "touch"] {
@@ -654,28 +772,21 @@ fn callback_names() -> Vec<(String, &'static str)> {
     names
 }
 
-/// The callbacks, on the singleton of one model.
+/// The callbacks, on the singleton of one base class.
 ///
-/// **Nothing here is mapped**, which is the no-place rule and the reason this cannot make a jump
-/// worse: `define_model_callbacks` is a `def` in activesupport that no line of the user's code
-/// wrote, so there is no span to record and the honest answer to "where was this declared" is
-/// nowhere. What it takes away is a *jump into a gem that has nothing to do with the file*.
+/// **Nothing here is mapped** (the no-place rule), so this cannot make a jump worse: no line of
+/// user code wrote these methods, so the honest answer to "where" is nowhere. What it removes is a
+/// jump into an unrelated gem.
 ///
-/// `(*untyped)` because a callback takes symbols, a hash of conditions, or neither; `-> void`
-/// because nobody chains off one. The block is optional and is handed the **record**, which is
-/// `ActiveSupport::Callbacks`' own behaviour for a proc that takes an argument — so
-/// `before_save { |story| ... }` types `story`, and a call that writes no block reaches the same
-/// arm, because an optional block applies both ways.
+/// `(*untyped)` because a callback takes symbols, a condition hash, or neither; `-> void` because
+/// nobody chains off one. The optional block is handed the **record** (`ActiveSupport::Callbacks`'
+/// behaviour for a proc with an argument), so `before_save { |story| ... }` types `story`, and a
+/// call without a block reaches the same arm.
 ///
-/// **Declared on the base and inherited**, exactly as [`class_side`] is and for the same
-/// reason: a callback registrar is a class method, and one copy on `ApplicationRecord` answers
-/// for every model under it. The block parameter is
-/// [`Return::Element`](crate::analysis::types::Return::Element), so `before_save { |story| ... }`
-/// still types `story` as the model the call was written on rather than as the base.
-///
-/// An abstract class keeping these is no longer a place this parts company with [`class_side`],
-/// because that one is on the abstract class too now — `ApplicationRecord.before_save` is real
-/// Ruby, which is what this clause was always about.
+/// **Declared on the base and inherited**, like [`class_side`]: one copy on `ApplicationRecord`
+/// answers for every model under it. The block parameter is
+/// [`Return::Element`](crate::analysis::types::Return::Element), so `story` still types as the
+/// model the call was written on, not as the base.
 pub(super) fn callbacks(facts: &mut Facts, base: &str) {
     for (name, installed_by) in callback_names() {
         facts.declare(Declared {
@@ -696,61 +807,51 @@ pub(super) fn callbacks(facts: &mut Facts, base: &str) {
 
 /// The relation class for a collection of `element`, monomorphised.
 ///
-/// No type parameter anywhere, which is the decision every collection rests on: ya-lsp
-/// writes this text, so it never has to write an `ActiveRecord::Relation[Comment]` it cannot
-/// then instantiate. The price is one class per element type and a name that must not collide,
-/// and both are the caller's to hold.
+/// No type parameter anywhere, the decision every collection rests on: ya-lsp writes this text, so
+/// it never writes an `ActiveRecord::Relation[Comment]` it cannot instantiate. The price is one
+/// class per element type and a name that must not collide; the caller holds both.
 ///
-/// **Nothing this function writes is mapped.** No line of anybody's code declares
-/// `Comment::Relation#first`, so there is no span to record and
-/// [`Origin::Unknown`](crate::analysis::synthesized::Origin) is the honest answer: it types a
-/// chain and is never a jump target. A relation shared by four `has_many :comments` could be
-/// pointed at one of them, and pointing at an arbitrary one of four is the confidently-wrong
-/// answer this half of the release exists to avoid.
+/// **Nothing written here is mapped.** No line of code declares `Comment::Relation#first`, so
+/// [`Origin::Unknown`](crate::analysis::synthesized::Origin) is the honest answer: it types a chain
+/// and is never a jump target. Pointing at one of four `has_many :comments` would be confidently
+/// wrong.
 ///
-/// A **scope** is the one thing on a relation class that is mapped, and it is not written here:
-/// a file really does declare `Comment::Relation#recent`, on the same line it declares
-/// `Comment.recent`, so [`Chained`] puts the span on both.
+/// A **scope** is the one mapped thing on a relation class, and it is not written here: a file
+/// really declares `Comment::Relation#recent` on the same line as `Comment.recent`, so [`Chained`]
+/// puts the span on both.
 ///
-/// One comment for the whole class, because the *class* is what ya-lsp invented: a reader who
-/// reaches any member of it has already been told, by its name, that nobody wrote it.
-/// [`class_side`] cannot say it that way and does not try.
+/// One comment for the whole class, because the *class* is what ya-lsp invented: its name already
+/// tells a reader nobody wrote it. [`class_side`] cannot say that and does not try.
 pub(super) fn relation(facts: &mut Facts, element: &str) {
     let owner = Owner::Instance(relation_of(element));
     facts.note(
         owner.clone(),
         format!("A collection of `{element}`. ya-lsp writes this class; no file declares it."),
     );
-    // And that is the whole of it. Every member of the query interface is on [`RELATION_BASE`],
-    // written once for the project, because the two receiver-relative return types keep the
-    // element out of the signatures — leaving each relation class the scopes [`Chained`] writes
-    // onto it and nothing else. The body may well be opened by one of those instead: a document
-    // that writes a scope onto a relation it was not asked to *emit* opens the class with no
-    // superclass, and the two statements merge exactly as a reopened Ruby class does.
+    // That is all. Every query-interface member is on [`RELATION_BASE`], written once, because the
+    // receiver-relative return types keep the element out of signatures. A relation class gets only
+    // the scopes [`Chained`] writes. One of those may open the body first: a document writing a
+    // scope onto a relation it was not asked to *emit* opens the class with no superclass, and the
+    // two merge like a reopened Ruby class.
     //
-    // A project that declares [`RELATION_BASE`] itself is why this is never reached with a
-    // superclass it did not write: `Analysis::model_declarations` withdraws every relation
-    // rather than letting one inherit whatever the user meant by the name.
+    // This is never reached with a superclass the pass did not write: if a project declares
+    // [`RELATION_BASE`] itself, `knowledge::rails` withdraws every relation instead of letting one
+    // inherit whatever the user meant.
     facts.inherits(owner, RELATION_BASE.to_owned());
 }
 
 /// The query interface, written once for the whole project.
 ///
-/// [`RELATION_BASE`] has the argument. Every relation class in the workspace inherits from this
-/// one and declares nothing of its own, so the interface costs a project *one* copy however
-/// many models it has — which is the difference between 77,128 generated members on discourse
-/// and a number that does not grow with the model count.
+/// [`RELATION_BASE`] has the argument. Every relation class inherits from this one and declares
+/// nothing itself, so the interface costs *one* copy per project however many models it has.
 ///
-/// **`include Enumerable`**, which is Rails' own line — `ActiveRecord::Relation` includes it —
-/// and leaving it out costs measurable down-moves: `User.where(...).select(:id)`
-/// answers a relation, and a relation with no `Enumerable` in it is a **dead end** for the
-/// `.index_by` or `.map` that habitually follows: the first hop made right and the second made
-/// impossible. It goes on the class every relation inherits, for the same reason everything
-/// else here does — one `include` for the project.
+/// **`include Enumerable`**, Rails' own line (`ActiveRecord::Relation` includes it). Without it,
+/// `User.where(...).select(:id)` answers a relation that is a **dead end** for the `.index_by` or
+/// `.map` that usually follows. It goes on the class every relation inherits: one `include` per
+/// project.
 ///
-/// The names go on in [`query_interface`]'s order and the ones that are `Persistence`'s alone
-/// are skipped — [`Side`] is what says which, and `instantiate` is the only one this body does
-/// not get.
+/// Names go on in [`query_interface`]'s order, skipping the ones only `Persistence` has. [`Side`]
+/// says which; `instantiate` is the only one skipped.
 pub fn relation_base(facts: &mut Facts) {
     let owner = Owner::Instance(RELATION_BASE.to_owned());
     facts.note(
@@ -777,54 +878,48 @@ pub fn relation_base(facts: &mut Facts) {
     }
 }
 
-/// The delegated half of the same list on a class object, so a chain can *start*.
+/// The delegated half of the same list, on a class object, so a chain can *start*.
 ///
-/// `Story.recent.first.title` works off a macro alone and `Story.first.title` does not, because
-/// nothing declares `first`, `where` or `find` on a model itself — the half of the query interface
-/// that has no macro to be read from. There is no new convention here and no new reading of
-/// anybody's file: [`query_interface`] already knows what each of these returns.
+/// `Story.recent.first.title` works off a macro alone, but `Story.first.title` needs this: nothing
+/// declares `first`, `where` or `find` on a model, because that half of the query interface has no
+/// macro to read. No new convention and no new reading: [`query_interface`] already knows what each
+/// name returns.
 ///
-/// # It goes on the **base** class, and that is what keeps the declaration count down
+/// # On the **base** class
 ///
-/// `base` is the topmost class of a model's own superclass chain that the application declares —
-/// and then, where the bundle is indexed, `ActiveRecord::Base` itself, which is where Rails really
-/// installs the interface. `synthesize::base_of` is the walk. Ruby follows a class object's
-/// singleton chain up the class chain, so one copy on the base answers for every model under it,
-/// and a project pays the interface and the callbacks once per *base* rather than once per model —
-/// an order of magnitude fewer generated members.
+/// `base` is the topmost class of the model's own superclass chain that the application declares,
+/// or, where the bundle is indexed, `ActiveRecord::Base` itself, where Rails really installs the
+/// interface. `knowledge::rails::base_of` is the walk. Ruby follows a class object's singleton
+/// chain up the class chain, so one copy on the base answers for every model under it: the project
+/// pays per *base*, not per model.
 ///
-/// **A base this crate invented would have been simpler and does not work.** A generated
-/// `class Story < ActiveRecordModel` is silently ignored wherever the user's own file already
-/// writes a superclass, which is every Rails model there is — see [`RELATION_BASE`], where the
-/// same mechanism is safe because nothing but this pass declares a relation class. So the
-/// inheritance has to be the one the application already wrote.
+/// **An invented base would be simpler, and does not work.** A generated
+/// `class Story < ActiveRecordModel` is silently ignored wherever the user's file already writes a
+/// superclass, which is every Rails model (see [`RELATION_BASE`]; it is safe there only because
+/// nothing else declares a relation class). So the inheritance must be the one the application
+/// wrote.
 ///
-/// # Why inheriting the class side is safe here
+/// # Why inheriting is safe
 ///
-/// It is inherited, so an interface naming a *concrete* class would answer `Category.order(...)`
-/// with a relation of a class no row is an instance of. The two receiver-relative returns are what
-/// fix that rather than avoid it: `Category.order` reads
-/// [`Return::Collection`](crate::analysis::types::Return::Collection) and answers
-/// `Category::Relation`, and `Captain::Assistant.find` answers a `Captain::Assistant`.
+/// An inherited interface naming a *concrete* class would answer `Category.order(...)` with a
+/// relation of a class no row belongs to. The receiver-relative returns fix that: `Category.order`
+/// reads [`Return::Collection`](crate::analysis::types::Return::Collection) and answers
+/// `Category::Relation`, and `Captain::Assistant.find` answers `Captain::Assistant`.
 ///
-/// What is left of the trade is stated rather than hidden: **`ApplicationRecord.where` resolves
-/// and raises in Ruby**. That is the same kind of wrongness as the callbacks', which are declared
-/// on an abstract class deliberately, and it costs a name on a receiver nobody writes — where the
-/// alternative is a wrong *type* on receivers everybody writes.
+/// The remaining trade: **`ApplicationRecord.where` resolves here and raises in Ruby.** It is the
+/// same kind of wrongness as the callbacks on an abstract class, and it costs a name on a receiver
+/// nobody writes. The alternative is a wrong *type* on receivers everybody writes.
 ///
-/// **Nothing here is mapped**, by the no-place rule: no line of anybody's code declares
-/// `Story.where`.
+/// **Nothing here is mapped** (the no-place rule): no line of code declares `Story.where`.
 pub(super) fn class_side(facts: &mut Facts, base: &str) {
     for query in query_interface() {
         let because = match query.side {
             Side::Relation => continue,
-            // Deliberately short, and the length is the reason. This sentence is written above
-            // **every** class-side declaration, which measures the provenance at 57% of
-            // all the generated RBS in the workspace before it was cut. What it may not do is
-            // disappear: `class ApplicationRecord` is the user's own class, and a generated
-            // `def self.pluck` with nothing above it reads as something their file declared.
-            // A relation class carries none because the *class* is what ya-lsp invented, which
-            // is an argument this side cannot make.
+            // Deliberately short. This sentence sits above **every** class-side declaration, so its
+            // length dominated the generated RBS. It may not disappear: `class ApplicationRecord`
+            // is the user's own class, and a generated `def self.pluck` with nothing above it reads
+            // as something their file declared. A relation class needs none, because the *class* is
+            // what ya-lsp invented, an argument this side cannot make.
             Side::Both => {
                 "ActiveRecord's query interface, on every model that inherits this.".to_owned()
             }
@@ -854,12 +949,11 @@ mod tests {
     use crate::generated::declaring;
     use crate::workspace::rails;
 
-    /// [`relation_of`] and [`element_of`] are one mapping, and it has to be invertible.
+    /// [`relation_of`] and [`element_of`] are one mapping, and it must be invertible.
     ///
-    /// One copy for the project turns on it: the interface is declared once, so the only
-    /// thing that says which model an answer is about is the receiver's **name**. A name that
-    /// is not a relation answers `None` rather than itself, because the caller's next question
-    /// would build a class out of it.
+    /// The interface is declared once per project, so only the receiver's **name** says which model
+    /// an answer is about. A non-relation name answers `None`, not itself, because the caller's
+    /// next question would build a class out of it.
     #[test]
     fn a_relation_names_its_element_and_nothing_else_does() {
         for element in ["Story", "Spree::Order", "A::B::C"] {
@@ -872,24 +966,36 @@ mod tests {
         }
     }
 
-    /// One copy for the project, asked of the table rather than of a document.
+    /// One copy per project, checked on the table, not on a document.
     ///
-    /// **No signature in the interface names a concrete class of the application's**, which is
-    /// the whole mechanism: where a signature would name `Story` it names [`ELEMENT`], and where
-    /// it would name `Story::Relation` it names [`COLLECTION`], so the list is written once for
-    /// the project. Checked as a property of every row rather than of the four it was built from —
-    /// a row added tomorrow that spells an element is a row that would have to be per model
-    /// again, and this is what says so.
+    /// **No interface signature names a concrete application class**, which is the whole mechanism:
+    /// where it would name `Story` it names [`ELEMENT`], and where it would name `Story::Relation`
+    /// it names [`COLLECTION`]. Checked on every row, so a row added later that spells an element
+    /// (and would need a copy per model again) fails here.
     #[test]
     fn no_signature_in_the_interface_names_what_the_collection_holds() {
         let queries = query_interface();
+        // And how many rows do it: what [`RELATION_BASE`] would cost per model if the
+        // receiver-relative returns were removed. A tripwire, since nothing else would notice that
+        // number going stale.
+        let naming_the_element = queries
+            .iter()
+            .filter(|query| {
+                let mut text = format!("{} {}", query.parameters, query.returns);
+                for (parameters, returns) in &query.overloads {
+                    text.push_str(&format!(" {parameters} {returns}"));
+                }
+                text.contains(ELEMENT)
+            })
+            .count();
+        assert_eq!(naming_the_element, 90, "of {} rows", queries.len());
         let named = |want: &str| {
             queries
                 .iter()
                 .find(|query| query.name == want)
                 .unwrap_or_else(|| panic!("{want}"))
         };
-        // The three places an element can be named, each real and each receiver-relative now.
+        // The three places an element can be named, each receiver-relative.
         assert_eq!(named("first").returns, format!("{ELEMENT}?"));
         assert_eq!(
             named("select").overloads,
@@ -936,8 +1042,8 @@ mod tests {
                 },
             )
             .render(&declaring(&[]));
-        // A relation class is a superclass line and a note, and
-        // every member of it is on `RELATION_BASE`, written once for the project.
+        // A relation class is a superclass line and a note; every member is on `RELATION_BASE`,
+        // written once for the project.
         assert!(
             declarations.rbs.contains(&format!(
                 "class Comment::Relation < {RELATION_BASE}\n  # A collection of `Comment`."
@@ -945,17 +1051,16 @@ mod tests {
             "{}",
             declarations.rbs
         );
-        // What this file's own macros declared, and not one more: the class side and the
-        // callbacks are on the base, which this document was not asked to write. Eight readers,
-        // four more for each of the three singular associations that name a class, three more
-        // for each of the three collections, the writer of the polymorphic one, and the
-        // `scope`'s second home on `Story::Relation` — see [`Chained`].
+        // What this file's own macros declared, and not one more: the class side and the callbacks
+        // are on the base, which this document was not asked to write. Eight readers, four more for
+        // each of the three singular associations that name a class, three more for each of the
+        // three collections, the polymorphic one's writer, and the `scope`'s second home on
+        // `Story::Relation` (see [`Chained`]).
         assert_eq!(declarations.methods, 8 + 3 * 4 + 3 * 3 + 1 + 1);
         assert_eq!(declarations.spans.len(), 8 + 3 * 4 + 3 * 3 + 1 + 1);
         // `Story`, the `Story::Relation` the scope is chained onto, and the `Comment::Relation`
-        // this caller asked for. The scope's own class is not among the bodies this document
-        // opens for a superclass line, which is the point of the third: a relation class gets
-        // members here whether or not this is the document that writes its superclass.
+        // this caller asked for. The third shows that a relation class gets members here whether or
+        // not this document writes its superclass.
         assert_eq!(declarations.classes, 3);
     }
 
@@ -971,8 +1076,8 @@ mod tests {
             )),
             "{rbs}"
         );
-        // Rails' own line, and leaving it out costs down-moves: a relation with no `Enumerable`
-        // is a dead end for the `.index_by` or `.map` that follows a `select`.
+        // Rails' own line. Without it, a relation is a dead end for the `.index_by` or `.map` that
+        // follows a `select`.
         assert!(rbs.contains("\n  include Enumerable\n"), "{rbs}");
         // The overload set, rendered on one line because a `Span` is a byte range: the
         // count decides the arm, so `first` is a record and `first(3)` is an array of them.
@@ -996,11 +1101,10 @@ mod tests {
 
     #[test]
     fn the_callback_names_are_rails_four_call_sites_and_not_a_product_of_three_by_ten() {
-        // The count matters more than the spelling here, because the spelling is the part a
-        // reader can check against Rails and the count is the part a wrong reading
-        // silently changes. A `before`/`around`/`after` × ten product rule gives thirty from
-        // ten events; Rails installs **twenty-three**, and every one of the seven missing is a
-        // name Ruby raises on.
+        // The count matters more than the spelling: a reader can check spellings against Rails, but
+        // a wrong reading silently changes the count. A `before`/`around`/`after` × ten events rule
+        // gives thirty; Rails installs **twenty-three**, and Ruby raises on each of the missing
+        // seven.
         let names: Vec<String> = callback_names().into_iter().map(|(name, _)| name).collect();
         assert_eq!(names.len(), 23);
         assert_eq!(
@@ -1046,14 +1150,12 @@ mod tests {
 
     #[test]
     fn the_class_side_says_what_the_relation_says_and_maps_to_nothing_either() {
-        // The two halves are written from one list, so the test that matters is not
-        // that the names are present but that both sides agree about every one they share:
-        // `Story.where` and `Story.all.where` are one method reached two ways, and a table that
-        // let them drift would type a chain differently depending on where it started.
+        // Both halves come from one list, so what matters is that both sides agree on every name
+        // they share: `Story.where` and `Story.all.where` are one method reached two ways.
         //
-        // The list holds a second thing — which side each name is on — and this is where it is checked
-        // both ways round: a name `QUERYING_METHODS` does not delegate must be on the relation
-        // and must **not** be on the class side, because `Story.each` raises in Ruby.
+        // The list also says which side each name is on, checked both ways here: a name
+        // `QUERYING_METHODS` does not delegate must be on the relation and **not** on the class
+        // side, because `Story.each` raises in Ruby.
         let model = read_model(MODEL);
         let bases: BTreeSet<String> = ["ApplicationRecord"]
             .into_iter()
@@ -1100,28 +1202,27 @@ mod tests {
                 Side::Class => class_only += 1,
             }
         }
-        // A tripwire on the bound rather than on the table: 113 is
-        // `ActiveRecord::Querying::QUERYING_METHODS` counted, plus `Querying#with`, which is a
-        // `def` beside the constant, plus the five `Persistence::ClassMethods` names that
-        // `relation.rb` defines too. A name added here without a line of Rails behind it moves
-        // this number and has to say which file it read.
+        // A tripwire on the bound: `ActiveRecord::Querying::QUERYING_METHODS` counted, plus
+        // `Querying#with`, plus the five `Persistence::ClassMethods` names that `relation.rb` also
+        // defines. A name added without a line of Rails behind it moves this number and must say
+        // which file it read.
         assert_eq!(
             on_both, 119,
             "QUERYING_METHODS, `with`, and `relation.rb`'s five"
         );
         assert_eq!(
-            relation_only, 7,
+            relation_only, 46,
             "`Relation`'s own — the five that raise on the model, `new`, which `relation.rb` aliases `build` to, \
-             and `reload`"
+             `reload`, and `Enumerable`'s 39"
         );
         assert_eq!(
             class_only, 1,
             "`instantiate`, which `Relation` does not define"
         );
-        // Every class-side declaration carries its own provenance, because `class
-        // ApplicationRecord` is the user's own class and a note attached to *it* would read as
-        // a claim about their file. The relation base carries one note for the whole class,
-        // which is an argument this side cannot make.
+        // Every class-side declaration carries its own provenance, because
+        // `class ApplicationRecord` is the user's own class and a note on *it* would read as a
+        // claim about their file. The relation base carries one note for the whole class, an
+        // argument this side cannot make.
         assert_eq!(
             class_side
                 .matches("ActiveRecord's query interface, on every model that inherits this.")
@@ -1140,10 +1241,9 @@ mod tests {
             !class_side.contains("ya-lsp writes this class"),
             "the class is not generated, only these members are: {class_side}"
         );
-        // The base and never the model: `Story.where` is inherited, which is what makes one
-        // copy answer for every model in the application. This file writes `class Story` and
-        // its macros name `Comment`, and the interface is on neither of them — one copy, in
-        // the body of the base.
+        // The base, never the model: `Story.where` is inherited, so one copy answers for every
+        // model. This file writes `class Story` and its macros name `Comment`; the interface is on
+        // neither, only in the base's body.
         let (before, after) = class_side
             .split_once("class ApplicationRecord\n")
             .expect("the base's body");
@@ -1156,6 +1256,61 @@ mod tests {
         );
     }
 
+    /// `Enumerable`'s half of the interface: what instantiating `E` buys.
+    ///
+    /// Both shapes a row exists for. The block parameter is `row`, not `comment`, on purpose: a
+    /// name that camelizes onto a class is answered by the guess rung whatever the signature says,
+    /// so `|comment|` would pass with the feature removed.
+    #[test]
+    fn a_block_over_a_relation_is_handed_the_model() {
+        // A block handed an element.
+        let source = "Story.new.comments.map { |row| row.story }\n";
+        let (mut harness, _dump, uri) = models_project(source);
+        let mapped = card(&mut harness, &uri, source, "story");
+        assert!(mapped.contains("Comment#story"), "{mapped}");
+        assert!(
+            !mapped.contains("Matched on the method name alone"),
+            "{mapped}"
+        );
+
+        // And a return that is the element itself.
+        let source = "Story.new.comments.detect { |one| one }.story\n";
+        let (mut harness, _dump, uri) = models_project(source);
+        let found = card(&mut harness, &uri, source, "story");
+        assert!(found.contains("Comment#story"), "{found}");
+        assert!(
+            !found.contains("Matched on the method name alone"),
+            "{found}"
+        );
+    }
+
+    /// A name the interface copies from `Enumerable` is offered **once**.
+    ///
+    /// The relation has both its own declaration and the module's (through Rails' `include`). A
+    /// member walk that did not hide the second behind the first would list each copied name twice
+    /// in completion and push the wanted name down. Ruby's lookup hides it, and so does the walk
+    /// this reads.
+    #[test]
+    fn a_name_the_interface_copies_out_of_enumerable_is_offered_once() {
+        let (mut harness, _dump, uri) = models_project("");
+        let answer = harness.complete(&uri, "Story.new.comments.~\n");
+        let (labels, precise) = offered(&answer);
+        assert!(
+            precise,
+            "the receiver is a relation, not name-matched: {labels:?}"
+        );
+        assert_eq!(
+            labels.iter().filter(|label| *label == "map").count(),
+            1,
+            "{labels:?}"
+        );
+        assert_eq!(
+            labels.iter().filter(|label| *label == "entries").count(),
+            1,
+            "the one the interface leaves to the `include` is there exactly once too: {labels:?}"
+        );
+    }
+
     #[test]
     fn what_the_relation_class_is_called() {
         assert_eq!(relation_of("Comment"), "Comment::Relation");
@@ -1164,11 +1319,10 @@ mod tests {
 
     #[test]
     fn a_collection_chains_through_a_relation_class_that_no_file_declares() {
-        // The relation class's whole point. `story.comments` is a relation, `.first` is a
-        // `Comment`, and
-        // `.title` — hmm, `Comment` has no columns here, so the chain is checked one link
-        // further along instead: `.first.story` is a `Story` again, which is the association
-        // `belongs_to` wrote, reached through a class this pass invented.
+        // The relation class's whole point: `story.comments` is a relation and `.first` is a
+        // `Comment`. `Comment` has no columns here, so the chain goes one link further:
+        // `.first.story` is a `Story` again, through the `belongs_to`, reached via a class this
+        // pass invented.
         let source = "Story.new.comments.first.story\n";
         let (mut harness, _story, uri) = models_project(source);
 
@@ -1179,10 +1333,9 @@ mod tests {
 
     #[test]
     fn a_model_answers_the_query_interface_on_its_own_class() {
-        // `Comment::Relation` is the hard half; without a class side nothing declares `first`,
-        // `where` or `find` on the model *itself*, so a chain can be followed and never
-        // started. `Story.recent.first.user` works off a macro alone and `Story.first.user`
-        // does not, which is a strange thing for a server to be able to say.
+        // Without a class side, nothing declares `first`, `where` or `find` on the model *itself*,
+        // so a chain could be followed but never started: `Story.recent.first.user` would work off
+        // a macro alone and `Story.first.user` would not.
         let source = "Story.first.user\n";
         let (mut harness, _story, uri) = models_project(source);
 
@@ -1206,11 +1359,9 @@ mod tests {
     /// The word *after* a scope, which is the half a class object cannot answer.
     #[test]
     fn a_scope_is_declared_on_the_relation_as_well_as_on_the_class_object() {
-        // `Story.recent.visible.first` is the ordinary spelling of a query and Rails makes it
-        // work by delegating every scope to the relation — `ActiveRecord::Delegation` builds a
-        // module per relation class holding them. Declared on the class object alone, the first
-        // hop resolves and every hop after it falls to the name-based list: a chain that gets
-        // *worse* the further the code has already got.
+        // `Story.recent.visible.first` is ordinary Rails: `ActiveRecord::Delegation` builds a
+        // module per relation class holding every scope. Declared on the class object alone, the
+        // first hop resolves and every later hop falls to the name-based list.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         let story = harness.write(
@@ -1255,12 +1406,12 @@ mod tests {
     /// The same, where the two halves are written into **two different generated documents**.
     #[test]
     fn a_concerns_scope_reaches_the_relation_whose_class_another_document_wrote() {
-        // A concern's `scope` is declared on each includer and lives in the *concern's*
-        // document; the includer's relation class is written wherever it was first asked for,
-        // which for a model no macro collects is the model's own. So `Poll::Relation` is opened
-        // in `poll.rb`'s document with its superclass and reopened in `expireable.rb`'s with a
-        // member — the one shape where a member and the class it hangs on are written by two
-        // generators that never see each other.
+        // A concern's `scope` is declared on each includer and lives in the *concern's* document.
+        // The includer's relation class is written where it was first asked for, which for a model
+        // no macro collects is the model's own document. So `Poll::Relation` is opened in
+        // `poll.rb`'s document with its superclass and reopened in `expireable.rb`'s with a member:
+        // the one shape where a member and its class come from two generators that never see each
+        // other.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         let concern = harness.write(
@@ -1303,10 +1454,9 @@ mod tests {
 
     #[test]
     fn a_callback_macro_that_declares_nothing_still_answers_nothing() {
-        // A bound rather than a gap: `define_model_callbacks` writes `before_save` at run time
-        // and no file anywhere holds a `def` for it, so there is nothing for either half of the
-        // concern edge to find. Declaring one is `models.rs`' job, and this asserts it was not
-        // quietly done here.
+        // No file holds a `def` for `before_save`: `define_model_callbacks` writes it at run time.
+        // The concern edge must not invent one, and the generated callback has no place, so
+        // `definition` answers nothing.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write("app/models/application_record.rb", CONCERNS);
@@ -1323,10 +1473,10 @@ mod tests {
 
     #[test]
     fn the_query_interface_is_read_by_arity_like_every_other_signature() {
-        // The arity partition doing work it already does, on text this crate wrote rather than on
-        // `vendor/rbs`. `find` requires an argument and `find_by` does not, so `Story.find(1)`
-        // is a `Story` and `Story.find` is nothing — the arm that would have answered is one no
-        // call reached, which is the whole of why a generated signature is safe to write.
+        // The arity partition, on text this crate wrote instead of `vendor/rbs`. `find` requires an
+        // argument and `find_by` does not, so `Story.find(1)` is a `Story` and `Story.find` is
+        // nothing. The arm that would have answered is one no call reached, which is why a
+        // generated signature is safe to write.
         let source = "Story.find(1).user\n";
         let (mut harness, _story, uri) = models_project(source);
         let found = card(&mut harness, &uri, source, "user");
@@ -1336,8 +1486,8 @@ mod tests {
             "{found}"
         );
 
-        // `find_by` is declared `Story?`, and optional takes the inner type — so the chain off
-        // it is the same one, which is the entry `types.md` calls the one inexact one.
+        // `find_by` is declared `Story?`, and an optional takes its inner type, so the chain off it
+        // is the same. `types.md` lists this as the one inexact entry.
         let maybe = "Story.find_by(id: 1).user\n";
         let by = harness.write("app/by.rb", maybe);
         harness.watch(&[&by]);
@@ -1356,9 +1506,9 @@ mod tests {
 
     #[test]
     fn the_query_interface_is_not_a_place_a_user_is_sent() {
-        // The no-place clause, in a stronger version. A relation's members could at least
-        // have been pointed at one of the `has_many`s that asked for the class; `Story.where`
-        // could be pointed nowhere at all, because no line of anybody's code declares it.
+        // The no-place rule, stronger. A relation's members could at least point at one of the
+        // `has_many`s that asked for the class; `Story.where` can point nowhere, because no line of
+        // code declares it.
         let source = "Story.first\n";
         let (mut harness, _story, uri) = models_project(source);
         assert!(
@@ -1369,11 +1519,9 @@ mod tests {
 
     #[test]
     fn every_model_answers_the_query_interface_and_nothing_else_does() {
-        // The bound is the superclass chain and not "a class some macro made a collection",
-        // which is evidence a file states and is also the wrong evidence: ActiveRecord answers `where` on a model because it is a model, and
-        // `has_many` has nothing to do with it. So the bound is now the superclass chain, which
-        // is evidence a file states too — and declaring the names on *everything* is still
-        // how a convention table starts being wrong, which is what the last assertion holds.
+        // The bound is the superclass chain: ActiveRecord answers `where` on a model because it is
+        // a model, and `has_many` has nothing to do with it. Declaring the names on *everything* is
+        // how a convention table starts being wrong, which the last assertion guards.
         let (mut harness, _story, _uri) = models_project("");
         assert!(harness.has("Story::<Story>#where()"));
 
@@ -1402,15 +1550,12 @@ mod tests {
 
     #[test]
     fn the_callbacks_resolve_on_a_model_and_on_nothing_else() {
-        // `before_create` is a `def` in activesupport that
-        // `define_model_callbacks` wrote at boot, so no file in the workspace declares it, the
-        // graph correctly found nothing, and the name rung answered with the only
-        // `before_create` anybody's file *does* write —
-        // `Fabrication::Schematic::Evaluator#before_create`, in a gem, in a fixture library.
+        // `before_create` is a `def` that `define_model_callbacks` writes at boot, so no workspace
+        // file declares it. Without this, the graph finds nothing and the name rung answers with
+        // the only `before_create` anybody's file writes: a fixture library's, in a gem.
         //
-        // The last assertion is the bound, and it is the entry points' shape: a class that is
-        // not a model gets none of these, so a gem that really does define one keeps
-        // every position it had.
+        // The last assertion is the bound, shaped like the entry points': a class that is not a
+        // model gets none of these, so a gem that really defines one keeps its answers.
         let (mut harness, _story, _uri) = models_project("");
         let source = "class Widget < ApplicationRecord\n                        after_initialize :a\n                        before_create :b\n                        before_save :c\n                        after_create_commit :d\n                      end\n";
         let widget = harness.write("app/models/widget.rb", source);
@@ -1454,14 +1599,11 @@ mod tests {
 
     #[test]
     fn a_receiverless_call_answers_what_the_same_call_on_self_answers() {
-        // Asserted as an **equality** rather than as a list of expected types, because the
-        // right answer is known before the server is asked. `self.comments.first` resolves;
-        // `comments.first`, one word shorter and the same Ruby, reaches the name rung and
-        // offers a list unless a receiverless call is read as `self`.
+        // Asserted as an **equality**, because the right answer is known before asking.
+        // `self.comments.first` resolves; `comments.first` is the same Ruby and must answer the
+        // same, which it does only if a receiverless call is read as `self`.
         //
-        // Two files rather than two lines of one, because `position_of` takes the first
-        // occurrence of a word — and because that is the shape the probe which found this used:
-        // the same expression, written twice, with one difference.
+        // Two files, not two lines of one, because `position_of` takes a word's first occurrence.
         let (mut harness, _story, _uri) = models_project("");
         let explicit_source = "class Widget < ApplicationRecord\n                                 has_many :comments\n                                 def a\n    self.comments.first\n  end\n                               end\n";
         let bare_source = "class Widget\n  def b\n    comments.first\n  end\nend\n";
@@ -1481,10 +1623,10 @@ mod tests {
              answer differently"
         );
 
-        // The widened guard, measured on its own because it is the half that can reach a method
-        // the file does not declare. `find(1)` writes an argument, so a guard that refuses
-        // arguments makes it `Receiver::Unknown` and ends the chain — the guard is a bound on
-        // the *guess* and must not be spent on the lookup as well.
+        // The widened guard, checked alone because it is the half that can reach a method the file
+        // does not declare. `find(1)` writes an argument, so a guard that refused arguments would
+        // make it `Receiver::Unknown` and end the chain. The guard bounds the *guess*, not the
+        // lookup.
         let with_argument = "class Gizmo < ApplicationRecord\n                               has_many :comments\n                               def self.c\n    find(1).comments.first\n  end\n                             end\n";
         let gizmo = harness.write("app/models/gizmo.rb", with_argument);
         harness.watch(&[&gizmo]);
@@ -1501,25 +1643,22 @@ mod tests {
 
     #[test]
     fn the_collection_predicates_are_on_the_side_rails_puts_them_on() {
-        // The collection predicates, both halves. `api_key_scopes.size` is the shape a user hits:
-        // an association that types, a relation that exists, and a member of it that nothing
-        // declared — so a chain which had already resolved twice fell to the name rung at its
-        // third hop and offered 192 possible definitions.
+        // The collection predicates, both halves. `api_key_scopes.size` is what a user hits: an
+        // association that types, a relation that exists, and a member nothing declared, so a chain
+        // that had resolved twice fell to the name rung at the third hop.
         //
-        // The other half is a subtraction, and it is a finding rather than a feature.
-        // `ActiveRecord::Querying::QUERYING_METHODS` *is* the class side, and it names
-        // neither `each` nor `to_a` — both a `NoMethodError` on a model in Ruby — nor `size`,
-        // `length` and `empty?`, which `Relation` defines and nothing delegates. A generated
-        // declaration no legal call can reach is the same defect as an inherited class side.
+        // The other half is a subtraction. `ActiveRecord::Querying::QUERYING_METHODS` *is* the
+        // class side, and it names neither `each` nor `to_a` (both a `NoMethodError` on a model),
+        // nor `size`, `length` and `empty?`, which `Relation` defines and nothing delegates. A
+        // declaration no legal call can reach is a defect.
         let source = "Story.first.comments.size
 ";
         let (mut harness, _story, uri) = models_project(source);
 
         let counted = card(&mut harness, &uri, source, "size");
-        // One copy for the project puts the whole interface onto one class the project's
-        // relations inherit, so the card names that rather than `Comment::Relation` — the
-        // stated cost, and it is the third hop of a chain that still resolves, which is what the
-        // assertion below is about.
+        // One copy per project puts the interface on one class every relation inherits, so the card
+        // names that class, not `Comment::Relation`. That is the stated cost; the assertion below
+        // checks the chain still resolves.
         assert!(counted.contains("ActiveRecordRelation#size"), "{counted}");
         assert!(
             !counted.contains("Matched on the method name alone"),
@@ -1556,17 +1695,17 @@ mod tests {
 
     #[test]
     fn a_relation_is_an_enumerable_and_a_select_chain_does_not_end_at_one() {
-        // Rails writes `include Enumerable` in `ActiveRecord::Relation`, and leaving it out
-        // costs measurable down-moves: `select` correctly answers a relation, and a relation
-        // with nothing of `Enumerable` in it is a **dead end** for the `.index_by` or `.map`
-        // that habitually follows one. Four of twelve
-        // down-moves were this and nothing else — the first hop made right and the second made
-        // impossible.
-        let source = "Story.where(id: 1).select(:id).sort\n";
+        // Rails writes `include Enumerable` in `ActiveRecord::Relation`. Without it, `select`
+        // correctly answers a relation that is a **dead end** for the `.index_by` or `.map` that
+        // usually follows.
+        //
+        // Asked of `entries`, which the interface deliberately does **not** copy from `Enumerable`
+        // (its `Array[E]` erases to `Array` either way), so only the `include` can answer it.
+        let source = "Story.where(id: 1).select(:id).entries\n";
         let (mut harness, _story, uri) = models_project(source);
 
-        let sorted = card(&mut harness, &uri, source, "sort");
-        assert!(sorted.contains("Enumerable#sort"), "{sorted}");
+        let sorted = card(&mut harness, &uri, source, "entries");
+        assert!(sorted.contains("Enumerable#entries"), "{sorted}");
         assert!(
             !sorted.contains("Matched on the method name alone"),
             "the hop after a `select` resolves rather than guessing: {sorted}"
@@ -1581,12 +1720,11 @@ mod tests {
 
     /// A model whose superclass chain leaves the application pays for its own class side.
     ///
-    /// One copy for the project puts the query interface on the **base**, and the base has
-    /// to be a class this pass may declare on. forem writes `Tag < ActsAsTaggableOn::Tag` and
-    /// `EmailMessage < Ahoy::Message`, which are real models whose base class is in a gem: the
-    /// walk stops at the model itself, and it gets the copy every model used to get. The
-    /// alternative — a base ya-lsp invents — does not work at all, because a generated
-    /// superclass on a class the user's own file already gives one is silently ignored.
+    /// The query interface goes on the **base**, and the base must be a class this pass may declare
+    /// on. `Tag < ActsAsTaggableOn::Tag` and `EmailMessage < Ahoy::Message` are real models with a
+    /// base class in a gem, so the walk stops at the model itself and it gets its own copy. An
+    /// invented base does not work: a generated superclass on a class whose own file names one is
+    /// silently ignored.
     #[test]
     fn a_model_whose_base_is_not_the_applications_declares_its_own_class_side() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1624,21 +1762,18 @@ mod tests {
 
     #[test]
     fn the_vocabulary_is_rails_own_list_and_the_call_decides_the_arm() {
-        // The table is `ActiveRecord::Querying::QUERYING_METHODS` — all 113 — rather than the
-        // names somebody could type a signature for, plus the two places
-        // Rails puts a class method that is not in it. What the widening rests on is that a
-        // name may still refuse a *type*: `pick` and every `async_*` are declared `untyped`, so
-        // the name resolves and the chain stops: the type declines, the name never does.
+        // The table is all of `ActiveRecord::Querying::QUERYING_METHODS`, not just the names
+        // someone could type, plus the two places Rails puts a class method outside it. The width
+        // is safe because a name may still refuse a *type*: `pick` and every `async_*` are
+        // `untyped`, so the name resolves and the chain stops.
         let source = "Story.first.comments.pluck(:body)\n";
         let (mut harness, _story, uri) = models_project(source);
 
-        // `create!` is the interesting one: class-side, in `Persistence::ClassMethods`
-        // and **not** in `QUERYING_METHODS`, so a table read out of that constant alone could
-        // never have had it — and it is on no relation, because no relation answers it.
+        // `create!` is class-side, in `Persistence::ClassMethods` and **not** in
+        // `QUERYING_METHODS`, so a table read from that constant alone would miss it.
         assert!(harness.has("Story::<Story>#create!()"));
-        // …and `relation.rb` defines it too, which a completion sweep is what catches: five of
-        // that block's six names are on both sides, and
-        // `instantiate` is the one that is genuinely the class's alone.
+        // …and `relation.rb` defines it too: five of that block's six names are on both sides, and
+        // `instantiate` is the class's alone.
         assert!(harness.has("ActiveRecordRelation#create!()"));
         assert!(harness.has("Story::<Story>#instantiate()"));
         assert!(!harness.has("ActiveRecordRelation#instantiate()"));
@@ -1661,9 +1796,8 @@ mod tests {
             "{plucked}"
         );
 
-        // The arity split, which is the half that needed a new shape in the fact table: one
-        // declaration, two arms, and the count at the call site decides. `Array` is what
-        // `class_at` reads off the members offered, so this is the answer a user would see.
+        // The arity split: one declaration, two arms, and the call's argument count decides.
+        // `class_at` reads `Array` off the members offered, so this is what a user would see.
         assert_eq!(class_at(&mut harness, &uri, "Story.first(3).~"), "Array");
         assert_eq!(class_at(&mut harness, &uri, "Story.pluck(:id).~"), "Array");
         // `select` is the same shape decided by the block instead: with column names it is a
@@ -1683,15 +1817,14 @@ mod tests {
 
     #[test]
     fn where_never_answers_the_chain_a_keyword_hash_cannot_be_told_from() {
-        // A bound stated as a test, because it is a decision rather than an omission. `where` with no argument returns a `QueryMethods::WhereChain`, which is
-        // where `not`, `missing` and `associated` live — 843 call sites of `not` in the six
-        // corpora. An arity split beside `first`'s is **not expressible** for it: `arity_of` deliberately does not count a keyword hash as a positional
-        // argument, so `3.7.round(half: :up)` reaches the zero-argument arm — and so does
-        // `Story.where(title: "x")`, the commonest call in Rails. An arm answering `WhereChain`
-        // at arity 0 would answer it for that call too.
+        // A bound stated as a test, because it is a decision. `where` with no argument returns a
+        // `QueryMethods::WhereChain` (home of `not`, `missing` and `associated`). An arity split
+        // like `first`'s **cannot express** it: `arity_of` does not count a keyword hash as a
+        // positional argument, so `Story.where(title: "x")`, the commonest call in Rails, also
+        // reaches the zero-argument arm. A `WhereChain` arm would answer it for that call too.
         //
-        // So `where` answers a relation on every arm. The assertion that matters is the second
-        // one: the keyword form keeps the answer it has always had.
+        // So `where` answers a relation on every arm. The second assertion matters most: the
+        // keyword form keeps its answer.
         let source = "Story.where.not(id: 1)\nStory.where(title: \"x\").first.user\n";
         let (mut harness, _story, uri) = models_project(source);
         assert!(
@@ -1705,20 +1838,16 @@ mod tests {
 
     #[test]
     fn a_model_that_writes_no_macro_answers_on_its_own_relation_and_not_its_parents() {
-        // The defect the per-model class side exists to fix, and the reason the relation set
-        // is a **union** rather than a rule about abstract classes. lobsters writes `scope :select_fix` in its
-        // `ApplicationRecord`; that made `ApplicationRecord` a collection element, wrote an
-        // `ApplicationRecord::Relation`, and put the ten names on a singleton **every model in
-        // the application inherits** — so `Category.order(...)` answered a relation of a class
-        // no row is ever an instance of, and every chain off it was wrong rather than absent.
-        // 107 lobsters positions name `ApplicationRecord` in their card and 64 of them resolve
-        // or derive through exactly this.
+        // Why the relation set is a **union**, not a rule about abstract classes. A project writing
+        // `scope :select_fix` in its `ApplicationRecord` made `ApplicationRecord` a collection
+        // element and put the class side on a singleton **every model inherits**, so
+        // `Category.order(...)` answered a relation of a class no row belongs to, and every chain
+        // off it was wrong.
         //
-        // Declining to give an abstract class a relation deletes the wrong answer and supplies
-        // nothing: `Category.select_fix` goes with it, because a `scope` declares nothing at
-        // all when its class has no relation. That was built, measured at **64** down-moves
-        // against the 11 it was meant to repair, and reverted. What fixes it is `Category`
-        // owning the ten names itself, so the inherited pair is never reached.
+        // Refusing an abstract class a relation deletes the wrong answer and supplies nothing:
+        // `Category.select_fix` goes too, because a `scope` declares nothing when its class has no
+        // relation. That lost more answers than it fixed. The fix is `Category` owning the names
+        // itself, so the inherited pair is never reached.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut harness = Harness::at(dir, PositionEncoding::Utf16);
         harness.write("app/models/channel.rb", "module Channel\nend\n");
@@ -1741,13 +1870,11 @@ mod tests {
         let uri = harness.write("app/main.rb", source);
         harness.index();
 
-        // **Asserted on the place rather than on the card**, which one copy per project makes
-        // necessary and which is the sharper test either way. `order` is declared once on the
-        // base, so the card names `ApplicationRecord.order` whatever it
-        // returns; what has to be right is the *chain*, and every link of it is the defect:
-        // `Category.order` is a `Category::Relation`, its `first` is a `Category`, and only a
-        // `Category` has `things`. The defect is each of those answering `ApplicationRecord`
-        // instead.
+        // **Asserted on the place, not the card.** `order` is declared once on the base, so the
+        // card says `ApplicationRecord.order` whatever it returns. What must be right is the
+        // *chain*: `Category.order` is a `Category::Relation`, its `first` is a `Category`, and
+        // only a `Category` has `things`. The defect was each of those answering
+        // `ApplicationRecord`.
         let things = card(&mut harness, &uri, source, "things");
         assert!(
             things.contains("Category#things"),
@@ -1757,15 +1884,11 @@ mod tests {
             harness.has("ApplicationRecord::<ApplicationRecord>#select_fix()"),
             "and the parent keeps the scope it really does install on every subclass"
         );
-        // The other half, and the receiver-relative return types **reverse** it. Taking the
-        // class side off an abstract class is the right rule while the interface names a
-        // concrete class, because it is inherited — so a model whose own
-        // class side was out of reach for some other reason answered `ApplicationRecord` —
-        // chatwoot's `Captain::Assistant.find` is the position that measured it. The two
-        // receiver-relative return types fix that at its source rather than by withholding the
-        // declaration, so the interface is on the base *deliberately* now and the chain above
-        // is what says it is safe. What is left of the trade is stated: `ApplicationRecord.order`
-        // resolves and raises in Ruby, on a receiver nobody writes.
+        // The other half. While the interface named a concrete class, keeping the class side off an
+        // abstract class was right, because it is inherited. The receiver-relative return types fix
+        // that at the source, so the interface is on the base *deliberately*, and the chain above
+        // proves it safe. The stated trade: `ApplicationRecord.order` resolves here and raises in
+        // Ruby, on a receiver nobody writes.
         assert!(harness.has("ActiveRecordRelation#order()"));
         assert!(harness.has("ApplicationRecord::<ApplicationRecord>#order()"));
         assert!(
@@ -1776,18 +1899,15 @@ mod tests {
 
     #[test]
     fn the_chain_that_promoted_this_item_lands_on_one_target() {
-        // The chain this exists for: `Story.first.comments.first.user.username`, which without
-        // the generators answers with a name-based candidate list that merely happens to
-        // contain the right target.
+        // The chain this exists for: `Story.first.comments.first.user.username`, which without the
+        // generators answers with a name-based list that merely contains the right target.
         //
-        // Five links and four generators: the class side, a `has_many`, the relation it
-        // returns, a `belongs_to`, and then a column — with the last two documents reopening
-        // `class User` from two different files, which is the arrangement no other test here
-        // puts together.
+        // Five links, four generators: the class side, a `has_many`, the relation it returns, a
+        // `belongs_to`, then a column. The last two documents reopen `class User` from two files,
+        // which no other test here combines.
         let source = "Story.first.comments.first.user.username\n";
         let (mut harness, _story, uri) = models_project(source);
-        // The shared fixture's `Comment` has no author, and lobsters' does — the link the
-        // benchmark's chain turns on.
+        // The shared fixture's `Comment` has no author; this chain needs one.
         let comment = harness.write(
             "app/models/comment.rb",
             "class Comment < ApplicationRecord\n  belongs_to :story\n  \

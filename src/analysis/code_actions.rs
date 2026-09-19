@@ -1,40 +1,37 @@
-//! `textDocument/codeAction` — the refactorings that need no Ruby.
+//! `textDocument/codeAction`: the refactorings that need no Ruby.
 //!
-//! # Why these four, and why no quick fix
+//! # Why these four, and no quick fix
 //!
-//! Of the five families a Ruby editor is used to, exactly one needs a linter: autocorrect, which
-//! RuboCop serves over its own `textDocument/codeAction`, so a user running both servers already
-//! has it. The other four are rewrites over a Prism tree, and Prism is already linked into this
-//! binary — so this module composes with RuboCop rather than competing with it.
+//! Of the five action families a Ruby editor has, only autocorrect needs a linter, and RuboCop
+//! serves it over its own `textDocument/codeAction`, so a user running both servers already has it.
+//! The other four are rewrites over a Prism tree, and Prism is already in this binary, so this
+//! module complements RuboCop instead of competing.
 //!
-//! There is no `quickfix`, and the reason is the shape of the diagnostic table rather than a
-//! preference: two of its ten rules are statements about the user's code and the other eight are
-//! rubydex saying *it* gave up. A fix needs a rule that knows what the code should say instead,
-//! and "the indexer could not follow this" does not.
+//! No `quickfix`, because of the diagnostic table's shape: two of its ten rules are statements
+//! about the user's code, and the other eight are rubydex saying *it* gave up. A fix needs a rule
+//! that knows what the code should say instead, and "the indexer could not follow this" does not.
 //!
-//! # This is the second module in the crate that writes
+//! # The second module in the crate that writes
 //!
-//! [`rename`](super::rename) states the bar: every other wrong answer shows the user something
-//! unhelpful and they look elsewhere, while a wrong answer here edits their files. The test is
-//! not "how much can be refactored" but "what can be refactored *exactly*". Three things enforce
-//! it, in increasing order of how much they catch:
+//! [`rename`](super::rename) sets the bar: any other wrong answer shows something unhelpful, but a
+//! wrong answer here edits files. So the question is what can be refactored *exactly*. Three things
+//! enforce it, catching progressively more:
 //!
-//! - **Nothing is offered where the file does not parse.** A tree built by error recovery hands
-//!   out spans that do not nest, and an edit placed by one of those lands anywhere.
-//! - **Every guard refuses rather than approximating.** Where the analysis cannot answer — a
-//!   local the extraction would have to hand back, a block whose delimiters do not bind the same
-//!   way, an accessor that would read a different variable — the action is not offered. The
-//!   refusal is silent, unlike a rename's: the user pressed no key asking for this one, and an
-//!   action absent from a menu is the right way to say no.
-//! - **Every action is applied to a copy of the buffer and the result is parsed before it is
-//!   offered.** Exactness as a gate rather than as something measured afterwards. It is not
-//!   decoration: it catches spellings the guards above do not model, such as a `do … end` block
-//!   carrying an `ensure` (which a brace block cannot hold) and two adjacent string literals
-//!   joined by a line continuation (one string with two nodes in it). The first is what an RSpec
-//!   `around` hook looks like.
+//! - **Nothing is offered where the file does not parse.** A tree built by error recovery has spans
+//!   that do not nest, and an edit placed by one lands anywhere.
+//! - **Every guard refuses instead of approximating.** Where the analysis cannot answer (a local
+//!   the extraction would have to return, a block whose delimiters do not bind the same way, an
+//!   accessor that would read a different variable), the action is not offered. Silently, unlike a
+//!   rename: the user pressed no key for this one, and an action absent from a menu is the right
+//!   way to say no.
+//! - **Every action is applied to a copy of the buffer and re-parsed before it is offered.**
+//!   Exactness as a gate, not a measurement afterwards. It catches spellings the guards do not
+//!   model, such as a `do … end` block with an `ensure` (which a brace block cannot hold; this is
+//!   what an RSpec `around` hook looks like) and two adjacent string literals joined by a line
+//!   continuation (one string, two nodes).
 //!
-//! The re-parse cannot be the only guard, because Ruby's two block delimiters bind differently
-//! and both spellings parse:
+//! The re-parse cannot be the only guard, because Ruby's two block delimiters bind differently and
+//! both parse:
 //!
 //! ```ruby
 //! def show(x) = "show(#{x.inspect})"
@@ -42,13 +39,13 @@
 //! puts show [1, 2].map do |n| n * 2 end  # => show(#<Enumerator: [1, 2]:map>)
 //! ```
 //!
-//! Same code, delimiters swapped, a different program that still runs. Toggling block style
-//! therefore needs a precedence test, and extract-to-method needs to pass the locals it reads —
-//! slicing a selection out verbatim gives a method that raises `NameError` on its first call.
+//! Same code, delimiters swapped, a different program that still runs. So toggling block style
+//! needs a precedence test, and extract-to-method must pass the locals it reads: slicing a
+//! selection out verbatim gives a method that raises `NameError` on its first call.
 //!
 //! # Titles are not messages
 //!
-//! `messages.rs` holds every sentence about the *workspace*. A code action's title is part of an
+//! `messages.rs` holds every sentence about the *workspace*. A code action's title is part of the
 //! answer to one request, like a hover card or a completion label, so it lives here.
 
 use ruby_prism::{
@@ -67,8 +64,8 @@ const METHOD: &str = "extracted_method";
 
 /// One span of the document replaced with text.
 ///
-/// Byte offsets, as everything inside `analysis` is; the caller converts once, from the same
-/// read that produced them.
+/// Byte offsets, like everything inside `analysis`; the caller converts once, from the same read
+/// that produced them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
     pub start: u32,
@@ -78,8 +75,8 @@ pub struct Edit {
 
 /// Which menu an action belongs in.
 ///
-/// The two the protocol has for this, and the server advertises exactly these: a client filters
-/// on the kind before it asks, so a kind advertised and never returned shows an empty submenu.
+/// The protocol's two kinds for this, and the server advertises exactly these: a client filters on
+/// kind before asking, so a kind advertised and never returned shows an empty submenu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Extract,
@@ -96,14 +93,14 @@ pub struct Action {
 
 /// Every refactoring available over `source[start..end]`.
 ///
-/// A cursor is an empty range, and two of the four answer for one: an accessor and a block
-/// toggle need a position, the two extractions need a selection.
+/// A cursor is an empty range. An accessor and a block toggle need only a position; the two
+/// extractions need a selection.
 #[must_use]
 pub fn at(source: &str, start: u32, end: u32) -> Vec<Action> {
     let parsed = ruby_prism::parse(source.as_bytes());
     // Nothing is offered where the file does not parse. Recovery invents spans that do not nest
-    // — the trap `locator::spans` exists for — and an edit placed by one of those lands
-    // somewhere else in the buffer.
+    // (the trap `locator::spans` exists for), and an edit placed by one lands somewhere else in the
+    // buffer.
     if parsed.errors().next().is_some() {
         return Vec::new();
     }
@@ -119,13 +116,12 @@ pub fn at(source: &str, start: u32, end: u32) -> Vec<Action> {
 
 /// Whether applying `action` leaves a file Prism can still parse.
 ///
-/// The cheapest available proxy for exactness, and it is a gate rather than a report: an edit
-/// that breaks the buffer is a bug, and one the user never sees is better than one measured
-/// after the fact.
+/// The cheapest proxy for exactness, used as a gate, not a report: an edit that breaks the buffer
+/// is a bug, and one the user never sees is better than one measured afterwards.
 fn survives(source: &str, action: &Action) -> bool {
     let mut edited = source.to_owned();
     let mut edits = action.edits.clone();
-    // Back to front, so that each span still means what it meant when it was produced.
+    // Back to front, so each span still means what it meant when produced.
     edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
     for edit in edits {
         edited.replace_range(edit.start as usize..edit.end as usize, &edit.text);
@@ -142,19 +138,19 @@ fn survives(source: &str, action: &Action) -> bool {
 
 /// The accessors an instance variable under the cursor could be given.
 ///
-/// Exact by construction: an insertion at the top of the class body, which cannot change what
-/// any existing line means. The one thing that *could* be wrong is which variable the accessor
-/// would read, and [`scopes::accessor_site`] is what settles it — `attr_reader :count` reads an
-/// instance's `@count`, so it is not offered for the `@count` inside `def self.count`, where it
-/// would write an accessor that runs, returns `nil`, and looks right.
+/// Exact by construction: an insertion at the top of the class body cannot change what any existing
+/// line means. The one thing that *could* be wrong is which variable the accessor reads, and
+/// [`scopes::accessor_site`] settles it: `attr_reader :count` reads an instance's `@count`, so it
+/// is not offered for the `@count` inside `def self.count`, where it would run, return `nil`, and
+/// look right.
 fn accessors(source: &str, parsed: &ParseResult<'_>, offset: u32) -> Vec<Action> {
     let Some((name, body)) = scopes::accessor_site(source, offset) else {
         return Vec::new();
     };
     let bare = name.trim_start_matches('@').to_owned();
     let declared = Declared::of(parsed, body, &bare);
-    // An `attr_accessor` already there covers both halves, so all three would be noise; two
-    // separate declarations cover both halves too, and then only the third is.
+    // An existing `attr_accessor` covers both halves, so all three offers would be noise; two
+    // separate declarations cover both halves too, leaving only the third as noise.
     let declares = |macro_name: &str| declared.iter().any(|it| it == macro_name);
     let reads = declares("attr_reader") || declares("attr_accessor");
     let writes = declares("attr_writer") || declares("attr_accessor");
@@ -173,8 +169,8 @@ fn accessors(source: &str, parsed: &ParseResult<'_>, offset: u32) -> Vec<Action>
         actions.push(Action {
             title: format!("Declare {macro_name} :{bare}"),
             kind: Kind::Rewrite,
-            // The body's own indentation is reused twice over: once for the line being written
-            // and once to put back the indentation of the statement it displaces.
+            // The body's own indentation is reused twice: for the line being written, and to
+            // restore the indentation of the statement it displaces.
             edits: vec![Edit {
                 start: body,
                 end: body,
@@ -187,9 +183,8 @@ fn accessors(source: &str, parsed: &ParseResult<'_>, offset: u32) -> Vec<Action>
 
 /// Which `attr_` macros a namespace body already declares for one name.
 ///
-/// **Direct statements of the body only.** An `attr_reader` inside an `if` in the body is
-/// conditional and one inside a nested class belongs to the nested class, so neither is a reason
-/// to withhold the offer.
+/// **Direct statements of the body only.** An `attr_reader` inside an `if` is conditional, and one
+/// inside a nested class belongs to that class, so neither is a reason to withhold the offer.
 struct Declared<'a> {
     body: u32,
     name: &'a str,
@@ -260,20 +255,19 @@ impl<'pr> Visit<'pr> for Declared<'_> {
 
 /// Swap a block's delimiters, when the two spellings mean the same thing.
 ///
-/// The guard is the whole of it. `{ }` binds to the nearest call and `do … end` binds to
-/// the outermost command, so the swap is safe only where there is no command call in between —
-/// and the same test also refuses `it "works" do … end`, where the brace form is not a different
-/// program but a syntax error.
+/// The guard is everything. `{ }` binds to the nearest call and `do … end` to the outermost
+/// command, so the swap is safe only with no command call in between. The same test also refuses
+/// `it "works" do … end`, whose brace form is not a different program but a syntax error.
 fn toggle_block(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32) -> Vec<Action> {
     let calls = Calls::of(parsed, start, end);
-    // Innermost first, so a cursor inside a nested block toggles the block it is in rather than
-    // the one around it.
+    // Innermost first, so a cursor inside a nested block toggles the block it is in, not the one
+    // around it.
     let Some(at) = calls.iter().rposition(|call| call.block.is_some()) else {
         return Vec::new();
     };
     let owner = &calls[at];
-    // A command call cannot take a brace block at all, and one that encloses the owner's call in
-    // its own arguments is exactly the case above: the `do` form would bind to it instead.
+    // A command call cannot take a brace block, and one that holds the owner's call in its own
+    // arguments is exactly the case above: the `do` form would bind to it instead.
     let bound = owner.command()
         || calls[..at].iter().any(|outer| {
             outer.command()
@@ -300,8 +294,8 @@ fn toggle_block(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32) ->
             Edit {
                 start: opening.0,
                 end: opening.1,
-                // `do|n|` and `{|n|` both parse; a space is written anyway, because the point of
-                // the action is the reading and not the parsing.
+                // `do|n|` and `{|n|` both parse; a space is written anyway, because the action is
+                // about reading, not parsing.
                 text: format!("{open}{}", spacer(source, opening.1, true)),
             },
             Edit {
@@ -335,8 +329,8 @@ struct Call {
 }
 
 impl Call {
-    /// A command call: no parentheses and at least one argument, which is the shape whose two
-    /// block spellings do not mean the same thing.
+    /// A command call: no parentheses and at least one argument, the shape whose two block
+    /// spellings differ in meaning.
     fn command(&self) -> bool {
         self.bare && self.arguments.is_some()
     }
@@ -384,13 +378,13 @@ impl<'pr> Visit<'pr> for Calls {
 // Extract to variable
 // ---------------------------------------------------------------------------
 
-/// Lift the selected expression onto a local of its own, in front of the statement it is in.
+/// Lift the selected expression into a local of its own, in front of the statement it is in.
 ///
-/// The rewrite is trivial and the *placement* is the difficulty. Hoisting an expression out of a
-/// branch, a loop or the right of an `&&` changes how often it runs, so nothing between the
-/// selection and the statement may be a construct that decides whether or how many times its
-/// child is evaluated — and the statement itself has to be a line, which is what refuses the
-/// two spellings that look like statements and are not: a ternary's arms and `foo.bar if baz`.
+/// The rewrite is trivial; the *placement* is hard. Hoisting an expression out of a branch, a loop
+/// or the right side of `&&` changes how often it runs, so nothing between the selection and the
+/// statement may decide whether or how often its child runs. The statement itself must also be a
+/// line, which refuses the two spellings that look like statements but are not: a ternary's arms
+/// and `foo.bar if baz`.
 fn extract_variable(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32) -> Vec<Action> {
     let Some((start, end)) = trim(source, start, end) else {
         return Vec::new();
@@ -399,28 +393,27 @@ fn extract_variable(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32
         return Vec::new();
     }
     let chain = Chain::of(parsed, start, end);
-    // Innermost, so that `foo(x)` with `x` selected extracts the argument and not the argument
-    // list that happens to span the same bytes.
+    // Innermost, so `foo(x)` with `x` selected extracts the argument, not the argument list
+    // spanning the same bytes.
     let Some(selected) = chain
         .iter()
         .rposition(|step| step.value && (step.start, step.end) == (start, end))
     else {
         return Vec::new();
     };
-    // The innermost statement list that is a real one, and then the child of it the path goes
-    // through. A `#{}` body has already been demoted by `Chain::of`, so the search walks past
-    // it rather than writing a line inside an interpolation.
+    // The innermost real statement list, then the child of it the path goes through. A `#{}` body
+    // was already demoted by `Chain::of`, so the search walks past it instead of writing a line
+    // inside an interpolation.
     let statement = chain[..selected]
         .iter()
         .rposition(|step| step.shape == Shape::Statements)
-        // Total, and the fallback answers "the selection is its own statement", which the guard
-        // below then declines. A chain always holds the file's own statement list, so this is
-        // where a selection Prism placed nowhere ends up rather than a case with anything to do.
+        // Total: the fallback means "the selection is its own statement", which the guard below
+        // then declines. A chain always holds the file's own statement list, so this is where a
+        // selection Prism placed nowhere ends up, not a real case.
         .map_or(selected, |at| at + 1);
-    // The statement itself is in the range, and that is the half of this test that catches the
-    // commonest wrong answer: in `user && user.name` the statement *is* the `&&`, so nothing is
-    // crossed on the way out to it, and hoisting the right operand in front of it is what turns
-    // a guard into a `NoMethodError`.
+    // The statement itself is in the range, and that half catches the commonest wrong answer: in
+    // `user && user.name` the statement *is* the `&&`, so nothing is crossed on the way out, and
+    // hoisting the right operand before it turns a guard into a `NoMethodError`.
     if !chain[statement..selected]
         .iter()
         .all(|step| step.shape == Shape::Transparent)
@@ -428,8 +421,8 @@ fn extract_variable(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32
         return Vec::new();
     }
     // A selection that is already a whole statement has nowhere to go: `extracted = puts x`
-    // followed by `extracted` is the same program written worse, and it would sit in the menu
-    // beside the extraction that actually wants a whole statement.
+    // followed by `extracted` is the same program, written worse, and it would clutter the menu
+    // beside the extraction that really wants a whole statement.
     if statement == selected {
         return Vec::new();
     }
@@ -437,8 +430,8 @@ fn extract_variable(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32
     let Some((line, indent)) = span_owns_its_lines(source, statement.start, statement.end) else {
         return Vec::new();
     };
-    // A heredoc's body follows the line its opener is on, so an opener that moves up a line
-    // leaves the body behind. Nothing that fails to parse on its own may be lifted anywhere.
+    // A heredoc's body follows its opener's line, so an opener that moves up a line leaves its body
+    // behind. Nothing that fails to parse on its own may be lifted anywhere.
     if ruby_prism::parse(&source.as_bytes()[start as usize..end as usize])
         .errors()
         .next()
@@ -475,11 +468,10 @@ fn extract_variable(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32
 
 /// Lift a run of whole statements into a method beside the one they are in.
 ///
-/// The only one of the four that needs an analysis, and the analysis is
-/// [`scopes::crossing`]: a local the run reads before it writes becomes a parameter, and a local
-/// it writes that is touched afterwards has no single value the new method could hand back, so
-/// that case is declined rather than approximated — passing no parameters at all is the trade
-/// this module's opening paragraph refuses.
+/// The only one of the four that needs an analysis: [`scopes::crossing`]. A local the run reads
+/// before writing becomes a parameter. A local it writes that is used afterwards has no single
+/// value the new method could return, so that case is declined, not approximated (passing no
+/// parameters at all is the trade this module refuses).
 fn extract_method(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32) -> Vec<Action> {
     let Some((start, end)) = trim(source, start, end) else {
         return Vec::new();
@@ -488,8 +480,8 @@ fn extract_method(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32) 
         return Vec::new();
     }
     let chain = Chain::of(parsed, start, end);
-    // The run has to be whole statements: the innermost statement list containing the selection
-    // must have a child starting exactly where it starts and one ending exactly where it ends.
+    // The run must be whole statements: the innermost statement list containing the selection needs
+    // a child starting exactly where the selection starts and one ending exactly where it ends.
     let Some(statements) = chain
         .iter()
         .rposition(|step| step.shape == Shape::Statements)
@@ -500,15 +492,15 @@ fn extract_method(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32) 
     if !children.iter().any(|&(at, _)| at == start) || !children.iter().any(|&(_, at)| at == end) {
         return Vec::new();
     }
-    // Placed by the same rule the variable extraction uses, and here it does the same work: a
-    // run that does not own its lines is one of the spellings that only looks like a statement.
+    // Placed by the same rule as variable extraction, doing the same work: a run that does not own
+    // its lines is one of the spellings that only looks like a statement.
     let Some((line, indent)) = span_owns_its_lines(source, start, end) else {
         return Vec::new();
     };
 
-    // Searched over what is *outside* the statement list, which is what makes it the method the
-    // run is inside rather than the method the run is: selecting a whole `def` finds no
-    // enclosing one and is declined, where a search over the whole chain would find itself.
+    // Searched over what is *outside* the statement list, which finds the method the run is inside,
+    // not the method the run is: selecting a whole `def` finds no enclosing one and is declined,
+    // where a search over the whole chain would find itself.
     let Some(enclosing) = chain[..statements]
         .iter()
         .rev()
@@ -526,10 +518,10 @@ fn extract_method(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32) 
         return Vec::new();
     };
 
-    // Everything the run does that an ordinary call cannot do: `return` and its relatives leave
-    // the *new* method, `yield` has no block to reach, and `super` resolves against the new
-    // name. A multi-line literal is refused because the body is re-indented, and re-indenting a
-    // string changes what it says while leaving a file that still parses.
+    // Everything the run does that an ordinary call cannot: `return` and its relatives would leave
+    // the *new* method, `yield` has no block to reach, and `super` resolves against the new name. A
+    // multi-line literal is refused because the body is re-indented, and re-indenting a string
+    // changes what it says while still parsing.
     if Inside::any(source, parsed, start, end) {
         return Vec::new();
     }
@@ -575,21 +567,21 @@ fn extract_method(source: &str, parsed: &ParseResult<'_>, start: u32, end: u32) 
 
 /// A name that can be written as a positional parameter and read back unchanged.
 ///
-/// `it` and `_1` are read at every occurrence and written at none, because Ruby supplies them
-/// rather than the file declaring them — the same reason [`rename`](super::rename) refuses them.
+/// `it` and `_1` are read everywhere and written nowhere, because Ruby supplies them: the same
+/// reason [`rename`](super::rename) refuses them.
 fn is_plain_parameter(name: &str) -> bool {
     name != "it" && !name.starts_with('_')
 }
 
 /// Re-indent a run of whole lines from `from` to `to`.
 ///
-/// Relative indentation is kept: every line moves by the same amount, measured from the
-/// shallowest line in the run rather than from the first, so a nested `end` stays nested.
+/// Relative indentation is kept: every line moves by the same amount, measured from the shallowest
+/// line, not the first, so a nested `end` stays nested.
 fn reindent(body: &str, from: &str, to: &str) -> String {
     body.lines()
         .map(|line| match line.strip_prefix(from) {
-            // A blank line keeps nothing; a line shallower than the run's own indentation is
-            // inside a literal, which `Inside` has already refused.
+            // A blank line keeps nothing; a line shallower than the run's own indentation is inside
+            // a literal, which `Inside` already refused.
             Some(rest) if !rest.trim().is_empty() => format!("{to}{rest}"),
             _ => line.trim_end().to_owned(),
         })
@@ -624,9 +616,9 @@ impl Inside<'_> {
         if start < self.start || self.end < end {
             return;
         }
-        // Every escape a method boundary would change the meaning of. `return` and its relatives
-        // would leave the *new* method, `yield` has no block to reach from one, and `super`
-        // resolves against the name of the method it is written in.
+        // Every escape a method boundary would change the meaning of: `return` and its relatives
+        // would leave the *new* method, `yield` has no block to reach, and `super` resolves against
+        // the name of the method it is written in.
         self.found |= matches!(
             node,
             Node::ReturnNode { .. }
@@ -639,18 +631,17 @@ impl Inside<'_> {
                 | Node::ForwardingSuperNode { .. }
                 | Node::ForwardingArgumentsNode { .. }
         );
-        // A literal spelled over more than one line is refused because the body is re-indented
-        // on the way out, and re-indenting a string changes what it says while leaving a file
-        // that still parses — which is the one failure the parse gate above cannot see.
+        // A multi-line literal is refused because the body is re-indented, and re-indenting a
+        // string changes what it says while still parsing: the one failure the parse gate cannot
+        // see.
         self.found |= is_literal(node) && self.source[start as usize..end as usize].contains('\n');
     }
 }
 
 impl<'pr> Visit<'pr> for Inside<'_> {
-    // Both hooks, and the leaf one is not padding: `redo`, `retry` and a plain string literal
-    // have no children, so a visitor that only watched branches would let a multi-line string
-    // through — and re-indenting one leaves a file that still parses and no longer says the
-    // same thing, which is the one failure the parse gate cannot see.
+    // Both hooks, and the leaf one matters: `redo`, `retry` and a plain string literal have no
+    // children, so a visitor watching only branches would let a multi-line string through, and
+    // re-indenting it would still parse while saying something different.
     fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
         self.check(&node);
     }
@@ -686,15 +677,15 @@ fn is_literal(node: &Node<'_>) -> bool {
 enum Shape {
     /// A list whose direct children are statements. Where the placement stops.
     Statements,
-    /// A `#{}` interpolation. Its statement list is not a place a line can be written, so the
-    /// search goes past it — the one reason this is a shape of its own.
+    /// A `#{}` interpolation. Its statement list is no place to write a line, so the search goes
+    /// past it: the one reason this is its own shape.
     Embedded,
     /// Evaluated exactly once, unconditionally, when the statement around it runs.
     Transparent,
-    /// Everything else, which is **the default**: a node this module has not thought about is
-    /// one it declines to reach through. `&&`, a ternary's arms, a loop's condition, a
-    /// parameter's default and `rescue`'s modifier form all land here, and each of them decides
-    /// whether or how often its child runs.
+    /// Everything else, and **the default**: a node this module has not thought about is one it
+    /// declines to reach through. `&&`, a ternary's arms, a loop's condition, a parameter's default
+    /// and `rescue`'s modifier form all land here, and each decides whether or how often its child
+    /// runs.
     Opaque,
 }
 
@@ -714,11 +705,10 @@ struct Step {
 /// The method a selection is inside.
 struct Def {
     start: u32,
-    /// Just past the `end` keyword, which is where a sibling method is written. `None` for an
-    /// endless `def`, which has no statement list to extract from anyway.
+    /// Just past the `end` keyword, where a sibling method is written. `None` for an endless `def`,
+    /// which has no statement list to extract from anyway.
     closing: Option<u32>,
-    /// `def self.x`, which a method extracted out of it has to be too, or the call will not
-    /// resolve.
+    /// `def self.x`, which a method extracted from it must also be, or the call will not resolve.
     singleton: bool,
     /// `false` for `def obj.x`, where what the receiver is needs types.
     own: bool,
@@ -726,9 +716,8 @@ struct Def {
 
 /// Every node containing the selection, outermost first.
 ///
-/// Pre-order is what makes this the ancestor chain rather than a list that has to be sorted:
-/// a node containing the selection is on the path to it, and a walk announces a parent before
-/// its children.
+/// Pre-order walking makes this the ancestor chain without sorting: a node containing the selection
+/// is on the path to it, and a walk announces a parent before its children.
 struct Chain {
     start: u32,
     end: u32,
@@ -743,9 +732,9 @@ impl Chain {
             found: Vec::new(),
         };
         walk.visit(&parsed.node());
-        // A statement list that is a `#{}` body is not a place a line can go, so it is demoted
-        // to an ordinary transparent step and the search walks on past it. Done here rather
-        // than in the classification because it is the *parent* that decides it.
+        // A statement list that is a `#{}` body is no place for a line, so it is demoted to an
+        // ordinary transparent step and the search walks past it. Done here, not in the
+        // classification, because the *parent* decides it.
         for at in 1..walk.found.len() {
             if walk.found[at].shape == Shape::Statements
                 && walk.found[at - 1].shape == Shape::Embedded
@@ -756,17 +745,16 @@ impl Chain {
         walk.found
     }
 
-    /// Record a node reached through one of the thirteen typed methods the generic hook never
-    /// fires for.
+    /// Record a node reached through one of the thirteen typed methods the generic hook never fires
+    /// for.
     fn hole(&mut self, node: &Node<'_>) {
         let (start, end) = span(&node.location());
         let (shape, value) = classify(node);
-        // `CallNode` and `ConstantPathNode` arrive both ways — the second only from a match
-        // write and a constant-path assignment — so the same node can be announced twice in a
-        // row. One `dedup` costs less than knowing which way it came, and it has to compare the
-        // classification as well as the span: a file's `ProgramNode` and the statement list
-        // inside it are the same bytes, and dropping the second would leave top-level code with
-        // no statement list to be extracted from.
+        // `CallNode` and `ConstantPathNode` arrive both ways (the second only from a match write
+        // and a constant-path assignment), so the same node can be announced twice in a row. One
+        // `dedup` is cheaper than knowing which way it came, and it must compare the classification
+        // too: a file's `ProgramNode` and its statement list are the same bytes, and dropping the
+        // second would leave top-level code with no statement list to extract from.
         if self.found.last().is_some_and(|last| {
             (last.start, last.end) == (start, end) && last.shape == shape && last.value == value
         }) {
@@ -801,18 +789,18 @@ impl<'pr> Visit<'pr> for Chain {
         self.take(&node);
     }
 
-    // The thirteen the generic hook never sees, announced here and then deferred to, exactly as
-    // `ranges::Selection` does it. `BlockArgumentNode` is the one that arrives that way only
-    // from an index assignment carrying a block, which Ruby's own parser rejects; it is written
-    // anyway rather than left as the one hole a reader would have to rediscover.
+    // The thirteen the generic hook never sees, announced here and then deferred to, as
+    // `ranges::Selection` does. `BlockArgumentNode` arrives this way only from an index assignment
+    // carrying a block, which Ruby's own parser rejects; it is written anyway so no reader has to
+    // rediscover the hole.
 
     fn visit_statements_node(&mut self, node: &StatementsNode<'pr>) {
         let at = span(&node.location());
         self.hole(&node.as_node());
-        // The span test is what ties the children to *this* node. A statement list that does
-        // not contain the selection records nothing, and without the test its children would be
-        // written onto whichever step happened to be last — which is the enclosing list, whose
-        // own children are the ones the extraction is measured against.
+        // The span test ties the children to *this* node. A statement list not containing the
+        // selection records nothing; without the test, its children would be written onto whichever
+        // step was last, which is the enclosing list, whose own children are what the extraction is
+        // measured against.
         if let Some(step) = self.found.last_mut()
             && (step.start, step.end) == at
         {
@@ -828,9 +816,9 @@ impl<'pr> Visit<'pr> for Chain {
 
     fn visit_def_node(&mut self, node: &DefNode<'pr>) {
         // Announced generically a moment ago, so this only annotates what is already there. The
-        // span test is the whole of the condition and does the containment test with it: a step
-        // exists only for a node that contains the selection, so a `def` that does not contain
-        // it never matches the step on top.
+        // span test is the whole condition and doubles as the containment test: a step exists only
+        // for a node containing the selection, so a `def` that does not contain it never matches
+        // the step on top.
         let (start, end) = span(&node.location());
         if let Some(step) = self.found.last_mut()
             && (step.start, step.end) == (start, end)
@@ -899,16 +887,16 @@ impl<'pr> Visit<'pr> for Chain {
 
 /// How a node behaves when the placement reaches through it, and whether it is a value.
 ///
-/// **Opaque and not a value is the default**, and that is the whole safety argument for this
-/// table: a node kind nobody here has thought about declines both questions rather than being
-/// assumed harmless. Prism has a hundred and fifty of them.
+/// **Opaque and not a value is the default**, and that is the whole safety argument for this table:
+/// a node kind nobody here has considered declines both questions instead of being assumed
+/// harmless. Prism has about a hundred and fifty kinds.
 fn classify(node: &Node<'_>) -> (Shape, bool) {
     match node {
         Node::StatementsNode { .. } => (Shape::Statements, false),
         Node::EmbeddedStatementsNode { .. } => (Shape::Embedded, false),
 
-        // Values that are also transparent: reaching through one of these evaluates it once,
-        // where the statement runs, and lifting it out is the same program.
+        // Values that are also transparent: reaching through one evaluates it once, where the
+        // statement runs, so lifting it out is the same program.
         Node::CallNode { .. }
         | Node::ArrayNode { .. }
         | Node::HashNode { .. }
@@ -943,9 +931,9 @@ fn classify(node: &Node<'_>) -> (Shape, bool) {
         | Node::AndNode { .. }
         | Node::OrNode { .. } => (Shape::Opaque, true),
 
-        // Transparent and not a value. Each of these evaluates its children unconditionally as
-        // the statement runs, and none of them is a thing a local could hold: an argument list,
-        // a hash entry, the value side of an assignment, the operand of an escape.
+        // Transparent but not a value. Each evaluates its children unconditionally when the
+        // statement runs, and none is something a local could hold: an argument list, a hash entry,
+        // the value side of an assignment, an escape's operand.
         Node::ProgramNode { .. }
         | Node::ArgumentsNode { .. }
         | Node::AssocNode { .. }
@@ -975,14 +963,13 @@ fn classify(node: &Node<'_>) -> (Shape, bool) {
     }
 }
 
-/// Where a span's own line starts and what it is indented by — `None` unless the span begins a
-/// line and ends one.
+/// Where a span's own line starts and its indentation: `None` unless the span begins a line and
+/// ends one.
 ///
-/// The test that refuses the two spellings which look like a statement and are not. `a ? b : c`
-/// puts each arm in a statement list of its own, and so does `foo.bar if baz`; in both, lifting
-/// a line out in front of "the statement" writes it where it will run when it should not, or
-/// where Ruby cannot parse it. Neither arm begins its line and ends it, and nothing else that
-/// matters fails to.
+/// The test that refuses the two spellings that look like statements but are not. `a ? b : c` puts
+/// each arm in its own statement list, and so does `foo.bar if baz`; in both, lifting a line out in
+/// front of "the statement" writes it where it runs when it should not, or where Ruby cannot parse
+/// it. Neither arm begins and ends its line, and nothing else that matters fails that test.
 fn span_owns_its_lines(source: &str, start: u32, end: u32) -> Option<(u32, String)> {
     let (line, indent) = line_start(source, start)?;
     let rest = source[end as usize..]
@@ -994,8 +981,8 @@ fn span_owns_its_lines(source: &str, start: u32, end: u32) -> Option<(u32, Strin
     (rest.is_empty() || rest.starts_with('#')).then_some((line, indent))
 }
 
-/// The offset the line holding `at` begins at, and the whitespace in front of `at` on it —
-/// `None` when anything else is in front of it.
+/// Where the line holding `at` begins, and the whitespace before `at` on it: `None` when anything
+/// else is in front of it.
 fn line_start(source: &str, at: u32) -> Option<(u32, String)> {
     let line = source[..at as usize]
         .rfind('\n')
@@ -1007,11 +994,11 @@ fn line_start(source: &str, at: u32) -> Option<(u32, String)> {
         .then(|| (line, indent.to_owned()))
 }
 
-/// The whitespace in front of `at` on its line, or nothing when `at` does not begin one.
+/// The whitespace before `at` on its line, or nothing when `at` does not begin one.
 ///
-/// An insertion at the top of a class body reuses it twice: once for the line it writes and once
-/// to put back the indentation of the statement it displaces. A body that opens mid-line —
-/// `class Foo; def bar` — has none, and the result is ugly rather than wrong.
+/// An insertion at the top of a class body uses it twice: for the line it writes, and to restore
+/// the indentation of the statement it displaces. A body opening mid-line (`class Foo; def bar`)
+/// has none, and the result is ugly, not wrong.
 fn indent_before(source: &str, at: u32) -> String {
     line_start(source, at)
         .map(|(_, indent)| indent)
@@ -1026,13 +1013,12 @@ fn trim(source: &str, start: u32, end: u32) -> Option<(u32, u32)> {
     Some((start + front as u32, end - back as u32))
 }
 
-/// `base`, or the first `base_2`, `base_3`… the file does not already write.
+/// `base`, or the first `base_2`, `base_3`… the file does not already contain.
 ///
-/// A whole-word search over the source rather than a scope walk, and deliberately over-strict:
-/// a mention in a comment is enough to move on to the next name. A name that is free because
-/// nothing in the file spells it cannot shadow a local, a method called without a receiver, or
-/// anything else — which is a property of the search rather than of a list of the things it
-/// would have had to enumerate.
+/// A whole-word search over the source, not a scope walk, and deliberately too strict: a mention in
+/// a comment is enough to move to the next name. A name nothing in the file spells cannot shadow a
+/// local, a receiverless method call, or anything else, which the search guarantees without listing
+/// those cases.
 fn free_name(source: &str, base: &str) -> String {
     let mut nth = 1;
     loop {
@@ -1082,12 +1068,11 @@ mod tests {
         at(&source, start, end)
     }
 
-    /// Whether anything offered over a selection is one of a family, by a word in its title.
+    /// Whether anything offered over a selection belongs to a family, by a word in its title.
     ///
-    /// One helper rather than a closure at each site, and for a reason worth naming: a
-    /// `!offers(…).iter().any(…)` over a list that is *meant* to be empty never runs its own
-    /// closure, so a module held to every line would be held to lines the assertions guarantee
-    /// nothing ever reaches.
+    /// A helper, not a closure at each site, for a reason: `!offers(…).iter().any(…)` over a list
+    /// *meant* to be empty never runs its closure, so a module held to full line coverage would be
+    /// charged for lines no assertion can reach.
     fn offers(source: &str, family: &str) -> bool {
         titles(source).iter().any(|title| title.contains(family))
     }
@@ -1101,15 +1086,14 @@ mod tests {
 
     /// The file as choosing one of the offered actions leaves it.
     ///
-    /// **The drawing is the rewritten Ruby**, which is `renaming.md`'s rule and is here for its
-    /// reason: a span one byte out writes visibly broken code — a name run into the one beside
-    /// it, an `end` eaten, a block delimiter left unmatched — where a list of offsets shows
-    /// nobody anything.
+    /// **The drawing is the rewritten Ruby**, per `renaming.md` and for its reason: a span one byte
+    /// off writes visibly broken code (a name run into its neighbour, an `end` eaten, an unmatched
+    /// block delimiter), where a list of offsets shows nobody anything.
     fn applied(source: &str, title: &str) -> String {
         let (source, start, end) = marked(source);
         let actions = at(&source, start, end);
-        // The message is built before it is needed rather than in a closure, so that a helper in
-        // a module held to every line does not carry two lines no test ever runs.
+        // The message is built up front, not in a closure, so a helper in a module held to full
+        // line coverage carries no lines no test runs.
         let offered: Vec<&str> = actions.iter().map(|it| it.title.as_str()).collect();
         let missing = format!("no action titled {title:?}; offered {offered:?}");
         let action = actions
@@ -1144,8 +1128,8 @@ mod tests {
             applied(source, "Declare attr_accessor :views"),
             "class Story\n  attr_accessor :views\n  def bump\n    @views = @views + 1\n  end\nend\n"
         );
-        // A module is a namespace like any other, and the cursor may be on a read rather than
-        // on the assignment.
+        // A module is a namespace like any other, and the cursor may be on a read, not the
+        // assignment.
         assert_eq!(
             applied(
                 "module Sized\n  def big?\n    @size~ > 10\n  end\nend\n",
@@ -1157,10 +1141,10 @@ mod tests {
 
     #[test]
     fn an_accessor_is_not_offered_where_it_would_read_a_different_variable() {
-        // The whole of what makes this action exact, and every one of these is an `@count` a
-        // regular expression would have offered for. An `attr_reader :count` declares an
-        // instance method reading an *instance's* `@count`: on the class object it would return
-        // `nil` and look right, and at the top level there is no class body to write it into.
+        // What makes this action exact: a regular expression would have offered for every one of
+        // these `@count`s. `attr_reader :count` declares an instance method reading an *instance's*
+        // `@count`; on the class object it would return `nil` and look right, and at the top level
+        // there is no class body to write into.
         for source in [
             "class Foo\n  def self.count\n    ~@count\n  end\nend\n",
             "class Foo\n  class << self\n    def count\n      ~@count\n    end\n  end\nend\n",
@@ -1190,9 +1174,8 @@ mod tests {
             ),
             ("  attr_accessor :count\n", vec![]),
             ("  attr_reader :count\n  attr_writer :count\n", vec![]),
-            // Everything a body can hold that is not a declaration of this name: another
-            // name, no name at all, a name that is not a symbol, a receiver, another macro,
-            // and a statement that is not a call.
+            // Everything a body can hold that is not a declaration of this name: another name, no
+            // name, a non-symbol name, a receiver, another macro, and a non-call statement.
             (
                 "  attr_reader :other\n",
                 vec!["attr_reader", "attr_writer", "attr_accessor"],
@@ -1217,8 +1200,8 @@ mod tests {
                 "  COUNT = 1\n",
                 vec!["attr_reader", "attr_writer", "attr_accessor"],
             ),
-            // Nested, and conditional: neither is a declaration of *this* class's accessor,
-            // so neither is a reason to withhold the offer.
+            // Nested, and conditional: neither declares *this* class's accessor, so neither is a
+            // reason to withhold the offer.
             (
                 "  class Inner\n    attr_accessor :count\n  end\n",
                 vec!["attr_reader", "attr_writer", "attr_accessor"],
@@ -1239,9 +1222,9 @@ mod tests {
 
     #[test]
     fn a_class_body_that_does_not_begin_a_line_is_written_to_anyway() {
-        // Ugly rather than wrong, which is the trade the whole action is built on: the
-        // insertion cannot change what any existing line means, so the worst case is a line
-        // break where a reader would not have put one.
+        // Ugly rather than wrong, the trade the action is built on: the insertion cannot change any
+        // existing line's meaning, so the worst case is a line break where a reader would not have
+        // put one.
         assert_eq!(
             applied(
                 "class Foo; def bar; ~@count; end; end\n",
@@ -1268,8 +1251,8 @@ mod tests {
             ),
             "[1, 2].each { |n|\n  puts n\n}\n"
         );
-        // A cursor on the call rather than inside the block, and the innermost block wins when
-        // one is nested in another.
+        // A cursor on the call instead of inside the block, and the innermost block wins when
+        // blocks nest.
         assert_eq!(
             applied("[1].ea~ch { puts 1 }\n", "Convert to a do…end block"),
             "[1].each do puts 1 end\n"
@@ -1297,11 +1280,10 @@ mod tests {
 
     #[test]
     fn a_block_on_a_command_call_is_left_alone() {
-        // Ruby's two block delimiters do not bind the same way, and the difference is not
-        // theoretical: with braces the block belongs to `map`, and with `do…end` it belongs to
-        // the command call outside it — which still parses, still runs, and prints something
-        // else. The `it "works" do` case is the same test catching the other failure: the brace
-        // form of that one is not a different program but a syntax error.
+        // Ruby's two block delimiters bind differently, and it matters: with braces the block
+        // belongs to `map`, and with `do…end` it belongs to the command call outside it, which
+        // still parses, still runs, and prints something else. The `it "works" do` case is the same
+        // test catching the other failure: its brace form is a syntax error.
         for source in [
             "def show(x) = x\nputs show [1, 2].map { |n| ~n * 2 }\n",
             "def show(x) = x\nputs show [1, 2].map do |n| ~n * 2 end\n",
@@ -1310,8 +1292,8 @@ mod tests {
         ] {
             assert!(!offers(source, "block"), "offered a toggle for {source:?}");
         }
-        // A command call the block's own call is not an *argument* of is no reason to refuse:
-        // here the block hangs off the receiver, where neither spelling can move it.
+        // A command call the block's own call is not an *argument* of is no reason to refuse: here
+        // the block hangs off the receiver, where neither spelling can move it.
         assert_eq!(
             applied("foo { ~1 }.bar baz\n", "Convert to a do…end block"),
             "foo do 1 end.bar baz\n"
@@ -1326,8 +1308,8 @@ mod tests {
     #[test]
     fn a_position_with_no_block_around_it_offers_no_toggle() {
         assert!(!offers("x = ~1\n", "block"));
-        // A lambda is not a block: `->() {}` has both spellings too, and swapping them is a
-        // different question with a different node behind it.
+        // A lambda is not a block: `->() {}` has both spellings too, but swapping them is a
+        // different question with a different node.
         assert!(!offers("f = -> { ~1 }\n", "block"));
     }
 
@@ -1344,9 +1326,9 @@ mod tests {
             ),
             "def f\n  extracted = story.title\n  puts extracted\nend\n"
         );
-        // The right of an assignment, an argument in the middle of a list, and a receiver in a
-        // chain: three places the statement is not the selection and the insertion is still one
-        // line above it, at the statement's own indentation.
+        // The right side of an assignment, an argument mid-list, and a receiver in a chain: three
+        // places where the statement is not the selection and the insertion still goes one line
+        // above it, at the statement's indentation.
         assert_eq!(
             applied(
                 "def f\n  x = ~a.b~\nend\n",
@@ -1372,10 +1354,10 @@ mod tests {
 
     #[test]
     fn the_selection_stays_where_it_would_run_the_same_number_of_times() {
-        // Placement is the whole point. Each of these has a statement the expression could be
-        // hoisted in front of, and in each the hoist would change the program: it would be
-        // evaluated when the guard says it should not be, on every turn of a loop rather than
-        // once, at a different time, or where Ruby cannot parse a line at all.
+        // Placement is the whole point. Each has a statement the expression could be hoisted in
+        // front of, and each hoist would change the program: evaluated when the guard says not to,
+        // on every loop turn instead of once, at a different time, or where Ruby cannot parse a
+        // line.
         for source in [
             "def f\n  user && ~user.name~\nend\n",
             "def f\n  a ? ~b.c~ : d\nend\n",
@@ -1393,8 +1375,8 @@ mod tests {
                 "offered an extraction for {source:?}"
             );
         }
-        // Inside a block and inside a branch it stays inside, because the statement list it
-        // lands in is the block's or the branch's own.
+        // Inside a block or a branch it stays inside, because the statement list it lands in is the
+        // block's or branch's own.
         assert_eq!(
             applied(
                 "def f\n  [1].each do |n|\n    puts ~n.to_s~\n  end\nend\n",
@@ -1419,9 +1401,9 @@ mod tests {
             // Half of a name, and half of a chain.
             "def f\n  puts ~foo.ba~r\nend\n",
             "def f\n  puts ~foo.~bar\nend\n",
-            // Two statements: no node spans them, and the other extraction is the one for it.
+            // Two statements: no node spans them, and the other extraction handles it.
             "def f\n  ~a\n  b~\nend\n",
-            // A whole statement, which would produce `extracted = puts x` and then `extracted`.
+            // A whole statement, which would give `extracted = puts x` and then `extracted`.
             "def f\n  ~foo.bar~\nend\n",
             // A splat and a target: neither is a value a local can hold.
             "def f\n  go(~*args~)\nend\n",
@@ -1436,15 +1418,15 @@ mod tests {
 
     #[test]
     fn nothing_that_does_not_parse_on_its_own_is_lifted_anywhere() {
-        // A heredoc's body follows the line its opener is written on, so an opener that moves up
-        // a line leaves the body behind — and the opener alone does not parse, which is what
-        // this refuses on rather than on a rule about heredocs.
+        // A heredoc's body follows its opener's line, so an opener moved up a line leaves its body
+        // behind. The opener alone does not parse, and that is what this refuses on, not a heredoc
+        // rule.
         assert!(!offers(
             "def f\n  puts ~<<-TEXT~\n    hi\n  TEXT\nend\n",
             "local"
         ));
-        // The same gate catching something that is not a heredoc at all: a hash key's symbol is
-        // a node whose own text is `a:`, and `a:` is not a program.
+        // The same gate catching a non-heredoc: a hash key's symbol is a node whose text is `a:`,
+        // and `a:` is not a program.
         assert!(!offers("def f\n  x = { ~a:~ 1 }\nend\n", "local"));
         // And in the run an extraction takes: the opener is a whole statement, its body is not.
         assert!(!offers(
@@ -1462,8 +1444,8 @@ mod tests {
             ),
             "def f\n  extracted = 1\n  extracted_2 = foo.bar\n  puts extracted_2\nend\n"
         );
-        // A whole-word search, so a longer name that merely contains the candidate is not a
-        // reason to move on — and a mention in a comment is, deliberately.
+        // A whole-word search, so a longer name merely containing the candidate is no reason to
+        // move on, but a mention in a comment deliberately is.
         assert_eq!(
             titles("def f\n  extracted_thing = 1\n  puts ~foo.bar~\nend\n"),
             ["Extract into local variable `extracted`"]
@@ -1472,7 +1454,7 @@ mod tests {
             titles("def f\n  # extracted\n  puts ~foo.bar~\nend\n"),
             ["Extract into local variable `extracted_2`"]
         );
-        // Both edges of "whole word", and both kinds of neighbour: a letter and an underscore.
+        // Both edges of "whole word", with both kinds of neighbour: a letter and an underscore.
         for spelling in [
             "zextracted",
             "extractedz",
@@ -1485,7 +1467,7 @@ mod tests {
                 "{spelling} is not the word `extracted`"
             );
         }
-        // And a mention at the very start of the file, where there is no character in front.
+        // And a mention at the very start of the file, with no character before it.
         assert_eq!(
             titles("extracted = 1\ndef f\n  puts ~foo.bar~\nend\n"),
             ["Extract into local variable `extracted_2`"]
@@ -1518,8 +1500,8 @@ mod tests {
 
     #[test]
     fn the_locals_the_run_reads_from_outside_become_its_parameters() {
-        // An extraction that slices the selection out verbatim and passes nothing produces a
-        // method that raises `NameError` on its first call.
+        // Extracting the selection verbatim and passing nothing would produce a method that raises
+        // `NameError` on its first call.
         assert_eq!(
             applied(
                 "def f\n  a = 1\n  b = 2\n  ~puts a + b\n  c = a * 2\n  puts c~\nend\n",
@@ -1528,8 +1510,8 @@ mod tests {
             "def f\n  a = 1\n  b = 2\n  extracted_method(a, b)\nend\n\
              \ndef extracted_method(a, b)\n  puts a + b\n  c = a * 2\n  puts c\nend\n"
         );
-        // A block parameter declared outside the run is a local like any other, and one
-        // declared inside it is not borrowed at all.
+        // A block parameter declared outside the run is a local like any other; one declared inside
+        // it is not borrowed.
         assert_eq!(
             applied(
                 "def f\n  [1].each do |n|\n    ~puts n~\n  end\nend\n",
@@ -1549,8 +1531,8 @@ mod tests {
 
     #[test]
     fn a_local_the_run_writes_and_the_rest_of_the_method_reads_is_declined() {
-        // There is no single value the new method could hand back for it, and approximating is
-        // the trade this module refuses. Both spellings of "touched afterwards" count.
+        // The new method would have no single value to return for it, and approximating is the
+        // trade this module refuses. Both spellings of "touched afterwards" count.
         for source in [
             "def f\n  ~y = 1~\n  puts y\nend\n",
             "def f\n  ~y = 1~\n  y += 1\nend\n",
@@ -1561,7 +1543,7 @@ mod tests {
                 "offered an extraction for {source:?}"
             );
         }
-        // A local the run writes and nothing afterwards reads is simply the new method's own.
+        // A local the run writes and nothing reads afterwards simply belongs to the new method.
         assert_eq!(
             applied(
                 "def f\n  ~y = 1\n  puts y~\n  puts 2\nend\n",
@@ -1574,8 +1556,8 @@ mod tests {
 
     #[test]
     fn nothing_that_would_mean_something_else_inside_a_method_is_extracted() {
-        // `return` and its relatives would leave the *new* method, `yield` has no block to
-        // reach from one, and `super` resolves against the name of the method it is written in.
+        // `return` and its relatives would leave the *new* method, `yield` has no block to reach,
+        // and `super` resolves against the name of the method it is written in.
         for escape in [
             "return 1", "break", "next", "redo", "retry", "yield 1", "super", "super(1)",
         ] {
@@ -1589,8 +1571,8 @@ mod tests {
 
     #[test]
     fn a_literal_spelled_over_more_than_one_line_is_not_re_indented() {
-        // The one failure the parse gate cannot see: a string that is moved and re-indented
-        // still parses, and no longer says what it said.
+        // The one failure the parse gate cannot see: a moved, re-indented string still parses but
+        // no longer says the same thing.
         assert!(!offers(
             "def f\n  if c\n    ~puts \"one\ntwo\"~\n  end\nend\n",
             "method"
@@ -1599,9 +1581,8 @@ mod tests {
 
     #[test]
     fn the_extracted_body_keeps_its_shape_at_the_new_depth() {
-        // Every line moves by the same amount, measured from the shallowest line in the run, so
-        // the nesting inside it survives — and a blank line stays blank rather than becoming
-        // whitespace.
+        // Every line moves by the same amount, measured from the shallowest line, so nesting inside
+        // the run survives, and a blank line stays blank instead of becoming whitespace.
         assert_eq!(
             applied(
                 "def f\n  x = 1\n  if x\n    ~puts x\n    \n    [1].each do |n|\n      puts n\n    end~\n  end\nend\n",
@@ -1614,8 +1595,8 @@ mod tests {
 
     #[test]
     fn a_singleton_method_extracts_into_a_singleton_method() {
-        // Otherwise the call does not resolve: the extracted body runs where `self` is the
-        // class object, and an instance method is not reachable from there.
+        // Otherwise the call does not resolve: the extracted body runs where `self` is the class
+        // object, which cannot reach an instance method.
         assert_eq!(
             applied(
                 "class Foo\n  def self.f\n    x = 1\n    ~puts x~\n  end\nend\n",
@@ -1624,8 +1605,8 @@ mod tests {
             "class Foo\n  def self.f\n    x = 1\n    extracted_method(x)\n  end\n\
              \n  def self.extracted_method(x)\n    puts x\n  end\nend\n"
         );
-        // `def obj.f` is an island — what the receiver is needs types — and an endless `def`
-        // has no `end` to write beside and no statement list to take a run from.
+        // `def obj.f` is an island (what the receiver is needs types), and an endless `def` has no
+        // `end` to write beside and no statement list to take a run from.
         assert!(!offers(
             "obj = Object.new\ndef obj.f\n  x = 1\n  ~puts x~\nend\n",
             "method"
@@ -1651,8 +1632,8 @@ mod tests {
 
     #[test]
     fn a_parameter_the_run_would_need_and_cannot_be_written_is_declined() {
-        // `it` and `_1` are read at every occurrence and written at none, because Ruby supplies
-        // them rather than the file declaring them — the same reason `rename` refuses them.
+        // `it` and `_1` are read everywhere and written nowhere, because Ruby supplies them: the
+        // same reason `rename` refuses them.
         for source in [
             "def f\n  [1].each do\n    ~puts it~\n  end\nend\n",
             "def f\n  [1].each do\n    ~puts _1~\n  end\nend\n",
@@ -1662,12 +1643,11 @@ mod tests {
                 "offered an extraction for {source:?}"
             );
         }
-        // Two locals spelled alike are *not* a case, and working out why is what removed a
-        // guard rather than adding one: a run lies inside one scope, an inner `n` shadows an
-        // outer one for the whole of it, and a block inside the run that declares its own `n`
-        // writes it before it reads it. So only one variable per name can ever be borrowed —
-        // and if that reasoning is wrong, `def m(n, n)` is a syntax error, which is the last
-        // gate's job rather than a guard's.
+        // Two locals spelled alike are *not* a case, and no guard is needed: a run lies inside one
+        // scope, an inner `n` shadows an outer one for all of it, and a block inside the run that
+        // declares its own `n` writes it before reading it. So only one variable per name can ever
+        // be borrowed, and if that reasoning were wrong, `def m(n, n)` would be a syntax error,
+        // which the last gate catches.
         assert_eq!(
             titles("def f\n  n = 1\n  ~[2].each { |n| puts n }\n  puts n~\nend\n"),
             ["Extract into method `extracted_method`"]
@@ -1685,18 +1665,17 @@ mod tests {
             "def f\n  [1].each do\n    puts ~x.y~\n  end\nend\n",
             "local"
         ));
-        // A one-line block: there is no line above `puts x.y` that is still inside the block,
-        // so the only placement available would run the expression once per file rather than
-        // once per iteration.
+        // A one-line block: no line above `puts x.y` is still inside the block, so the only
+        // placement would run the expression once per file instead of once per iteration.
         assert!(!offers("def f\n  [1].each { puts ~x.y~ }\nend\n", "local"));
     }
 
     #[test]
     fn a_method_with_no_end_and_a_method_that_shares_a_line_are_both_declined() {
-        // An endless `def` has no `end` to write a sibling beside — and it can still hold a
-        // statement list, which is what makes this a case rather than an impossibility.
+        // An endless `def` has no `end` to write a sibling beside, yet can still hold a statement
+        // list, which is what makes this a real case.
         assert!(!offers("def f = (\n  ~puts 1~\n  puts 2\n)\n", "method"));
-        // A `def` that does not begin its line has no indentation to write the sibling at.
+        // A `def` that does not begin its line has no indentation for the sibling.
         assert!(!offers("1; def f\n  ~puts 1~\nend\n", "method"));
         // And a `def` the selection is not inside is not the enclosing one.
         assert_eq!(
@@ -1711,10 +1690,9 @@ mod tests {
 
     #[test]
     fn a_run_inside_a_begin_block_is_extracted_like_any_other() {
-        // Four of the thirteen typed hooks are only reached through spellings no other fixture
-        // here writes — a block parameter, a destructuring assignment, `rescue` and `ensure` —
-        // and a walk that stopped announcing one of them would leave a hole in the chain that
-        // nothing else would show.
+        // Four of the thirteen typed hooks are reached only by spellings no other fixture here
+        // writes (a block parameter, a destructuring assignment, `rescue` and `ensure`), and a walk
+        // that stopped announcing one would leave a hole in the chain nothing else would show.
         assert_eq!(
             applied(
                 "def f(&blk)\n  a, b = 1, 2\n  begin\n    ~puts a~\n  rescue => e\n    puts e\n  ensure\n    puts b\n  end\nend\n",
@@ -1727,19 +1705,19 @@ mod tests {
 
     #[test]
     fn a_selection_no_statement_list_holds_is_answered_with_nothing() {
-        // A file that is one comment: Prism's program covers no bytes, so nothing at all
-        // contains the selection and every walk here starts empty rather than at a root.
+        // A file that is one comment: Prism's program covers no bytes, so nothing contains the
+        // selection and every walk starts empty, not at a root.
         assert!(at("# hi there\n", 2, 4).is_empty());
-        // The same, with a `def` in the file: the walk reaches one with nothing recorded yet,
-        // which is the only way a node it is meant to annotate is not the one on top.
+        // The same, with a `def` in the file: the walk reaches one with nothing recorded yet, the
+        // only way a node it means to annotate is not the one on top.
         assert!(at("# hi there\ndef f\nend\n", 2, 4).is_empty());
     }
 
     #[test]
     fn an_action_is_a_title_a_kind_and_a_list_of_spans() {
-        // The whole of what one is, pinned once. Everything else here draws the file the edits
-        // produce, which is the right assertion for a rewrite and says nothing about the shape
-        // the caller converts — two spans, one of them empty, and which menu it belongs in.
+        // The whole of what an action is, pinned once. Everything else draws the file the edits
+        // produce, which is right for a rewrite but says nothing about the shape the caller
+        // converts: two spans, one empty, and which menu it belongs in.
         let (source, start, end) = marked("def f\n  puts ~a.b~\nend\n");
         assert_eq!(
             at(&source, start, end),
@@ -1764,17 +1742,16 @@ mod tests {
 
     #[test]
     fn nothing_is_offered_where_the_file_does_not_parse() {
-        // Recovery hands out spans that do not nest, and an edit placed by one of those lands
-        // somewhere else in the buffer.
+        // Recovery hands out spans that do not nest, and an edit placed by one lands somewhere else
+        // in the buffer.
         assert!(titles("def f\n  puts ~story.title~\n").is_empty());
     }
 
     #[test]
     fn an_action_whose_result_would_not_parse_is_dropped_before_it_is_offered() {
-        // The last gate, and it is the one no guard above it can stand in for: it does not know
-        // *why* an edit is wrong, only that the buffer would stop being Ruby. Asked here of an
-        // action built by hand, because the guards above are what keep the four from producing
-        // one — which is the point of having them.
+        // The last gate, which no guard above can replace: it does not know *why* an edit is wrong,
+        // only that the buffer would stop being Ruby. Tested with a hand-built action, because the
+        // guards above keep the four actions from producing one.
         let source = "def f\n  puts 1\nend\n";
         let sound = Action {
             title: String::new(),
@@ -1800,12 +1777,12 @@ mod tests {
 
     #[test]
     fn a_range_the_document_does_not_hold_answers_with_nothing() {
-        // Clamped rather than trusted: a client may ask about a position in a buffer it has
-        // already changed, and a slice past the end of a `String` panics on the analysis
-        // thread, where a panic is a server that stops answering anything at all.
+        // Clamped, not trusted: a client may ask about a position in a buffer it has since changed,
+        // and slicing past the end of a `String` panics on the analysis thread, where a panic means
+        // a server that stops answering entirely.
         assert!(at("def f\nend\n", 0, 9_999).is_empty());
         assert!(at("def f\nend\n", 9_999, 9_999).is_empty());
-        // Inside out, which no editor sends and nothing here may assume it will not.
+        // Inside out: no editor sends it, and nothing here may assume none will.
         assert!(at("def f\n  puts 1\nend\n", 13, 9).is_empty());
     }
 
@@ -1817,8 +1794,8 @@ mod tests {
     #[test]
     fn a_code_action_arrives_as_an_edit_the_editor_can_apply_without_asking_again() {
         // No `command` and no `data`: everything the action does is in the `edit`, so there is
-        // nothing to resolve and nothing for the server to be asked a second time. The `kind`
-        // is what the client filters on before it asks at all.
+        // nothing to resolve or ask the server again. The `kind` is what the client filters on
+        // before asking.
         let mut harness = Harness::new();
         let uri = harness.write("app/story.rb", "");
         harness.index();
@@ -1840,7 +1817,7 @@ mod tests {
         assert_eq!(answer[0]["data"], serde_json::Value::Null);
         assert_eq!(answer[0]["kind"], "refactor.extract");
         // The same `WorkspaceEdit` a rename produces, from the same builder, so the version the
-        // client negotiated for arrives here too.
+        // client negotiated arrives here too.
         assert_eq!(
             answer[0]["edit"]["documentChanges"][0]["textDocument"]["version"],
             1
@@ -1849,9 +1826,9 @@ mod tests {
 
     #[test]
     fn a_position_with_nothing_to_offer_answers_null_rather_than_an_empty_list() {
-        // `[]` tells the client ya-lsp answered and had nothing; `null` tells it nothing was
-        // known. Neither costs a fallback here — no editor invents Ruby refactorings — but the
-        // two are different words and this one is the true one.
+        // `[]` says ya-lsp answered and had nothing; `null` says nothing was known. Neither
+        // triggers a fallback here (no editor invents Ruby refactorings), but they are different
+        // words, and this one is true.
         let mut harness = Harness::new();
         let uri = harness.write("app/story.rb", "");
         harness.index();
@@ -1861,10 +1838,9 @@ mod tests {
 
     #[test]
     fn a_template_is_offered_no_code_actions() {
-        // Declined for a reason no other request has. Every action here writes a **line**, and
-        // in a template a line belongs to the markup: `erb::ruby_view` keeps the offsets so that
-        // everything which reads answers unchanged, and there is nothing it can do about a line
-        // that starts with `<td>`.
+        // Declined for a reason no other request has. Every action here writes a **line**, and in a
+        // template a line belongs to the markup: `erb::ruby_view` preserves offsets so every read
+        // answers unchanged, but it can do nothing about a line starting with `<td>`.
         let mut harness = Harness::new();
         let uri = harness.write("app/views/stories/show.html.erb", "");
         harness.index();
@@ -1877,8 +1853,8 @@ mod tests {
 
     #[test]
     fn nothing_inside_a_gem_is_offered_a_code_action() {
-        // The same rule as a rename's, silently for the same reason: ya-lsp never proposes an
-        // edit to a file that is not the user's own, and a gem is opened to be read.
+        // The same rule as a rename's, silently for the same reason: ya-lsp never proposes an edit
+        // to a file that is not the user's own, and a gem is opened to be read.
         let (dir, gem_home, env) = project_with_gem(
             "module Shouty\n  def self.blast(volume)\n    volume * 2\n  end\nend\n",
         );

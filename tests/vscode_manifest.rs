@@ -1,14 +1,13 @@
 //! The VS Code manifest, checked against the server it configures.
 //!
-//! `editors/vscode/package.json` is where a user reads what a setting does and what it defaults
-//! to, and nothing in either language can see across that boundary. A documented default that
-//! drifts from `Config::default()` is wrong documentation with no failing test behind it, which
-//! is how `ya-lsp.logLevel` shipped two releases saying `warn` about a server whose fallback is
-//! `info`. The rule names of `[diagnostics.rules]` are the same shape of hazard from the other
-//! side: they have to be written down in the manifest for the editor to complete them, and a
-//! second copy of a list is a list that goes stale.
+//! `editors/vscode/package.json` is where a user reads what a setting does and what it defaults to,
+//! and neither language can see across that boundary. Two hazards:
+//! - **Defaults.** A documented default that drifts from `Config::default()` is wrong documentation
+//!   with no failing test behind it.
+//! - **Rule names.** The keys of `[diagnostics.rules]` must be written in the manifest for the
+//!   editor to complete them, and a second copy of a list goes stale.
 //!
-//! `editors/vscode/src/manifest.test.ts` holds the halves this cannot see — the scopes, and the
+//! `editors/vscode/src/manifest.test.ts` holds the halves this cannot see: the scopes, and the
 //! agreement between the manifest and the settings `config.ts` actually reads.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,7 +28,7 @@ fn manifest() -> Value {
     serde_json::from_str(&text).expect("the extension manifest is valid JSON")
 }
 
-/// Every `ya-lsp.*` property the manifest declares, flattened out of its five categories.
+/// Every `ya-lsp.*` property the manifest declares, flattened out of its categories.
 fn properties(manifest: &Value) -> BTreeMap<String, Value> {
     manifest["contributes"]["configuration"]
         .as_array()
@@ -47,10 +46,10 @@ fn properties(manifest: &Value) -> BTreeMap<String, Value> {
 
 /// Every language the server claims in a registration is one the extension wakes up for.
 ///
-/// The server names these because it registers document selectors of its own, over the roots the
-/// client cannot know about — a gem's source, Ruby's library — and a filter naming a language the
-/// extension never activates for claims nothing at all. Two lists in two languages, and the failure
-/// is the silent one: a Rails engine's templates would simply never answer, with nothing logged.
+/// The server names these because it registers document selectors of its own, over roots the client
+/// cannot know about (a gem's source, Ruby's library), and a filter naming a language the extension
+/// never activates for claims nothing. Two lists in two languages, and the failure is silent: a
+/// Rails engine's templates would never answer, with nothing logged.
 #[test]
 fn every_language_the_server_claims_is_one_the_extension_activates_for() {
     let manifest = manifest();
@@ -80,18 +79,18 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
     let properties = properties(&manifest);
     let config = Config::default();
 
-    // `"auto"` is written out below because `Switch` cannot be serialized; this is what holds
-    // the word to the server's own default, so the two cannot drift apart in silence.
+    // `"auto"` is written out below because `Switch` cannot be serialized; this holds the word to
+    // the server's own default, so the two cannot drift apart silently.
     assert_eq!(config.rails.enabled, Switch::Word(Word::Auto));
 
-    // An empty map is what `{}` in the manifest documents, and it is the only default here that
-    // cannot be written as a `json!` of the field itself — `Severity` is deserialized, never
-    // serialized, because nothing in the server ever sends one back.
+    // An empty map is what `{}` in the manifest documents, and the only default here that cannot be
+    // written as a `json!` of the field itself: `Severity` is deserialized, never serialized,
+    // because the server never sends one back.
     assert!(config.diagnostics.rules.is_empty());
 
-    // Left: what the settings UI tells the user. Right: what the server does when nobody has set
-    // anything. Reading settings with `inspect` means the left half is never sent, so it is
-    // documentation and nothing else — and documentation of a default rots without being noticed.
+    // Left: what the settings UI tells the user. Right: what the server does when nobody set
+    // anything. Settings are read with `inspect`, so the left half is never sent: it is
+    // documentation only, and documentation of a default rots unnoticed.
     let expected: Vec<(&str, Value)> = vec![
         ("ya-lsp.logLevel", json!(DEFAULT_LOG_FILTER)),
         ("ya-lsp.log.file", json!(config.log.file)),
@@ -99,8 +98,8 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
         ("ya-lsp.log.fileLevel", json!(config.log.file_level)),
         ("ya-lsp.gems.enabled", json!(config.gems.enabled)),
         ("ya-lsp.gems.defaultGems", json!(config.gems.default_gems)),
-        // `None` is spelled `""`. "Detect it" and "find one yourself" have no value to show, and
-        // a setting with no default at all reads as one nobody thought about.
+        // `None` is spelled `""`. "Detect it" and "find one yourself" have no value to show, and a
+        // setting with no default at all reads as one nobody thought about.
         (
             "ya-lsp.gems.rubyVersion",
             json!(config.gems.ruby_version.clone().unwrap_or_default()),
@@ -118,23 +117,23 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
         ),
         ("ya-lsp.types.structs", json!(config.types.structs)),
         ("ya-lsp.types.annotations", json!(config.types.annotations)),
-        // `Switch` is deserialized and never serialized — nothing in the server ever sends one
-        // back — so the word is written out here, the way `diagnostics.rules`' empty map is.
-        // What holds it to the server is the line below rather than this one.
+        // `Switch` is deserialized and never serialized (the server never sends one back), so the
+        // word is written out here, as `diagnostics.rules`' empty map is. The line below, not this
+        // one, holds it to the server.
         ("ya-lsp.rails.enabled", json!("auto")),
         ("ya-lsp.rails.schema", json!(config.rails.schema)),
         ("ya-lsp.rails.models", json!(config.rails.models)),
         ("ya-lsp.rails.routes", json!(config.rails.routes)),
         ("ya-lsp.rails.entrypoints", json!(config.rails.entrypoints)),
         ("ya-lsp.rails.views", json!(config.rails.views)),
-        // The two lists the manifest shows are the built-in ones, and they are read from the
-        // code rather than written out: a project *replaces* them, so what the settings UI puts
-        // in front of somebody about to do that has to be what they are actually replacing.
-        // `Config::default()` holds `None` for both, which is the same rule said as an absence.
+        // The two lists the manifest shows are the built-in ones, read from the code, not written
+        // out: a project *replaces* them, so what the settings UI shows someone about to do that
+        // must be what they are actually replacing. `Config::default()` holds `None` for both: the
+        // same rule, said as an absence.
         ("ya-lsp.trees.test", json!(TEST_TREES)),
         ("ya-lsp.trees.migration", json!([MIGRATION_PAIR])),
-        // Additive, so its default really is empty: the built-in name is documented in the
-        // description because a list that shows it would read as replaceable.
+        // Additive, so its default really is empty. The built-in name is documented in the
+        // description, because a list showing it would read as replaceable.
         ("ya-lsp.trees.testSupport", json!(config.trees.test_support)),
         (
             "ya-lsp.hints.blockParameters",
@@ -151,10 +150,6 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
         ("ya-lsp.index.exclude", json!(config.index.exclude)),
         ("ya-lsp.index.loadPaths", json!(config.index.load_paths)),
         ("ya-lsp.index.maxFiles", json!(config.index.max_files)),
-        (
-            "ya-lsp.index.respectGitignore",
-            json!(config.index.respect_gitignore),
-        ),
     ];
 
     for (setting, server_default) in &expected {
@@ -167,14 +162,16 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
         );
     }
 
-    // The other direction: nothing may be added to the manifest without landing in the table
-    // above. The three exceptions are named rather than matched by pattern, because each is the
-    // extension's own business and none has a server-side default to drift from — where the
-    // binary lives, whether the client traces its own traffic, and whether the client offers
-    // RuboCop's extension to a project that lints with RuboCop. That last one must never reach
-    // the server: `initializationOptions` is deserialized with `deny_unknown_fields`, so a
-    // client-only key that leaked into the layer would reject every setting in it, not just
-    // itself.
+    // The other direction: nothing may be added to the manifest without landing in the table above.
+    // The three exceptions are named, not matched by pattern, because each is the extension's own
+    // business with no server-side default to drift from:
+    // - where the binary lives;
+    // - whether the client traces its own traffic;
+    // - whether the client offers RuboCop's extension to a project that lints with RuboCop.
+    //
+    // That last one must never reach the server: `initializationOptions` is deserialized with
+    // `deny_unknown_fields`, so a client-only key leaking into the layer would reject every setting
+    // in it, not just itself.
     let checked: BTreeSet<&str> = expected.iter().map(|(setting, _)| *setting).collect();
     let unchecked: Vec<&str> = properties
         .keys()
@@ -193,11 +190,11 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
 
 #[test]
 fn the_rule_map_documents_exactly_the_rules_that_exist() {
-    // `[diagnostics.rules]` is the one setting whose *keys* an editor cannot guess: an open
-    // object completes its values and never its names, which is why nobody finds `parse-warning`
-    // without being told it exists. Declaring the ten fixes that and makes the list a second
-    // copy; `describe`'s match already breaks the build when rubydex adds an eleventh rule, and
-    // this is what makes it break the extension too rather than shipping a list one short.
+    // `[diagnostics.rules]` is the one setting whose *keys* an editor cannot guess: an open object
+    // completes its values, never its names, so nobody finds `parse-warning` without being told.
+    // Declaring the ten fixes that and makes the list a second copy. `describe`'s match already
+    // breaks the build when rubydex adds an eleventh rule; this makes it break the extension too,
+    // instead of shipping a list one short.
     let manifest = manifest();
     let mut declared: Vec<String> = properties(&manifest)["ya-lsp.diagnostics.rules"]["properties"]
         .as_object()
@@ -214,8 +211,8 @@ fn the_rule_map_documents_exactly_the_rules_that_exist() {
 
 #[test]
 fn every_severity_the_manifest_offers_is_one_the_server_can_read() {
-    // The values are the same hazard from the other end. `deny_unknown_fields` does not degrade:
-    // a severity the manifest offers and `Severity` cannot parse rejects the *entire* settings
+    // The values are the same hazard from the other end. `deny_unknown_fields` does not degrade: a
+    // severity the manifest offers that `Severity` cannot parse rejects the *entire* settings
     // layer, so every other setting silently stops working over one word in a drop-down.
     let manifest = manifest();
     let rules = properties(&manifest)["ya-lsp.diagnostics.rules"].clone();
@@ -243,11 +240,10 @@ fn every_severity_the_manifest_offers_is_one_the_server_can_read() {
 
 #[test]
 fn every_setting_the_server_reads_is_one_the_editor_can_set() {
-    // The defect with no natural test: five settings existed in `ya-lsp.toml` and nowhere in the
-    // editor, so a VS Code user who needed one had to discover a file the settings UI never
-    // mentions. What can be enforced is not "expose everything" — that is a judgement each time —
-    // but that a new server setting is either exposed or deliberately left out *here*, rather than
-    // forgotten the way these five were across three releases.
+    // The defect with no natural test: a setting that exists in `ya-lsp.toml` and nowhere in the
+    // editor, so a VS Code user who needs it must discover a file the settings UI never mentions.
+    // "Expose everything" is a judgement each time and cannot be enforced; what can be is that a
+    // new server setting is either exposed or deliberately left out *here*, not forgotten.
     let manifest = manifest();
     let declared = properties(&manifest);
 
@@ -255,13 +251,12 @@ fn every_setting_the_server_reads_is_one_the_editor_can_set() {
     // otherwise pass by finding nothing to check.
     assert!(fields_of("index").iter().any(|field| field == "load_paths"));
 
-    // `gems.max_files` is the deliberate omission. It is a ceiling on gem files nobody has needed
-    // to tune, `index.max_files` is the one that actually fires, and every exposed setting is a
-    // branch in `config.ts` and a test forever.
-    // `log.level` is the one key whose editor spelling is not its TOML spelling: it shipped as
-    // `ya-lsp.logLevel` while it was an environment variable, and the extension is on the
-    // Marketplace, so the key stays where it is rather than costing a deprecation and a window
-    // in which two keys can disagree.
+    // `gems.max_files` is the deliberate omission: a ceiling on gem files nobody has needed to
+    // tune. `index.max_files` is the one that actually fires, and every exposed setting is a branch
+    // in `config.ts` and a test forever.
+    // `log.level` is the one key whose editor spelling differs from its TOML spelling.
+    // `ya-lsp.logLevel` predates the file setting and the extension is on the Marketplace, so the
+    // key stays put instead of costing a deprecation and a window in which two keys can disagree.
     let renamed = [("log.level", "ya-lsp.logLevel")];
     let file_only = ["gems.max_files"];
 
@@ -297,11 +292,11 @@ fn every_setting_the_server_reads_is_one_the_editor_can_set() {
 
 /// Every field one of `PartialConfig`'s tables accepts, read out of serde's own complaint.
 ///
-/// There is no other way to enumerate them — `PartialConfig` is deserialized and never
-/// serialized — and a list written out here would be the third copy of the same thing, which is
-/// the copy that goes stale the moment somebody adds a field. `deny_unknown_fields` already names
-/// every field it would have taken; only the prose around the names varies with how many there
-/// are ("one of `a`, `b`" against "`a` or `b`"), so the names are taken and the prose is not.
+/// There is no other way to enumerate them (`PartialConfig` is deserialized, never serialized), and
+/// a list written out here would be a third copy, the one that goes stale the moment somebody adds
+/// a field. `deny_unknown_fields` already names every field it would have taken; only the prose
+/// around the names varies with their count ("one of `a`, `b`" against "`a` or `b`"), so the names
+/// are taken and the prose is not.
 fn fields_of(table: &str) -> Vec<String> {
     let text = format!("[{table}]\nthis-is-not-a-field = 1\n");
     let error = toml::from_str::<PartialConfig>(&text)
@@ -341,12 +336,14 @@ fn camel(snake: &str) -> String {
 
 /// The extensions the editor calls a template are the extensions the server blanks.
 ///
-/// The other side of `every_documented_default_is_the_one_the_server_actually_uses`, and a
-/// sharper failure: a file the manifest claims and `erb::is_template` does not is indexed as
-/// Ruby, so the whole of its markup reaches rubydex as code and its call sites are replaced by
-/// parse errors. The reverse — the server blanking an extension the editor never associates —
-/// is a template that opens as plain text and starts no server at all. Neither is visible from
-/// either language on its own.
+/// The other side of `every_documented_default_is_the_one_the_server_actually_uses`, with a sharper
+/// failure:
+/// - a file the manifest claims and `erb::is_template` does not is indexed as Ruby, so all its
+///   markup reaches rubydex as code, and its call sites are replaced by parse errors;
+/// - an extension the server blanks and the editor never associates is a template that opens as
+///   plain text and starts no server at all.
+///
+/// Neither is visible from either language alone.
 #[test]
 fn the_editor_and_the_server_agree_on_what_an_erb_template_is() {
     use ya_lsp::analysis::erb;

@@ -1,9 +1,8 @@
 //! `require "..."`: the one under the cursor, and every one in the file.
 //!
-//! rubydex indexes the *call* to `require` as a method reference, but not its argument, so the
-//! path string is invisible to the graph — and the path is exactly where people click. Finding
-//! it means looking at the syntax, which is why this is the one place outside rubydex that
-//! reaches for Prism directly.
+//! rubydex indexes the *call* to `require` as a method reference, but not its argument, so the path
+//! string is invisible to the graph, and the path is exactly where people click. Finding it means
+//! reading the syntax, so this module parses the file with Prism.
 //!
 //! A text scan of the line would be cheaper and wrong: it would fire inside comments, inside
 //! heredocs, and on `# require "foo"` in documentation.
@@ -13,12 +12,11 @@ use ruby_prism::{CallNode, Visit};
 /// A require call whose path the cursor is inside.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Require {
-    /// `require_relative` resolves against the requiring file's directory rather than the
-    /// load path.
+    /// `require_relative` resolves against the requiring file's directory, not the load path.
     pub relative: bool,
     /// The path as written, without quotes and without any `.rb` suffix.
     pub path: String,
-    /// The span of the path text, quotes excluded — what the editor underlines.
+    /// The span of the path text, quotes excluded: what the editor underlines.
     pub start: u32,
     pub end: u32,
 }
@@ -31,10 +29,10 @@ pub fn at(source: &str, offset: u32) -> Option<Require> {
 
 /// Every `require` and `require_relative` in the file, in source order.
 ///
-/// The same walk as [`at`] with the hit test taken out, and that is the whole difference between
-/// the two: `definition` asks about the one path the cursor is in, `documentLink` asks about all
-/// of them at once. A second visitor would be a second answer to what counts as a require, and
-/// the two would one day disagree about `Foo.require "x"`.
+/// The same walk as [`at`] with the hit test taken out, and that is the whole difference:
+/// `definition` asks about the one path the cursor is in, `documentLink` about all of them at once.
+/// A second visitor would be a second answer to what counts as a require, and the two would one day
+/// disagree about `Foo.require "x"`.
 #[must_use]
 pub fn all(source: &str) -> Vec<Require> {
     find(source, None)
@@ -53,9 +51,9 @@ fn find(source: &str, offset: Option<u32>) -> Vec<Require> {
 
 struct Finder {
     /// `Some` when only the require containing this offset is wanted. It is both halves of what
-    /// separates the two callers: what the hit test compares against, and what makes the walk
-    /// stop at the first hit — with no offset there is nothing to stop at, because every require
-    /// in the file is one.
+    /// separates the two callers: what the hit test compares against, and what stops the walk at
+    /// the first hit. With no offset there is nothing to stop at, because every require in the file
+    /// is a hit.
     offset: Option<u32>,
     found: Vec<Require>,
 }
@@ -95,10 +93,10 @@ impl Finder {
         let first = arguments.arguments().iter().next()?;
         let string = first.as_string_node()?;
 
-        // The hit test uses the whole literal, quotes included, so that a cursor resting on the
-        // opening quote still counts; the reported span is the content, which is what the
-        // editor should underline. `all` has no cursor and skips it — the *span* is the same
-        // either way, so a link and a jump underline the same characters.
+        // The hit test uses the whole literal, quotes included, so a cursor on the opening quote
+        // still counts; the reported span is the content, which the editor should underline. `all`
+        // has no cursor and skips the test. The *span* is the same either way, so a link and a jump
+        // underline the same characters.
         let literal = string.location();
         if let Some(offset) = self.offset
             && (offset < literal.start_offset() as u32 || offset > literal.end_offset() as u32)
@@ -142,8 +140,8 @@ mod tests {
 
     #[test]
     fn a_require_written_on_a_receiver_is_somebody_elses_method() {
-        // `Kernel#require` is the one this navigates. `Foo.require "x"` is a method that
-        // happens to share the name, and its argument is an ordinary string.
+        // `Kernel#require` is the one this navigates. `Foo.require "x"` is a method that shares the
+        // name, and its argument is an ordinary string.
         assert_eq!(find("Foo.require \"person\"\n", "person"), None);
         assert_eq!(find("self.require_relative \"sibling\"\n", "sibling"), None);
     }
@@ -165,8 +163,8 @@ mod tests {
 
     #[test]
     fn the_cursor_has_to_be_in_the_path() {
-        // On the method name, not the argument: that is a method reference, and the graph
-        // answers for it.
+        // On the method name, not the argument: that is a method reference, and the graph answers
+        // it.
         let source = "require \"person\"\n";
         assert!(at(source, 0).is_none());
         assert!(at(source, source.len() as u32).is_none());
@@ -201,7 +199,7 @@ mod tests {
     #[test]
     fn all_keeps_every_require_in_source_order() {
         // The half `at` cannot answer: none of these is under a cursor, and the order is the
-        // file's because that is the order the client underlines them in.
+        // file's, because the client underlines them in that order.
         let source = "require \"a\"\nrequire_relative \"b\"\nif x\n  require \"c\"\nend\n";
         let found = all(source);
 
@@ -225,8 +223,8 @@ mod tests {
 
     #[test]
     fn all_declines_exactly_what_at_declines() {
-        // One walk, so this is not a second rule: a receiver, an interpolated path, a comment
-        // and a string are each skipped by the code both callers go through.
+        // One walk, so this is not a second rule: a receiver, an interpolated path, a comment and a
+        // string are each skipped by the code both callers share.
         assert!(all("Foo.require \"person\"\n").is_empty());
         assert!(all("require \"lib/#{name}\"\n").is_empty());
         assert!(all("# require \"person\"\nputs \"require \\\"x\\\"\"\n").is_empty());
@@ -235,7 +233,7 @@ mod tests {
     #[test]
     fn a_require_path_navigates_to_the_file_it_names() {
         // The graph indexes the call to `require` but never its argument, so this is the one
-        // navigation answer that comes from parsing rather than from the index.
+        // navigation answer that comes from parsing, not the index.
         let mut harness = Harness::new();
         let library = harness.write("lib/person.rb", LIBRARY);
         let source = "require \"person\"\nrequire_relative \"person\"\nrequire \"nope\"\n";
@@ -261,11 +259,11 @@ mod tests {
 
     #[test]
     fn every_require_in_the_file_is_a_link_and_one_that_resolves_nowhere_is_not() {
-        // The same source the jump above navigates, asked without a cursor. Both spellings are
-        // underlined and the third line is not: a link whose target the graph cannot name would
-        // be an underline that opens nothing, which is worse than leaving the path plain. The
-        // protocol's other spelling — a link with no `target`, resolved on click — says the same
-        // thing a round trip later and there is nothing here that a round trip could learn.
+        // The source the jump above navigates, asked without a cursor. Both spellings are
+        // underlined and the third line is not: a link whose target the graph cannot name would be
+        // an underline that opens nothing, worse than a plain path. The protocol's other spelling
+        // (a link with no `target`, resolved on click) says the same thing a round trip later, and
+        // a round trip would learn nothing here.
         let mut harness = Harness::new();
         let library = harness.write("lib/person.rb", LIBRARY);
         let source = "require \"person\"\nrequire_relative \"person\"\nrequire \"nope\"\n";
@@ -295,9 +293,9 @@ mod tests {
 
     #[test]
     fn a_file_whose_requires_all_resolve_nowhere_answers_null() {
-        // `null` rather than `[]`, which is what every other whole-file answer here says when
-        // it found nothing, and the shape a client reads as "no links" rather than as "a link
-        // list that happens to be empty this keystroke".
+        // `null`, not `[]`: what every other whole-file answer here says when it found nothing, and
+        // what a client reads as "no links", not as "a link list that happens to be empty this
+        // keystroke".
         let mut harness = Harness::new();
         let source = "require \"nope\"\nclass Person\nend\n";
         let caller = harness.write("lib/main.rb", source);
@@ -308,10 +306,10 @@ mod tests {
 
     #[test]
     fn a_link_in_a_template_is_placed_in_the_markup_the_editor_has() {
-        // A template is read as its Ruby view — markup blanked, one space per byte — and
-        // addressed as the text the client holds. The require is parsed out of the first and
-        // the range comes back in the second, so the underline lands on the path rather than
-        // that many columns into the `<% %>` it is written in.
+        // A template is read as its Ruby view (markup blanked, one space per byte) and addressed as
+        // the text the client holds. The require is parsed out of the first and the range returned
+        // in the second, so the underline lands on the path, not that many columns into the `<% %>`
+        // it is written in.
         let mut harness = Harness::new();
         let library = harness.write("lib/person.rb", LIBRARY);
         let source = "<h1>Hi</h1>\n<% require \"person\" %>\n";

@@ -1,11 +1,11 @@
-//! `ya-lsp.toml` — project configuration.
+//! `ya-lsp.toml`: project configuration.
 //!
-//! Precedence: `ya-lsp.toml` > the client's `initializationOptions` > defaults. The file wins
-//! so a project can commit one setup that works for the whole team regardless of editor, and
-//! an absent file must always mean a working server.
+//! Precedence: `ya-lsp.toml` > the client's `initializationOptions` > defaults.
+//! - The file wins, so a project can commit one setup that works for the whole team in any editor.
+//! - An absent file must always mean a working server.
 //!
-//! Deliberately *not* reusing rubydex's `rubydex.toml`: that is rubydex's own linter config,
-//! and a project already using rubydex should not have ya-lsp silently reinterpreting it.
+//! Deliberately *not* `rubydex.toml`: that is rubydex's own linter config, and ya-lsp must not
+//! silently reinterpret it.
 
 use std::{
     collections::BTreeMap,
@@ -50,76 +50,69 @@ pub struct Config {
 pub struct IndexConfig {
     /// Globs, relative to the workspace root, of files to index.
     ///
-    /// The default covers every shape Ruby is written in rather than only `.rb`: an application's
-    /// `Rakefile`, `Gemfile`, `config.ru`, `lib/tasks/*.rake` and its own `.gemspec` are Ruby that
-    /// defines constants and methods like any other, and `sig/**/*.rbs` is the project saying what
-    /// those methods return.
+    /// The default covers every shape Ruby is written in, not only `.rb`. An application's
+    /// `Rakefile`, `Gemfile`, rackup files (any `.ru`), `lib/tasks/*.rake` and `.gemspec` define
+    /// constants and methods like any other Ruby. `sig/**/*.rbs` is the project saying what those
+    /// methods return.
     pub include: Vec<String>,
     /// Globs, relative to the workspace root, to skip.
     pub exclude: Vec<String>,
-    /// Extra roots to index and to resolve `require` against — the project's own `$LOAD_PATH`.
+    /// Extra roots to index and to resolve `require` against: the project's own `$LOAD_PATH`.
     ///
-    /// Relative to the workspace root, or absolute. A path that leaves the root is how a monorepo
-    /// names a tree its applications share: it is walked for `.rb` and `.rbs`, it counts as the
-    /// user's own code, and the server asks the editor to claim it, because no client's selector
-    /// reaches outside its own folder. `..` and a symlink out of the tree both work, and both
-    /// used to fail silently — see `workspace::resolve_load_path`.
+    /// Relative to the workspace root, or absolute. A path outside the root is how a monorepo names
+    /// a shared tree. It is walked for `.rb` and `.rbs`, counts as the user's own code, and the
+    /// server asks the editor to claim it, since no client's selector reaches outside its folder.
+    /// `..` and a symlink out of the tree both work; see `workspace::resolve_load_path`.
     pub load_paths: Vec<PathBuf>,
     /// Hard ceiling on indexed files. Refuse rather than thrash.
     pub max_files: usize,
-    /// Skip anything git ignores. Correct for a code indexer by default (it prunes
-    /// `vendor/bundle`, `node_modules`, `tmp`), but a generated-source project may need it off.
-    pub respect_gitignore: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GemsConfig {
     pub enabled: bool,
-    /// Index the gems that ship inside Ruby itself — `json`, `uri`, `forwardable`, `optparse`
-    /// and ~40 others — by adding Ruby's own library directory as a load path.
+    /// Index the gems that ship inside Ruby itself (`json`, `uri`, `forwardable`, `optparse` and
+    /// dozens more) by adding Ruby's own library directory as a load path.
     ///
-    /// Separate from `enabled` because it is a separate directory with a separate cost, and
-    /// because much of it is described twice once `[rbs] stdlib` is on: the signatures have the
-    /// types, Ruby's own library has the implementation, and a project may reasonably want one
-    /// without the other.
+    /// Separate from `enabled`: it is a separate directory with a separate cost. With
+    /// `[rbs] stdlib` on, much of it is described twice (signatures carry the types, the library
+    /// the implementation), and a project may want one without the other.
     pub default_gems: bool,
     /// Override when auto-detection picks the wrong Ruby.
     pub ruby_version: Option<String>,
-    /// Gem roots to search *before* the built-in table, relative to the workspace root or
-    /// absolute. Each should be a directory containing `gems/` — the output of `gem env gemdir`.
+    /// Gem roots to search *before* the built-in table, relative to the workspace root or absolute.
+    /// Each should contain `gems/`: the output of `gem env gemdir`.
     ///
-    /// The escape hatch for a layout the table does not know: a container image, a Nix store
-    /// path, a hand-rolled install. Without it, a machine we guess wrong about has no recourse
-    /// at all, and the whole table is guesswork about other people's filesystems.
+    /// The escape hatch for a layout the table does not know: a container image, a Nix store path,
+    /// a hand-rolled install. The table is guesswork about other people's filesystems, and without
+    /// this a machine it guesses wrong has no recourse.
     pub paths: Vec<PathBuf>,
-    /// Hard ceiling on indexed gem files, separate from `index.max_files` so a large bundle
-    /// cannot quietly consume the workspace's budget.
+    /// Hard ceiling on indexed gem files. Separate from `index.max_files`, so a large bundle cannot
+    /// quietly eat the workspace's budget.
     pub max_files: usize,
 }
 
 /// Ruby's own signatures: `String`, `Array`, `Hash`, `Kernel`, and the stdlib.
 ///
-/// These are RBS files, not Ruby, and they come from the `rbs` gem — or, when no Ruby is
-/// installed, from the copy vendored into this binary. See `workspace::rbs`.
+/// RBS files, not Ruby, from the `rbs` gem, or from the copy vendored into this binary when no Ruby
+/// is installed. See `workspace::rbs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RbsConfig {
-    /// Index Ruby's core signatures. Off means the graph holds the five built-in classes
-    /// rubydex fabricates and nothing else.
+    /// Index Ruby's core signatures. Off means the graph holds only the five built-in classes
+    /// rubydex fabricates.
     pub enabled: bool,
-    /// Also index the stdlib signatures: `Set`, `CSV`, `URI`, `Pathname`, `Logger`, and the
-    /// other ~57 libraries. Measured at ~3.5 ms added to the resolve every request pays, so it
-    /// is separable from core, which costs ~0.05 ms.
+    /// Also index the stdlib signatures: `Set`, `CSV`, `URI`, `Pathname`, `Logger` and the rest.
+    /// Separate from core because it adds far more to the resolve every request pays.
     pub stdlib: bool,
-    /// An explicit rbs root — a directory holding `core/`, usually an unpacked `rbs-x.y.z` gem.
-    /// Skips discovery, and skips the vendored copy.
+    /// An explicit rbs root: a directory holding `core/`, usually an unpacked `rbs-x.y.z` gem.
+    /// Skips discovery and the vendored copy.
     pub path: Option<PathBuf>,
 }
 
 /// Whether a body of knowledge applies to this project: yes, no, or work it out.
 ///
-/// `true`/`false` and `"on"`/`"off"` are the same two answers written two ways, because both are
-/// what somebody reaches for and a config that rejects one of them is a config that wasted an
-/// afternoon.
+/// `true`/`false` and `"on"`/`"off"` are the same two answers. People reach for both, and a config
+/// that rejects one wastes an afternoon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum Switch {
@@ -129,8 +122,8 @@ pub enum Switch {
     Word(Word),
 }
 
-/// [`Switch`]'s spelled-out form. Separate so that `"auto"` is a value serde can name in its
-/// error rather than a string it silently fails to read as a boolean.
+/// [`Switch`]'s spelled-out form. Separate so `"auto"` is a value serde can name in its error, not
+/// a string it silently fails to read as a boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Word {
@@ -142,8 +135,8 @@ pub enum Word {
 impl Switch {
     /// What this switch means, given what detection found.
     ///
-    /// `detected` is only consulted for `auto`, which is what keeps the detection off the path
-    /// of a project that has already answered.
+    /// `detected` is consulted only for `auto`, which keeps detection off the path of a project
+    /// that has already answered.
     #[must_use]
     pub fn decide(self, detected: bool) -> bool {
         match self {
@@ -157,174 +150,183 @@ impl Switch {
 
 /// What ya-lsp knows about Rails, and which parts of it this project wants.
 ///
-/// **The reason these exist is answers, not speed.** "Turn Rails off to make it faster" is what a
-/// user will reach for and it is the wrong reason: the generator lists are reference-filtered
-/// before anything is read, so a project with no `belongs_to`, no `schema.rb` and no `routes.rb`
-/// already opens no files. What a non-Rails project really pays is narrower and real — the
-/// projection walk, and the **path conventions**, which are asked of filenames rather than of
-/// calls. Any project with an `app/views/` is having `rails::controller_of` applied to it whether
-/// or not it is Rails, and a Sinatra or Hanami application with one gets a *Derived* card citing
-/// a controller that does not exist.
+/// **These exist for correct answers, not speed.** "Turn Rails off to make it faster" is the wrong
+/// reason: generator lists are reference-filtered before anything is read, so a project with no
+/// `belongs_to`, `schema.rb` or `routes.rb` opens no files.
 ///
-/// So the switch is for correctness and for trust: a project that is not Rails should not be told
-/// about Rails, and a project that is Rails but does not use one family of it should be able to
-/// say so.
+/// What a non-Rails project does pay is narrower:
+/// - the projection walk;
+/// - the **path conventions**, asked of filenames, not calls. Any project with `app/views/` gets
+///   `rails::controller_of` applied, so a Sinatra or Hanami app gets a *Derived* card citing a
+///   controller that does not exist.
+///
+/// So the switch is for correctness and trust. A non-Rails project should not be told about Rails,
+/// and a Rails project that skips one family should be able to say so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RailsConfig {
-    /// All of the below at once, and `auto` by default rather than `true`.
+    /// All of the below at once, and `auto` by default, not `true`.
     ///
-    /// A plain boolean makes somebody go and find a setting to turn off a thing they never asked
-    /// for. `auto` answers yes when the root holds `config/application.rb` **or** `Gemfile.lock`
-    /// locks `railties` — both halves needed, because an engine has no `config/application.rb`
-    /// and a fresh clone has no `Gemfile.lock`.
+    /// A plain boolean makes somebody hunt for a setting to turn off a thing they never asked for.
+    /// `auto` says yes when the root holds `config/application.rb` **or** `Gemfile.lock` locks
+    /// `railties`. Both halves are needed: an engine has no `config/application.rb`, and a fresh
+    /// clone has no `Gemfile.lock`.
     pub enabled: Switch,
     /// `db/*schema.rb`, `db/*structure.sql`, and the macros that rename a table.
     pub schema: bool,
-    /// Associations, `enum`, `attribute`, `delegate`, the 17 tail macros, and the query
-    /// interface a model's relations are written against.
+    /// Associations, `enum`, `attribute`, `delegate`, the 17 tail macros, and the query interface a
+    /// model's relations are written against.
     pub models: bool,
     /// `config/routes.rb` and the helper module every controller and view includes.
     pub routes: bool,
     /// Mailers, jobs and Sidekiq workers.
     pub entrypoints: bool,
-    /// The view context — what a bare word in a template may call — and the rung that types a
+    /// The view context (what a bare word in a template may call), and the rung that types a
     /// template's `@story` from the controller its path names.
     pub views: bool,
 }
 
 /// Where this project keeps the trees the fence is about.
 ///
-/// `analysis::environment` decides that from four hard-coded words and one hard-coded pair, all
-/// of them written against six repositories that happen to agree. A project that keeps its suite
-/// in `qa/`, a project whose `db/` really is autoloaded, a monorepo whose `test/` is a published
-/// library — none of them could say so, and every one is either losing answers it should have or
-/// keeping answers it should not.
+/// `analysis::environment` decides that from four hard-coded words and one hard-coded pair, tuned
+/// on a few repositories that happen to agree. Projects that differ had no way to say so, and each
+/// either lost answers or kept wrong ones:
+/// - a suite in `qa/`;
+/// - a `db/` that really is autoloaded;
+/// - a monorepo whose `test/` is a published library.
 ///
-/// **One list replaces and one extends, and that is the asymmetry the module already documents
-/// rather than an inconsistency.** A name on the *target* list deletes an answer when it is
-/// wrong, so a key that merely appended to it would invite somebody to add `lib` and silently
-/// delete their whole workspace from `completion`, `definition` and `hover`. A name on the
-/// *cursor* list only turns the fence **off**, so being wrong there costs nothing but the
-/// protection it was going to give — and that one takes the additive shape `gems.paths` has.
+/// **One list replaces and one extends. That asymmetry is deliberate.**
+/// - A name on the *target* list deletes answers when wrong. An appending key would invite adding
+///   `lib` and silently deleting the whole workspace from `completion`, `definition` and `hover`.
+/// - A name on the *cursor* list only turns the fence **off**, so a wrong one costs only the
+///   protection. It takes the additive shape `gems.paths` has.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TreesConfig {
-    /// The test trees, **replacing** `spec`, `test`, `tests` and `features`. `None` is the
-    /// built-in list; `Some([])` turns the target fence off, which is a legitimate answer.
+    /// The test trees, **replacing** `spec`, `test`, `tests` and `features`. `None` is the built-in
+    /// list; `Some([])` turns the target fence off, a legitimate answer.
     pub test: Option<Vec<String>>,
-    /// Extra directory names that turn the fence **off** when the cursor is inside one, over and
-    /// above the built-in `testing_support`. Additive, never replacing.
+    /// Extra directory names that turn the fence **off** when the cursor is inside one, on top of
+    /// the built-in `testing_support`. Additive, never replacing.
     pub test_support: Vec<String>,
     /// The migration trees, as `parent/mark` pairs, **replacing** `db/migrat`. `None` is the
     /// built-in pair; `Some([])` turns the migration fence off.
     ///
-    /// A pair and not a name: `migrate` is an ordinary enough word for `app/services/migrate/`,
-    /// and what is unloadable is only the tree under `db/`. The mark is a **substring** of the
-    /// directory's name, which is what makes `db/migrate`, `db/post_migrate` and
-    /// `db/old_migrations` one rule.
+    /// A pair, not a name: `migrate` is ordinary enough for `app/services/migrate/`, and only the
+    /// tree under `db/` is unloadable. The mark is a **substring** of the directory name, so
+    /// `db/migrate`, `db/post_migrate` and `db/old_migrations` are one rule.
     pub migration: Option<Vec<String>>,
 }
 
 /// The types ya-lsp derives, and the one rung of them a user may want silenced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypesConfig {
-    /// `Struct.new` and `Data.define` — plain Ruby, in `[types]` rather than `[rails]` because
-    /// it is not Rails and a Rails word over it would be the first one to leak.
+    /// `Struct.new` and `Data.define`. Plain Ruby, so in `[types]`, not `[rails]`: a Rails word
+    /// over it would be the first to leak.
     pub structs: bool,
     /// A Sorbet `sig` and a YARD `@return`. In `[types]` for `structs`' reason.
     pub annotations: bool,
-    /// Answer from a receiver's own name when nothing else can: `@user` is a `User`, `person`
-    /// is a `Person`.
+    /// Answer from a receiver's own name when nothing else can: `@user` is a `User`, `person` is a
+    /// `Person`.
     ///
-    /// The only answer ya-lsp gives that is allowed to be wrong. It is labelled as a guess
-    /// wherever it appears — a hover footnote, a completion card — and it never displaces an
-    /// answer the code states or one derived from a signature. Off leaves ya-lsp with only
-    /// checkable answers, which is a defensible thing to want and the reason the setting is
-    /// here at all.
+    /// The only answer ya-lsp gives that may be wrong. It is labelled as a guess wherever it
+    /// appears (a hover footnote, a completion card), and it never displaces an answer the code
+    /// states or a signature derives. Off leaves only checkable answers, a defensible thing to
+    /// want.
     pub guess_from_names: bool,
 }
 
 /// Which inlay hints are drawn. One flag per family, because taste is per family.
 ///
-/// There is deliberately no `enabled` beside them, unlike `[diagnostics]`. A diagnostic is
-/// pushed and the editor has no switch for it; an inlay hint is pulled, and every client that
-/// asks for one already has a master switch of its own — a fourth setting duplicating it would
-/// be a second place to look when the margin is empty.
+/// No `enabled` beside them, unlike `[diagnostics]`. A diagnostic is pushed and the editor has no
+/// switch for it. An inlay hint is pulled, and every client already has a master switch; a
+/// duplicate would be a second place to look when the margin is empty.
 ///
 /// **No flag turns the bottom tier on.** A type matched on a name alone is never drawn, in any
-/// family, and that is a property of the module rather than a default — see
-/// [`hints`](crate::analysis::hints).
+/// family. That is a property of the module, not a default; see [`hints`](crate::analysis::hints).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HintsConfig {
-    /// `stories.each do |story|` — what the called method's signature says its block receives.
+    /// `stories.each do |story|`: what the called method's signature says its block receives.
     pub block_parameters: bool,
-    /// `author = story.author` — what the call on the right hands back. Only where the
-    /// assignment does not already name the class.
+    /// `author = story.author`: what the call on the right hands back. Only where the assignment
+    /// does not already name the class.
     pub locals: bool,
-    /// `def title` — what a signature declares the method returns, where the source does not.
+    /// `def title`: what a signature declares the method returns, where the source does not.
     pub returns: bool,
 }
 
 /// Where the log goes, and how much of it.
 ///
-/// The log **is** an interface: when a user asks why they have no completions, this is the only
-/// thing that answers. Two sinks rather than one tee'd into two, because the whole point of the
-/// file is that it can sit at `debug` while stderr stays at `info` — one filter over both would
-/// make the quiet sink decide how much the loud one carries.
+/// The log **is** an interface: when a user asks why they have no completions, it is the only thing
+/// that answers. Two sinks, not one tee'd into two, so the file can sit at `debug` while stderr
+/// stays at `info`. One filter over both would let the quiet sink decide what the loud one carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogConfig {
     /// What stderr carries. A bare level (`info`, `debug`, `off`) is scoped to ya-lsp itself;
-    /// anything with an `=` or a `,` in it is passed to `EnvFilter` as written.
+    /// anything with an `=` or a `,` goes to `EnvFilter` as written.
     ///
-    /// `YA_LSP_LOG` outranks it. That is the one inversion of this file's precedence and it is
-    /// deliberate: the environment variable is what somebody debugging from a terminal types,
-    /// and a project file that quietly overrode it would be the opposite of a debugging aid.
+    /// `YA_LSP_LOG` outranks it: the one deliberate inversion of this file's precedence. The
+    /// environment variable is what someone debugging from a terminal types, and a project file
+    /// quietly overriding it would defeat the point.
     pub level: String,
-    /// Write a second copy to a file, so a bug report can carry one instead of a screenshot of
-    /// an output channel.
+    /// Write a second copy to a file, so a bug report can attach it instead of a screenshot of an
+    /// output channel.
     ///
-    /// Off by default. A server somebody installed for hover does not start writing into their
-    /// repository from the first keystroke.
+    /// Off by default: a server installed for hover must not start writing into the repository from
+    /// the first keystroke.
     pub file: bool,
     /// Where that copy goes, relative to the workspace root or absolute.
     ///
-    /// `tmp/` and not the root: every corpus this project measures against gitignores `tmp`,
-    /// `index.exclude` prunes it, and a default of `.ya-lsp.log` at the root would have made
-    /// every one of them dirty the moment somebody turned the file on.
+    /// `tmp/`, not the root: Rails projects gitignore `tmp`, and `index.exclude` prunes it. A
+    /// root-level `.ya-lsp.log` would dirty the working tree the moment the file was turned on.
     pub file_path: PathBuf,
-    /// What the file carries, read the same way as `level`. `debug` rather than `info`: the
-    /// reason to turn the file on at all is the per-request detail stderr does not carry.
+    /// What the file carries, read like `level`. `debug`, not `info`: the reason to turn the file
+    /// on is the per-request detail stderr lacks.
     pub file_level: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticsConfig {
     pub enabled: bool,
-    /// Per-rule severity, keyed by rubydex's own rule name (`parse-error`,
-    /// `dynamic-constant-reference`, ...) — the same string the editor shows in a diagnostic's
-    /// `code` field.
+    /// Per-rule severity, keyed by rubydex's rule name (`parse-error`,
+    /// `dynamic-constant-reference`, ...), the same string the editor shows in a diagnostic's
+    /// `code`.
     ///
-    /// Rules absent from the map use the default in `analysis::diagnostics`, where most of them
-    /// are `Off` because they fire on correct Ruby. Names are validated there too: this map is
-    /// open-ended by necessity, so a typo has to be caught against the real rule list.
+    /// Absent rules use the default in `analysis::diagnostics`, where most are `Off` because they
+    /// fire on correct Ruby. Names are validated there too: this map is open-ended, so a typo must
+    /// be caught against the real rule list.
     pub rules: BTreeMap<String, Severity>,
 }
 
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
-            // Extensions first, then the fixed names, and every one of them spelled `**/` so it
-            // matches at the root and at every depth — an engine keeps its own `Rakefile`, and a
-            // monorepo keeps a `.gemspec` per gem. `Gemfile.lock` is deliberately not here: it is
-            // data Bundler writes, `bundler.rs` reads it as text, and it is not Ruby.
+            // Extensions first, then fixed names, each spelled `**/` so it matches at every depth:
+            // an engine keeps its own `Rakefile`, a monorepo a `.gemspec` per gem. `Gemfile.lock`
+            // is not here: it is data Bundler writes, which `bundler.rs` reads as text.
+            //
+            // `**/*.ru`, not `**/config.ru`: a rackup file is Ruby whatever its name, and an
+            // application may mount several (`admin.ru`, `sidekiq.ru`). The extension is also all a
+            // client routing by extension can express, so a narrower glob would disagree with what
+            // Claude Code sends (`tests/claude_plugin.rs`).
+            //
+            // `.jbuilder`, `.builder` and `.ruby` are Rails' other template handlers:
+            // - A template is `name.format.handler`, and every glob here reads the *handler*.
+            // - All three are plain Ruby with no markup, so none needs ERB's blanking.
+            // - Like `.erb`, Rails compiles them into a method body; `erb::is_compiled_template` is
+            //   the one place that matters.
+            // - `**/`, not anchored at `app/views`, because an engine in a monorepo keeps its own
+            //   views (e.g. under `promotions/lib/views/`).
             include: vec![
                 "**/*.rb".to_owned(),
                 "**/*.erb".to_owned(),
+                "**/*.jbuilder".to_owned(),
+                "**/*.builder".to_owned(),
+                "**/*.ruby".to_owned(),
                 "**/*.rbs".to_owned(),
                 "**/*.rake".to_owned(),
                 "**/*.gemspec".to_owned(),
+                "**/*.ru".to_owned(),
                 "**/Rakefile".to_owned(),
                 "**/Gemfile".to_owned(),
-                "**/config.ru".to_owned(),
             ],
             exclude: vec![
                 "vendor/**/*".to_owned(),
@@ -334,7 +336,6 @@ impl Default for IndexConfig {
             ],
             load_paths: vec![PathBuf::from("lib"), PathBuf::from("app")],
             max_files: 50_000,
-            respect_gitignore: true,
         }
     }
 }
@@ -426,8 +427,8 @@ impl DiagnosticsConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Wire format — every field optional, so "absent" is distinguishable from
-// "explicitly set to the default value". Layering needs that distinction.
+// Wire format. Every field is optional, so "absent" differs from "explicitly the default". Layering
+// needs that.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize)]
@@ -451,7 +452,6 @@ pub struct PartialIndex {
     pub exclude: Option<Vec<String>>,
     pub load_paths: Option<Vec<PathBuf>>,
     pub max_files: Option<usize>,
-    pub respect_gitignore: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -531,7 +531,6 @@ impl Config {
             replace(&mut self.index.exclude, index.exclude);
             replace(&mut self.index.load_paths, index.load_paths);
             replace(&mut self.index.max_files, index.max_files);
-            replace(&mut self.index.respect_gitignore, index.respect_gitignore);
         }
         if let Some(log) = layer.log {
             replace(&mut self.log.level, log.level);
@@ -564,10 +563,9 @@ impl Config {
             replace(&mut self.rails.views, rails.views);
         }
         if let Some(trees) = layer.trees {
-            // `test` and `migration` replace and `test_support` extends, so the first two take
-            // the layer's list whole — including an empty one, which is how a fence is turned
-            // off — and the third is assigned like any other field because *its* list is the
-            // additive one the user wrote.
+            // `test` and `migration` replace, so they take the layer's list whole, including an
+            // empty one (how a fence is turned off). `test_support` extends, so it is assigned like
+            // any other field: *its* list is the additive one the user wrote.
             if trees.test.is_some() {
                 self.trees.test = trees.test;
             }
@@ -588,8 +586,8 @@ impl Config {
         }
         if let Some(diagnostics) = layer.diagnostics {
             replace(&mut self.diagnostics.enabled, diagnostics.enabled);
-            // Rules merge key-by-key rather than wholesale, so a project file can silence one
-            // rule without restating everything the client already configured.
+            // Rules merge key by key, so a project file can silence one rule without restating the
+            // client's.
             if let Some(rules) = diagnostics.rules {
                 self.diagnostics.rules.extend(rules);
             }
@@ -598,14 +596,14 @@ impl Config {
 }
 
 impl Config {
-    /// Which tables a layer actually moved, for the one line that says what a config file did.
+    /// Which tables a layer actually moved, for the one line saying what a config file did.
     ///
-    /// Named tables rather than named keys, and that is the whole decision: a key-by-key diff
-    /// would be a second copy of the schema to keep in step with the first, and what a reader of
-    /// the log needs is the pointer — *this project configures gems and hints* — not the values,
-    /// which are in the file they can open. Empty means the file changed nothing, which is worth
-    /// saying out loud: a `ya-lsp.toml` full of keys that are all already the default reads
-    /// exactly like one that was never found.
+    /// Tables, not keys. A key-by-key diff would be a second copy of the schema to keep in step.
+    /// The log reader needs the pointer (*this project configures gems and hints*), not the values,
+    /// which are in the file.
+    ///
+    /// Empty means the file changed nothing, which is worth saying: a `ya-lsp.toml` whose keys are
+    /// all defaults reads exactly like one never found.
     #[must_use]
     pub fn changed_from_defaults(&self) -> Vec<&'static str> {
         let defaults = Self::default();
@@ -641,8 +639,8 @@ pub struct Loaded {
     pub config: Config,
     /// `Some` when a `ya-lsp.toml` was found and read.
     pub path: Option<PathBuf>,
-    /// Human-readable problems worth surfacing to the editor. Never fatal: a broken config
-    /// degrades to defaults rather than taking the server down.
+    /// Human-readable problems to surface to the editor. Never fatal: a broken config falls back to
+    /// defaults instead of taking the server down.
     pub problems: Vec<String>,
 }
 
@@ -687,11 +685,11 @@ pub fn load(root: &Path, initialization_options: Option<&serde_json::Value>) -> 
     }
 }
 
-/// One `trees.migration` entry split into the directory and the name of the one above it.
+/// One `trees.migration` entry, split into the directory and the name of the one above it.
 ///
-/// The **last** separator, so `lib/data/migrat` reads as the directory `data` holding the tree,
-/// which is the shape a deeper path is written in. An entry with no separator at all is not a
-/// pair and is refused rather than guessed at.
+/// The **last** separator, so `lib/data/migrat` reads as directory `data` holding the tree: the
+/// shape a deeper path takes. An entry with no separator is not a pair and is refused, not guessed
+/// at.
 #[must_use]
 pub fn migration_pair(entry: &str) -> Option<(&str, &str)> {
     let (parent, mark) = entry.rsplit_once('/')?;
@@ -723,17 +721,16 @@ fn validate(config: &Config) -> Vec<String> {
         ));
     }
 
-    // A `trees.migration` entry with no parent in it is the one way to write this key that
-    // deletes answers rather than merely not adding any: `migrate` on its own fences
-    // `app/services/migrate/`, which the project really does load.
+    // A `trees.migration` entry with no parent is the one spelling of this key that deletes
+    // answers: a bare `migrate` fences `app/services/migrate/`, which the project really does load.
     for entry in config.trees.migration.iter().flatten() {
         if migration_pair(entry).is_none() {
             problems.push(messages::migration_needs_a_parent(entry));
         }
     }
 
-    // A configured rbs root that is not one is worth saying out loud: the fallback is silent,
-    // and "my signatures are the wrong version" is not a symptom anyone traces back to a typo.
+    // A configured rbs root that is not one must be reported. The fallback is silent, and nobody
+    // traces "my signatures are the wrong version" back to a typo.
     if let Some(path) = &config.rbs.path
         && !path.join("core").is_dir()
     {
@@ -766,8 +763,8 @@ mod tests {
 
     #[test]
     fn a_config_file_that_cannot_be_read_is_a_problem_not_a_missing_file() {
-        // "Not there" is the ordinary case and says nothing. Anything else — a directory where
-        // the file should be, a permission error — is a config the user believes is in effect.
+        // "Not there" is ordinary and says nothing. Anything else (a directory where the file
+        // should be, a permission error) is a config the user believes is in effect.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(CONFIG_FILE_NAME)).unwrap();
 
@@ -784,8 +781,8 @@ mod tests {
 
     #[test]
     fn initialization_options_that_do_not_parse_are_reported_and_dropped() {
-        // The editor's layer is the one the user cannot see. Silently ignoring it would leave
-        // every setting they changed apparently doing nothing.
+        // The editor's layer is the one the user cannot see. Ignoring it silently would make every
+        // setting they changed appear to do nothing.
         let dir = tempfile::tempdir().unwrap();
         let options = serde_json::json!({ "index": { "max_files": "lots" } });
         let loaded = load(dir.path(), Some(&options));
@@ -800,8 +797,8 @@ mod tests {
 
     #[test]
     fn a_configuration_that_would_index_nothing_says_so() {
-        // Each of these is a config that starts a server which then answers every question with
-        // silence — the single hardest failure to attribute to a setting.
+        // Each of these starts a server that then answers everything with silence: the hardest
+        // failure to trace back to a setting.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(CONFIG_FILE_NAME),
@@ -826,8 +823,8 @@ mod tests {
 
     #[test]
     fn an_rbs_path_that_is_not_a_signature_root_is_worth_saying_out_loud() {
-        // The fallback is silent, and "my signatures are the wrong version" is not a symptom
-        // anyone traces back to a typo in a path.
+        // The fallback is silent, and nobody traces "my signatures are the wrong version" back to a
+        // typo in a path.
         let dir = tempfile::tempdir().unwrap();
         let signatures = dir.path().join("signatures");
         std::fs::create_dir_all(&signatures).unwrap();
@@ -855,21 +852,28 @@ mod tests {
 
     #[test]
     fn the_default_include_is_every_shape_ruby_is_written_in() {
-        // Spelled out rather than derived, because this list *is* the decision: it is what a
-        // project gets with no configuration, it is republished in the extension's manifest
-        // (`tests/vscode_manifest.rs`), and each entry becomes a file watcher the client
-        // registers. Adding one is a settings change and should read as one in the diff.
+        // Spelled out, not derived, because this list *is* the decision:
+        // - it is what a project gets with no configuration;
+        // - the extension's manifest republishes it (`tests/vscode_manifest.rs`);
+        // - each entry becomes a file watcher the client registers.
+        //
+        // Adding one is a settings change and should read as one in the diff.
         assert_eq!(
             IndexConfig::default().include,
             vec![
                 "**/*.rb",
                 "**/*.erb",
+                // Rails' three other template handlers, plain Ruby and read as such.
+                // `erb::is_template` stays false for all three, so none is blanked.
+                "**/*.jbuilder",
+                "**/*.builder",
+                "**/*.ruby",
                 "**/*.rbs",
                 "**/*.rake",
                 "**/*.gemspec",
+                "**/*.ru",
                 "**/Rakefile",
                 "**/Gemfile",
-                "**/config.ru",
             ]
         );
     }
@@ -892,7 +896,6 @@ mod tests {
             exclude = ["spec/**/*"]
             load_paths = ["lib", "app"]
             max_files = 1234
-            respect_gitignore = false
 
             [gems]
             enabled = false
@@ -911,7 +914,6 @@ mod tests {
 
         assert_eq!(config.index.include, vec!["lib/**/*.rb"]);
         assert_eq!(config.index.max_files, 1234);
-        assert!(!config.index.respect_gitignore);
         assert!(!config.gems.enabled);
         assert_eq!(config.gems.ruby_version.as_deref(), Some("3.1.4"));
         assert_eq!(config.gems.paths, vec![PathBuf::from("/opt/gems")]);
@@ -953,8 +955,8 @@ mod tests {
         assert_eq!(config.log.file_path, PathBuf::from("/var/log/ya-lsp.log"));
         assert_eq!(config.log.file_level, "trace");
 
-        // And the defaults, which are what the VS Code manifest republishes: off, in `tmp/`, and
-        // louder than stderr because the reason to turn the file on is the detail stderr lacks.
+        // And the defaults, which the VS Code manifest republishes: off, in `tmp/`, and louder than
+        // stderr, because the reason to turn the file on is the detail stderr lacks.
         let defaults = LogConfig::default();
         assert!(!defaults.file);
         assert_eq!(defaults.file_path, PathBuf::from("tmp/ya-lsp.log"));
@@ -970,9 +972,8 @@ mod tests {
 
     #[test]
     fn a_config_that_changes_nothing_says_so_and_one_that_does_names_the_tables() {
-        // "It is reading my ya-lsp.toml" and "it is reading my ya-lsp.toml and every key in it is
-        // already the default" behave identically and used to log identically, which is what
-        // somebody who has just mistyped a table name has.
+        // "It is reading my ya-lsp.toml" and "it reads it, but every key is already the default"
+        // must not log identically. The second is what someone who mistyped a table name has.
         assert!(Config::default().changed_from_defaults().is_empty());
         assert!(
             parse("[types]\nguess_from_names = true\n")
@@ -1020,12 +1021,12 @@ mod tests {
 
     #[test]
     fn a_migration_entry_is_a_directory_and_the_one_above_it() {
-        // The **last** separator, so `lib/data/migrat` reads as the directory `data` holding the
-        // tree — the shape a deeper path is written in.
+        // The **last** separator, so `lib/data/migrat` reads as directory `data` holding the tree:
+        // the shape a deeper path takes.
         assert_eq!(migration_pair("db/migrat"), Some(("db", "migrat")));
         assert_eq!(migration_pair("lib/data/migrat"), Some(("data", "migrat")));
-        // Half a pair is not a pair. A bare `migrate` would fence `app/services/migrate/`,
-        // which the project really does load, so it is refused rather than guessed at.
+        // Half a pair is not a pair. A bare `migrate` would fence `app/services/migrate/`, which
+        // the project really does load, so it is refused.
         assert_eq!(migration_pair("migrate"), None);
         assert_eq!(migration_pair("db/"), None);
         assert_eq!(migration_pair("/migrat"), None);
@@ -1056,8 +1057,8 @@ mod tests {
 
     #[test]
     fn the_two_lists_that_replace_take_an_empty_list_as_a_fence_turned_off() {
-        // `None` and `Some([])` are different answers and the difference is the whole shape of
-        // these keys: one is "nobody said", the other is "no fence, and I mean it".
+        // `None` and `Some([])` are different answers, and that difference is the whole shape of
+        // these keys: "nobody said" versus "no fence, and I mean it".
         assert!(Config::default().trees.test.is_none());
         assert!(Config::default().trees.migration.is_none());
 
@@ -1065,8 +1066,8 @@ mod tests {
         assert_eq!(off.trees.test.as_deref(), Some([].as_slice()));
         assert_eq!(off.trees.migration.as_deref(), Some([].as_slice()));
 
-        // And the additive one is a plain list, empty by default, that a layer replaces
-        // wholesale — the shape `gems.paths` already has.
+        // The additive one is a plain list, empty by default, that a layer replaces wholesale: the
+        // shape `gems.paths` has.
         assert!(Config::default().trees.test_support.is_empty());
         assert_eq!(
             parse("[trees]\ntest_support = [\"fixtures\"]\n")
@@ -1078,8 +1079,7 @@ mod tests {
 
     #[test]
     fn the_rails_switch_takes_a_word_or_a_boolean_and_only_auto_asks() {
-        // Both spellings, because both are what somebody reaches for and a config that rejected
-        // one of them is a config that wasted an afternoon.
+        // Both spellings: people reach for both, and a config that rejects one wastes an afternoon.
         assert_eq!(Config::default().rails.enabled, Switch::Word(Word::Auto));
         assert_eq!(
             parse("[rails]\nenabled = true\n").rails.enabled,
@@ -1089,8 +1089,8 @@ mod tests {
             parse("[rails]\nenabled = \"off\"\n").rails.enabled,
             Switch::Word(Word::Off)
         );
-        // `decide` only consults detection for `auto`, which is what keeps a filesystem test off
-        // the path of a project that has already answered.
+        // `decide` consults detection only for `auto`, which keeps a filesystem test off the path
+        // of a project that has already answered.
         assert!(Switch::Fixed(true).decide(false));
         assert!(!Switch::Fixed(false).decide(true));
         assert!(Switch::Word(Word::On).decide(false));
@@ -1186,12 +1186,11 @@ mod tests {
 
     #[test]
     fn ruby_that_is_not_named_rb_is_indexed_with_no_configuration() {
-        // Ruby that is not named `.rb`: `Rakefile`, `Gemfile`, `*.gemspec`, `*.rake` and `config.ru`
-        // are Ruby, define constants and methods like any other Ruby, and were missed by a
-        // default include of `**/*.rb` — **12 files in lobsters**.
+        // Ruby not named `.rb`: `Rakefile`, `Gemfile`, `*.gemspec`, `*.rake` and `*.ru` define
+        // constants and methods like any other Ruby, and a `**/*.rb` include misses them.
         //
-        // rubydex dispatches on the extension and calls everything that is not `.rbs` Ruby, so
-        // no name here needs a special case; what needed one was the glob.
+        // rubydex dispatches on the extension and treats everything but `.rbs` as Ruby, so no name
+        // needs a special case. Only the glob did.
         let mut harness = Harness::new();
         harness.write("Rakefile", "class RakeRoot\nend\n");
         harness.write(
@@ -1201,7 +1200,13 @@ mod tests {
         harness.write("Gemfile", "class GemfileRoot\nend\n");
         harness.write("thing.gemspec", "class GemspecRoot\nend\n");
         harness.write("config.ru", "class RackRoot\nend\n");
-        // Data Bundler writes, not Ruby, and it must stay out however similar the name looks.
+        // A rackup file that is not the conventional one. An application may mount several
+        // (`admin.ru`, `sidekiq.ru`), and they are Ruby by extension, not name. `**/config.ru`
+        // would index none of these, and would disagree with a client that can only route by
+        // extension.
+        harness.write("admin.ru", "class AdminRack\nend\n");
+        harness.write("ops/sidekiq.ru", "class SidekiqRack\nend\n");
+        // Data Bundler writes, not Ruby. It must stay out, however similar the name.
         harness.write("Gemfile.lock", "GEM\n  specs:\n");
         let source = "BuildTask.new.run\n";
         let uri = harness.write("app/main.rb", source);
@@ -1213,6 +1218,8 @@ mod tests {
             "GemfileRoot",
             "GemspecRoot",
             "RackRoot",
+            "AdminRack",
+            "SidekiqRack",
         ] {
             assert!(harness.has(name), "{name} was not indexed");
         }

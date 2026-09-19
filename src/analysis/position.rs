@@ -3,16 +3,15 @@
 //! # Why this is ours and not rubydex's
 //!
 //! `rubydex::offset::Offset::to_location` always returns UTF-8 columns.
-//! `rubydex::model::encoding::Encoding::to_wide()` is defined but is never called anywhere
-//! in the crate, so `Graph::set_encoding` has no effect on the numbers that come back out.
-//! Editors negotiate UTF-16 by default, so delegating would misplace every span on a line
-//! containing an emoji, an accent, or CJK text.
+//! `rubydex::model::encoding::Encoding::to_wide()` exists but nothing in rubydex calls it, so
+//! `Graph::set_encoding` does not change the numbers that come out. Editors negotiate UTF-16 by
+//! default, so delegating would misplace every span on a line with an emoji, an accent or CJK text.
 //!
-//! We use `line_index` only for line boundaries (its scanner is the SIMD one from rustc) and
-//! do the column arithmetic here, because `LineIndex::offset` does not clamp: a column past
-//! the end of a line silently returns an offset inside the *next* line.
+//! `line_index` is used only for line boundaries (its scanner is rustc's SIMD one). The column
+//! arithmetic is done here, because `LineIndex::offset` does not clamp: a column past the end of a
+//! line silently returns an offset inside the *next* line.
 
-use line_index::{LineIndex, TextRange, TextSize};
+use line_index::{LineCol, LineIndex, TextRange, TextSize, WideEncoding};
 use lsp_types::{Position, PositionEncodingKind, Range};
 
 /// The position encoding negotiated with the client at `initialize`.
@@ -74,21 +73,82 @@ impl PositionEncoding {
     }
 }
 
+/// A byte span as an LSP range, counted from a line index alone.
+///
+/// [`TextDocument::range_at`] needs the text, because it measures a line's prefix in code units. A
+/// [`LineIndex`] records where each line's non-ASCII characters are *when it is built*, so the same
+/// arithmetic works from the index alone. **rubydex has already built one for every document in the
+/// graph**, so a span in a document nobody has open is placed without opening, reading or scanning
+/// the file. Reading those files was a measurable share of the analysis thread's time on wide
+/// answers, and remembering files already read per request would have saved little: the cost is how
+/// many *distinct* files an answer reaches.
+///
+/// `None` for an offset the index cannot place: past the end of the text, or inside a multi-byte
+/// character. A caller that gets `None` reads the text, as it would have anyway.
+///
+/// **Its coordinates are the indexed text's**, so do not use it for a document whose text differs
+/// from the client's: a buffer being typed into ([`Rebase`]), or a template, which is *read* as the
+/// blanked view and *addressed* as the markup ([`TextDocument::blanked`]).
+///
+/// One offset comes out differently than from [`TextDocument::position_at`]: an offset strictly
+/// between a `\r` and its `\n` resolves to the column *after* the line's last character, because an
+/// index does not remember how a line ends. Both are legal LSP positions, and no span this is asked
+/// about can reach that offset: Prism ends no node inside a line terminator.
+#[must_use]
+pub fn range_in(
+    index: &LineIndex,
+    encoding: PositionEncoding,
+    start: u32,
+    end: u32,
+) -> Option<Range> {
+    Some(Range {
+        start: position_in(index, encoding, start)?,
+        end: position_in(index, encoding, end.max(start))?,
+    })
+}
+
+/// One byte offset as an LSP position, counted in a line index alone. See [`range_in`].
+#[must_use]
+pub fn position_in(index: &LineIndex, encoding: PositionEncoding, offset: u32) -> Option<Position> {
+    let line_col = index.try_line_col(TextSize::from(offset))?;
+    let character = match encoding {
+        // rubydex speaks byte offsets and a UTF-8 column is one, so there is nothing to convert.
+        PositionEncoding::Utf8 => line_col.col,
+        PositionEncoding::Utf16 => wide_column(index, WideEncoding::Utf16, line_col),
+        PositionEncoding::Utf32 => wide_column(index, WideEncoding::Utf32, line_col),
+    };
+    Some(Position {
+        line: line_col.line,
+        character,
+    })
+}
+
+/// A UTF-8 column re-counted in `encoding`'s code units, from what the index remembers.
+///
+/// `LineIndex::to_wide` answers `None` only when a `checked_sub` over the wide characters *before*
+/// the column underflows, which a column this index produced cannot do. So the fallback is the
+/// UTF-8 column: right for every line without a wide character, and the only answer available if
+/// the index ever disagreed about one.
+fn wide_column(index: &LineIndex, encoding: WideEncoding, line_col: LineCol) -> u32 {
+    index
+        .to_wide(encoding, line_col)
+        .map_or(line_col.col, |wide| wide.col)
+}
+
 /// An open buffer: source text plus its line index, kept in sync by construction.
 ///
-/// Note that rubydex's `Document` exposes a `line_index()` but *not* the source text, so we
-/// keep our own copy regardless. It is also what incremental sync and cursor context need.
+/// rubydex's `Document` exposes a `line_index()` but *not* the source text, so this keeps its own
+/// copy. Incremental sync and cursor context need it anyway.
 ///
 /// # Two texts, one set of offsets
 ///
-/// A document is *read* and it is *addressed*, and for every file but one those are the same
-/// string. A template is not: it is read as the blanked Ruby view
-/// [`erb::ruby_view`](super::erb::ruby_view) makes of it, and it is addressed as the markup the
-/// editor actually has open. The byte offset is common to both — the view preserves length and
-/// every line break, which is the whole of why ERB needs no position map — but a *column* is
-/// not, because a column is a count of code units and blanking a 3-byte `“` writes three
-/// spaces where the client counts one UTF-16 unit. So [`Self::text`] is what is read and
-/// [`Self::coordinates`] is what columns are counted in.
+/// A document is *read* and *addressed*, and for every file but one those are the same string. A
+/// template is not: it is read as the blanked Ruby view [`erb::ruby_view`](super::erb::ruby_view)
+/// makes of it, and addressed as the markup the editor has open. Byte offsets are shared, because
+/// the view keeps the length and every line break (which is why ERB needs no position map). Columns
+/// are not: a column counts code units, and blanking a 3-byte `“` writes three spaces where the
+/// client counts one UTF-16 unit. So [`Self::text`] is what is read, and [`Self::coordinates`] is
+/// what columns are counted in.
 #[derive(Debug)]
 pub struct TextDocument {
     text: String,
@@ -114,13 +174,12 @@ impl TextDocument {
 
     /// A document that is *read* as `view` and *addressed* as `source`.
     ///
-    /// The two are the same length, byte for byte, with their line breaks in the same places —
-    /// [`erb::ruby_view`](super::erb::ruby_view)'s central property, held by a `proptest` in
-    /// that module, and the only reason one line index and one byte offset can serve both. What
-    /// differs is how many code units a prefix is, so counting a column against the view
-    /// displaces the cursor left by (bytes − units) of every non-ASCII character in the markup
-    /// before it on the line, and displaces every span this server answers with by the same
-    /// amount in the other direction.
+    /// The two are the same length, byte for byte, with line breaks in the same places. That is
+    /// [`erb::ruby_view`](super::erb::ruby_view)'s central property, held by a `proptest` there,
+    /// and the only reason one line index and one byte offset serve both. What differs is how many
+    /// code units a prefix is: counting columns against the view would shift the cursor left by
+    /// (bytes − units) of every non-ASCII character before it in the markup, and shift every
+    /// returned span right by the same amount.
     #[must_use]
     pub fn blanked(source: String, view: String, encoding: PositionEncoding) -> Self {
         let index = LineIndex::new(&source);
@@ -142,13 +201,12 @@ impl TextDocument {
     /// Apply one `textDocument/didChange` content change.
     ///
     /// A `None` range means the client sent the whole buffer. Otherwise the range is in the
-    /// document *as it stands now*, which is why a batch of changes has to be applied one at a
-    /// time, in the order the client sent them.
+    /// document *as it stands now*, which is why a batch of changes must be applied one at a time,
+    /// in order.
     ///
-    /// The line index is rebuilt on every change rather than patched. That is O(file) per
-    /// keystroke, but rubydex reparses the whole buffer immediately afterwards, so it is not
-    /// remotely the bottleneck — and an incrementally maintained index is a well-known source
-    /// of silent off-by-one corruption.
+    /// The line index is rebuilt on every change, not patched. That is O(file) per keystroke, but
+    /// rubydex reparses the whole buffer right after, so it is nowhere near the bottleneck, and an
+    /// incrementally maintained index is a classic source of silent off-by-one corruption.
     pub fn apply(&mut self, range: Option<Range>, replacement: &str) {
         let Some(range) = range else {
             self.set_text(replacement.to_owned());
@@ -161,10 +219,9 @@ impl TextDocument {
         self.text
             .replace_range(start as usize..end as usize, replacement);
         self.index = LineIndex::new(&self.text);
-        // An edited document addresses itself. The buffer an editor edits is never a blanked
-        // view — `with_text` builds those per request and hands out a shared reference — but a
-        // `source` that outlived an edit would count columns in text this document no longer
-        // holds, which is the failure this module exists to make impossible.
+        // An edited document addresses itself. The buffer an editor edits is never a blanked view
+        // (`with_text` builds those per request and hands out a shared reference), but a `source`
+        // that outlived an edit would count columns in text this document no longer holds.
         self.source = None;
     }
 
@@ -186,10 +243,9 @@ impl TextDocument {
 
     /// Convert an LSP position to a byte offset.
     ///
-    /// Out-of-range input is clamped rather than rejected: the LSP spec tells clients to clamp,
-    /// but a rejected position here would mean a dropped request, and a panic would take the
-    /// server down. A position that splits a multi-byte character resolves to that character's
-    /// first byte.
+    /// Out-of-range input is clamped, not rejected: the LSP spec tells clients to clamp, a rejected
+    /// position would drop the request, and a panic would take the server down. A position that
+    /// splits a multi-byte character resolves to that character's first byte.
     #[must_use]
     pub fn offset_at(&self, position: Position) -> u32 {
         let Some(line_range) = self.index.line(position.line) else {
@@ -214,10 +270,10 @@ impl TextDocument {
 
     /// Convert a byte offset to an LSP position.
     ///
-    /// An offset strictly inside a `\r\n` has no LSP position of its own — a position
-    /// addresses a character of a line, and the terminator is not one. Such an offset resolves
-    /// to the end of the line it terminates, so this is not a total inverse of
-    /// [`Self::offset_at`]; it is idempotent through it, which is the property that matters.
+    /// An offset strictly inside a `\r\n` has no LSP position of its own: a position addresses a
+    /// character of a line, and the terminator is not one. It resolves to the end of the line it
+    /// terminates, so this is not a total inverse of [`Self::offset_at`]; it is idempotent through
+    /// it, which is the property that matters.
     #[must_use]
     pub fn position_at(&self, offset: u32) -> Position {
         let offset = self.clamp_to_char_boundary(offset);
@@ -250,8 +306,8 @@ impl TextDocument {
         }
     }
 
-    /// The text a position's line and column are counted in: the document itself, unless it is
-    /// a template, in which case it is the markup the editor has and not the view.
+    /// The text a position's line and column are counted in: the document itself, or, for a
+    /// template, the markup the editor has rather than the view.
     fn coordinates(&self) -> &str {
         self.source.as_deref().unwrap_or(&self.text)
     }
@@ -276,23 +332,22 @@ impl TextDocument {
 
 /// How the buffer's byte offsets map onto the ones the graph was indexed with.
 ///
-/// **What makes deferring the index answerable at all.** rubydex's offsets index the text the
-/// indexer was last given, and `cursor::at` reads the *buffer*. The two are the same string
-/// wherever nothing has been typed since the last settle, and nothing has to translate; between
-/// a keystroke and the settle that indexes it they are not, and a buffer offset used as a graph
-/// key names different text — a **wrong** answer rather than a missing one.
+/// **This is what makes deferring the index workable.** rubydex's offsets index the text the
+/// indexer was last given, but `cursor::at` reads the *buffer*. While nothing has been typed since
+/// the last settle, they are the same string. Between a keystroke and the settle that indexes it
+/// they are not, and a buffer offset used as a graph key names different text: a **wrong** answer,
+/// not a missing one.
 ///
-/// It is [`TextDocument::blanked`]'s move on a second axis. There a document is *read* as one
-/// text and *addressed* as another because blanking replaced markup; here it is because time
-/// passed. The
-/// shared coordinate is the byte offset, and the translation is a function of the two texts —
-/// not of a maintained edit log, which is the version that can drift.
+/// It is [`TextDocument::blanked`]'s move on a second axis: there a document is read as one text
+/// and addressed as another because blanking replaced markup; here, because time passed. The shared
+/// coordinate is the byte offset, and the translation is a function of the two texts, not of a
+/// maintained edit log, which is the version that can drift.
 ///
-/// The map is a common byte prefix and a common byte suffix, so the buffer's
-/// `[prefix, buffer_len - suffix)` and the graph's `[prefix, graph_len - suffix)` are the
-/// regions that differ. Outside them the translation is exact; **inside, there is no answer and
-/// the caller must refuse** — a scattered edit merely widens the refused region, so this
-/// degrades safe rather than approximating.
+/// The map is a common byte prefix plus a common byte suffix, so the buffer's
+/// `[prefix, buffer_len - suffix)` and the graph's `[prefix, graph_len - suffix)` are the regions
+/// that differ. Outside them the translation is exact. **Inside, there is no answer and the caller
+/// must refuse.** A scattered edit only widens the refused region, so this degrades safely instead
+/// of approximating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rebase {
     prefix: u32,
@@ -313,16 +368,16 @@ impl Rebase {
         }
     }
 
-    /// Two scans, both early-exit. Boundaries are backed off to char boundaries so a translated
-    /// offset can never split a character — the same rule `clamp_to_char_boundary` keeps.
+    /// Two scans, both early-exit. Boundaries are backed off to char boundaries, so a translated
+    /// offset never splits a character (the same rule `clamp_to_char_boundary` keeps).
     #[must_use]
     pub fn between(buffer: &str, indexed: &str) -> Self {
         /// Whether a byte can be part of one of the words this map has to keep whole.
         ///
-        /// Deliberately wider than Ruby's identifier: `:` keeps a constant *path* together, so
-        /// `XY::Person` and `HR::Person` do not share `::Person` as an unchanged suffix, and
-        /// every non-ASCII byte counts because an identifier may hold one and a wrong answer
-        /// costs more here than a refusal does.
+        /// Wider than Ruby's identifier on purpose: `:` keeps a constant *path* together, so
+        /// `XY::Person` and `HR::Person` do not share `::Person` as an unchanged suffix. Every
+        /// non-ASCII byte counts, because an identifier may hold one and a wrong answer costs more
+        /// here than a refusal.
         fn is_word_byte(byte: u8) -> bool {
             byte.is_ascii_alphanumeric()
                 || matches!(byte, b'_' | b':' | b'@' | b'$' | b'?' | b'!')
@@ -335,18 +390,17 @@ impl Rebase {
         while prefix < max && b[prefix] == g[prefix] {
             prefix += 1;
         }
-        // **Byte identity is not token identity, and every consumer of this map needs the
-        // second.** `Alpha.` rewritten to `Gamma.` shares its last two bytes — `a.` — so a
-        // purely byte-wise scan leaves that `.` in the common suffix and hands back an offset
-        // the graph files `Alpha` under, which is the wrong class rather than no class.
-        // `Receiver::Constant` holds the byte after a constant path and `Instance` the byte
-        // after the constant it was built from, so an offset stands for a whole word and
-        // survives only if that word did. The changed region is therefore widened outward
-        // over word bytes at both ends.
+        // **Byte identity is not token identity, and every consumer of this map needs the second.**
+        // `Alpha.` rewritten to `Gamma.` shares its last two bytes (`a.`), so a purely byte-wise
+        // scan leaves that `.` in the common suffix and hands back an offset the graph files
+        // `Alpha` under: the wrong class, not no class. `Receiver::Constant` holds the byte after a
+        // constant path and `Instance` the byte after the constant it was built from, so an offset
+        // stands for a whole word and survives only if that word did. So the changed region is
+        // widened outward over word bytes at both ends.
         //
-        // The condition is two-sided on purpose: a head that ends on `\n` before `class`
-        // ends *at* a token boundary, and widening it would refuse offsets in text neither
-        // side touched. It widens only where the word really straddles the seam.
+        // The condition is two-sided on purpose: a head ending on `\n` before `class` ends *at* a
+        // token boundary, and widening it would refuse offsets in text neither side touched. It
+        // widens only where a word really straddles the seam.
         while prefix > 0
             && is_word_byte(b[prefix - 1])
             && (b.get(prefix).copied().is_some_and(is_word_byte)
@@ -354,13 +408,12 @@ impl Rebase {
         {
             prefix -= 1;
         }
-        // **No char-boundary back-off, because the rule above already is one.** A prefix that
-        // ends in the middle of a character has a continuation byte on both sides of it, every
-        // byte of a multi-byte character is `>= 0x80`, and `is_word_byte` calls all of those
-        // word bytes — so the loop above walks out of the character before it stops. The same
-        // holds at the tail. `every_translated_offset_round_trips_and_lands_on_a_boundary` is
-        // what holds that property, and it is the reason the `0x80` arm may not be narrowed
-        // without putting an explicit back-off back.
+        // **No char-boundary back-off, because the rule above already is one.** A prefix ending
+        // mid-character has a continuation byte on both sides, every byte of a multi-byte character
+        // is `>= 0x80`, and `is_word_byte` counts all of those as word bytes, so the loop above
+        // walks out of the character before it stops. The same holds at the tail.
+        // `every_translated_offset_round_trips_and_lands_on_a_boundary` holds this property; do not
+        // narrow the `0x80` arm without adding an explicit back-off.
         let mut suffix = 0;
         while suffix < max - prefix && b[b.len() - 1 - suffix] == g[g.len() - 1 - suffix] {
             suffix += 1;
@@ -393,15 +446,15 @@ impl Rebase {
         self.buffer_len == self.graph_len && self.prefix >= self.buffer_len
     }
 
-    /// The graph offset a buffer offset names, or `None` where the text under it is text the
-    /// graph has never been given.
+    /// The graph offset a buffer offset names, or `None` where the text under it is text the graph
+    /// has never been given.
     #[must_use]
     pub fn to_graph(&self, offset: u32) -> Option<u32> {
         self.map(offset, self.buffer_len, self.graph_len)
     }
 
-    /// The region of the graph's text the buffer no longer agrees with, which is the widest a
-    /// scope question may be asked over when the cursor itself cannot be translated.
+    /// The region of the graph's text the buffer no longer agrees with: the widest a scope question
+    /// may be asked over when the cursor itself cannot be translated.
     #[must_use]
     pub fn changed_in_graph(&self) -> (u32, u32) {
         (self.prefix, self.graph_len.saturating_sub(self.suffix))
@@ -409,31 +462,29 @@ impl Rebase {
 
     /// The inverse: a span the graph handed back, in the buffer's coordinates.
     ///
-    /// **Not optional, and the failure it prevents is worse than a slow answer.** `hover` and
-    /// `definition` answer with a range `locate` found in the *graph*, and a deferred buffer is
-    /// not the text those offsets came from — so without this a jump lands on the line a
-    /// declaration has moved off. `None` where the span overlaps what was just typed: it has no
-    /// honest position in the new text, and the request settles and asks again rather than
-    /// guessing at one.
+    /// **Not optional: without it, answers are wrong, not just slow.** `hover` and `definition`
+    /// answer with a range `locate` found in the *graph*, and a deferred buffer is not the text
+    /// those offsets came from, so a jump would land on the line a declaration has moved off.
+    /// `None` where the span overlaps what was just typed: it has no honest position in the new
+    /// text, so the request settles and asks again instead of guessing.
     ///
-    /// **A span and not two offsets, because the span is what resolves the ambiguity.** Text
-    /// inserted at offset *p* leaves the graph's position *p* naming two places in the buffer —
-    /// before what was typed and after it — and [`map`](Self::map) refuses it for that reason,
-    /// which is right for a caret and wrong for the ends of a span. A span's start is the byte
-    /// it covers first and its end the byte it covers last, so each leans on the side the span
-    /// is on and the pair comes back in order. Ask this about a declaration that begins its file
-    /// while a line is being typed above it and the answer is the line it is on now; ask `map`
-    /// and the place is dropped, which cost the corpora 36 of them.
+    /// **A span, not two offsets, because the span resolves the ambiguity.** Text inserted at
+    /// offset *p* leaves the graph's position *p* naming two buffer places, before and after the
+    /// insertion, and [`map`](Self::map) refuses it for that reason. That is right for a caret and
+    /// wrong for the ends of a span. A span's start is the first byte it covers and its end the
+    /// last, so each leans toward the span's side and the pair comes back in order. A declaration
+    /// at the top of its file, with a line being typed above it, keeps its place this way; `map`
+    /// would drop it.
     #[must_use]
     pub fn span_to_buffer(self, span: ByteSpan) -> Option<ByteSpan> {
-        // **Backwards is a caller's mistake, not a fact about the text**, and refusing is the one
-        // answer to it that cannot be wrong — a refused span settles and asks again, so the cost
-        // is a slow answer rather than a range pointing at text nobody asked about.
+        // **Backwards is a caller's mistake, not a fact about the text.** Refusing is the one
+        // answer that cannot be wrong: a refused span settles and asks again, so the cost is a slow
+        // answer, not a range over text nobody asked about.
         if span.start > span.end {
             return None;
         }
-        // An empty span covers no byte, so there is no side for it to lean on and nothing here
-        // can say which of the two places it means. That is `map`'s question exactly.
+        // An empty span covers no byte, so there is no side to lean on and nothing here can say
+        // which of the two places it means. That is exactly `map`'s question.
         if span.start == span.end {
             let at = self.map(span.start, self.graph_len, self.buffer_len)?;
             return Some(ByteSpan { start: at, end: at });
@@ -446,12 +497,12 @@ impl Rebase {
 
     /// Where a position goes when it is defined by the byte on **one** side of it.
     ///
-    /// The map is a common prefix and a common suffix, so a byte survives the edit exactly while
-    /// it is inside one of them: inside the prefix it has not moved, inside the suffix it has
-    /// moved by the difference in length. A position is a gap between two bytes and it is
-    /// *named* by the byte it leans on — [`Side::Right`] the one at `offset`, which is what a
-    /// span's start covers, [`Side::Left`] the one at `offset - 1`, which is what its end
-    /// covers. The two tests are the same pair of comparisons one index apart.
+    /// The map is a common prefix and a common suffix, so a byte survives the edit exactly while it
+    /// is inside one of them: in the prefix it has not moved, in the suffix it moved by the length
+    /// difference. A position is a gap between two bytes, *named* by the byte it leans on:
+    /// [`Side::Right`] the one at `offset` (what a span's start covers), [`Side::Left`] the one at
+    /// `offset - 1` (what its end covers). The two tests are the same pair of comparisons, one
+    /// index apart.
     fn one_sided(&self, offset: u32, from_len: u32, to_len: u32, side: Side) -> Option<u32> {
         if self.is_identity() {
             return (offset <= from_len).then_some(offset);
@@ -472,25 +523,23 @@ impl Rebase {
 
     /// The body both directions share, which is why they take their lengths as arguments.
     ///
-    /// **One copy on purpose.** The rule below is subtle enough that it has already been wrong
-    /// once — the bounds were `<=` and had to become strict — and a second copy is a second
-    /// place for the next correction to miss. It is written as the *agreement* of the two
-    /// one-sided maps rather than as its own pair of comparisons, so the strictness cannot drift
-    /// from them.
+    /// **One copy on purpose.** The rule below is subtle enough to have been wrong once (the bounds
+    /// were `<=` and had to become strict), and a second copy is a second place for the next fix to
+    /// miss. It is written as the *agreement* of the two one-sided maps, so the strictness cannot
+    /// drift from them.
     ///
-    /// **Strictly** inside the common prefix or the common suffix, and the strictness is a
-    /// defect this module's own test found rather than caution. A position names the same place
-    /// in both texts only when *both* of the bytes around it are unchanged — which is what a
-    /// caret means, and a caret is what every offset this translates is.
+    /// **Strictly** inside the common prefix or suffix. A position names the same place in both
+    /// texts only when *both* bytes around it are unchanged, which is what a caret means, and every
+    /// offset this translates is a caret.
     ///
-    /// With `<=` a pure deletion slips through: `Alpha.` becoming `Alph.` leaves the buffer side
-    /// of the changed region **empty**, so a boundary offset refused nothing, and the end of the
-    /// constant the user is halfway through typing landed inside the span of the longer one the
-    /// graph still holds — a precise answer about `Alpha` for a receiver spelled `Alph`, which
-    /// is exactly the class of wrong answer this map exists to stop.
+    /// With `<=`, a pure deletion slips through: `Alpha.` becoming `Alph.` leaves the buffer side
+    /// of the changed region **empty**, so a boundary offset refuses nothing, and the end of the
+    /// half-typed constant lands inside the span of the longer one the graph still holds. That is a
+    /// precise answer about `Alpha` for a receiver spelled `Alph`, exactly the wrong answer this
+    /// map exists to stop.
     ///
-    /// It also makes the map injective, which `<=` was not: an insertion had two buffer
-    /// positions straddling it naming one graph position.
+    /// Strictness also makes the map injective: with `<=`, the two buffer positions straddling an
+    /// insertion named one graph position.
     fn map(&self, offset: u32, from_len: u32, to_len: u32) -> Option<u32> {
         let at = self.one_sided(offset, from_len, to_len, Side::Right)?;
         (self.one_sided(offset, from_len, to_len, Side::Left) == Some(at)).then_some(at)
@@ -499,12 +548,11 @@ impl Rebase {
 
 /// A byte range of one document, `end` exclusive.
 ///
-/// **Named fields and no positional constructor, because the two ends are not
-/// interchangeable.** [`Rebase::span_to_buffer`] leans them opposite ways — a start on the byte
-/// it covers first, an end on the byte it covers last — so a pair written the wrong way round
-/// comes back shifted by the length of whatever was typed, and looks like an ordinary range. A
-/// caller has to name both fields to build one, and one whose `start` is past its `end` is
-/// refused rather than translated.
+/// **Named fields and no positional constructor, because the two ends are not interchangeable.**
+/// [`Rebase::span_to_buffer`] leans them opposite ways (a start on the first byte covered, an end
+/// on the last), so a pair written the wrong way round comes back shifted by the length of what was
+/// typed and looks like an ordinary range. A caller must name both fields, and a span whose `start`
+/// is past its `end` is refused, not translated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteSpan {
     /// The first byte the span covers.
@@ -533,20 +581,20 @@ mod tests {
 
     /// A span for the assertions here, and **only** here.
     ///
-    /// `ByteSpan`'s fields are named so that production code cannot write one backwards by
-    /// accident; a test writing twenty of them longhand would bury what it is asserting, and a
-    /// swap inside an assertion is visible in the assertion. `a_span_handed_over_backwards_is_
-    /// refused_rather_than_translated` is what holds the guarantee itself.
+    /// `ByteSpan`'s fields are named so production code cannot write one backwards by accident. A
+    /// test writing twenty of them longhand would bury what it asserts, and a swap inside an
+    /// assertion is visible. `a_span_handed_over_backwards_is_refused_rather_than_translated` holds
+    /// the guarantee itself.
     fn span(start: u32, end: u32) -> ByteSpan {
         ByteSpan { start, end }
     }
 
     #[test]
     fn a_span_handed_over_backwards_is_refused_rather_than_translated() {
-        // The one mistake the type cannot prevent, and the reason it fails closed: a start and
-        // an end lean opposite ways, so a swapped pair comes back shifted by the length of what
-        // was typed — an ordinary-looking range over text nobody asked about. A refusal settles
-        // and asks again instead.
+        // The one mistake the type cannot prevent, and why it fails closed: a start and an end lean
+        // opposite ways, so a swapped pair comes back shifted by the length of what was typed, an
+        // ordinary-looking range over text nobody asked about. A refusal settles and asks again
+        // instead.
         let rebase = Rebase::between("\nmodule Foo\nend\n", "module Foo\nend\n");
         assert_eq!(rebase.span_to_buffer(span(0, 15)), Some(span(1, 16)));
         assert_eq!(rebase.span_to_buffer(span(15, 0)), None);
@@ -582,15 +630,15 @@ mod tests {
             rebase.to_graph(buffer.len() as u32),
             Some(indexed.len() as u32)
         );
-        // The two positions straddling the inserted `f` are refused rather than both being
-        // called graph 10, which is what makes the map injective and the round trip an
-        // equality rather than an idempotence.
+        // The two positions straddling the inserted `f` are refused instead of both being called
+        // graph 10, which makes the map injective and the round trip an equality, not just an
+        // idempotence.
         assert_eq!(rebase.to_graph(10), None);
         assert_eq!(rebase.to_graph(11), None);
         for offset in 0..=buffer.len() as u32 {
             if let Some(graph) = rebase.to_graph(offset) {
-                // The empty span is the strict map, which is what `to_graph` answered with —
-                // so this is the round trip and not a weaker statement of it.
+                // The empty span is the strict map, which is what `to_graph` answered, so this is
+                // the round trip itself and not a weaker version.
                 assert_eq!(
                     rebase.span_to_buffer(span(graph, graph)),
                     Some(span(offset, offset)),
@@ -602,12 +650,12 @@ mod tests {
 
     #[test]
     fn an_offset_inside_the_edit_is_refused_rather_than_approximated() {
-        // Mid-typing a constant: the graph has never held the text under this cursor, and the
-        // whole point of the map is that it says so instead of naming a neighbour.
+        // Mid-typing a constant: the graph has never held the text under this cursor, and the map
+        // must say so instead of naming a neighbour.
         let rebase = Rebase::between("x = Stor\n", "x = Widget\n");
         assert_eq!(rebase.to_graph(3), Some(3));
-        // The gap where the two constants start diverging is refused too: the byte after it is
-        // `S` in one text and `W` in the other, so it is not the same place.
+        // The gap where the two constants start to diverge is refused too: the byte after it is `S`
+        // in one text and `W` in the other, so it is not the same place.
         assert_eq!(rebase.to_graph(4), None);
         assert_eq!(rebase.to_graph(6), None);
         assert_eq!(rebase.to_graph(7), None);
@@ -615,12 +663,12 @@ mod tests {
 
     #[test]
     fn a_scattered_edit_widens_the_refused_region_rather_than_lying() {
-        // Two edits far apart collapse to one region spanning both. Every offset it covers is
-        // refused, which is safe; nothing outside it is wrong.
+        // Two edits far apart collapse to one region spanning both. Every offset in it is refused,
+        // which is safe; nothing outside it is wrong.
         let rebase = Rebase::between("a = 2\nb = 1\nc = 4\n", "a = 1\nb = 1\nc = 3\n");
         assert_eq!(rebase.to_graph(0), Some(0));
-        // Both edges of the region and everything between them — including the whole untouched
-        // middle line — are refused; only what has an unchanged byte on either side maps.
+        // Both edges of the region and everything between (including the untouched middle line) are
+        // refused; only offsets with an unchanged byte on either side map.
         assert_eq!(rebase.to_graph(3), Some(3));
         assert_eq!(rebase.to_graph(4), None);
         assert_eq!(rebase.to_graph(9), None);
@@ -630,10 +678,10 @@ mod tests {
 
     #[test]
     fn a_word_the_graph_still_holds_widens_the_seam_even_where_the_buffer_broke_it() {
-        // **Why the straddle test is two-sided.** Here the buffer has `-b` where the graph has
-        // `ab`: on the buffer's side `b` starts a token of its own, so asking only the buffer
-        // would leave `b.x` in the common suffix and hand back the offset the graph files `ab`
-        // under. The graph's side is what knows the word was longer.
+        // **Why the straddle test is two-sided.** The buffer has `-b` where the graph has `ab`. On
+        // the buffer's side `b` starts a token of its own, so asking only the buffer would leave
+        // `b.x` in the common suffix and return the offset the graph files `ab` under. Only the
+        // graph's side knows the word was longer.
         let rebase = Rebase::between("-b.x\n", "ab.x\n");
         assert_eq!(
             rebase.to_graph(2),
@@ -646,9 +694,9 @@ mod tests {
 
     #[test]
     fn the_inverse_refuses_an_offset_inside_the_edit_too() {
-        // The round-trip proptest only ever asks the inverse about offsets the forward map
-        // accepted, so it cannot reach the refusal — and an inverse that answered inside the
-        // edit would put a graph span onto buffer text that never held it.
+        // The round-trip proptest only asks the inverse about offsets the forward map accepted, so
+        // it cannot reach the refusal. An inverse that answered inside the edit would put a graph
+        // span onto buffer text that never held it.
         let rebase = Rebase::between("Gamma.\n", "Alpha.\n");
         let (lo, hi) = rebase.changed_in_graph();
         assert!(lo < hi, "the fixture has to leave a region to refuse");
@@ -657,12 +705,10 @@ mod tests {
 
     #[test]
     fn a_span_that_begins_the_document_survives_an_insertion_above_it() {
-        // **The defect a corpus sweep found, at its smallest.** A newline typed at the top of a
-        // file leaves every byte of the text the graph holds intact, and yet graph offset 0 —
-        // where `class` and `module` start in most Ruby files — used to refuse, so a file
-        // written the ordinary way lost the place of its own declaration on the first keystroke
-        // above it. Here offset 0 is both the document's first position and the seam, which is
-        // why it is the *smallest* case and not a separate one.
+        // **The smallest case of a real defect.** A newline typed at the top of a file leaves every
+        // byte the graph holds intact, so graph offset 0 (where `class` and `module` usually start)
+        // must still map. Refusing it loses a file's own declaration's place on the first keystroke
+        // above it. Here offset 0 is both the document's first position and the seam.
         let indexed = "module Foo\nend\n";
         let buffer = "\nmodule Foo\nend\n";
         let rebase = Rebase::between(buffer, indexed);
@@ -671,19 +717,18 @@ mod tests {
             Some(span(1, buffer.len() as u32)),
             "`module` and everything it declares moved down by exactly one byte"
         );
-        // The caret at the same place is a different question and is still refused: nothing here
-        // says what the user meant by a position with new text on one side of it.
+        // The caret at the same place is a different question and is still refused: nothing says
+        // what the user meant by a position with new text on one side of it.
         assert_eq!(rebase.to_graph(0), None);
     }
 
     #[test]
     fn a_span_that_starts_where_the_edit_did_follows_the_text_it_covers() {
-        // **The general case, of which the document's first position is only a corner.** A
-        // settle puts what has already been typed into the graph, so the next keystroke leaves a
-        // declaration starting not at offset 0 but *at the seam* — an unchanged byte on each
-        // side of it, one that did not move and one that did. `map` refuses it, correctly, for a
-        // caret: it names two places in the buffer, before what was typed and after it. A span
-        // is not two places, and the corpora lost 36 of them here.
+        // **The general case; the document's first position is only a corner of it.** A settle puts
+        // what was typed into the graph, so the next keystroke leaves a declaration starting *at
+        // the seam*, not at offset 0: an unchanged byte on each side, one that moved and one that
+        // did not. `map` correctly refuses that for a caret, which names two buffer places (before
+        // and after the typing). A span is not two places, so it must keep its place.
         let indexed = "\nmodule Foo\nend\n";
         let buffer = "\n\nmodule Foo\nend\n";
         let rebase = Rebase::between(buffer, indexed);
@@ -700,10 +745,9 @@ mod tests {
 
     #[test]
     fn a_span_that_ends_the_document_survives_an_insertion_below_it() {
-        // The end of a span leans the other way, and this is where that shows: the last
-        // position of a document has no byte to its right at all, so only the byte before it can
-        // name it. A file with no trailing newline is the one whose last declaration really does
-        // end there.
+        // The end of a span leans the other way, and this shows it: a document's last position has
+        // no byte to its right, so only the byte before it can name it. A file with no trailing
+        // newline is the one whose last declaration really ends there.
         let indexed = "module Foo\nend";
         let buffer = "module Foo\nend\n\nx = 1\n";
         let rebase = Rebase::between(buffer, indexed);
@@ -716,12 +760,11 @@ mod tests {
 
     #[test]
     fn an_edge_the_edit_itself_reached_is_refused_in_both_directions() {
-        // **A lean is not a licence: the byte it leans on still has to have survived.** Read
-        // backwards, an insertion above the first line is a *deletion* of it, and then the span
-        // the graph recorded for `Alpha` covers text that is simply gone — no offset in the
-        // buffer is where it is now. The caret is refused for the same reason and a stronger
-        // one: answering would card the constant the user just deleted, which is the class of
-        // wrong answer the strictness exists to stop.
+        // **A lean is not a licence: the byte it leans on must still have survived.** Read
+        // backwards, an insertion above the first line is a *deletion* of it, and the span the
+        // graph recorded for `Alpha` then covers text that is gone; no buffer offset is where it is
+        // now. The caret is refused too, for a stronger reason: answering would show a card for the
+        // constant the user just deleted.
         let indexed = "Alpha\nx = 1\n";
         let buffer = "x = 1\n";
         let rebase = Rebase::between(buffer, indexed);
@@ -731,13 +774,12 @@ mod tests {
 
     #[test]
     fn a_word_that_changed_is_never_mapped_onto_the_word_that_replaced_it() {
-        // **The map is about tokens and not about bytes**, and a same-length replacement is
-        // what tells the two apart. `Alpha.` and `Gamma.` share `a.`, so a byte-wise scan puts
-        // the `.` — which is exactly the offset `Receiver::Constant` holds — in the common
-        // suffix and maps a cursor on one constant onto the other. Every offset the two words
-        // occupy, and the `.` after them that `Receiver::Constant` actually holds, has to be
-        // refused. The newline past that is common to both texts and no constant is filed
-        // under it, so it maps and should.
+        // **The map is about tokens, not bytes**, and a same-length replacement tells the two
+        // apart. `Alpha.` and `Gamma.` share `a.`, so a byte-wise scan puts the `.` (exactly the
+        // offset `Receiver::Constant` holds) in the common suffix and maps a cursor on one constant
+        // onto the other. Every offset the two words occupy, plus the `.` after them, must be
+        // refused. The newline after that is common to both texts and names no constant, so it
+        // maps.
         let indexed = "class Alpha\nend\nAlpha.\n";
         let buffer = "class Alpha\nend\nGamma.\n";
         let rebase = Rebase::between(buffer, indexed);
@@ -757,8 +799,8 @@ mod tests {
     #[test]
     fn a_constant_path_is_one_word_for_this_purpose() {
         // `::` is a word byte, so `HR::Person` and `XY::Person` do not share `::Person` as an
-        // unchanged suffix — the reference the graph holds is filed under the whole path, and
-        // its end offset means a different class in the two texts.
+        // unchanged suffix: the graph files the reference under the whole path, and its end offset
+        // means a different class in each text.
         let rebase = Rebase::between("XY::Person.\n", "HR::Person.\n");
         let end = "XY::Person".len() as u32;
         assert_eq!(rebase.to_graph(end), None);
@@ -766,9 +808,9 @@ mod tests {
 
     #[test]
     fn an_edit_that_ends_on_a_token_boundary_widens_nothing() {
-        // The other side of the two-sided condition. `# pad!\n` inserted in front of `class`
-        // ends *at* a boundary, so the word after it did not change and refusing offsets in it
-        // would cost the map most of its value.
+        // The other side of the two-sided condition. `# pad!\n` inserted before `class` ends *at* a
+        // boundary, so the word after it did not change, and refusing offsets in it would cost the
+        // map most of its value.
         let indexed = "class Alpha\nend\n";
         let buffer = "# pad!\nclass Alpha\nend\n";
         let rebase = Rebase::between(buffer, indexed);
@@ -781,8 +823,8 @@ mod tests {
 
     #[test]
     fn a_multibyte_edit_never_splits_a_character() {
-        // The char-boundary rule again: a translated offset that is not one would index
-        // into the middle of a character and panic the moment anybody slices with it.
+        // The char-boundary rule again: a translated offset that is not on one would index into the
+        // middle of a character and panic the moment anybody slices with it.
         let indexed = "x = \"\u{201c}\"\ny\n";
         let buffer = "x = \"\u{201c}\u{201d}\"\ny\n";
         let rebase = Rebase::between(buffer, indexed);
@@ -819,10 +861,10 @@ mod tests {
             }
         }
 
-        /// Each side of a span has a domain the round trip above cannot reach — every position
-        /// the strict map refuses and one lean accepts — so the three properties are stated of
-        /// the one-sided map directly. Injectivity is the one with teeth: two declarations the
-        /// graph found in different places must not come back at the same offset.
+        /// Each side of a span has a domain the round trip above cannot reach (every position the
+        /// strict map refuses and one lean accepts), so the three properties are stated directly on
+        /// the one-sided map. Injectivity is the one with teeth: two declarations the graph found
+        /// in different places must not come back at the same offset.
         #[test]
         fn every_span_endpoint_lands_in_range_on_a_boundary_and_alone(
             buffer in "\\PC{0,40}", indexed in "\\PC{0,40}") {
@@ -853,8 +895,8 @@ mod tests {
 
     #[test]
     fn length_is_bytes_and_agrees_with_emptiness() {
-        // Offsets are byte offsets everywhere in this crate — `offset_at` clamps to `len` —
-        // so a multi-byte character must count as its bytes rather than as one character.
+        // Offsets are byte offsets everywhere in this crate (`offset_at` clamps to `len`), so a
+        // multi-byte character must count as its bytes, not as one character.
         let empty = TextDocument::new(String::new(), PositionEncoding::Utf16);
         assert_eq!(empty.len(), 0);
         assert!(empty.is_empty());
@@ -888,11 +930,9 @@ mod tests {
 
     /// The `\n` of a `\r\n` is the one byte offset an LSP position cannot name.
     ///
-    /// The `offset < len` guard is not defensive: `0..=len` is the range every caller here
-    /// walks, and the end of the buffer is a perfectly ordinary offset to ask about. It was
-    /// missing for as long as no fixture ended in a bare `\r`, which is exactly the kind of
-    /// hole a hand-written corpus leaves and `PIECES` does not — the properties below found it
-    /// on their first run.
+    /// The `offset < len` guard is not defensive: callers walk `0..=len`, and the end of the buffer
+    /// is an ordinary offset to ask about. It was missing until a fixture ended in a bare `\r`, a
+    /// hole hand-written fixtures leave and `PIECES` does not.
     fn inside_crlf(text: &str, offset: usize) -> bool {
         offset > 0
             && offset < text.len()
@@ -922,11 +962,108 @@ mod tests {
         }
     }
 
+    /// The index alone places every offset exactly where the text does.
+    ///
+    /// **The property [`position_in`] rests on**, and what makes it safe to answer a jump from
+    /// rubydex's line index instead of the file. If the two could disagree by one column on any
+    /// line, `definition` would answer with a range that is not the declaration, in a document
+    /// nobody opened: the hardest kind of wrong answer to notice.
+    ///
+    /// The `\n` of a `\r\n` is excluded, for a sharper reason than in the round trips above: it is
+    /// the one offset where the two are *known* to differ, because a line index does not remember
+    /// line endings. `the_one_offset_the_index_alone_spells_differently` pins it separately.
+    #[test]
+    fn the_index_alone_places_every_offset_where_the_text_does() {
+        for text in TRICKY {
+            let index = LineIndex::new(text);
+            for encoding in ALL {
+                let doc = TextDocument::new((*text).to_owned(), encoding);
+                for offset in 0..=text.len() {
+                    if !text.is_char_boundary(offset) || inside_crlf(text, offset) {
+                        continue;
+                    }
+                    assert_eq!(
+                        position_in(&index, encoding, offset as u32),
+                        Some(doc.position_at(offset as u32)),
+                        "{text:?} at {offset} ({encoding:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What the index cannot place, it declines — and the caller reads the file.
+    #[test]
+    fn the_index_alone_refuses_what_it_cannot_place() {
+        let text = "x = \u{1f600}\n";
+        let index = LineIndex::new(text);
+        assert_eq!(
+            position_in(&index, PositionEncoding::Utf16, text.len() as u32 + 1),
+            None,
+            "past the end of the text"
+        );
+        assert_eq!(
+            position_in(&index, PositionEncoding::Utf16, 5),
+            None,
+            "inside the emoji"
+        );
+        assert_eq!(
+            range_in(&index, PositionEncoding::Utf16, 0, 5),
+            None,
+            "a range is no better placed than the worse of its two ends"
+        );
+        assert_eq!(
+            range_in(&index, PositionEncoding::Utf16, 5, 9),
+            None,
+            "either end"
+        );
+    }
+
+    /// An inverted span is empty at its start, exactly as [`TextDocument::range_at`] makes it.
+    #[test]
+    fn the_index_alone_makes_an_inverted_span_empty() {
+        let text = "caf\u{e9} = 1\n";
+        let index = LineIndex::new(text);
+        let doc = TextDocument::new(text.to_owned(), PositionEncoding::Utf16);
+        assert_eq!(
+            range_in(&index, PositionEncoding::Utf16, 8, 3),
+            Some(doc.range_at(8, 3))
+        );
+    }
+
+    /// The one offset a line index cannot spell the way the text does.
+    ///
+    /// Stated, not worked around: the column *after* the line's last character instead of *at* it.
+    /// Both are legal LSP positions on that line, every client clamps the second, and no span this
+    /// is asked about can reach the offset: Prism ends no node between a `\r` and its `\n`.
+    #[test]
+    fn the_one_offset_the_index_alone_spells_differently() {
+        let text = "caf\u{e9}\r\nx\n";
+        let index = LineIndex::new(text);
+        let doc = TextDocument::new(text.to_owned(), PositionEncoding::Utf16);
+        let at = text.find('\n').expect("a newline") as u32;
+        assert_eq!(
+            doc.position_at(at),
+            Position {
+                line: 0,
+                character: 4
+            },
+            "the text knows the line ends `\\r\\n` and stops at its last character"
+        );
+        assert_eq!(
+            position_in(&index, PositionEncoding::Utf16, at),
+            Some(Position {
+                line: 0,
+                character: 5
+            }),
+            "the index does not"
+        );
+    }
+
     #[test]
     fn position_at_is_idempotent_through_offset_at_everywhere() {
-        // Weaker than a round trip, but total: it must hold even for the offsets that have no
-        // exact position, and it is what guarantees a span never drifts when it makes the trip
-        // twice.
+        // Weaker than a round trip, but total: it must hold even for offsets with no exact
+        // position, and it guarantees a span never drifts when it makes the trip twice.
         for text in TRICKY {
             for encoding in ALL {
                 let doc = TextDocument::new((*text).to_owned(), encoding);
@@ -1048,14 +1185,13 @@ mod tests {
 
     /// A blanked document is addressed exactly as the text the client has.
     ///
-    /// The whole of what [`TextDocument::blanked`] is for, stated as an equality: for a template
-    /// and the Ruby view of it, every conversion in this module must answer what it answers for
-    /// the template alone. `text()` is the *only* thing a view is allowed to change. It fails on
-    /// any of the four places the arithmetic could reach for `self.text` instead.
+    /// What [`TextDocument::blanked`] is for, stated as an equality: for a template and its Ruby
+    /// view, every conversion in this module must answer what it answers for the template alone.
+    /// `text()` is the *only* thing a view may change. This fails if any of the four conversions
+    /// reads `self.text` instead.
     ///
-    /// The view is made by `erb::ruby_view` rather than by a hand-written analogue, because the
-    /// property this rests on is that function's and asserting it against a local imitation
-    /// would be asserting the imitation.
+    /// The view comes from `erb::ruby_view`, not a hand-written imitation, because the property
+    /// belongs to that function; testing an imitation would test the imitation.
     #[test]
     fn a_blanked_document_is_addressed_as_the_text_the_client_has() {
         // A curly quote (3 bytes, 1 UTF-16 unit), an accent (2/1), an emoji (4/2) and CJK
@@ -1093,10 +1229,10 @@ mod tests {
             }
         }
 
-        // Non-vacuous, and the defect itself: the view addressed as its own text. The second
-        // line's markup is seven units short of its bytes —
-        // one for the accent, two for the emoji, four for the two CJK characters — so the caret
-        // the client put on `story` arrives seven bytes to the left of it.
+        // Non-vacuous, and the defect itself: the view addressed as its own text. The second line's
+        // markup is seven units short of its bytes (one for the accent, two for the emoji, four for
+        // the two CJK characters), so the client's caret on `story` would arrive seven bytes to its
+        // left.
         let at_call = template.find("story.title").expect("the fixture") as u32;
         let position =
             TextDocument::new(template.to_owned(), PositionEncoding::Utf16).position_at(at_call);
@@ -1162,8 +1298,8 @@ mod tests {
     #[test]
     fn changes_apply_one_after_another_against_the_updated_text() {
         // The LSP contract: each range is expressed in the document the previous change left
-        // behind. Applying them against the original text would corrupt every edit after the
-        // first that changes a line's length.
+        // behind. Applying them against the original text would corrupt every later edit that
+        // changes a line's length.
         let mut doc = TextDocument::new("a\nb\n".to_owned(), PositionEncoding::Utf16);
         doc.apply(Some(range((0, 0), (0, 1))), "hello");
         doc.apply(Some(range((0, 5), (0, 5))), " world");
@@ -1209,23 +1345,21 @@ mod tests {
     // -----------------------------------------------------------------------
     // Properties
     //
-    // Everything above is a fixture, and this file was already at 100% of lines and branches
-    // without any of what follows — which says every line ran, not that every *sequence* of
-    // edits produces the right buffer. There is no fixture for that: the input is a list whose
-    // every element is interpreted against the text the one before it left behind, so what
-    // needs enumerating is not a string but a history. The failure mode is the worst this crate
-    // has, worse than a wrong answer — a buffer that quietly stops matching the file the user
-    // is typing in, and every span computed from it thereafter pointing at the wrong bytes.
+    // Everything above is a fixture. Full line and branch coverage says every line ran, not that
+    // every *sequence* of edits produces the right buffer. The input is a list where each element
+    // is read against the text the previous one left, so what needs enumerating is a history, not a
+    // string. The failure mode is the worst this crate has: a buffer that quietly stops matching
+    // the file the user is typing in, so every later span points at the wrong bytes.
     // -----------------------------------------------------------------------
 
     /// Pieces a generated buffer is built from.
     ///
-    /// The alphabet is the point rather than the length: an accent (2 bytes, 1 UTF-16 unit), CJK
-    /// (3/1), an emoji (4/2 — a surrogate pair), a combining mark (a character that is not a
-    /// grapheme), and the three line terminators including a lone `\r`, which is what puts a
-    /// `\r\n` next to text that is not one. Concatenating pieces rather than generating
-    /// arbitrary `String`s is also what makes a failure legible: proptest shrinks the *list*,
-    /// so a counterexample arrives as the few pieces that still reproduce it.
+    /// The alphabet matters more than the length: an accent (2 bytes, 1 UTF-16 unit), CJK (3/1), an
+    /// emoji (4/2, a surrogate pair), a combining mark (a character that is not a grapheme), and
+    /// all three line terminators including a lone `\r`, which puts a `\r\n` next to text that is
+    /// not one. Concatenating pieces instead of generating arbitrary `String`s also makes failures
+    /// readable: proptest shrinks the *list*, so a counterexample arrives as the few pieces that
+    /// still reproduce it.
     const PIECES: &[&str] = &[
         "a",
         "b",
@@ -1250,14 +1384,14 @@ mod tests {
         prop::sample::select(&ALL[..])
     }
 
-    /// The nearest offset at or before `at` that an LSP position can actually name.
+    /// The nearest offset at or before `at` that an LSP position can name.
     ///
-    /// Two things disqualify one: not being a character boundary, and being the `\n` of a
-    /// `\r\n` — the one byte in a buffer that belongs to no line's content, so `position_at`
-    /// answers with the end of the line it terminates and the trip back lands somewhere else.
-    /// `offset_inside_a_crlf_reports_the_end_of_the_line_it_terminates` is that case pinned;
-    /// here it is excluded, because a model that spliced at an offset with no position would be
-    /// asserting the disagreement rather than the conversion.
+    /// Two things disqualify an offset: not being a character boundary, and being the `\n` of a
+    /// `\r\n`, the one byte that belongs to no line's content (so `position_at` answers with the
+    /// end of the line it terminates, and the trip back lands elsewhere).
+    /// `offset_inside_a_crlf_reports_the_end_of_the_line_it_terminates` pins that case; here it is
+    /// excluded, because a model splicing at an offset with no position would assert the
+    /// disagreement, not the conversion.
     fn addressable(text: &str, at: usize) -> usize {
         let mut at = at.min(text.len());
         while at > 0 && (!text.is_char_boundary(at) || inside_crlf(text, at)) {
@@ -1270,12 +1404,11 @@ mod tests {
         /// A change list applied through LSP positions must land exactly where the same splices
         /// land on a plain `String`.
         ///
-        /// This is the whole of incremental sync, stated once. The subject converts byte spans
-        /// out to `Range`s and the client's `Range`s back to byte spans, over a line index it
-        /// rebuilds after every edit; the model does `replace_range` and knows nothing about
-        /// lines, columns or encodings. They are allowed to agree only if every one of those
-        /// conversions is exact — and they have to keep agreeing as the text underneath them
-        /// changes, which is what a list buys over a single edit.
+        /// This is all of incremental sync, stated once. The subject converts byte spans to
+        /// `Range`s and the client's `Range`s back to byte spans, over a line index rebuilt after
+        /// every edit; the model does `replace_range` and knows nothing of lines, columns or
+        /// encodings. They agree only if every conversion is exact, and they must keep agreeing as
+        /// the text changes, which is what a list buys over a single edit.
         #[test]
         fn a_change_list_lands_where_plain_string_splices_land(
             start in text(),
@@ -1286,9 +1419,9 @@ mod tests {
             let mut doc = TextDocument::new(start, encoding);
 
             for (first, second, replacement) in changes {
-                // Chosen against the text as it stands *now*, which is what makes this a
-                // history rather than a batch: an index generated up front would address a
-                // buffer that the previous change has already moved.
+                // Chosen against the text as it stands *now*, which makes this a history, not a
+                // batch: an index generated up front would address a buffer the previous change
+                // already moved.
                 let one = addressable(&model, first % (model.len() + 1));
                 let two = addressable(&model, second % (model.len() + 1));
                 let (from, to) = (one.min(two), one.max(two));
@@ -1302,10 +1435,9 @@ mod tests {
 
         /// Whatever a client sends, the offset it resolves to is one this crate can slice at.
         ///
-        /// Positions arrive from outside and are not required to be sane — a line past the end
-        /// of the buffer, a column in the middle of an emoji, `u32::MAX`. Every one of them has
-        /// to come back in range and on a character boundary, because the next thing that
-        /// happens to the answer is `replace_range`, and `String` panics on either mistake.
+        /// Positions arrive from outside and need not be sane: a line past the end, a column
+        /// mid-emoji, `u32::MAX`. Every one must come back in range and on a character boundary,
+        /// because the next step is `replace_range`, and `String` panics on either mistake.
         #[test]
         fn any_position_a_client_can_send_resolves_to_a_sliceable_offset(
             text in text(),
@@ -1322,9 +1454,9 @@ mod tests {
 
         /// Every offset a position can name survives the trip out and back.
         ///
-        /// The same property `round_trips_every_addressable_char_boundary` asserts over eleven
-        /// hand-written strings, over generated ones instead — and exhaustively within each, so
-        /// a generated buffer is a whole family of assertions rather than one.
+        /// `round_trips_every_addressable_char_boundary`'s property over generated strings instead
+        /// of hand-written ones, exhaustively within each, so one generated buffer is a whole
+        /// family of assertions.
         #[test]
         fn every_addressable_offset_round_trips(text in text(), encoding in encoding()) {
             let doc = TextDocument::new(text.clone(), encoding);
@@ -1344,16 +1476,44 @@ mod tests {
                 );
             }
         }
+
+        /// The index alone places every *generated* offset where the text does.
+        ///
+        /// `the_index_alone_places_every_offset_where_the_text_does`, over generated strings and
+        /// exhaustively within each. The alphabet is what matters: an accent, CJK, a surrogate
+        /// pair, a combining mark and all three line terminators, in every order concatenation can
+        /// produce.
+        #[test]
+        fn the_index_alone_places_every_generated_offset_where_the_text_does(
+            text in text(),
+            encoding in encoding(),
+        ) {
+            let index = LineIndex::new(&text);
+            let doc = TextDocument::new(text.clone(), encoding);
+
+            for offset in 0..=text.len() {
+                if !text.is_char_boundary(offset) || inside_crlf(&text, offset) {
+                    continue;
+                }
+                prop_assert_eq!(
+                    position_in(&index, encoding, offset as u32),
+                    Some(doc.position_at(offset as u32)),
+                    "{:?} at {} ({:?})",
+                    text,
+                    offset,
+                    encoding
+                );
+            }
+        }
     }
 
     /// The fixture the coordinate bug was found in, laid out so the collision is exact.
     ///
-    /// `Alpha.` and `Gamma.` are on consecutive lines, so the two constant references are
-    /// **exactly `"Alpha.\n".len()` apart** — seven bytes. Insert seven bytes above them and a
-    /// buffer offset that names `Alpha` names `Gamma` in the graph: not "roughly wrong", the
-    /// other class's reference, byte for byte. That is what makes the two tests below a pair —
-    /// one asserts the right answer, the other asserts the wrong one is what you get without
-    /// the map.
+    /// `Alpha.` and `Gamma.` are on consecutive lines, so the two constant references are **exactly
+    /// `"Alpha.\n".len()` apart** (seven bytes). Insert seven bytes above them and a buffer offset
+    /// naming `Alpha` names `Gamma` in the graph: the other class's reference, byte for byte. That
+    /// makes the two tests below a pair: one asserts the right answer, the other that the wrong one
+    /// is what you get without the map.
     const SHIFTED: &str = "class Alpha\n  def self.alpha_only\n  end\nend\n\n\
                            class Gamma\n  def self.gamma_only\n  end\nend\n\n\
                            Alpha.\nGamma.\n";
@@ -1363,8 +1523,8 @@ mod tests {
 
     /// A constant reference that really is one, and a declaration *below* where the pad goes.
     ///
-    /// `SHIFTED` cannot serve the jump test: `Alpha.\nGamma.` is one chained call to Ruby, so
-    /// its `Gamma` is a method name and resolves to nothing even with no deferral at all.
+    /// `SHIFTED` cannot serve the jump test: `Alpha.\nGamma.` is one chained call in Ruby, so its
+    /// `Gamma` is a method name and resolves to nothing even with no deferral.
     const JUMPABLE: &str = "class Alpha\nend\n\nclass Gamma\nend\n\nGamma\n";
 
     /// Open `SHIFTED`, index it, then defer and insert `PAD` at the top without indexing.
@@ -1373,8 +1533,8 @@ mod tests {
         let uri = harness.write("lib/main.rb", SHIFTED);
         harness.index();
         harness.open(&uri, SHIFTED);
-        // From here the graph is frozen: `didChange` records the edit and nothing indexes it,
-        // which is the whole of the deferred design.
+        // From here the graph is frozen: `didChange` records the edit and nothing indexes it. That
+        // is the whole deferred design.
         harness.edit_without_indexing(
             &uri,
             vec![TextChange {
@@ -1393,11 +1553,11 @@ mod tests {
         serde_json::json!({ "line": 11, "character": 6 })
     }
 
-    /// That the request really was answered from the graph as it stood, and not by falling back.
+    /// That the request really was answered from the graph as it stood, not by falling back.
     ///
-    /// **The fallback property is what makes this necessary.** A refused map settles and asks again, so the
-    /// *answer* is correct either way and asserting on it proves nothing about the translation.
-    /// What only a genuinely deferred answer leaves behind is a graph that never saw the edit.
+    /// **The fallback is why this is needed.** A refused map settles and asks again, so the
+    /// *answer* is right either way, and asserting on it proves nothing about the translation. Only
+    /// a truly deferred answer leaves behind a graph that never saw the edit.
     fn assert_deferred(harness: &Harness, uri: &DocUri, indexed: &str) {
         assert_eq!(
             harness.analysis.indexed_text.get(uri).map(String::as_str),
@@ -1433,11 +1593,10 @@ mod tests {
 
     #[test]
     fn without_the_map_the_same_deferred_completion_answers_the_wrong_class() {
-        // Delete the mechanism and watch it break. `rebase_for` falls back to the identity when
-        // it has no record of what the document was indexed as, so clearing the record is
-        // exactly "defer the index and keep using buffer offsets as graph keys" — which is the
-        // configuration this design exists to avoid, and it is `Alpha.new.` offering `Gamma`'s
-        // members. Reproduced here rather than described.
+        // Delete the mechanism and watch it break. `rebase_for` falls back to the identity when it
+        // has no record of what the document was indexed as, so clearing the record is exactly
+        // "defer the index and keep using buffer offsets as graph keys": the configuration this
+        // design exists to avoid, where `Alpha.new.` offers `Gamma`'s members.
         let (mut harness, uri) = deferred_after_a_shift();
         harness.analysis.indexed_text.clear();
 
@@ -1450,12 +1609,11 @@ mod tests {
         );
         let (labels, precise) = offered(&answer);
 
-        // What the buffer offset names in the older text is `Gamma`'s reference, and the call's
-        // own method reference is narrower than it — so `locate` keeps the call, `constant_at`
-        // finds no constant at all, and the receiver types as nothing. The degradation is
-        // therefore the **name-based list** rather than a confident answer about `Gamma`, and
-        // that list matches every method in the project: it contains `gamma_only`, which the
-        // correct answer above does not offer at all.
+        // What the buffer offset names in the older text is `Gamma`'s reference, and the call's own
+        // method reference is narrower, so `locate` keeps the call, `constant_at` finds no
+        // constant, and the receiver types as nothing. The result degrades to the **name-based
+        // list**, not a confident answer about `Gamma`, and that list matches every method in the
+        // project: it includes `gamma_only`, which the correct answer above never offers.
         assert!(
             !precise,
             "without the map the receiver resolved, which this test cannot then tell apart"
@@ -1468,17 +1626,17 @@ mod tests {
 
     #[test]
     fn a_receiver_inside_what_was_just_typed_is_refused_rather_than_guessed_at() {
-        // The other half of the map's contract. Here the *receiver itself* is being typed, so
-        // no graph offset names it at all — the map refuses, the request falls back to a
-        // settle and asks again, and `Alph` is a constant nothing declares either way. What must not
-        // happen, on either side of that fallback, is `Alpha`'s members: they are what sits at
-        // this offset in the older text, and they are the wrong answer twice over.
+        // The other half of the map's contract. Here the *receiver itself* is being typed, so no
+        // graph offset names it: the map refuses, the request settles and asks again, and `Alph` is
+        // a constant nothing declares either way. What must not appear, on either side of that
+        // fallback, is `Alpha`'s members: they sit at this offset in the older text, and are wrong
+        // twice over.
         let mut harness = Harness::new();
         let uri = harness.write("lib/main.rb", SHIFTED);
         harness.index();
         harness.open(&uri, SHIFTED);
-        // Rewrite the `Alpha.` line into `Alph.` — the constant under the cursor is now text
-        // the graph has never held.
+        // Rewrite the `Alpha.` line into `Alph.`: the constant under the cursor is now text the
+        // graph has never held.
         harness.edit_without_indexing(
             &uri,
             vec![TextChange {
@@ -1511,12 +1669,11 @@ mod tests {
 
     #[test]
     fn an_edit_that_swallows_a_scope_boundary_does_not_answer_from_the_wrong_scope() {
-        // **The case `changed_in_graph` cannot serve and the fallback cannot catch.** The edit
-        // runs from inside `first` to inside `second`, so the region the graph disagrees with
-        // spans an `end` and a `def`. The narrowest graph scope containing all of it is the
-        // *class body*, where `self` is the class object — so `self.` would offer the singleton
-        // while the caret is plainly inside an instance method. It is a wrong answer rather
-        // than an empty one, so retrying never happens.
+        // **The case `changed_in_graph` cannot serve and the fallback cannot catch.** The edit runs
+        // from inside `first` to inside `second`, so the region the graph disagrees with spans an
+        // `end` and a `def`. The narrowest graph scope containing all of it is the *class body*,
+        // where `self` is the class object, so `self.` would offer the singleton while the caret is
+        // plainly inside an instance method. That answer is wrong, not empty, so no retry happens.
         let mut harness = Harness::new();
         let uri = harness.write("lib/main.rb", TWO_SCOPES);
         harness.index();
@@ -1553,11 +1710,11 @@ mod tests {
 
     #[test]
     fn a_member_typed_after_a_settled_receiver_is_answered_without_indexing_it() {
-        // **The path the whole design is for**, and the one the other two tests do not reach.
-        // Here the *caret* is inside text the graph has never been given while the receiver is
-        // not, so `to_graph` refuses the cursor, the scope question is asked over the changed
-        // region instead, and `Receiver::Constant` still maps because it sits in the common
-        // prefix. This is what every keystroke of a member does.
+        // **The path the whole design is for**, which the other two tests do not reach. The *caret*
+        // is inside text the graph has never seen while the receiver is not: `to_graph` refuses the
+        // cursor, the scope question is asked over the changed region instead, and
+        // `Receiver::Constant` still maps because it sits in the common prefix. Every keystroke of
+        // a member name goes this way.
         let mut harness = Harness::new();
         let uri = harness.write("lib/main.rb", SHIFTED);
         harness.index();
@@ -1587,8 +1744,8 @@ mod tests {
             "a member typed on a settled receiver answered {labels:?}"
         );
         // And it was answered *deferred*: the fallback would have indexed the buffer, so the
-        // text the indexer was last handed still being the file on disk is what says the graph
-        // was never touched. Without this the assertion above passes either way.
+        // indexer's last text still being the file on disk proves the graph was never touched.
+        // Without this, the assertion above passes either way.
         assert_eq!(
             harness.analysis.indexed_text.get(&uri).map(String::as_str),
             Some(SHIFTED),
@@ -1598,10 +1755,10 @@ mod tests {
 
     #[test]
     fn a_deferred_hover_cards_the_constant_under_the_caret_and_not_the_one_below_it() {
-        // `PAD` is the distance between the two references on purpose, so an offset handed to
-        // the graph unmapped lands exactly on the *other* class — a card that is precise,
-        // confident and about the wrong constant. The range has to come back through the map
-        // too, or the highlight sits a line above the word.
+        // `PAD` is the distance between the two references on purpose, so an offset handed to the
+        // graph unmapped lands exactly on the *other* class: a precise, confident card about the
+        // wrong constant. The range must come back through the map too, or the highlight sits a
+        // line above the word.
         let (mut harness, uri) = deferred_after_a_shift();
 
         let answer = harness.ask(
@@ -1626,19 +1783,15 @@ mod tests {
 
     #[test]
     fn a_deferred_jump_lands_where_the_declaration_is_now_and_not_where_it_was() {
-        // The inverse map's own test, and both halves of the map are in it: the caret is below
-        // the edit and so is the class it names. `class Gamma` is on line 3 of the text the
-        // graph holds and line 4 of the buffer, so a jump answered in the graph's coordinates
-        // lands a line above the class — the right file, the wrong line, and nothing about the
-        // answer says so.
+        // The inverse map's own test, with both halves of the map in it: the caret is below the
+        // edit and so is the class it names. `class Gamma` is on line 3 of the graph's text and
+        // line 4 of the buffer, so a jump answered in the graph's coordinates lands a line above
+        // the class: right file, wrong line, and nothing in the answer says so.
         //
-        // **The pad goes in the middle**, so the declaration is clear of the seam and both ends
-        // of its span shift whichever way they lean. A declaration starting *at* the seam is the
-        // other case and has its own test — it used to be refused here on the reasoning that
-        // such an offset is "honestly either 0 or 7", which is true of a caret and false of a
-        // span the graph already found. `assert_deferred` is what keeps either test honest: a
-        // refused map settles and re-asks, so the answer is right whether or not the translation
-        // ever ran.
+        // **The pad goes in the middle**, so the declaration is clear of the seam and both ends of
+        // its span shift whichever way they lean. A declaration starting *at* the seam has its own
+        // test. `assert_deferred` keeps both honest: a refused map settles and re-asks, so the
+        // answer is right whether or not the translation ran.
         let mut harness = Harness::new();
         let uri = harness.write("lib/main.rb", JUMPABLE);
         harness.index();
@@ -1675,22 +1828,21 @@ mod tests {
         assert_deferred(&harness, &uri, JUMPABLE);
     }
 
-    /// One class opened in two files, which is the shape that kept the loss silent.
+    /// One class opened in two files: the shape that kept the loss silent.
     ///
-    /// A constant with several declarations is ordinary Ruby and routine Rails — the corpus this
-    /// was measured on has one with eighty-five. `link` maps four offsets per place and drops
-    /// the *place* when any of them refuses, so losing one leaves the response shorter rather
-    /// than empty; `answered_nothing` is false, the settle-and-retry never fires, and nothing
-    /// anywhere says a place is missing.
+    /// A constant with many declarations is ordinary Ruby and routine Rails. `link` maps four
+    /// offsets per place and drops the *place* when any of them refuses, so losing one makes the
+    /// response shorter, not empty: `answered_nothing` is false, the settle-and-retry never fires,
+    /// and nothing says a place is missing.
     const REOPENED_ONE: &str = "class Alpha\n  def one\n  end\nend\n";
     const REOPENED_TWO: &str = "class Alpha\n  def two\n  end\nend\n";
 
     #[test]
     fn a_deferred_jump_keeps_a_place_whose_declaration_begins_its_file() {
         // The pad goes at the very top of `lib/one.rb`, so `class Alpha` there starts at graph
-        // offset 0 — the one offset in a document that has no byte to its left. Before
-        // `at_an_untouched_edge` that place was dropped and the jump came back with one
-        // location instead of two, silently and with no retry.
+        // offset 0, the one offset with no byte to its left. Without `at_an_untouched_edge`, that
+        // place is dropped and the jump returns one location instead of two, silently and with no
+        // retry.
         let mut harness = Harness::new();
         let one = harness.write("lib/one.rb", REOPENED_ONE);
         let two = harness.write("lib/two.rb", REOPENED_TWO);
@@ -1744,25 +1896,22 @@ mod tests {
         assert_deferred(&harness, &one, REOPENED_ONE);
     }
 
-    /// A typed instance variable and a call on it, which is the pair of paths the map reached
-    /// last.
+    /// A typed instance variable and a call on it: the pair of paths the map reaches.
     ///
-    /// `@thing` is typed by an assignment written above the cursor, and what that assignment
-    /// yields is a `Receiver` holding the **offset of `Alpha`** — a graph key, parsed out of the
-    /// buffer. Both cards below go through `types::method_receiver` on it: one asks what the
-    /// variable is, the other what a member on it resolves to. Neither translated, so an
-    /// unindexed keystroke anywhere above them lost the assignment and the card fell to the
-    /// variable's own name.
+    /// `@thing` is typed by an assignment above the cursor, and that assignment yields a `Receiver`
+    /// holding the **offset of `Alpha`**, a graph key parsed out of the buffer. Both cards below go
+    /// through `types::method_receiver` on it: one asks what the variable is, the other what a
+    /// member on it resolves to. Without translation, an unindexed keystroke anywhere above them
+    /// loses the assignment, and the card falls to the variable's own name.
     const TYPED_IVAR: &str = "class Alpha\n  def only_alpha\n  end\nend\n\n\
                               class Holder\n  def run\n    @thing = Alpha.new\n\
                               \u{20}   @thing.only_alpha\n  end\nend\n";
 
     /// Open `TYPED_IVAR`, index it, then defer and insert `PAD` at the top without indexing.
     ///
-    /// The pad is above everything, so every offset the two cards need moves by exactly its
-    /// length and nothing the user pointed at changed — the edit a deferred answer is supposed
-    /// to survive completely, and the one the audit's fifth check makes at every position it
-    /// samples.
+    /// The pad is above everything, so every offset the two cards need moves by exactly its length
+    /// and nothing the user pointed at changed: the edit a deferred answer must survive completely,
+    /// and the one the audit makes at every position it samples.
     fn deferred_after_a_typed_ivar() -> (Harness, DocUri) {
         let mut harness = Harness::new();
         let uri = harness.write("lib/main.rb", TYPED_IVAR);
@@ -1784,11 +1933,10 @@ mod tests {
     #[test]
     fn a_deferred_card_on_an_instance_variable_keeps_the_type_its_assignment_gives_it() {
         // `locator::resolve_variable` reads the buffer and keys the graph, and the hinge is the
-        // constant inside the assignment: `Alpha` sits at one offset in the buffer and another
-        // in the text the graph holds. Untranslated it resolves to nothing, the whole chain
-        // collapses, and what is left is the variable's spelling — a *guessed* card where a
-        // derived one stood a keystroke earlier, which is the deferred path answering less than
-        // the eager one.
+        // constant inside the assignment: `Alpha` sits at one offset in the buffer and another in
+        // the graph's text. Untranslated, it resolves to nothing, the chain collapses, and only the
+        // variable's spelling is left: a *guessed* card where a derived one stood a keystroke
+        // earlier.
         let (mut harness, uri) = deferred_after_a_typed_ivar();
 
         let answer = harness.ask(
@@ -1804,9 +1952,9 @@ mod tests {
             card.contains("class Alpha"),
             "the assignment stopped typing the variable: {card}"
         );
-        // The provenance line is the buffer's and stays the buffer's — `Receiver::Assigned`'s
-        // offset is deliberately not translated, because this names a line for a reader in the
-        // text the reader is looking at. Line 9 is where the assignment is *now*.
+        // The provenance line belongs to the buffer and stays there: `Receiver::Assigned`'s offset
+        // is deliberately not translated, because it names a line for a reader in the text they are
+        // looking at. Line 9 is where the assignment is *now*.
         assert!(
             card.contains("Type taken from the assignment on line 9"),
             "the card named the wrong line for the assignment: {card}"
@@ -1820,12 +1968,11 @@ mod tests {
 
     #[test]
     fn a_deferred_call_on_an_instance_variable_is_typed_in_the_graph_s_coordinates() {
-        // The same receiver one token to the right, and a different function reaching it:
-        // `locator::typed`, which is what `hover` and `definition` share. The degradation here
-        // is quieter than the card above — `only_alpha` is declared once in the whole fixture,
-        // so the name-based list finds it anyway and *the answer looks right*. What says it is
-        // not is the footnote: a list matched on a name says so, and a receiver that was really
-        // typed says where the type came from.
+        // The same receiver one token to the right, reached by a different function:
+        // `locator::typed`, which `hover` and `definition` share. The failure is quieter here:
+        // `only_alpha` is declared once in the fixture, so the name-based list finds it anyway and
+        // *the answer looks right*. The footnote tells them apart: a name-matched list says so,
+        // while a really typed receiver says where the type came from.
         let (mut harness, uri) = deferred_after_a_typed_ivar();
 
         let answer = harness.ask(
@@ -1854,12 +2001,12 @@ mod tests {
 
     #[test]
     fn a_templates_variable_survives_an_unindexed_edit_in_the_controller_that_types_it() {
-        // **The cross-document half, and the cursor is not in the edited file at all.** The
-        // view↔renderer rung reads the controller's *buffer* on purpose — an unsaved
-        // controller should type the template it renders — and that is exactly the moment the
-        // controller's offsets stop naming the graph's text. So the map that has to be applied
-        // is the controller's, fetched with its text rather than derived from the request's
-        // document, which is the only map the template's own request knows about.
+        // **The cross-document half: the cursor is not in the edited file at all.** The
+        // view↔renderer rung reads the controller's *buffer* on purpose (an unsaved controller
+        // should type the template it renders), and that is exactly when the controller's offsets
+        // stop naming the graph's text. So the map to apply is the controller's, fetched with its
+        // text, not derived from the request's document, whose map is the only one the template's
+        // request knows.
         let mut harness = Harness::new();
         harness.write("app/models/story.rb", STORY);
         let controller = harness.write("app/controllers/stories_controller.rb", CONTROLLER);
@@ -1893,15 +2040,15 @@ mod tests {
             card.contains("Story#title"),
             "an edit in another document lost the template's type: {card}"
         );
-        // The whole rung, and this is the assertion that fires without the map: `Story#title`
-        // is *also* what the name guess answers, because the variable happens to be spelled
-        // after its class. The right answer and the lucky one differ only in the footnote.
+        // The whole rung, and the assertion that fires without the map: `Story#title` is *also*
+        // what the name guess answers, because the variable is spelled after its class. The right
+        // answer and the lucky one differ only in the footnote.
         assert!(
             !card.contains("guessed from the name"),
             "the convention gave way to the name guess: {card}"
         );
-        // Line 4 and not line 3: the lookup follows the graph and the line a reader is sent to
-        // follows the buffer, and this is the one card that can tell the two apart.
+        // Line 4, not line 3: the lookup follows the graph and the line a reader is sent to follows
+        // the buffer. This is the one card that can tell them apart.
         assert!(
             card.contains("Type taken from `StoriesController`, line 4"),
             "the card named the line the assignment used to be on: {card}"
@@ -1911,11 +2058,11 @@ mod tests {
 
     #[test]
     fn an_assignment_being_typed_is_refused_rather_than_read_at_the_old_offsets() {
-        // The other half of the map's contract, on the rung above: here the edit is *inside*
-        // the constant the assignment names, so no graph offset stands for it at all. What must
-        // not happen is `Alpha` — it is what sits at that offset in the older text, and a card
-        // naming it would be confident, precise and about a class the buffer no longer mentions.
-        // Falling to the variable's own name is the degradation this is supposed to have.
+        // The other half of the map's contract, on the rung above: the edit is *inside* the
+        // constant the assignment names, so no graph offset stands for it. What must not appear is
+        // `Alpha`: it sits at that offset in the older text, and a card naming it would be
+        // confident, precise and about a class the buffer no longer mentions. Falling to the
+        // variable's own name is the intended degradation.
         let mut harness = Harness::new();
         let uri = harness.write("lib/main.rb", TYPED_IVAR);
         harness.index();
@@ -1948,11 +2095,10 @@ mod tests {
 
     #[test]
     fn a_controller_assignment_being_typed_leaves_the_template_the_rung_below() {
-        // The same refusal one document over, and the reason it is a `continue` rather than a
-        // decline: the request is about the *template*, which nobody has touched, so there is
-        // nothing here for a settle-and-retry to have been triggered by. The rung says it
-        // cannot answer, the name guess answers instead, and the card says which — the whole of
-        // what is owed while somebody is mid-word in another file.
+        // The same refusal one document over, and why it is a `continue`, not a decline: the
+        // request is about the *template*, which nobody touched, so nothing here would trigger a
+        // settle-and-retry. The rung says it cannot answer, the name guess answers instead, and the
+        // card says which. That is all that is owed while somebody is mid-word in another file.
         let mut harness = Harness::new();
         harness.write("app/models/story.rb", STORY);
         let controller = harness.write("app/controllers/stories_controller.rb", CONTROLLER);
@@ -1991,17 +2137,17 @@ mod tests {
 
     #[test]
     fn an_index_that_crashed_does_not_leave_the_map_claiming_the_graph_caught_up() {
-        // **The bulkhead meeting the map, and the failure is silent in both directions.** A
-        // contained panic costs the document its update: the graph keeps the version it already had. If
-        // `indexed_text` recorded the text that *failed* to go in, the map would compare two
-        // equal strings, answer `identity`, and hand a buffer offset to a graph some unknown
-        // number of edits behind — with no refusal, so nothing falls back.
+        // **The bulkhead meets the map, and the failure is silent both ways.** A contained panic
+        // costs the document its update: the graph keeps its previous version. If `indexed_text`
+        // recorded the text that *failed* to go in, the map would compare two equal strings, answer
+        // `identity`, and hand a buffer offset to a graph some edits behind, with no refusal, so
+        // nothing falls back.
         //
-        // What the caret then lands on is text seven bytes along, and on *this* fixture that is
-        // the `Gamma` of `Alpha.\nGamma.` — one chained call to Ruby, so a method name that
-        // resolves to nothing, and the symptom is silence rather than a wrong class. It is the
-        // same defect either way: the offset was handed to a graph that never received the
-        // edit. The assertion is on the answer being right, which covers both.
+        // On *this* fixture the caret would land seven bytes along, on the `Gamma` of
+        // `Alpha.\nGamma.` (one chained call in Ruby, so a method name that resolves to nothing),
+        // and the symptom is silence, not a wrong class. It is the same defect either way: the
+        // offset went to a graph that never got the edit. The assertion is that the answer is
+        // right, which covers both.
         let mut harness = Harness::new();
         let uri = harness.write("lib/main.rb", SHIFTED);
         harness.index();
@@ -2016,10 +2162,10 @@ mod tests {
                 text: PAD.to_owned(),
             }],
         );
-        // Armed rather than written into the text, because the sentinel is 33 bytes and this
-        // fixture's whole point is a *seven*-byte shift: a sentinel in the buffer destroys the
-        // common suffix, the map then refuses everything, and the test would pass on a
-        // refusal instead of on the map being right.
+        // Armed, not written into the text: the sentinel is 33 bytes and this fixture depends on a
+        // *seven*-byte shift. A sentinel in the buffer would destroy the common suffix, the map
+        // would refuse everything, and the test would pass on a refusal instead of on the map being
+        // right.
         indexer::SOURCE_INDEXES_TO_CRASH.with(|counter| counter.set(1));
         // Something that is not deferred forces the index, which panics and is contained.
         harness.analysis.settle();
@@ -2042,11 +2188,11 @@ mod tests {
 
     #[test]
     fn a_refused_receiver_is_answered_by_indexing_rather_than_by_answering_nothing() {
-        // **The map is an optimization and not a filter**, and this is the test that says so.
-        // Rewriting `Alpha.` into `Gamma.` puts a constant the graph knows perfectly well at an
-        // offset the graph has never seen — the refusal is about the *offset*, not the name —
-        // so the deferred attempt has nothing to say. Answering nothing there would trade a
-        // correct answer for a fast empty list, so the request settles and asks again.
+        // **The map is an optimization, not a filter**, and this test says so. Rewriting `Alpha.`
+        // into `Gamma.` puts a constant the graph knows well at an offset the graph has never seen;
+        // the refusal is about the *offset*, not the name, so the deferred attempt has nothing to
+        // say. Answering nothing would trade a correct answer for a fast empty list, so the request
+        // settles and asks again.
         let mut harness = Harness::new();
         let uri = harness.write("lib/main.rb", SHIFTED);
         harness.index();
@@ -2123,9 +2269,9 @@ mod tests {
 
     #[test]
     fn navigation_ranges_are_in_the_negotiated_encoding() {
-        // The failure this guards against is invisible on ASCII and silent everywhere else: a
-        // range built from byte offsets sends the editor to the wrong column on every line
-        // that contains an emoji, an accent, or CJK text.
+        // This failure is invisible on ASCII and silent everywhere else: a range built from byte
+        // offsets sends the editor to the wrong column on every line with an emoji, an accent or
+        // CJK text.
         let source = "x = \"\u{1f600}\u{1f600}\"; class Person; end\n";
         for (encoding, expected) in [
             (PositionEncoding::Utf8, 22),  // two 4-byte emoji
@@ -2160,38 +2306,34 @@ mod tests {
         }
     }
 
-    /// The same call under three prefixes, one of which is prose in English.
+    /// The same call under three prefixes, one of them prose in English.
     ///
-    /// A line of markup is a line of a *document*, and a client counts its columns in UTF-16
-    /// units of the text it has. Only the first and last lines here are ones where that agrees
-    /// with the bytes: the middle line's quotes, accent and emoji are seven units short of
-    /// their eighteen bytes.
+    /// A line of markup is a line of a *document*, and a client counts its columns in UTF-16 units
+    /// of its own text. Only the first and last lines here agree with the bytes: the middle line's
+    /// quotes, accent and emoji are seven units short of their eighteen bytes.
     const WIDE: &str = "\
 <p>plain <%= Story::TAGLINE %></p>
 <p>\u{201c}curly\u{201d} caf\u{e9} \u{1f680} <%= Story::TAGLINE %></p>
 <p><%= Story::TAGLINE %></p>
 ";
 
-    /// The markup to the left of a cursor may not move it, whatever it is made of.
+    /// The markup left of a cursor must not move it, whatever the markup is made of.
     ///
-    /// A defect a corpus sweep finds rather than a test. An LSP position
-    /// is a count of UTF-16 units of the text the **client** has, and `with_text` converted it
-    /// against the blanked view — where a 3-byte `\u{201c}` in the markup has become three
-    /// spaces. So the cursor was displaced left by (bytes − units) of every non-ASCII character
-    /// in the markup before it on the line, and every range answered back was displaced right
-    /// by the same amount. It is a *wrong* answer and not only a missing one: on a dense enough
-    /// line the displaced cursor lands on a different identifier.
+    /// An LSP position counts UTF-16 units of the text the **client** has. Converting it against
+    /// the blanked view, where a 3-byte `\u{201c}` has become three spaces, shifts the cursor left
+    /// by (bytes − units) of every non-ASCII character before it on the line, and every returned
+    /// range right by the same amount. On a dense line the shifted cursor lands on a different
+    /// identifier: a *wrong* answer, not just a missing one.
     ///
-    /// Both directions are one bug and this asks about both at once. `definition` reads a
-    /// position the client sent, and its `originSelectionRange` is a position the client will
-    /// use — so the middle row is the assertion: the cursor arrives at column 30, and the span
-    /// comes back naming columns 30 to 37 rather than the bytes 37 to 44 it was found at.
+    /// Both directions are one bug, and this checks both at once. `definition` reads a position the
+    /// client sent, and its `originSelectionRange` is a position the client will use. The middle
+    /// row is the assertion: the cursor arrives at column 30, and the span comes back as columns 30
+    /// to 37, not the bytes 37 to 44 it was found at.
     ///
-    /// It is the reproduction rather than an illustration. With the conversion pointed back at
-    /// the view, the middle row answers **`story.rb:0`** — the seven-unit displacement puts the
-    /// cursor inside `Story::`, and the jump lands on `class Story` instead of on the constant
-    /// the user clicked. The other two rows are unmoved, which is what makes it a defect users
-    /// only hit when they do not write their markup in English.
+    /// It reproduces the bug: with the conversion pointed back at the view, the middle row answers
+    /// **`story.rb:0`**, because the seven-unit shift puts the cursor inside `Story::` and the jump
+    /// lands on `class Story`. The other two rows do not move, which is why only people whose
+    /// markup is not English would ever see it.
     #[test]
     fn a_cursor_in_a_template_is_where_the_editor_put_it() {
         /// The LSP position of `needle` on `line`, counted the way a client counts.
@@ -2261,9 +2403,9 @@ mod tests {
 
     #[test]
     fn a_non_ascii_line_of_markup_above_the_cursor_does_not_move_the_answer() {
-        // Why the ERB scanner pads by byte and not by character: padding by character would let
-        // the emoji on the line above shorten the buffer by three bytes, and every offset below
-        // it would be wrong — silently, and only for people who do not write markup in English.
+        // Why the ERB scanner pads by byte, not by character: padding by character would let the
+        // emoji on the line above shorten the buffer by three bytes, and every offset below would
+        // be wrong, silently, and only for people who do not write markup in English.
         let wide = VIEW.replace(
             "<h1>Stories</h1>",
             "<h1>\u{413}\u{43e}\u{440}\u{44f}\u{447}\u{438}\u{435} \u{1f525}</h1>",
@@ -2273,8 +2415,8 @@ mod tests {
         harness.write("app/views/stories/index.html.erb", &wide);
         harness.index();
 
-        // The same line and the same column as the ASCII fixture above: the markup grew by
-        // fourteen bytes and the Ruby did not move.
+        // The same line and column as the ASCII fixture above: the markup grew by fourteen bytes
+        // and the Ruby did not move.
         assert_eq!(
             harness.reference_list(&model, STORY, "title", true),
             ["story.rb:3:6", "index.html.erb:2:15"]

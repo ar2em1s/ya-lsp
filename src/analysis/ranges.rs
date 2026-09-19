@@ -1,51 +1,57 @@
 //! What a file's *shape* is: what expanding the selection reaches, and what folds.
 //!
-//! Both are pure functions of one buffer, both walk Prism outwards from something, and neither
-//! ever asks the graph — so the fourth direct use of Prism, after `cursor`, `requires` and
-//! `scopes`, is one module rather than two.
+//! Both are pure functions of one buffer, both walk Prism outwards from something, and neither asks
+//! the graph. So they share one module.
 //!
-//! Expand-selection has no fallback: in a Ruby file the command does nothing without a provider.
-//! Folding has a decent one — VS Code guesses from indentation and is usually right on
-//! well-formatted Ruby — so this exists for what that guess cannot see: a heredoc's body, a
-//! literal whose closing bracket is outdented, `if`/`elsif`/`else` as three regions rather than
-//! one, a run of comment lines, and `#region` markers.
+//! Why each exists:
+//! - **Expand-selection** has no fallback: in a Ruby file the command does nothing without a
+//!   provider.
+//! - **Folding** has a decent fallback: VS Code guesses from indentation. This covers what that
+//!   guess cannot see: a heredoc's body, a literal whose closing bracket is outdented,
+//!   `if`/`elsif`/`else` as three regions, a run of comment lines, and `#region` markers.
 //!
 //! # `end` stays on screen
 //!
-//! A collapsed range hides the lines *after* its first, so a `def` whose range ended on its `end`
-//! keyword would hide the keyword, and a folded `def foo` with nothing closing it reads as broken
-//! code rather than folded code. Every range therefore ends on the last line of the construct's
-//! **body**, never on its closer — which is also why a single-line construct produces no range:
-//! `def foo; end` would hide nothing and leave a chevron that does nothing.
+//! A collapsed range hides the lines *after* its first. A `def` whose range ended on its `end`
+//! would hide the keyword, and a folded `def foo` with nothing closing it reads as broken code.
+//!
+//! So every range ends on the last line of the construct's **body**, never on its closer. That is
+//! also why a single-line construct gets no range: `def foo; end` would hide nothing and show a
+//! chevron that does nothing.
 //!
 //! # Locations that do not nest
 //!
-//! A selection chain is *defined* by every link containing the one before it, and Prism's error
-//! recovery hands out locations that do not — the trap [`locator::spans`] exists for, and
+//! A selection chain is *defined* by every link containing the one before it. Prism's error
+//! recovery hands out locations that do not nest: the trap [`locator::spans`] exists for, and
 //! [`locator::nests`] is the one predicate both ask. Half-written code is the normal state of a
-//! buffer, so the chain is built by filtering rather than by trusting the parser, and every span
-//! is clamped to the buffer before it is measured.
+//! buffer, so:
+//! - the chain is built by filtering, not by trusting the parser;
+//! - every span is clamped to the buffer before it is measured.
 //!
 //! # What is a step here, and what is not
 //!
-//! The steps added are the ones *Ruby* has and a generic walk misses: a string's contents before
-//! its quotes, one argument before the argument list, a body before the construct that opens it,
-//! and a message and its receiver before the next call in a chain. What is deliberately not added
-//! is the name in an assignment — `value` inside `value = 1`. That is exactly what a word-based
-//! provider finds, every client merges one in already, and Prism spells it across twenty node
-//! types with no accessor in common.
+//! Added: the steps *Ruby* has and a generic walk misses:
+//! - a string's contents before its quotes;
+//! - one argument before the argument list;
+//! - a body before the construct that opens it;
+//! - a message and its receiver before the next call in a chain.
+//!
+//! Not added: the name in an assignment (`value` inside `value = 1`). A word-based provider finds
+//! it, every client merges one in already, and Prism spells it across twenty node types with no
+//! common accessor.
 //!
 //! # Prism's visitor has thirteen holes
 //!
-//! `Visit::visit` announces each node through `visit_branch_node_enter` before dispatching, which
-//! is the generic hook the selection walk is built on. Thirteen node kinds are reached by their
-//! *typed* method instead — `visit_arguments_node`, `visit_statements_node` and eleven more — and
-//! for those the hook never fires. The first two are "one argument before the whole argument
-//! list" and "a block's body before the block", which are two of the steps this module exists
-//! for. Twelve are overridden below to announce themselves and then defer, so the walk underneath
-//! stays Prism's own. The thirteenth is `BlockArgumentNode`, reached that way only from an index
-//! assignment carrying a block — `a[&b] = 1`, which Ruby's own parser rejects — so it is left
-//! alone rather than written and never run.
+//! `Visit::visit` announces each node through `visit_branch_node_enter` before dispatching; the
+//! selection walk is built on that hook. Thirteen node kinds are reached by their *typed* method
+//! instead (`visit_arguments_node`, `visit_statements_node` and eleven more), and for those the
+//! hook never fires. The first two carry two of this module's steps: one argument before the list,
+//! a block's body before the block.
+//!
+//! Twelve are overridden below to announce themselves and then defer, so the walk underneath stays
+//! Prism's own. The thirteenth, `BlockArgumentNode`, arrives that way only from an index assignment
+//! carrying a block (`a[&b] = 1`), which Ruby's own parser rejects. It is left alone rather than
+//! written and never run.
 
 use lsp_types::{FoldingRange, FoldingRangeKind, SelectionRange};
 use ruby_prism::{
@@ -63,12 +69,11 @@ use super::{locator, position::TextDocument};
 // selectionRange
 // ---------------------------------------------------------------------------
 
-/// The chain at `offset` in the shape the protocol wants it: innermost first, each link
-/// carrying the one it expands into.
+/// The chain at `offset` in the shape the protocol wants: innermost first, each link carrying the
+/// one it expands into.
 ///
-/// The outermost link is always the buffer itself, which is what makes this total — the seed
-/// below is that link rather than a special case, and a position Prism could not place anywhere
-/// still answers with the file.
+/// The outermost link is always the buffer itself. That makes this total: a position Prism could
+/// not place still answers with the file.
 #[must_use]
 pub fn selection_range(text: &TextDocument, offset: u32) -> SelectionRange {
     let spans = selection_chain(text.text(), offset);
@@ -87,11 +92,10 @@ pub fn selection_range(text: &TextDocument, offset: u32) -> SelectionRange {
 
 /// Every span the cursor at `offset` can expand out to, innermost first.
 ///
-/// Never empty: the buffer itself is the last link of every chain, which is also the whole answer
-/// where Prism produced no node at all — past the last statement, or in the whitespace of a file
-/// that is still being written. LSP asks for one chain per position and has no spelling for "not
-/// this one", so having something to say for every position is a requirement rather than a
-/// courtesy.
+/// Never empty: the buffer is the last link of every chain. It is the whole answer where Prism
+/// produced no node: past the last statement, or in the whitespace of a file being written. LSP
+/// asks for one chain per position and cannot say "not this one", so an answer for every position
+/// is required.
 #[must_use]
 pub fn selection_chain(source: &str, offset: u32) -> Vec<(u32, u32)> {
     let parsed = ruby_prism::parse(source.as_bytes());
@@ -110,16 +114,15 @@ pub fn selection_chain(source: &str, offset: u32) -> Vec<(u32, u32)> {
         .collect();
     spans.push((0, eof));
 
-    // Widest last, ties broken by the earlier start, so the fold below only ever has to ask
-    // whether the next span contains the one it kept.
+    // Widest last, ties broken by the earlier start. The fold below then only asks whether the next
+    // span contains the one it kept.
     spans.sort_by_key(|&(start, end)| (end - start, start));
     spans.dedup();
 
     let mut chain: Vec<(u32, u32)> = Vec::new();
     for span in spans {
-        // A link that does not contain the previous one is not a step out of it. Recovery
-        // produces exactly that, and sending it makes the client's own walk wrong rather than
-        // merely short.
+        // A link that does not contain the previous one is not a step out of it. Recovery produces
+        // exactly that, and sending it makes the client's walk wrong, not merely short.
         if chain.last().is_none_or(|&last| locator::nests(span, last)) {
             chain.push(span);
         }
@@ -134,9 +137,8 @@ struct Selection {
 }
 
 impl Selection {
-    /// A span is a step in the chain when the cursor is inside it or against either edge — the
-    /// caret between `foo` and `.bar` belongs to both, and sorting by width picks the one the
-    /// user meant to start from.
+    /// A span is a step when the cursor is inside it or against either edge. The caret between
+    /// `foo` and `.bar` belongs to both; sorting by width picks the one the user meant.
     fn take(&mut self, at: &Location<'_>) {
         self.span(at.start_offset() as u32, at.end_offset() as u32);
     }
@@ -148,7 +150,7 @@ impl Selection {
     }
 
     /// What an interpolated literal has instead of a `content_loc`: everything between the
-    /// delimiters, which is one or more parts and whatever text lies around them.
+    /// delimiters, meaning its parts and the text around them.
     fn inside(&mut self, opening: Option<&Location<'_>>, closing: Option<&Location<'_>>) {
         if let (Some(opening), Some(closing)) = (opening, closing) {
             self.span(opening.end_offset() as u32, closing.start_offset() as u32);
@@ -165,9 +167,9 @@ impl<'pr> Visit<'pr> for Selection {
         self.take(&node.location());
     }
 
-    // The thirteen the generic hook never sees. Each announces itself before deferring, and does
-    // so unconditionally rather than only on the typed path: a kind that arrives both ways would
-    // otherwise need to know which way it came, and a repeated span costs one `dedup`.
+    // The thirteen the generic hook never sees. Each announces itself before deferring, always, not
+    // only on the typed path: a kind that arrives both ways would otherwise need to know how it
+    // came, and a repeated span costs one `dedup`.
     fn visit_arguments_node(&mut self, node: &ArgumentsNode<'pr>) {
         self.take(&node.location());
         ruby_prism::visit_arguments_node(self, node);
@@ -225,11 +227,10 @@ impl<'pr> Visit<'pr> for Selection {
 
     // And the steps Ruby has that its node tree does not.
 
-    /// `foo` inside `def foo(a)`, and `bar` and then `foo.bar` inside `foo.bar(1)`.
+    /// `foo` inside `def foo(a)`, and `bar` then `foo.bar` inside `foo.bar(1)`.
     ///
-    /// The receiver step is taken only through a real call operator: `a + b` is a call too, and
-    /// "the receiver through the message" there is `a +`, which is not a thing anyone meant to
-    /// select.
+    /// The receiver step needs a real call operator. `a + b` is a call too, and "receiver through
+    /// message" there is `a +`, which nobody means to select.
     fn visit_call_node(&mut self, node: &CallNode<'pr>) {
         self.take(&node.location());
         if let Some(message) = node.message_loc() {
@@ -250,7 +251,7 @@ impl<'pr> Visit<'pr> for Selection {
         ruby_prism::visit_def_node(self, node);
     }
 
-    /// The contents before the quotes: pulling `hello` out of `"hello"` is the first expansion
+    /// The contents before the quotes. Pulling `hello` out of `"hello"` is the first expansion
     /// anybody reaches for, and there is no node for it.
     fn visit_string_node(&mut self, node: &StringNode<'pr>) {
         self.take(&node.location());
@@ -272,13 +273,13 @@ impl<'pr> Visit<'pr> for Selection {
         ruby_prism::visit_regular_expression_node(self, node);
     }
 
-    /// `name` inside `:name`, and inside `name:` — a hash key's colon is part of the symbol, and
-    /// selecting the key without it is what renaming one starts from.
+    /// `name` inside `:name` and inside `name:`. A hash key's colon is part of the symbol, and
+    /// renaming the key starts from selecting it without the colon.
     fn visit_symbol_node(&mut self, node: &SymbolNode<'pr>) {
         self.take(&node.location());
-        // Only where there is punctuation to step out of: `:name` carries a leading colon and
-        // a hash key `name:` a trailing one, while a `%i[]` element and the `b` in `alias b a`
-        // are bare names already, whose value is the whole node.
+        // Only where there is punctuation to step out of: `:name` has a leading colon, a hash key
+        // `name:` a trailing one. A `%i[]` element and the `b` in `alias b a` are bare names
+        // already.
         if let Some(value) = node
             .opening_loc()
             .or(node.closing_loc())
@@ -325,22 +326,21 @@ pub fn folds(text: &TextDocument) -> Vec<FoldingRange> {
     let mut ranges = walk.found;
     ranges.extend(comment_folds(text, &parsed));
 
-    // One chevron per line is all an editor can draw, so two ranges opening on the same line are
-    // one range and one piece of noise. The widest wins, because it is the outer construct: on
-    // `xs = ys.map do |y|` the assignment and the block both open on that line, and folding the
-    // assignment is what the reader clicking there meant.
+    // An editor draws one chevron per line, so two ranges opening on one line are one range plus
+    // noise. The widest wins, being the outer construct: on `xs = ys.map do |y|` the assignment and
+    // the block both open there, and the reader clicking meant the assignment.
     ranges.sort_by_key(|range| (range.start_line, std::cmp::Reverse(range.end_line)));
     ranges.dedup_by_key(|range| range.start_line);
     ranges
 }
 
-/// One collapsible region, or `None` where it would collapse nothing — a construct written on a
-/// single line, or a comment that has no neighbour. The one place that rule is decided, so that
-/// a fold coming from syntax and a fold coming from a comment cannot disagree about it.
+/// One collapsible region, or `None` where it would collapse nothing: a single-line construct, or a
+/// lone comment. The one place that rule is decided, so syntax folds and comment folds cannot
+/// disagree.
 ///
-/// Line-granular, deliberately: every client that matters sets `lineFoldingOnly` and discards the
-/// character offsets, the ones that do not still understand a whole-line range, and a folded Ruby
-/// construct is a run of whole lines under either reading.
+/// Line-granular on purpose: every client that matters sets `lineFoldingOnly` and drops character
+/// offsets, the others still understand whole-line ranges, and a folded Ruby construct is whole
+/// lines either way.
 fn line_fold(
     start_line: u32,
     end_line: u32,
@@ -360,16 +360,14 @@ struct Folds<'t> {
 }
 
 impl Folds<'_> {
-    /// A construct that opens at `keyword`, folds down to the last line of `body`, and is closed
-    /// by `closer`.
+    /// A construct that opens at `keyword`, folds down to the last line of `body`, and is closed by
+    /// `closer`.
     ///
-    /// The closer is consulted only for the one shape whose body location lies. A `def`, `class`
-    /// or block with a bare `rescue` in it is given an implicit `BeginNode` for a body, and that
-    /// node's location runs all the way to the *enclosing* construct's `end`, because that is the
-    /// keyword closing it. Measured by the body, such a fold swallows the `end` this whole module
-    /// exists to keep on screen — so an implicit begin is measured by the line above its closer
-    /// instead. An explicit `begin ... end` arrives the same way and lands on the same answer,
-    /// since its own `end` is the line above the outer one.
+    /// The closer matters for one shape only, where the body's location lies. A `def`, `class` or
+    /// block with a bare `rescue` gets an implicit `BeginNode` body, and its location runs to the
+    /// *enclosing* `end`. Measured by the body, the fold would swallow that `end`. So an implicit
+    /// begin is measured by the line above its closer. An explicit `begin ... end` lands on the
+    /// same answer, since its own `end` is the line above the outer one.
     fn body(&mut self, keyword: &Location<'_>, body: Option<Node<'_>>, closer: Option<&Location>) {
         let Some(body) = body else {
             return;
@@ -378,8 +376,8 @@ impl Folds<'_> {
             (Node::BeginNode { .. }, Some(closer)) => {
                 self.line_of(closer.start_offset()).saturating_sub(1)
             }
-            // One past the body, so the line wanted is the one its last *byte* is on: a body that
-            // ends with its own newline would otherwise measure as the line below itself.
+            // The body's end is one past its last byte, so measure the line of that last *byte*. A
+            // body ending with its own newline would otherwise measure as the line below.
             _ => self.line_of(body.location().end_offset().saturating_sub(1)),
         };
         self.take(keyword, end);
@@ -391,24 +389,24 @@ impl Folds<'_> {
 
     /// A `case` as a whole, measured by the line above its `end`.
     ///
-    /// Not by its last branch, which is the obvious reading and the wrong one: an `else` carries
-    /// the `end` keyword *inside* its own location, so folding to there hides the `end`. Each
-    /// branch folds separately as well, so both the whole and the parts are on offer.
+    /// Not by its last branch, the obvious and wrong reading: an `else` carries the `end` keyword
+    /// *inside* its location, so folding there hides the `end`. Each branch also folds on its own,
+    /// so both the whole and the parts are on offer.
     fn case(&mut self, keyword: &Location<'_>, closer: &Location<'_>) {
         let end = self.line_of(closer.start_offset()).saturating_sub(1);
         self.take(keyword, end);
     }
 
-    /// A literal whose delimiters are on lines of their own: fold from the opening bracket to the
-    /// last element, leaving the closing one visible for the same reason `end` stays visible.
+    /// A literal whose delimiters sit on their own lines: fold from the opening bracket to the last
+    /// element. The closing bracket stays visible, for the same reason `end` does.
     fn literal(&mut self, opening: Option<&Location<'_>>, elements: &NodeList<'_>) {
         if let Some(opening) = opening {
             self.body(opening, elements.last(), None);
         }
     }
 
-    /// A heredoc, which is the one literal whose body is nowhere near the expression it belongs
-    /// to. `<<~SQL` opens the fold; the terminator is the closer and stays visible.
+    /// A heredoc: the one literal whose body is nowhere near its expression. `<<~SQL` opens the
+    /// fold; the terminator is the closer and stays visible.
     fn heredoc(&mut self, opening: Option<&Location<'_>>, body: Option<&Location<'_>>) {
         if let (Some(opening), Some(body)) = (opening, body)
             && opening.as_slice().starts_with(b"<<")
@@ -475,11 +473,11 @@ impl<'pr> Visit<'pr> for Folds<'_> {
         ruby_prism::visit_lambda_node(self, node);
     }
 
-    /// `if`, `elsif` and `else` are three regions, not one: an `elsif` arrives as an `IfNode` of
-    /// its own in the first one's `subsequent`, so nothing here has to know the word.
+    /// `if`, `elsif` and `else` are three regions, not one. An `elsif` arrives as its own `IfNode`
+    /// in the first one's `subsequent`, so nothing here needs to know the word.
     ///
-    /// The guard is what keeps a modifier (`x if y`) and a ternary out — both are `IfNode`s, and
-    /// only the statement form starts where its keyword does.
+    /// The guard keeps a modifier (`x if y`) and a ternary out: both are `IfNode`s, and only the
+    /// statement form starts at its keyword.
     fn visit_if_node(&mut self, node: &IfNode<'pr>) {
         if let Some(keyword) = node.if_keyword_loc()
             && keyword.start_offset() == node.location().start_offset()
@@ -543,8 +541,8 @@ impl<'pr> Visit<'pr> for Folds<'_> {
         ruby_prism::visit_for_node(self, node);
     }
 
-    /// Only a `begin` the user wrote. A `def` with a `rescue` in it carries an implicit
-    /// `BeginNode` with no keyword, and the `def`'s own fold already covers those lines.
+    /// Only a `begin` the user wrote. A `def` with a `rescue` carries an implicit keyword-less
+    /// `BeginNode`, and the `def`'s fold already covers those lines.
     fn visit_begin_node(&mut self, node: &BeginNode<'pr>) {
         if let Some(keyword) = node.begin_keyword_loc() {
             self.statements(&keyword, node.statements());
@@ -562,18 +560,16 @@ impl<'pr> Visit<'pr> for Folds<'_> {
         ruby_prism::visit_ensure_node(self, node);
     }
 
-    /// A call whose arguments run past the line the *message* is on — `foo(\n  a,\n  b\n)`, and
-    /// the paren-less `validates :name,\n  presence: true` with it.
+    /// A call whose arguments run past the line its *message* is on: `foo(\n  a,\n  b\n)`, and
+    /// paren-less `validates :name,\n  presence: true`.
     ///
-    /// Here because advertising the provider *replaces* the editor's indentation guess rather
-    /// than adding to it, and a multi-line argument list is the commonest thing that guess folds
-    /// in Rails code. Ends at the last argument, so a closing paren on its own line stays visible
-    /// like every other closer.
+    /// Needed because advertising a provider *replaces* the editor's indentation guess, and a
+    /// multi-line argument list is the commonest thing that guess folds in Rails code. Ends at the
+    /// last argument, so a closing paren on its own line stays visible.
     ///
-    /// Measured from the message and not from the call, which is where the receiver is: in a
-    /// chain written down the page, `store.constants\n  .collect(gates)` is one call whose start
-    /// is two lines above its own name, and folding from there hides a line of the chain for no
-    /// reason anybody looking at it would recognise.
+    /// Measured from the message, not the call start where the receiver is. In a chain written down
+    /// the page, `store.constants\n  .collect(gates)` is one call starting two lines above its own
+    /// name, and folding from there hides a chain line for no visible reason.
     fn visit_call_node(&mut self, node: &CallNode<'pr>) {
         if let Some(arguments) = node.arguments() {
             let opens = node.message_loc().unwrap_or_else(|| node.location());
@@ -597,8 +593,8 @@ impl<'pr> Visit<'pr> for Folds<'_> {
         ruby_prism::visit_string_node(self, node);
     }
 
-    /// An interpolated heredoc has no `content_loc` — its body is its parts, and the last of them
-    /// ends on the last line before the terminator.
+    /// An interpolated heredoc has no `content_loc`. Its body is its parts, and the last one ends
+    /// on the line before the terminator.
     fn visit_interpolated_string_node(&mut self, node: &InterpolatedStringNode<'pr>) {
         let last = node.parts().last().map(|at| at.location());
         self.heredoc(node.opening_loc().as_ref(), last.as_ref());
@@ -619,9 +615,8 @@ enum Marker {
 
 /// Runs of whole-line comments, and the regions markers delimit.
 ///
-/// A comment that follows code on the same line is that line's tail rather than a line of its
-/// own, so it neither joins a run nor breaks one: `x = 1 # why` between two commented lines would
-/// otherwise cut the block in half.
+/// A comment after code on the same line is that line's tail, so it neither joins a run nor breaks
+/// one. Otherwise `x = 1 # why` between two commented lines would cut the block in half.
 fn comment_folds(text: &TextDocument, parsed: &ParseResult<'_>) -> Vec<FoldingRange> {
     let source = text.text();
     let mut ranges = Vec::new();
@@ -644,16 +639,15 @@ fn comment_folds(text: &TextDocument, parsed: &ParseResult<'_>) -> Vec<FoldingRa
             }
             Some(Marker::End) => {
                 close_run(&mut run, &mut ranges);
-                // An unmatched `#endregion` is a typo, and so is an unmatched `#region` — which
-                // is why an open one left over at the end of the file is dropped rather than
-                // folded to EOF. Collapsing the rest of a file over a typo is worse than not
-                // collapsing anything.
+                // An unmatched `#endregion` is a typo, and so is an unmatched `#region`. So a
+                // region still open at the end of the file is dropped, not folded to EOF:
+                // collapsing the rest of a file over a typo is worse than collapsing nothing.
                 if let Some(opened) = regions.pop() {
                     ranges.extend(line_fold(opened, first, Some(FoldingRangeKind::Region)));
                 }
             }
-            // `=begin`/`=end` arrives as one comment several lines tall, so it opens a run and
-            // closes it by itself.
+            // `=begin`/`=end` arrives as one comment several lines tall, so it opens and closes a
+            // run by itself.
             None => match run {
                 Some((from, to)) if to + 1 == first => run = Some((from, last)),
                 _ => {
@@ -680,8 +674,8 @@ fn starts_its_line(source: &str, start: usize) -> bool {
     prefix.trim().is_empty()
 }
 
-/// A region marker, written with or without a space after the `#` and with or without a label
-/// after the word — the two spellings every editor that supports these accepts.
+/// A region marker, with or without a space after the `#` and with or without a label after the
+/// word: the two spellings every editor that supports these accepts.
 fn marker(comment: &str) -> Option<Marker> {
     let rest = comment.strip_prefix('#')?.trim_start();
     for (word, marker) in [("endregion", Marker::End), ("region", Marker::Start)] {
@@ -701,21 +695,24 @@ mod tests {
     use crate::analysis::position::PositionEncoding;
     use crate::analysis::testing::*;
 
-    /// Every fold drawn down the left of the file it was computed from: `┌` where one opens, `│`
-    /// through each line it hides, and `┘` on the last line it hides. A comment run opens with a
-    /// `c` and a region with an `r`, since for those two the *kind* is part of the answer.
+    /// Every fold drawn down the left of its file:
+    /// - `┌` where one opens;
+    /// - `│` through each line it hides;
+    /// - `┘` on the last line it hides;
+    /// - `c` opens a comment run and `r` a region, since for those two the *kind* is part of the
+    ///   answer.
     ///
-    /// Drawn rather than asserted as line numbers for the reason the highlight map is: the rule
-    /// this module is likeliest to break is "the closer stays visible", and here that is a thing
-    /// you can see — the line holding `end` carries no mark — where `assert_eq!(end_line, 4)` can
-    /// only be checked against the same arithmetic that produced it. Source and drawing are both
-    /// written a line at a time so that the two line up in the file the way they do on screen.
+    /// Drawn, not asserted as line numbers, for the same reason as the highlight map. The rule
+    /// likeliest to break is "the closer stays visible", and here you can see it: the `end` line
+    /// carries no mark. `assert_eq!(end_line, 4)` can only be checked against the arithmetic that
+    /// produced it. Source and drawing are written a line at a time so they line up in the file as
+    /// on screen.
     fn drawn(source: &[&str]) -> String {
         let text = TextDocument::new(source.join("\n") + "\n", PositionEncoding::Utf16);
         let found = folds(&text);
 
-        // One lane per fold, reused left to right once the fold holding it has closed, so nesting
-        // reads as indentation and two unrelated folds do not each claim a column of their own.
+        // One lane per fold, reused left to right once its fold has closed. Nesting reads as
+        // indentation, and unrelated folds do not each claim a column.
         let mut lanes: Vec<Vec<&FoldingRange>> = Vec::new();
         for range in &found {
             let free = lanes
@@ -761,8 +758,8 @@ mod tests {
         rows.join("\n")
     }
 
-    /// The text each link of the chain covers, innermost first, with newlines shown so that a
-    /// multi-line link stays one line of the assertion.
+    /// The text each link of the chain covers, innermost first. Newlines are shown so a multi-line
+    /// link stays one line of the assertion.
     fn chain(marked: &str) -> String {
         let offset = marked.find('~').expect("a ~ marking the cursor") as u32;
         let source = marked.replace('~', "");
@@ -777,9 +774,9 @@ mod tests {
 
     #[test]
     fn every_definition_folds_and_every_closer_survives_it() {
-        // Six constructs nested six deep, and the whole rule of the module visible in one
-        // picture: not one of the five `end` keywords carries a mark, because a collapsed
-        // `def build` with nothing closing it reads as broken code rather than as folded code.
+        // Six constructs nested six deep, and the module's whole rule in one picture: none of the
+        // five `end` keywords carries a mark. A collapsed `def build` with nothing closing it reads
+        // as broken code.
         assert_eq!(
             drawn(&[
                 "module Shop",
@@ -812,10 +809,9 @@ mod tests {
 
     #[test]
     fn a_branch_is_a_region_of_its_own() {
-        // `if`, `elsif` and `else` fold as three rather than one, which is what the editor's
-        // indentation guess already does and what anyone reading a long conditional wants. An
-        // `elsif` arrives as an `IfNode` inside the first one's `subsequent`, so nothing in this
-        // module knows that word — and nothing knows `when` either.
+        // `if`, `elsif` and `else` fold as three, like the editor's indentation guess and as anyone
+        // reading a long conditional wants. An `elsif` arrives as an `IfNode` in the first one's
+        // `subsequent`, so this module knows neither that word nor `when`.
         assert_eq!(
             drawn(&[
                 "if a", "  one", "elsif b", "  two", "else", "  three", "end", "case x", "when 1",
@@ -873,8 +869,8 @@ mod tests {
 
     #[test]
     fn for_until_unless_and_a_pattern_match() {
-        // A `case` folds as a whole *and* as its branches; the whole one ends at the last branch
-        // rather than at `end`, which is why the last two lines look the way they do.
+        // A `case` folds as a whole *and* as its branches. The whole ends at the last branch, not
+        // at `end`, hence the last two lines.
         assert_eq!(
             drawn(&[
                 "for i in list",
@@ -915,8 +911,8 @@ mod tests {
 
     #[test]
     fn a_lambda_a_brace_block_and_a_block_on_super() {
-        // `super do ... end` is the one place Prism hands a block to its typed visitor rather
-        // than through `visit`, so it is in the fixture to keep that override honest.
+        // `super do ... end` is the one place Prism hands a block to its typed visitor instead of
+        // `visit`. It is in the fixture to keep that override honest.
         assert_eq!(
             drawn(&[
                 "run = ->(a) {",
@@ -949,9 +945,9 @@ mod tests {
 
     #[test]
     fn two_constructs_opening_on_one_line_leave_one_chevron() {
-        // The setter's argument list and the block both open on the first line, and an editor
-        // can only draw one chevron there. The wider is the one to keep: it is the outer
-        // construct, and it is what a reader clicking that line meant to collapse.
+        // The setter's argument list and the block both open on the first line, and an editor draws
+        // one chevron there. Keep the wider: it is the outer construct, and what a reader clicking
+        // that line meant.
         assert_eq!(
             drawn(&["obj.items = list.map do |x|", "  x", "end"]),
             rows(&["┌ obj.items = list.map do |x|", "│   x", "┘ end"])
@@ -960,10 +956,9 @@ mod tests {
 
     #[test]
     fn literals_a_heredoc_and_an_argument_list() {
-        // The four an indentation guess gets wrong or cannot see at all. A heredoc is the one
-        // literal whose body is nowhere near the expression it belongs to, and `%w[]` is here
-        // because its elements are strings with no quotes of their own — the shape that decides
-        // whether the heredoc test is asking about the right location.
+        // The four an indentation guess gets wrong or cannot see. A heredoc's body is nowhere near
+        // its expression. `%w[]` is here because its elements are strings with no quotes of their
+        // own, which decides whether the heredoc test asks about the right location.
         assert_eq!(
             drawn(&[
                 "ROWS = [",
@@ -1008,9 +1003,9 @@ mod tests {
 
     #[test]
     fn a_single_line_construct_folds_nothing() {
-        // A range whose two lines are the same renders a chevron that does nothing when it is
-        // clicked, which is worse than no chevron at all. Every line below holds a construct this
-        // module otherwise recognises, and the whole answer is the empty gutter.
+        // A range whose two lines are the same draws a chevron that does nothing, which is worse
+        // than none. Every line below holds a construct this module otherwise folds, and the answer
+        // is an empty gutter.
         assert_eq!(
             drawn(&[
                 "def foo; end",
@@ -1041,10 +1036,12 @@ mod tests {
 
     #[test]
     fn comment_runs_regions_and_the_lines_that_are_neither() {
-        // Four rules in one picture: a run needs a second line, a comment that follows code is
-        // that line's tail rather than a line of its own, `# regional` is a word that merely
-        // starts like a marker, and a real marker ends whatever run it interrupts and opens a
-        // fold the syntax knows nothing about.
+        // Four rules in one picture:
+        // 1. A run needs a second line.
+        // 2. A comment after code is that line's tail, not a line of its own.
+        // 3. `# regional` merely starts like a marker.
+        // 4. A real marker ends the run it interrupts and opens a fold the syntax knows nothing
+        //    about.
         assert_eq!(
             drawn(&[
                 "# one",
@@ -1083,8 +1080,8 @@ mod tests {
 
     #[test]
     fn an_unmatched_region_marker_folds_nothing() {
-        // Both directions of the same typo. Collapsing the rest of a file because somebody forgot
-        // an `#endregion` is a worse answer than leaving those lines alone.
+        // Both directions of the same typo. Collapsing the rest of a file over a forgotten
+        // `#endregion` is worse than leaving those lines alone.
         assert_eq!(
             drawn(&["# region open", "x = 1", "y = 2"]),
             rows(&[" # region open", " x = 1", " y = 2"])
@@ -1097,9 +1094,9 @@ mod tests {
 
     #[test]
     fn a_rescue_the_user_did_not_open_a_begin_for_folds_once() {
-        // Prism gives a `def` with a `rescue` in it an implicit `BeginNode` with no keyword. The
-        // `def`'s own fold already covers those lines, so a second one opening on the same line
-        // would be a duplicate chevron sitting on top of the first.
+        // A `def` with a `rescue` gets an implicit keyword-less `BeginNode`. The `def`'s own fold
+        // already covers those lines, so a second fold would be a duplicate chevron on the same
+        // line.
         assert_eq!(
             drawn(&["def f", "  1", "rescue", "  2", "end"]),
             rows(&["┌  def f", "│    1", "│┌ rescue", "┘┘   2", "   end"])
@@ -1109,7 +1106,7 @@ mod tests {
     #[test]
     fn a_half_typed_buffer_still_folds_what_it_has() {
         // The normal state of a file. Prism recovers, the `class` still has a body, and the folds
-        // are the ones the finished file would have had.
+        // match the finished file's.
         assert_eq!(
             drawn(&["class Foo", "  def bar", "    x"]),
             rows(&["┌  class Foo", "│┌   def bar", "┘┘     x"])
@@ -1139,8 +1136,8 @@ mod tests {
 
     #[test]
     fn one_argument_comes_before_the_whole_argument_list() {
-        // `ArgumentsNode` is one of the thirteen Prism reaches through its typed visitor, so
-        // without that override this chain jumps straight from `2` to the whole call.
+        // `ArgumentsNode` is one of the thirteen reached through the typed visitor. Without that
+        // override, this chain jumps from `2` straight to the whole call.
         assert_eq!(
             chain("total(1, ~2, 3)\n"),
             rows(&["2", "1, 2, 3", "total(1, 2, 3)", "total(1, 2, 3)⏎"])
@@ -1163,9 +1160,9 @@ mod tests {
 
     #[test]
     fn a_message_comes_before_its_receiver_and_the_call_before_the_next_one() {
-        // The step a generic walk misses in the shape Ruby writes most: `a.b.c` nests as
-        // `((a.b).c)`, so the receiver of the outer call is the whole inner one and there is no
-        // node spelling `order.line_items` on its own.
+        // The step a generic walk misses, in Ruby's commonest shape. `a.b.c` nests as `((a.b).c)`:
+        // the outer call's receiver is the whole inner call, and no node spells `order.line_items`
+        // alone.
         assert_eq!(
             chain("order.li~ne_items.first\n"),
             rows(&[
@@ -1179,18 +1176,18 @@ mod tests {
 
     #[test]
     fn the_buffer_is_the_answer_where_there_is_nothing_else() {
-        // Past the last statement there is no node to start from, and the file is the answer
-        // rather than an empty array: the protocol pairs chains to positions by index, so every
-        // position has to have one.
+        // Past the last statement there is no node to start from, and the file is the answer, not
+        // an empty array. The protocol pairs chains to positions by index, so every position needs
+        // one.
         assert_eq!(chain("x = 1\n\n~"), "x = 1⏎⏎");
         assert_eq!(chain("~"), "");
     }
 
     #[test]
     fn every_link_contains_the_one_before_it_however_the_buffer_parses() {
-        // The invariant the protocol *defines* the response by, swept over a file being typed one
-        // character at a time — which is where Prism's recovery hands out the locations that do
-        // not nest. `locator::nests` is the predicate; this is what says it is asked everywhere.
+        // The invariant the protocol *defines* the response by, swept over a file typed one
+        // character at a time. That is where Prism's recovery hands out locations that do not nest.
+        // `locator::nests` is the predicate; this proves it is asked everywhere.
         let finished = "class Foo\n  def bar(a)\n    a + [1, \"two\"]\n  end\nend\n";
         for typed in 1..=finished.len() {
             let Some(source) = finished.get(..typed) else {
@@ -1217,8 +1214,8 @@ mod tests {
 
     #[test]
     fn the_awkward_literals_each_offer_their_contents() {
-        // Four spellings that all need a step Prism has no node for, and one — the interpolated
-        // string — where the step is what lies between the delimiters rather than a `content`.
+        // Four spellings that need a step Prism has no node for. In one, the interpolated string,
+        // the step is what lies between the delimiters, not a `content`.
         assert_eq!(chain("x = :na~me\n").lines().next(), Some("name"));
         assert_eq!(chain("x = /ab~c/\n").lines().next(), Some("abc"));
         assert_eq!(chain("x = `ec~ho`\n").lines().next(), Some("echo"));
@@ -1248,9 +1245,12 @@ mod tests {
 
     #[test]
     fn the_typed_visitor_kinds_are_each_reached() {
-        // The rest of the thirteen, each in the one shape that arrives through its typed visitor
-        // rather than through `visit`: a constant path being assigned, a `super` with a block, a
-        // named capture, a find pattern, a capture pattern, and a block parameter.
+        // The rest of the thirteen, each in the one shape that arrives through its typed visitor:
+        // - a constant path being assigned;
+        // - a `super` with a block;
+        // - a named capture;
+        // - a find pattern and a capture pattern;
+        // - a block parameter.
         for marked in [
             "Foo::B~ar = 1\n",
             "def f\n  super do\n    1~\n  end\nend\n",
@@ -1267,9 +1267,8 @@ mod tests {
 
     #[test]
     fn a_selection_chain_arrives_as_a_nest_of_parents() {
-        // The half `ranges` own tests cannot see: LSP spells a chain as one range carrying its
-        // parent rather than as a list, the innermost is the one at the top, and the outermost
-        // carries no `parent` key at all.
+        // The half `ranges`' own tests cannot see. LSP spells a chain as one range carrying its
+        // parent, the innermost at the top, and the outermost has no `parent` key at all.
         let mut harness = Harness::new();
         let uri = harness.write("lib/a.rb", "");
         harness.index();
@@ -1297,9 +1296,8 @@ mod tests {
 
     #[test]
     fn one_chain_comes_back_per_position_asked_about_in_the_order_asked() {
-        // The protocol pairs the two arrays by index and has no spelling for "not this one", so
-        // a position that resolved to nothing still has to answer — with the buffer, which is
-        // what the second of these is.
+        // The protocol pairs the two arrays by index and cannot say "not this one". So a position
+        // that resolved to nothing still answers, with the buffer: the second of these.
         let mut harness = Harness::new();
         let uri = harness.write("lib/a.rb", "");
         harness.index();
@@ -1328,9 +1326,9 @@ mod tests {
 
     #[test]
     fn folding_ranges_are_whole_lines_and_carry_no_characters() {
-        // `lineFoldingOnly` is what every client that matters sends, and a character offset it
-        // has been told to ignore is a field that can only ever be wrong. The `kind` is absent
-        // for the same reason: syntax folds have none, and `null` is not one of LSP's three.
+        // Every client that matters sends `lineFoldingOnly`, so a character offset would be a field
+        // it ignores and that can only be wrong. `kind` is absent too: syntax folds have none, and
+        // `null` is not one of LSP's three.
         let mut harness = Harness::new();
         let uri = harness.write("lib/a.rb", "");
         harness.index();
@@ -1346,9 +1344,9 @@ mod tests {
 
     #[test]
     fn a_file_with_nothing_to_fold_answers_null_rather_than_an_empty_list() {
-        // The one place `null`-versus-`[]` costs the user something they had: a client with a
-        // folding provider stops guessing folds from indentation, so an empty array would take
-        // the guess away *and* put nothing in its place. A `null` hands it back.
+        // Here `null` versus `[]` costs the user something. A client with a folding provider stops
+        // guessing folds from indentation, so `[]` would remove the guess and replace it with
+        // nothing. `null` hands it back.
         let mut harness = Harness::new();
         let uri = harness.write("lib/a.rb", "");
         harness.index();
@@ -1361,8 +1359,8 @@ mod tests {
 
     #[test]
     fn a_file_the_editor_never_opened_still_folds_and_still_expands() {
-        // Both read through `with_text`, so both answer from disk for a file no `didOpen` ever
-        // named — which is what an editor does when it asks about a file it is only previewing.
+        // Both read through `with_text`, so both answer from disk for a file no `didOpen` named, as
+        // when an editor previews a file.
         let mut harness = Harness::new();
         let uri = harness.write("lib/b.rb", "def foo\n  1\nend\n");
         harness.index();

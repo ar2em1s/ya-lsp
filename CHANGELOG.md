@@ -4,6 +4,63 @@ The server and the VS Code extension ship as one version. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-09-23
+
+### Added
+
+- **Claude Code plugin.** Install it with `/plugin marketplace add ar2em1s/ya-lsp`, then
+  `/plugin install ya-lsp@ya-lsp`. The agent's `LSP` tool then answers about Ruby.
+  - `/ya-lsp:ya-lsp-setup` installs or updates the binary and proves it works on your project.
+    It asks before it downloads or writes anything.
+  - Known limits: `Gemfile` and `Rakefile` are not routed, and jumps into git-ignored
+    directories are hidden.
+- **Go to implementation.** Returns the `def` a call reaches, then every override below the
+  receiver's own class. The definition itself is always listed first.
+- **Go to type definition.** Returns the class of the value under the cursor. At `story.author`
+  that is `class Author`, not `def author`. It also works on locals.
+- **Go to declaration.** Returns the RBS signature of a method, such as `string.rbs` for
+  `String#split`. If there is no signature it returns nothing.
+- **Show the RBS ya-lsp generated.** A code action on a Rails-generated member (a column, an
+  association, an enum or a route) opens the RBS behind it, read-only, and refreshes it when the
+  source changes. It needs a client that can both show and read a document, which VS Code can.
+- **Renaming a Rails file renames its class.** Moving `order.rb` to `purchase.rb` renames `Order`
+  to `Purchase` everywhere, in the same undo step. Any move the rule does not cover stays a plain
+  file move with no message. Needs `rails.enabled` and a client that asks before moving files.
+- **Unsaved buffers are answered.** An `Untitled-1` set to Ruby gets an outline, completion,
+  hover, jumps into your project, and parse errors. Nothing in it leaks back into your project.
+- **`.jbuilder`, `.builder` and `.ruby` views are indexed** as plain Ruby. **If you set your own
+  `[index] include`, add these three globs to it yourself.**
+- **ya-lsp watches files itself when the editor cannot**, as in Claude Code, Helix, eglot and
+  Neovim on Linux. A `git checkout`, a rebase, or an agent editing through a shell is picked up
+  with no restart.
+- **Open files follow the disk** where ya-lsp is the only watcher, unless the buffer has
+  unsaved changes.
+
+### Fixed
+
+- **Types**
+  - `1 + 2` is an `Integer`, and `1.5 + 1` is a `Float` (it used to say `BigDecimal`). When one
+    method has several overloads, the arguments you pass now choose between them.
+  - A method returning `self` returns the receiver's type. For example, `params[:q].presence` is a
+    `String?`.
+  - `!x` is `bool`. This gives `blank?`, `present?` and most predicates a type.
+  - `.nil?` and about 70 other core methods that return a literal (`() -> false`) now have a type.
+  - `alias` and `alias_method` carry the renamed method's type, so `[1].blank?` gets one.
+  - `true`/`false` receivers ask both classes, so `x.empty?.blank?` is `bool`, not `false`.
+  - `:x.as_json` is no longer a `Hash`. A core signature that two gems' bodies disagree with is
+    now shown alongside those bodies.
+- **Jumps**
+  - A `def` written inside a block, such as `class_eval do` or an RSpec `describe`, is no longer
+    offered on every object. `Foo.new` no longer jumps into a gem's monkey patch.
+  - A `def` two generators both declared is listed once, not twice.
+  - Jumping to a generated member now selects the whole method, not just its first line.
+- **Scope**
+  - A file opened *outside* the project can still read the project, but the project no longer
+    sees it: no symbols, jumps or renames into it.
+- **Startup and indexing**
+  - The first request on a cold server waits for the index instead of answering empty.
+  - Every `*.ru` file is indexed, not only `config.ru`.
+
 ## [0.5.1] — 2026-09-17
 
 ### Fixed
@@ -1022,7 +1079,8 @@ name wherever the receiver cannot be named.
   ya-lsp can be confidently wrong rather than merely absent.
 - **A Ruby file outside every workspace folder gets no server**, because there is no root to index.
 
-[Unreleased]: https://github.com/ar2em1s/ya-lsp/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ar2em1s/ya-lsp/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.5.1
 [0.5.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.4.0
 [0.3.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.3.0

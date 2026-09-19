@@ -1,31 +1,33 @@
 //! Ruby's own signatures: where they come from, and how they reach the graph as files.
 //!
 //! Ruby's core classes are written in C, so no Ruby source on disk defines `String#upcase`. What
-//! exists instead is RBS — the signature language `ruby/rbs` maintains — and rubydex indexes it
-//! natively: `LanguageId::Rbs`, dispatched off the `.rbs` extension by `index_files`. So the work
-//! here is not indexing. It is deciding *which* copy of the signatures to index, and making sure
+//! exists instead is RBS, the signature language `ruby/rbs` maintains, and rubydex indexes it
+//! natively (`LanguageId::Rbs`, dispatched off the `.rbs` extension by `index_files`). So the work
+//! here is not indexing. It is choosing *which* copy of the signatures to index, and making sure
 //! there is always one.
 //!
 //! # The ladder
 //!
-//! 1. **`[rbs] path`** — an explicit root. The escape hatch, same role `[gems] paths` plays.
-//! 2. **On disk** — the highest-versioned `rbs-*` gem holding a `core/`, in the gem roots gem
-//!    discovery already knows how to find. This is the copy that matches the Ruby the project
-//!    actually runs, so it wins whenever it exists.
-//! 3. **Vendored** — the copy `build.rs` embedded. The only rung that survives `PATH` pointing at
-//!    an empty directory, which is the situation this whole server is built for.
+//! 1. **`rbs.path`**: an explicit root. The escape hatch, the role `gems.paths` plays for gems.
+//! 2. **On disk**: the highest-versioned `rbs-*` gem holding a `core/`, in the gem roots gem
+//!    discovery already finds. This copy matches the Ruby the project actually runs, so it wins
+//!    whenever it exists.
+//! 3. **Vendored**: the copy `build.rs` embedded. The only rung that survives `PATH` pointing at an
+//!    empty directory, the situation this whole server is built for.
 //!
 //! # Why the vendored copy is written to disk
 //!
-//! rubydex keys documents by `Url::from_file_path`, and go-to-definition on `String#upcase` has
-//! to answer with a URI the editor can open. An in-memory document would resolve and hover and
-//! then fail at the one moment the user asked to see it. So the embedded copy is extracted once
-//! to a cache directory and indexed from there.
+//! rubydex keys documents by `Url::from_file_path`, and go-to-definition on `String#upcase` must
+//! answer with a URI the editor can open. An in-memory document would resolve and hover, then fail
+//! the moment the user asked to see it. So the embedded copy is extracted once to a cache directory
+//! and indexed from there.
 //!
-//! That is not an index cache. Nothing is read back that this binary did not just write, the
-//! directory is keyed by the version the binary carries, and a failed extraction falls back to
-//! having no signatures rather than to having wrong ones — so none of the invalidation problems
-//! that make caching the *graph* a bad trade apply.
+//! That is not an index cache:
+//! - nothing is read back that this binary did not just write;
+//! - the directory is keyed by the version the binary carries;
+//! - a failed extraction falls back to no signatures, never to wrong ones.
+//!
+//! So none of the invalidation problems that make caching the *graph* a bad trade apply.
 
 use std::{
     fs,
@@ -46,7 +48,7 @@ mod embedded {
 /// The `rbs` release the vendored signatures were taken from.
 ///
 /// Public because `--licenses` names it: a reader holding only the binary needs to know which
-/// signatures are in it, and the notice is worth little without that.
+/// signatures are in it, or the notice is worth little.
 #[must_use]
 pub fn vendored_version() -> &'static str {
     embedded::VERSION
@@ -55,7 +57,7 @@ pub fn vendored_version() -> &'static str {
 /// Which rung of the ladder answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
-    /// `[rbs] path` named it.
+    /// `rbs.path` named it.
     Configured,
     /// An `rbs-*` gem on this machine.
     Discovered,
@@ -77,14 +79,14 @@ impl Origin {
 /// A resolved set of signature files, ready to hand to `index_files`.
 #[derive(Debug, Clone, Default)]
 pub struct Signatures {
-    /// The directory holding `core/` and `stdlib/`. Kept for logging and for the URI prefix
-    /// that keeps these documents out of `is_own_code`.
+    /// The directory holding `core/` and `stdlib/`. Kept for logging, and for the URI prefix that
+    /// keeps these documents out of `is_own_code`.
     pub root: PathBuf,
     pub version: String,
     pub origin: Option<Origin>,
-    /// `core/**/*.rbs` — the classes the interpreter itself provides.
+    /// `core/**/*.rbs`: the classes the interpreter itself provides.
     pub core: Vec<PathBuf>,
-    /// `stdlib/**/*.rbs`. Empty when `[rbs] stdlib = false`.
+    /// `stdlib/**/*.rbs`. Empty when `rbs.stdlib = false`.
     pub stdlib: Vec<PathBuf>,
     pub problems: Vec<String>,
 }
@@ -106,9 +108,8 @@ impl Signatures {
 
 /// Find the signatures to index.
 ///
-/// Never fails. Every way this can go wrong ends in an empty result plus a line in `problems`:
-/// a server that will not start because it could not find `String` is worse than one that starts
-/// without it.
+/// Never fails. Every failure ends in an empty result plus a line in `problems`: a server that will
+/// not start because it could not find `String` is worse than one that starts without it.
 #[must_use]
 pub fn discover(
     workspace_root: &Path,
@@ -164,8 +165,8 @@ fn locate(
             let version = version_of(&root).unwrap_or_else(|| "configured".to_owned());
             return Some((root, version, Origin::Configured));
         }
-        // Not fatal, and already reported by `config::validate` — but say which path was
-        // skipped, because the fallback is otherwise indistinguishable from success.
+        // Not fatal, and already reported by `config::validate`, but say which path was skipped:
+        // otherwise the fallback looks exactly like success.
         tracing::warn!("rbs.path {} has no core/; falling back", root.display());
     }
 
@@ -184,9 +185,9 @@ fn locate(
 
 /// The highest-versioned unpacked `rbs` gem across the machine's gem roots.
 ///
-/// Deliberately independent of `[gems] enabled`: whether a bundle should be indexed and where
-/// Ruby is installed are different questions, and someone who turned gem indexing off to save
-/// the memory did not thereby ask for `String` to disappear.
+/// Deliberately independent of `gems.enabled`. Whether to index a bundle and where Ruby is
+/// installed are different questions: someone who turned gem indexing off to save memory did not
+/// ask for `String` to disappear.
 fn newest_installed(
     workspace_root: &Path,
     gems_config: &GemsConfig,
@@ -200,7 +201,7 @@ fn newest_installed(
             continue;
         };
         for path in entries.flatten() {
-            // A `sig/` directory is not signatures for Ruby, it is signatures for rbs itself.
+            // A `sig/` directory holds signatures for rbs itself, not for Ruby.
             if !path.join("core").is_dir() {
                 continue;
             }
@@ -222,10 +223,11 @@ fn newest_installed(
 
 /// A gem version, ordered the way RubyGems orders one.
 ///
-/// Only enough of it to pick between installed copies: numeric segments compare numerically,
-/// and anything with a non-numeric segment (`4.2.0.pre1`) sorts below the same numbers without
-/// one, which is RubyGems' rule and the one that matters — a prerelease must never outrank the
-/// release it precedes.
+/// Only enough to pick between installed copies:
+/// - numeric segments compare numerically;
+/// - a version with a non-numeric segment (`4.2.0.pre1`) sorts below the same numbers without one.
+///
+/// That is RubyGems' rule, and the part that matters: a prerelease must never outrank its release.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Version {
     numbers: Vec<u64>,
@@ -240,8 +242,8 @@ impl Version {
         for segment in spelled.split(['.', '-']) {
             match segment.parse::<u64>() {
                 Ok(number) if release => numbers.push(number),
-                // Everything after the first non-numeric segment is prerelease or platform
-                // noise; neither participates in the numeric comparison.
+                // Everything after the first non-numeric segment is prerelease or platform noise;
+                // neither takes part in the numeric comparison.
                 _ => {
                     release = false;
                 }
@@ -260,8 +262,8 @@ fn version_of(root: &Path) -> Option<String> {
 
 /// Write the vendored signatures out, once per version, and answer with where they went.
 ///
-/// The marker file is written last and holds the version, so an extraction killed halfway
-/// through is redone rather than half-trusted.
+/// The marker file is written last and holds the version, so an extraction killed halfway is
+/// redone, not half-trusted.
 fn extract(env: &Env) -> Result<PathBuf, String> {
     let base = cache_dir(env).ok_or_else(messages::no_cache_directory)?;
     let root = base.join(format!("rbs-{}", embedded::VERSION));
@@ -303,8 +305,8 @@ fn cache_dir(env: &Env) -> Option<PathBuf> {
         return Some(local.join("ya-lsp").join("cache"));
     }
     let home = env.home.as_ref()?;
-    // Not `~/Library/Caches` on macOS. This is developer-tool state that someone may well want
-    // to `rm -rf`, and every other language server on the machine puts it in `~/.cache`.
+    // Not `~/Library/Caches` on macOS. This is developer-tool state someone may want to `rm -rf`,
+    // and every other language server on the machine puts it in `~/.cache`.
     Some(home.join(".cache").join("ya-lsp"))
 }
 
@@ -340,9 +342,9 @@ mod tests {
 
     /// A fixture workspace, inside the fixture's home.
     ///
-    /// Inside, because `ruby_version::resolve` walks from the workspace root up to `$HOME`: a
-    /// workspace in a *second* temp directory has no ceiling on that chain and would read
-    /// whatever `/tmp` and `/` happen to hold on the machine running the test.
+    /// Inside, because `ruby_version::resolve` walks from the workspace root up to `$HOME`. A
+    /// workspace in a *second* temp directory has no ceiling on that walk, and would read whatever
+    /// `/tmp` and `/` hold on the test machine.
     fn fixture() -> (tempfile::TempDir, PathBuf) {
         let home = tempfile::tempdir().unwrap();
         let workspace = home.path().join("workspace");
@@ -359,10 +361,10 @@ mod tests {
 
     #[test]
     fn each_origin_names_itself_the_way_the_log_and_the_docs_spell_it() {
-        // The three rungs of the ladder, and the only place they are given a human name. It is
-        // the string a user greps the startup log for when built-ins are missing, and it is the
-        // one in `ya-lsp.toml`'s documentation — so a renamed variant must not silently rename
-        // what the server says it did.
+        // The three rungs of the ladder, and the only place they get a human name. It is the string
+        // a user greps the startup log for when built-ins are missing, and the one `ya-lsp.toml`'s
+        // documentation uses, so renaming a variant must not silently rename what the server says
+        // it did.
         assert_eq!(Origin::Configured.as_str(), "configured");
         assert_eq!(Origin::Discovered.as_str(), "discovered");
         assert_eq!(Origin::Vendored.as_str(), "vendored");
@@ -371,10 +373,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unwritable_cache_is_reported_rather_than_left_half_extracted() {
-        // The vendored copy is the bottom rung, and it needs to write ~250 files into
-        // `~/.cache`. A cache directory that cannot be written — a read-only home, a container
-        // running as a different user — has to come back as a problem the user can read.
-        // Failing silently here means `String` does not exist and nothing says why.
+        // The vendored copy is the bottom rung, and it must write hundreds of files into
+        // `~/.cache`. A cache directory that cannot be written (a read-only home, a container
+        // running as another user) must come back as a problem the user can read. Failing silently
+        // means `String` does not exist and nothing says why.
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -418,8 +420,8 @@ mod tests {
 
     #[test]
     fn a_number_after_a_prerelease_segment_is_not_part_of_the_version() {
-        // `4.1-rc.2` is 4.1 with a tag on it, not 4.1.2. Counting the trailing number would
-        // make a release candidate outrank the release.
+        // `4.1-rc.2` is 4.1 with a tag, not 4.1.2. Counting the trailing number would make a
+        // release candidate outrank the release.
         assert_eq!(
             Version::parse("4.1-rc.2"),
             Version {
@@ -433,7 +435,7 @@ mod tests {
 
     #[test]
     fn a_cache_directory_is_named_by_each_platforms_own_convention() {
-        // Windows has no XDG variable and `~/.cache` is not where anything looks.
+        // Windows has no XDG variable, and nothing looks in `~/.cache` there.
         let windows = Env {
             local_app_data: Some(PathBuf::from("C:/Users/x/AppData/Local")),
             home: Some(PathBuf::from("C:/Users/x")),
@@ -464,7 +466,7 @@ mod tests {
             Some(PathBuf::from("/home/x/.cache/ya-lsp"))
         );
 
-        // Nowhere to put it, which is what makes the vendored copy unusable.
+        // Nowhere to put it, which makes the vendored copy unusable.
         assert_eq!(cache_dir(&Env::default()), None);
     }
 
@@ -483,8 +485,8 @@ mod tests {
 
     #[test]
     fn a_configured_root_whose_core_is_empty_is_reported_rather_than_silently_useless() {
-        // `core/` is there, so the ladder stops here — and there is nothing in it, so every
-        // built-in class is about to be missing. Saying so is the only way anyone finds out.
+        // `core/` is there, so the ladder stops here, and it is empty, so every built-in class is
+        // about to be missing. Saying so is the only way anyone finds out.
         let dir = tempfile::tempdir().unwrap();
         let signatures_root = dir.path().join("signatures");
         std::fs::create_dir_all(signatures_root.join("core")).unwrap();
@@ -511,15 +513,15 @@ mod tests {
 
     #[test]
     fn an_rbs_gem_without_rubys_signatures_in_it_is_not_the_one() {
-        // The `rbs` gem ships its *own* signatures in `sig/`, which are signatures for rbs
-        // rather than for Ruby. Taking one of those would replace `String` with `RBS::Parser`.
+        // The `rbs` gem ships its *own* signatures in `sig/`, for rbs, not Ruby. Taking those would
+        // replace `String` with `RBS::Parser`.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let workspace = home.join("workspace");
         let root = home.join("gems");
 
-        // The newest one on disk holds only its own `sig/`, so the older one wins — a copy with
-        // no `core/` is not a copy of Ruby's signatures at all.
+        // The newest one on disk holds only its own `sig/`, so the older one wins: a copy with no
+        // `core/` is not Ruby's signatures at all.
         std::fs::create_dir_all(root.join("gems/rbs-4.1.3/sig")).unwrap();
         std::fs::create_dir_all(root.join("gems/rbs-4.0.2/core")).unwrap();
 
@@ -536,10 +538,10 @@ mod tests {
 
     #[test]
     fn an_rbs_directory_that_does_not_name_a_version_never_wins() {
-        // `rbs-*` is a glob over directory names and a match is not a promise: a `git`-sourced
-        // rbs unpacks as `rbs-<sha>`, and a half-deleted gem leaves `rbs-` behind. Each of
-        // those still parses — into a `Version` with no numbers in it, which is what sorts them
-        // below every real release rather than above one on a string comparison.
+        // `rbs-*` is a glob over directory names, and a match is not a promise: a `git`-sourced rbs
+        // unpacks as `rbs-<sha>`, and a half-deleted gem leaves `rbs-` behind. Each still parses,
+        // into a `Version` with no numbers, which sorts it below every real release instead of
+        // above one by string comparison.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let workspace = home.join("workspace");
@@ -563,10 +565,9 @@ mod tests {
 
     #[test]
     fn a_gem_root_that_reads_as_a_glob_pattern_costs_only_itself() {
-        // The pattern is built by joining onto a path we were handed, so a `[` anywhere above
-        // the gems is a `PatternError` rather than a directory listing. Users do have such
-        // paths — a checkout named `feature[2]`, a bundle under a Windows-ish directory — and
-        // the cost of one has to be that root, not every built-in Ruby has.
+        // The pattern is built by joining onto a path we were handed, so a `[` anywhere above the
+        // gems is a `PatternError`, not a directory listing. Real paths have them (a checkout named
+        // `feature[2]`), and the cost of one must be that root, not every built-in Ruby has.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let workspace = home.join("workspace");
@@ -599,7 +600,7 @@ mod tests {
             names.len()
         );
         assert!(names.iter().any(|name| name.starts_with("stdlib/")));
-        // The point of vendoring: `String#upcase` has to actually be in there.
+        // The point of vendoring: `String#upcase` must actually be in there.
         let string = embedded::FILES
             .iter()
             .find(|(name, _)| *name == "core/string.rbs")
@@ -619,7 +620,7 @@ mod tests {
             embedded::VERSION
         );
 
-        // Second call must not rewrite: proven by editing a file and finding it untouched.
+        // A second call must not rewrite: proven by editing a file and finding it untouched.
         fs::write(root.join("core/string.rbs"), "# clobbered\n").unwrap();
         let again = extract(&env).expect("extracted");
         assert_eq!(again, root);
@@ -628,7 +629,7 @@ mod tests {
             "# clobbered\n"
         );
 
-        // A half-finished extraction is redone, which is the only reason the marker exists.
+        // A half-finished extraction is redone; the marker exists only for this.
         fs::remove_file(root.join(".complete")).unwrap();
         extract(&env).expect("extracted");
         assert!(
@@ -643,10 +644,9 @@ mod tests {
         let (home, workspace) = fixture();
         let env = env_with(home.path());
 
-        // Stated rather than assumed: the rung below is only reached because nothing on the
-        // machine is visible from here. `Env::default()` carries no system roots for exactly
-        // this reason — when it did, a CI runner with a system `rbs` gem answered `Discovered`
-        // and this assertion failed on a machine nobody could see.
+        // Stated, not assumed: the rung below is reached only because nothing on the machine is
+        // visible from here. `Env::default()` carries no system roots for exactly this reason, or a
+        // CI runner with a system `rbs` gem would answer `Discovered`.
         assert!(
             gems::roots(&workspace, &GemsConfig::default(), &env).is_empty(),
             "gem discovery escaped the fixture"
@@ -704,10 +704,10 @@ mod tests {
 
     #[test]
     fn the_startup_line_says_which_rbs_answered_and_how_much_it_found() {
-        // The one line a user greps when `String` has no methods. It has to name the rung that
-        // answered, the version, and the counts — "vendored 4.1.3, 89 core files" is the
-        // difference between "no Ruby installed, working as designed" and "something is wrong".
-        // A log nobody asserts is a log that quietly stops saying anything useful.
+        // The one line a user greps when `String` has no methods. It must name the rung that
+        // answered, the version and the counts ("vendored <version>, <n> core files"): the
+        // difference between "no Ruby installed, working as designed" and "something is wrong". A
+        // log nobody asserts quietly stops saying anything useful.
         let (home, workspace) = fixture();
         let env = env_with(home.path());
 
@@ -755,7 +755,7 @@ mod tests {
         );
 
         assert_eq!(signatures.origin, Some(Origin::Discovered));
-        // The newer of the two, not whichever `glob` happened to yield first.
+        // The newer of the two, not whichever `glob` yielded first.
         assert_eq!(signatures.version, "4.0.2");
         assert_eq!(signatures.core.len(), 1);
     }
@@ -796,7 +796,7 @@ mod tests {
             &env_with(home.path()),
         );
 
-        // Degraded, not broken: the whole point is that built-ins never simply vanish.
+        // Degraded, not broken: built-ins never simply vanish.
         assert_eq!(signatures.origin, Some(Origin::Vendored));
     }
 }

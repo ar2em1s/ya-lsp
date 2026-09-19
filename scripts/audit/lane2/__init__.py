@@ -1,14 +1,13 @@
-"""Lane 2 — the checks that need **no key at all**.
+"""Lane 2: the checks that need **no key at all**.
 
-They compare ya-lsp's answers against each other, so a violation is a self-contradiction rather
-than a disagreement with somebody's opinion. That is the whole reason the lane exists: it is the
-part of the audit that could one day run unattended, because nothing in it is a judgement anyone
-has to make twice.
+They compare ya-lsp's answers with each other, so a violation is a self-contradiction, not a
+disagreement with somebody's opinion. That is why the lane exists: nothing in it is a judgement
+anyone makes twice, so it could one day run unattended.
 
-**One module per check, and the registry below is what numbers them.** A check owns four things
-and they all live in its own file: the counters it keeps, the test itself, the line it prints,
-and the finding kinds it raises. Adding a sixth check is adding a file and one name to `CHECKS`;
-nothing in `report` or `commands` enumerates checks by hand.
+**One module per check; the registry below numbers them.** A check's own file holds everything it
+owns: its counters, the test, its report line and its finding kinds, plus `POST`, `ask` or `fold`
+where it needs them. Adding a check is one file and one name in `CHECKS`; nothing in `report` or
+`commands` lists checks by hand.
 
     counters()                 -> a fresh dict of the counter keys this check owns
     check(row, place, counts, findings)
@@ -17,51 +16,97 @@ nothing in `report` or `commands` enumerates checks by hand.
     summary(counts)            -> the same number over every corpus
     under(counts)   optional   -> extra lines indented directly under this check's line
     breakdown(counts) optional -> extra lines in the trailing block, after both lanes
+    fold(place, drawn, answers, counts, findings)
+                    optional   -> counted once per corpus rather than once per position, for a
+                                  check whose unit is a file or a label rather than a cursor
     FINDINGS                   -> the finding kinds it raises, in the order to print them
+    POST            optional   -> a `client.Post` named in `METHODS`: the request this check
+                                  sends, the params it needs, the shapes it may be concluded
+                                  from and how much of the draw it takes
+    ask(client, corpus, drawn, answers, opened)
+                    optional   -> the requests a `Post` cannot express, returned as
+                                  `{key: reply}` and merged into `answers`
+
+**`POST` is one request per eligible position; `ask` is everything else.**
+- A `Post` is declarative (a method, its params, its legal shapes, its stride), and `ask_all` sends
+  it beside the others in one pass.
+- `ask` covers conversations: a request whose unit is not a drawn position (check 8 asks per file),
+  or whose params are a previous reply (check 9's `incomingCalls` carries the item
+  `prepareCallHierarchy` returned).
+A check that needs neither has neither.
 """
 
 from audit.answers import first_place, names_an_id
-from audit.lane2 import footnotes, highlight, rebase, receiver, resolved, spans
+from audit.lane2 import (footnotes, highlight, incoming, margins, rebase, receiver, references,
+                         renaming, resolved, spans)
 from audit.lane2.context import Corpus, Row
 
-# The order is the numbering: `check 1` is the first entry. It is also the order findings print
-# in, so a reader who has just read `check 2`'s line meets `check 2`'s findings next.
-# Appended rather than slotted in: the numbering is what a reader of last week's report holds in
-# their head, and a check inserted in the middle renumbers every one after it.
-CHECKS = (highlight, resolved, spans, footnotes, rebase, receiver)
+# The order is the numbering: `check 1` is the first entry. Findings print in this order too, so a
+# reader meets `check 2`'s findings right after its line.
+#
+# Append; never insert. Readers remember last week's numbering, and an insertion renumbers every
+# check after it.
+CHECKS = (highlight, resolved, spans, footnotes, rebase, receiver, references, margins, incoming,
+          renaming)
 
-# What lane 2 needs asked of every position. `hover` and `definition` are the pair every lane
-# reads; `documentHighlight` is check 1's alone, and check 5 asks the first two a second time.
-# **`completion` is deliberately not here.** Check 6 reads it, but lane 1's key is what sends it —
-# at 45% of the draw and the largest single cost in the budget, a second copy of that request is
-# not a thing to own twice. See `lane2.context.Row`.
-METHODS = ("textDocument/hover", "textDocument/definition", "textDocument/documentHighlight")
+# What lane 2 needs asked. `hover` and `definition` are the pair every lane reads;
+# `documentHighlight` is check 1's alone; check 5 asks the first two a second time.
+#
+# **Three are asked at every position and the fourth is not**, so this is strings plus one
+# [`client.Post`]. `references` is legal at only three of the six shapes (`highlight.rs` answers a
+# local from a scope walk `references` lacks), needs a `context` the others do not, and is the
+# widest answer the server gives, so its share of the draw is a measurement. All of that lives in
+# `lane2/references.py`, beside the check that reads the reply: a request posted here with its
+# meaning written there would drift.
+#
+# **`completion` is not here, on purpose.** Check 6 reads it, but lane 1's key sends it, and it is
+# the largest single cost in the budget, so it has one owner. See `lane2.context.Row`.
+METHODS = ("textDocument/hover", "textDocument/definition", "textDocument/documentHighlight",
+           references.POST, renaming.POST)
+
+
+def asked(client, corpus, drawn, answers, opened):
+    """Every check's `ask` hook, merged into `answers`. Returns what was added.
+
+    Runs after `ask_all` (a hook that reads the transcript needs one) and **before** `ask_rebased`,
+    which inserts a line at the top of every sampled document and would move every cursor these
+    hooks pose. Lane 1's asking keys are under the same constraint. That is why `measure()` calls
+    this, not `run`: by the time the checks run, the server is stopped.
+    """
+    added = {}
+    for check in CHECKS:
+        hook = getattr(check, "ask", None)
+        if hook:
+            added.update(hook(client, corpus, drawn, answers, opened) or {})
+    answers.update(added)
+    return added
 
 
 def run(corpus, drawn, answers, rebased=None, shifted=None, places=None):
     """Every check over one corpus' answers. Returns `(counts, findings)`.
 
-    `findings` is `[(kind, site, detail)]` and the caller decides how many to print. The `site`
-    is `audit.site` — `path:offset`, carrying no word — and it is a finding's identity in two
-    places: lane 3 subtracts it from the draw, and a committed baseline records it so a later
-    run can say which findings are new. The `detail` is for a person and does carry the word.
+    `findings` is `[(kind, site, detail)]`; the caller decides how many to print.
+    - `site` is `audit.site` (`path:offset`, no word), a finding's identity: lane 3 subtracts it
+      from the draw, and the committed baseline records it so a later run can say which findings are
+      new.
+    - `detail` is for a person and does carry the word.
 
-    `score` writes nothing to disk: the identifier under the cursor reaches the terminal because
-    a finding nobody can go and look at is not a finding, and what the licence rule governs is
-    what gets **committed** — the ledger and the baseline, neither of which holds a word.
+    `score` writes nothing to disk. The identifier reaches the terminal, because a finding nobody
+    can go and look at is not a finding. The licence rule governs what is **committed**: the ledger
+    and the baseline, which hold no word.
     """
-    # **Two measurements beside `tiers`, and neither is a check.** They are counted for every
-    # position the way the tier is, they raise nothing, and no line here says whether a number is
-    # good — `lane3.signature`'s standard, reached because a whole class of change is invisible
-    # without them. `shape/tier/places` says how many places an answer named and never which came
-    # first, so re-ordering a list moves no counter at all; and a card that prints an internal id
-    # instead of a name leaves the tier and the count exactly where they were.
+    # **Two measurements beside `tiers`; neither is a check.** Counted per position like the tier,
+    # they raise nothing and judge nothing (`lane3.signature`'s standard). Each catches a change
+    # otherwise invisible:
+    # - `shape/tier/places` counts places but never which came first, so a re-ordered list moves no
+    #   counter;
+    # - a card printing an internal id instead of a name leaves the tier and the count unchanged.
     counts = {"positions": len(drawn), "hover": 0, "definition": 0, "highlight": 0,
               "tiers": {"resolved": 0, "derived": 0, "guessed": 0},
               "first-place": {"one-library": 0, "majority": 0, "minority": 0},
               "cards-anonymous": 0,
-              # Counted per distinct place rather than per position, so it is handed in already
-              # summed rather than accumulated in the loop below.
+              # Counted per distinct place, not per position, so it arrives already summed instead
+              # of accumulated in the loop below.
               "def-places": places or {"described": 0, "undescribed": 0, "not-asked": 0}}
     for check in CHECKS:
         counts.update(check.counters())
@@ -83,4 +128,10 @@ def run(corpus, drawn, answers, rebased=None, shifted=None, places=None):
             counts["highlight"] += 1
         for check in CHECKS:
             check.check(row, place, counts, findings)
+    for check in CHECKS:
+        # After every row, because a check that counts files or labels still reports under its own
+        # number in the same line. Only the unit differs, not where it prints.
+        fold = getattr(check, "fold", None)
+        if fold:
+            fold(place, drawn, answers, counts, findings)
     return counts, findings
