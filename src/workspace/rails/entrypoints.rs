@@ -32,7 +32,10 @@
 
 use ruby_prism::{ClassNode, DefNode, Node, StatementsNode};
 
-use super::syntax::{constant_spelling, def_span, parameters_of, spellable, symbol_or_string};
+use super::syntax::{
+    constant_spelling, def_span, keyword, parameters_of, spellable, string_literal,
+    symbol_or_string,
+};
 use super::{BASES, INHERITS, WORKERS};
 use crate::generated::{Declared, Facts, Owner, Source};
 
@@ -73,7 +76,9 @@ const DELIVERIES: [(&str, &str); 4] = [
 /// for "the `def`'s own" (`perform_later` takes exactly what `perform` takes) and `Some` for the
 /// two that prepend a parameter of their own.
 const INSTALLS: [(Convention, &str, Option<&str>, &str); 6] = [
-    (Convention::Job, "perform_later", None, "untyped"),
+    // ActiveJob hands back what `enqueue` did: the job it made, or `false` where a callback or the
+    // adapter stopped the enqueue. A block is handed the job and changes neither.
+    (Convention::Job, "perform_later", None, "instance | false"),
     (Convention::Job, "perform_now", None, "untyped"),
     // Sidekiq's client returns the job id it pushed, or `nil` when a client middleware stopped the
     // push. One class, in Ruby's own signatures, and true of all three.
@@ -134,6 +139,24 @@ pub fn is_mailer(superclass: &str) -> bool {
     convention_of(Some(superclass), &[]) == Some(Convention::Mailer)
 }
 
+/// Where a mailer's `default template_path:` puts the views of every mailer below it.
+///
+/// ActionMailer looks a mailer's views up in `headers[:template_path] || mailer_name`, and `default`
+/// merges into a class attribute each subclass inherits, so the nearest class that wrote one decides
+/// (`analysis::views`). A lambda is run on the mailer (`instance_exec`), with the mailer as its one
+/// argument where it takes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplatePath {
+    /// A written directory, shared by every mailer below the class that wrote it.
+    Fixed(String),
+    /// The mailer's own name (`name.underscore`) between two written parts: one application's
+    /// `->(mailer) { "mailers/#{mailer.class.name.underscore}" }`. `nil` is both parts empty, which
+    /// is where Rails looks without one.
+    Named { before: String, after: String },
+    /// Anything else: the views moved somewhere only running Ruby knows.
+    Unknown,
+}
+
 /// One public `def` a convention turns into a class method.
 #[derive(Debug)]
 struct Action {
@@ -165,6 +188,8 @@ struct Entry {
 #[derive(Debug)]
 pub struct Entrypoints {
     classes: Vec<Entry>,
+    /// Each mailer here that wrote a `default template_path:`, and the last one it wrote.
+    template_paths: Vec<(String, TemplatePath)>,
 }
 
 /// Read every mailer action and job entry point `source` declares.
@@ -175,6 +200,7 @@ pub fn read_entrypoints(source: &str) -> Entrypoints {
         source,
         nesting: Vec::new(),
         classes: Vec::new(),
+        template_paths: Vec::new(),
     };
     reader.walk(
         parsed
@@ -184,10 +210,21 @@ pub fn read_entrypoints(source: &str) -> Entrypoints {
     );
     Entrypoints {
         classes: reader.classes,
+        template_paths: reader.template_paths,
     }
 }
 
 impl Entrypoints {
+    /// Every mailer here that moved its views with `default template_path:`, and where to.
+    ///
+    /// Read by `analysis::views`, not declared: which mailer renders `mailers/notify_mailer/x` is a
+    /// question about a path, like the rest of the view convention.
+    pub fn template_paths(&self) -> impl Iterator<Item = (&str, &TemplatePath)> {
+        self.template_paths
+            .iter()
+            .map(|(name, path)| (name.as_str(), path))
+    }
+
     /// Whether any class here is a mailer, so the caller can pick the one file that writes the
     /// [`MESSAGE_DELIVERY`] stub. Exactly one may, as with a relation class: it is one type however
     /// many files reach it.
@@ -254,9 +291,108 @@ impl Entry {
                 at: Some((action.at, action.name_at)),
                 from: Source::Convention,
                 overloads: Vec::new(),
+                private: false,
             });
         }
     }
+}
+
+/// Where a `template_path:` value puts the views: a written string, or a lambda or `proc` whose body
+/// is one string around the mailer's own name ([`TemplatePath`]).
+fn moved_to(source: &str, value: &Node<'_>) -> TemplatePath {
+    if value.as_nil_node().is_some() {
+        return TemplatePath::Named {
+            before: String::new(),
+            after: String::new(),
+        };
+    }
+    if let Some((written, _)) = string_literal(source, value) {
+        return TemplatePath::Fixed(written);
+    }
+    // `->(mailer) { … }`, `-> { … }`, `proc { |mailer| … }`, `lambda { … }`.
+    let (parameters, body) = if let Some(lambda) = value.as_lambda_node() {
+        (lambda.parameters(), lambda.body())
+    } else if let Some(call) = value.as_call_node().filter(|call| {
+        call.receiver().is_none() && matches!(call.name().as_slice(), b"proc" | b"lambda")
+    }) && let Some(block) = call.block().and_then(|block| block.as_block_node())
+    {
+        (block.parameters(), block.body())
+    } else {
+        return TemplatePath::Unknown;
+    };
+    let parameter = parameters
+        .and_then(|parameters| parameters.as_block_parameters_node())
+        .and_then(|parameters| parameters.parameters())
+        .and_then(|parameters| parameters.requireds().iter().next())
+        .and_then(|required| required.as_required_parameter_node())
+        .map(|required| String::from_utf8_lossy(required.name().as_slice()).into_owned());
+    let Some(statements) = body.and_then(|body| body.as_statements_node()) else {
+        return TemplatePath::Unknown;
+    };
+    let statements: Vec<Node<'_>> = statements.body().iter().collect();
+    let [only] = statements.as_slice() else {
+        return TemplatePath::Unknown;
+    };
+    if let Some((written, _)) = string_literal(source, only) {
+        return TemplatePath::Fixed(written);
+    }
+    own_name_between(source, only, parameter.as_deref()).unwrap_or(TemplatePath::Unknown)
+}
+
+/// The spellings of a mailer's own name a `template_path` lambda writes, with `it` for the lambda's
+/// one argument (the mailer) and `self` for the mailer it runs on.
+const OWN_NAMES: [&str; 5] = [
+    "it.class.name.underscore",
+    "self.class.name.underscore",
+    "it.class.mailer_name",
+    "self.class.mailer_name",
+    "mailer_name",
+];
+
+/// `"mailers/#{mailer.class.name.underscore}"`: one interpolation of the mailer's own name
+/// ([`OWN_NAMES`]) between written parts. `None` for any other string.
+fn own_name_between(
+    source: &str,
+    node: &Node<'_>,
+    parameter: Option<&str>,
+) -> Option<TemplatePath> {
+    let string = node.as_interpolated_string_node()?;
+    let mut before = String::new();
+    let mut after = String::new();
+    let mut named = false;
+    for part in string.parts().iter() {
+        if let Some((written, _)) = string_literal(source, &part) {
+            if named {
+                after.push_str(&written);
+            } else {
+                before.push_str(&written);
+            }
+            continue;
+        }
+        let embedded = part.as_embedded_statements_node()?;
+        let statements: Vec<Node<'_>> = embedded.statements()?.body().iter().collect();
+        let [only] = statements.as_slice() else {
+            return None;
+        };
+        let location = only.location();
+        let spelled: String = source
+            .get(location.start_offset()..location.end_offset())?
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        let spelled = match parameter {
+            Some(parameter) => spelled
+                .strip_prefix(parameter)
+                .filter(|rest| rest.starts_with('.'))
+                .map_or(spelled.clone(), |rest| format!("it{rest}")),
+            None => spelled,
+        };
+        if named || !OWN_NAMES.contains(&spelled.as_str()) {
+            return None;
+        }
+        named = true;
+    }
+    named.then_some(TemplatePath::Named { before, after })
 }
 
 /// The class a mailer action returns, written once for the whole workspace.
@@ -283,6 +419,7 @@ fn message_delivery(facts: &mut Facts) {
             at: None,
             from: Source::Convention,
             overloads: Vec::new(),
+            private: false,
         });
     }
 }
@@ -291,6 +428,7 @@ struct Reader<'src> {
     source: &'src str,
     nesting: Vec<String>,
     classes: Vec<Entry>,
+    template_paths: Vec<(String, TemplatePath)>,
 }
 
 impl Reader<'_> {
@@ -312,6 +450,9 @@ impl Reader<'_> {
                 if let Some(entry) = self.entry(&class) {
                     self.classes.push(entry);
                 }
+                if let Some(moved) = self.template_path(&class) {
+                    self.template_paths.push(moved);
+                }
                 (class.constant_path(), class.body())
             } else if let Some(module) = statement.as_module_node() {
                 (module.constant_path(), module.body())
@@ -326,24 +467,53 @@ impl Reader<'_> {
 
     /// One `class` body: what it inherits, what it includes, and the `def`s that follow.
     fn entry(&self, node: &ClassNode<'_>) -> Option<Entry> {
-        let name = {
-            let path = node.constant_path();
-            let mut nesting = self.nesting.clone();
-            nesting.push(constant_spelling(self.source, &path));
-            nesting.join("::")
-        };
         let body = node.body().and_then(|body| body.as_statements_node());
-        let superclass = node
-            .superclass()
-            .map(|superclass| constant_spelling(self.source, &superclass));
-        let convention = convention_of(superclass.as_deref(), &self.mixins(body.as_ref()))?;
+        let convention = self.convention(node)?;
         let actions = self.actions(body.as_ref(), convention);
         (!actions.is_empty()).then_some(Entry {
-            name,
+            name: self.named(node),
             convention,
             actions,
             singletons: self.singletons(body.as_ref()),
         })
+    }
+
+    /// The class spelled with its lexical nesting, as rubydex spells it.
+    fn named(&self, node: &ClassNode<'_>) -> String {
+        let mut nesting = self.nesting.clone();
+        nesting.push(constant_spelling(self.source, &node.constant_path()));
+        nesting.join("::")
+    }
+
+    /// What the class inherits and includes makes it.
+    fn convention(&self, node: &ClassNode<'_>) -> Option<Convention> {
+        let body = node.body().and_then(|body| body.as_statements_node());
+        let superclass = node
+            .superclass()
+            .map(|superclass| constant_spelling(self.source, &superclass));
+        convention_of(superclass.as_deref(), &self.mixins(body.as_ref()))
+    }
+
+    /// A mailer body's last `default … template_path: …` statement, read.
+    ///
+    /// Only a statement of the body, on the class itself (`self.default` too): `default` merges when
+    /// the class loads, and one inside a `def` runs when somebody calls it.
+    fn template_path(&self, node: &ClassNode<'_>) -> Option<(String, TemplatePath)> {
+        if self.convention(node)? != Convention::Mailer {
+            return None;
+        }
+        let body = node.body()?.as_statements_node()?;
+        let written = body
+            .body()
+            .iter()
+            .filter_map(|statement| statement.as_call_node())
+            .filter(|call| {
+                call.receiver().is_none_or(|on| on.as_self_node().is_some())
+                    && call.name().as_slice() == b"default"
+            })
+            .filter_map(|call| keyword(&call, "template_path"))
+            .last()?;
+        Some((self.named(node), moved_to(self.source, &written)))
     }
 
     /// Every class method the body writes itself, in both spellings.
@@ -560,7 +730,7 @@ end
             "\
 class DigestJob
   # From `app/mailers/user_mailer.rb`, `def perform`. ActiveJob installs it beside `perform`.
-  def self.perform_later: (untyped, ?untyped) -> untyped
+  def self.perform_later: (untyped, ?untyped) -> (instance | false)
   # From `app/mailers/user_mailer.rb`, `def perform`. ActiveJob installs it beside `perform`.
   def self.perform_now: (untyped, ?untyped) -> untyped
 end
@@ -720,7 +890,9 @@ end
             let source = format!("class T < ApplicationJob\n  {def}\nend\n");
             let rbs = rbs(&source, false);
             assert!(
-                rbs.contains(&format!("def self.perform_later: {expected} -> untyped")),
+                rbs.contains(&format!(
+                    "def self.perform_later: {expected} -> (instance | false)"
+                )),
                 "{def} rendered:\n{rbs}"
             );
         }
@@ -730,7 +902,7 @@ end
     /// `Synthesized::record` refuses a generated document it cannot parse *whole*.
     ///
     /// **A writer is spellable and is routed.** `ActionMailer::Base` answers every public instance
-    /// method on the class, `value=` included, and RBS accepts `def self.value=: (untyped) -> …`.
+    /// method on the class, `value=` included, and RBS accepts `def self.value=: (untyped value) -> …`.
     /// `<=>` is the shape the guard exists for.
     #[test]
     fn a_method_name_rbs_cannot_spell_is_the_only_one_declined() {
@@ -989,11 +1161,11 @@ end
             card.contains("MessageDelivery#deliver_later"),
             "the chain did not reach the stub: {card}"
         );
-        assert!(!card.contains("Matched on the method name alone"), "{card}");
+        assert!(!card.contains("Guessed from name alone"), "{card}");
     }
 
     #[test]
-    fn a_hover_on_a_mailer_action_says_which_def_it_came_from() {
+    fn a_hover_on_a_mailer_action_takes_its_def_s_parameters() {
         // The provenance rule again: the card names the file and the `def` because the *generated
         // RBS* carries a comment above the declaration. Nothing in `hover.rs` knows the word
         // "mailer".
@@ -1003,8 +1175,10 @@ end
         harness.watch(&[&mailer]);
 
         let card = card(&mut harness, &uri, source, "welcome");
-        assert!(card.contains("app/mailers/user_mailer.rb"), "{card}");
-        assert!(card.contains("def welcome"), "{card}");
+        assert!(
+            card.contains("UserMailer.welcome(user) -> ActionMailer::MessageDelivery"),
+            "{card}"
+        );
     }
 
     #[test]
@@ -1012,7 +1186,7 @@ end
         // The job half. Arity must be exact: an answer is partitioned by the *call's* positional
         // argument count, so a `perform_later` claiming `()` would answer nothing for any real
         // call.
-        let source = "DigestJob.perform_later(1)\n";
+        let source = "job = DigestJob.perform_later(1)\n";
         let (mut harness, _story, uri) = models_project(source);
         let job = harness.write(
             "app/jobs/digest_job.rb",
@@ -1026,7 +1200,7 @@ end
 
         let rbs = harness.generated_rbs("app/jobs/digest_job.rb");
         assert!(
-            rbs.contains("def self.perform_later: (untyped, ?untyped) -> untyped\n"),
+            rbs.contains("def self.perform_later: (untyped, ?untyped) -> (instance | false)\n"),
             "{rbs}"
         );
         assert!(
@@ -1036,6 +1210,12 @@ end
         assert!(
             !rbs.contains("helper"),
             "a job's only entry point is `perform`: {rbs}"
+        );
+
+        // ActiveJob hands back the job it enqueued, or `false` where the enqueue was stopped.
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "job: DigestJob | false = DigestJob.perform_later(1)"
         );
 
         // Both map to the one `def perform`: that is the convention.
@@ -1130,6 +1310,125 @@ end
         assert!(
             definition.as_array().is_none_or(Vec::is_empty),
             "a generated declaration with no span is not a place: {definition}"
+        );
+    }
+
+    /// Every shape a mailer's `default template_path:` is read in, and the ones that say only that
+    /// the views moved. Only a mailer's own statement counts, and the last one it wrote.
+    #[test]
+    fn where_a_mailer_s_default_template_path_puts_its_views() {
+        let source = r##"
+class ApplicationMailer < ActionMailer::Base
+  default from: "x"
+  default(
+    from: -> { email_from },
+    template_path: ->(mailer) { "mailers/#{mailer.class.name.underscore}" },
+  )
+end
+class Fixed < ApplicationMailer
+  default template_path: "shared"
+  default template_path: -> { "later" }
+end
+class Framed < ApplicationMailer
+  default template_path: -> { "emails/#{self.class.name.underscore}/html" }
+end
+class Procs < ApplicationMailer
+  default template_path: proc { |m| "x/#{m.class.mailer_name}" }
+end
+class Own < ApplicationMailer
+  default template_path: lambda { "#{mailer_name}" }
+end
+class Reset < ApplicationMailer
+  default template_path: nil
+end
+class Its < ApplicationMailer
+  default template_path: -> { "y/#{it.class.name.underscore}" }
+end
+class Other < ApplicationMailer
+  default template_path: -> { "mailers/#{something_else}" }
+end
+class Unlike < ApplicationMailer
+  default template_path: ->(mailer) { "mailers/#{mailerx.class.name.underscore}" }
+end
+class Listed < ApplicationMailer
+  default template_path: ["a", "b"]
+end
+class Twice < ApplicationMailer
+  default template_path: -> { "#{mailer_name}/#{mailer_name}" }
+end
+class Variable < ApplicationMailer
+  default template_path: -> { "a/#@folder" }
+end
+class Crowded < ApplicationMailer
+  default template_path: -> { "a/#{x; mailer_name}" }
+end
+class Blank < ApplicationMailer
+  default template_path: -> { "a/#{}" }
+end
+class Joined < ApplicationMailer
+  default template_path: -> { "a" "b" }
+end
+class Statements < ApplicationMailer
+  default template_path: proc { log; "y" }
+end
+class Empty < ApplicationMailer
+  default template_path: -> {}
+end
+class Called < ApplicationMailer
+  default template_path: Paths.for(self)
+end
+class Passed < ApplicationMailer
+  default template_path: proc(&PATHS)
+end
+class Quiet < ApplicationMailer
+  default from: "x"
+
+  def welcome
+    default template_path: "y"
+  end
+end
+class Service
+  default template_path: "z"
+end
+class Hollow < ApplicationMailer
+end
+class Selfish < ApplicationMailer
+  self.default template_path: "own"
+end
+class Foreign < ApplicationMailer
+  Other.default template_path: "theirs"
+end
+"##;
+        let named = |before: &str, after: &str| TemplatePath::Named {
+            before: before.to_owned(),
+            after: after.to_owned(),
+        };
+        let read = read_entrypoints(source);
+        let moved: Vec<(&str, &TemplatePath)> = read.template_paths().collect();
+        assert_eq!(
+            moved,
+            [
+                ("ApplicationMailer", &named("mailers/", "")),
+                ("Fixed", &TemplatePath::Fixed("later".to_owned())),
+                ("Framed", &named("emails/", "/html")),
+                ("Procs", &named("x/", "")),
+                ("Own", &named("", "")),
+                ("Reset", &named("", "")),
+                ("Its", &named("y/", "")),
+                ("Other", &TemplatePath::Unknown),
+                ("Unlike", &TemplatePath::Unknown),
+                ("Listed", &TemplatePath::Unknown),
+                ("Twice", &TemplatePath::Unknown),
+                ("Variable", &TemplatePath::Unknown),
+                ("Crowded", &TemplatePath::Unknown),
+                ("Blank", &TemplatePath::Unknown),
+                ("Joined", &TemplatePath::Unknown),
+                ("Statements", &TemplatePath::Unknown),
+                ("Empty", &TemplatePath::Unknown),
+                ("Called", &TemplatePath::Unknown),
+                ("Passed", &TemplatePath::Unknown),
+                ("Selfish", &TemplatePath::Fixed("own".to_owned())),
+            ]
         );
     }
 }

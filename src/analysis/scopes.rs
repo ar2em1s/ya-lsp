@@ -33,18 +33,20 @@
 //! The last rule makes `def c` inside `class << self` land back on the class, sharing its `@v` with
 //! `def self.b`.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use ruby_prism::{
-    BlockLocalVariableNode, BlockNode, BlockParameterNode, ClassNode, ConstantId, DefNode,
-    InstanceVariableAndWriteNode, InstanceVariableOperatorWriteNode, InstanceVariableOrWriteNode,
-    InstanceVariableReadNode, InstanceVariableTargetNode, InstanceVariableWriteNode,
-    ItLocalVariableReadNode, KeywordRestParameterNode, LambdaNode, LocalVariableAndWriteNode,
-    LocalVariableOperatorWriteNode, LocalVariableOrWriteNode, LocalVariableReadNode,
-    LocalVariableTargetNode, LocalVariableWriteNode, Location, ModuleNode, Node,
-    OptionalKeywordParameterNode, OptionalParameterNode, RequiredKeywordParameterNode,
+    BlockLocalVariableNode, BlockNode, BlockParameterNode, CallNode, ClassNode, ConstantId,
+    DefNode, InstanceVariableAndWriteNode, InstanceVariableOperatorWriteNode,
+    InstanceVariableOrWriteNode, InstanceVariableReadNode, InstanceVariableTargetNode,
+    InstanceVariableWriteNode, ItLocalVariableReadNode, KeywordRestParameterNode, LambdaNode,
+    LocalVariableAndWriteNode, LocalVariableOperatorWriteNode, LocalVariableOrWriteNode,
+    LocalVariableReadNode, LocalVariableTargetNode, LocalVariableWriteNode, Location, ModuleNode,
+    Node, OptionalKeywordParameterNode, OptionalParameterNode, RequiredKeywordParameterNode,
     RequiredParameterNode, RestParameterNode, SingletonClassNode, Visit,
 };
+
+use super::cursor;
 
 /// One place a variable is written or read.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -64,18 +66,54 @@ pub struct Occurrence {
 /// of a string) and lets the caller fall through to the graph.
 #[must_use]
 pub fn occurrences(source: &str, offset: u32) -> Option<Vec<Occurrence>> {
-    variable(source, offset).map(|(_, occurrences)| occurrences)
+    variable(&cursor::Parsed::new(source), offset).map(|(_, _, occurrences)| occurrences)
 }
 
-/// The variable under `offset`: its name as Ruby spells it, and every place it appears.
+/// The variable under `offset`: its name as Ruby spells it, the occurrence the cursor is on, and
+/// every place it appears.
 ///
 /// The name comes from here, not cut out of the source, because the identity the occurrences share
 /// already *is* the name. A caller has nothing to re-derive and no absent case. An instance
 /// variable's name carries its `@`, which is how [`rename`](super::rename) recognises one without
 /// re-reading the syntax.
 #[must_use]
-pub fn variable(source: &str, offset: u32) -> Option<(String, Vec<Occurrence>)> {
-    scoped(source).under(offset)
+pub fn variable(
+    text: &cursor::Parsed<'_>,
+    offset: u32,
+) -> Option<(String, Occurrence, Vec<Occurrence>)> {
+    scoped_in(text).under(offset)
+}
+
+/// The calls that write an instance variable by name ([`reflections`]): the set, and the removal.
+/// A document that writes one may build the name (`"@#{x}"`) and so never spell the variable it
+/// writes, which a caller skipping texts by the name must know.
+pub(crate) const REFLECTIVE_WRITERS: [&str; 2] =
+    ["instance_variable_set", "remove_instance_variable"];
+
+/// One occurrence of an instance variable as the walk places it, for a caller that places a
+/// loose one ([`Group::loose`]) by what its block's call says `self` is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placed {
+    pub occurrence: Occurrence,
+    /// [`Group::level`] of the object the walk hangs it off.
+    pub level: i32,
+    /// In a block or lambda straight in a namespace body, so the walk does not know its `self`.
+    pub loose: bool,
+}
+
+/// The instance variable under `offset` and every occurrence of its name in the same namespace,
+/// at any level: its name, which of them the cursor is on, and all of them in offset order.
+///
+/// `None` for anything else, including a local and a variable no namespace this file writes
+/// owns (the top level, an island). [`variable`] is this family narrowed to the cursor's own
+/// level; a caller that knows where a loose occurrence runs regroups it
+/// (`locator::occurrences_at`).
+#[must_use]
+pub fn instance_family(
+    text: &cursor::Parsed<'_>,
+    offset: u32,
+) -> Option<(String, usize, Vec<Placed>)> {
+    scoped_in(text).family(offset)
 }
 
 /// Every write to `@name` on an *instance* of the class written as `path`.
@@ -94,6 +132,236 @@ pub fn variable(source: &str, offset: u32) -> Option<(String, Vec<Occurrence>)> 
 #[must_use]
 pub fn writes_to(source: &str, path: &str, name: &str) -> Vec<Occurrence> {
     scoped(source).written(path, name)
+}
+
+/// Every `attr_writer` and `attr_accessor` in a text, as the instance variable each one writes.
+///
+/// A setter writes `@name` with whatever its caller passes, and no `@name =` is written anywhere
+/// for it. [`cursor`](super::cursor)'s table keeps each as a write nothing can type, so a read it
+/// can reach is refused instead of being folded over the writes that happen to be spelled out.
+///
+/// Only where `self` is a namespace this file names: a setter declared at the top level or on an
+/// island belongs to an object no type can name here.
+#[must_use]
+pub fn setters(source: &str) -> Vec<Accessor> {
+    scoped(source).setters.clone()
+}
+
+/// Every `attr_reader` and `attr_accessor` in a text, as the instance variable each one reads.
+///
+/// - **[`setters`]' other half, from the same visit**, so a reader and a setter declared by one
+///   `attr_accessor` name the same variable at the same level. `types` reads a reader's return as
+///   that variable, read on the object ([`types::method_return`](super::types::method_return)).
+/// - **Not in a block written straight in a namespace body** ([`Group::loose`]): `included do`
+///   runs on the class, `class_methods do` on its singleton, and nothing in the block says which
+///   object's variable the reader returns.
+#[must_use]
+pub fn readers(source: &str) -> Vec<Accessor> {
+    scoped(source).readers.clone()
+}
+
+/// One instance variable a declared accessor reads or writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Accessor {
+    /// As Ruby spells the variable, `@` included.
+    pub name: String,
+    /// What [`Group::level`] says for the variable: 0 for `attr_writer` in a class body.
+    pub level: i32,
+    /// Where the accessor's name starts, inside the colon or the quotes: where rubydex files the
+    /// method it declares.
+    pub at: u32,
+}
+
+/// Every call in a text that writes an instance variable by reflection:
+/// `instance_variable_set` and `remove_instance_variable`.
+///
+/// No `@name =` is written for these, so without this list a fold over the spelled writes would
+/// miss them. [`cursor`](super::cursor)'s table keeps each as a write nothing can type (a removal
+/// as `nil`), on the object whose variable it reaches.
+#[must_use]
+pub fn reflections(source: &str) -> Vec<Reflection> {
+    scoped(source).reflections.clone()
+}
+
+/// The class variables a text writes by reflection: the first argument of every
+/// `class_variable_set`, on any receiver.
+///
+/// A written `@@name =` is rubydex's; this is the write no `@@` is spelled for. A name no literal
+/// spells, a local's included, matches every variable.
+#[must_use]
+pub fn class_variable_sets(source: &str) -> Vec<Spelled> {
+    scoped(source).class_reflections.clone()
+}
+
+/// One reflective write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reflection {
+    /// Which names it can reach: one spelling for a literal, every value a local can hold for a
+    /// local, and the argument callers pass for a method's own parameter.
+    pub names: Vec<Spelled>,
+    /// Whose variable it writes.
+    pub on: Reflected,
+    /// `remove_instance_variable`: the variable is `nil` again.
+    pub removes: bool,
+    /// Where the call's name is written.
+    pub at: u32,
+}
+
+/// Whose variable a reflective call writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reflected {
+    /// `self`'s, at [`Group::level`]; `None` where that is not known, inside a block straight in a
+    /// namespace body.
+    Own(Option<i32>),
+    /// The top level's `self`: `main` in a script, the view in a template. Only the top level reads
+    /// its variables.
+    Main,
+    /// Another object's (`obj.instance_variable_set`), or an island's (`def obj.f`).
+    Other,
+}
+
+/// The names a reflective call can reach, as written in its first argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Spelled {
+    /// One name, `@` included.
+    Exactly(String),
+    /// Every name that starts with `head` and ends with `tail`: the literal parts around an
+    /// interpolation. Both are empty for a name no literal spells, which matches every name.
+    Like { head: String, tail: String },
+    /// Whatever the callers of `method` pass as its positional argument `index`: the name is the
+    /// enclosing method's own parameter. Only the callers can say; asked alone, every name.
+    Argument { method: String, index: usize },
+}
+
+impl Spelled {
+    /// The pattern every name fits.
+    pub(super) fn everything() -> Self {
+        Self::Like {
+            head: String::new(),
+            tail: String::new(),
+        }
+    }
+
+    /// The pattern every writer's name fits: anything ending in `=`.
+    pub(super) fn writer() -> Self {
+        Self::Like {
+            head: String::new(),
+            tail: "=".to_owned(),
+        }
+    }
+
+    /// Whether every name this spells is a writer's: a spelling or an interpolation's
+    /// literal tail ending in `=`. A name nothing spells, or a parameter's, may be anything.
+    #[must_use]
+    pub fn names_a_writer(&self) -> bool {
+        match self {
+            Self::Exactly(exactly) => exactly.ends_with('='),
+            Self::Like { tail, .. } => tail.ends_with('='),
+            Self::Argument { .. } => false,
+        }
+    }
+
+    /// Whether one name this spells can be a writer's: [`Self::names_a_writer`], or a name whose
+    /// end nothing spells.
+    #[must_use]
+    pub fn may_name_a_writer(&self) -> bool {
+        match self {
+            Self::Like { tail, .. } if tail.is_empty() => true,
+            Self::Argument { .. } => true,
+            _ => self.names_a_writer(),
+        }
+    }
+
+    /// Whether this can be the variable spelled `name`.
+    #[must_use]
+    pub fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::Exactly(exactly) => exactly == name,
+            Self::Like { head, tail } => {
+                name.len() >= head.len() + tail.len()
+                    && name.starts_with(head.as_str())
+                    && name.ends_with(tail.as_str())
+            }
+            Self::Argument { .. } => true,
+        }
+    }
+}
+
+/// What the call whose name starts at `at` passes as its positional argument `index`, as the names
+/// a reflective write given it could reach ([`Spelled`]).
+///
+/// `None` where no call's name starts there, the call passes fewer arguments, or a splat comes
+/// first: the position cannot be read, so the caller must assume any name.
+#[must_use]
+pub fn argument_at(source: &str, at: u32, index: usize) -> Option<Spelled> {
+    struct Find {
+        at: u32,
+        index: usize,
+        found: Option<Option<Spelled>>,
+    }
+    impl<'pr> Visit<'pr> for Find {
+        fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+            let starts = node
+                .message_loc()
+                .is_some_and(|message| message.start_offset() as u32 == self.at);
+            // One call's name starts at any one offset, so the first match is the only one.
+            if starts {
+                let arguments: Vec<Node<'pr>> = node
+                    .arguments()
+                    .map(|found| found.arguments().iter().collect())
+                    .unwrap_or_default();
+                let splat = arguments
+                    .iter()
+                    .take(self.index + 1)
+                    .any(|argument| argument.as_splat_node().is_some());
+                self.found = Some(arguments.get(self.index).filter(|_| !splat).map(spelled_by));
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let result = super::cursor::parse(source);
+    let mut find = Find {
+        at,
+        index,
+        found: None,
+    };
+    find.visit(&result.node());
+    find.found.flatten()
+}
+
+/// Every variable in a text, each with the occurrences that are it.
+///
+/// [`variable`] asked of every occurrence at once, for the one caller that needs them all:
+/// [`cursor`](super::cursor)'s reaching-writes table. For every read it asks which writes are the
+/// *same* variable, and how far that variable's scope runs, which is where a block's later caller
+/// can still reach it.
+///
+/// In order of each variable's first occurrence, so the answer does not depend on a hash.
+#[must_use]
+pub fn every_variable(source: &str) -> Vec<Group> {
+    scoped(source).groups()
+}
+
+/// One variable, and every place it is written or read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    /// As Ruby spells it, `@` included for an instance variable.
+    pub name: String,
+    /// The span of the scope a local lives in: its `def`, block, lambda or namespace body, or the
+    /// whole file. `None` for an instance variable, which belongs to an object, not a scope.
+    pub scope: Option<(u32, u32)>,
+    /// For an instance variable, how many singleton steps its `self` is above an instance of the
+    /// namespace it is written in: 0 in an instance method, 1 in a class body or `def self.`.
+    ///
+    /// `None` for a local, and for an instance variable whose `self` no namespace in the file names:
+    /// the top level (`main`), and an island (`def obj.f`, `class << obj`).
+    pub level: Option<i32>,
+    /// The occurrences whose `self` is not known: those in a block or lambda written straight in
+    /// a namespace body. `before_action { @story = … }` runs on an instance, `included do` on the
+    /// class, and nothing in the block says which.
+    pub loose: Vec<u32>,
+    /// Every occurrence, in offset order.
+    pub occurrences: Vec<Occurrence>,
 }
 
 /// Which locals a byte range borrows from around it, and whether anything it writes escapes.
@@ -152,15 +420,27 @@ struct Scoped {
     /// Every instance-variable occurrence that belongs to an instance of a namespace, with the
     /// name and the offset an accessor for it would be declared at.
     sites: Vec<(Occurrence, String, u32)>,
+    /// The span of every local scope, indexed by the number [`Variable::Local`] carries.
+    spans: Vec<(u32, u32)>,
+    /// Every occurrence whose `self` is not known ([`Group::loose`]), by where it starts.
+    loose: std::collections::HashSet<u32>,
+    /// Every declared setter ([`setters`]).
+    setters: Vec<Accessor>,
+    /// Every declared reader ([`readers`]).
+    readers: Vec<Accessor>,
+    /// Every reflective write ([`reflections`]).
+    reflections: Vec<Reflection>,
+    /// Every reflective class-variable write ([`class_variable_sets`]).
+    class_reflections: Vec<Spelled>,
 }
 
 /// How many source texts the memo holds at once.
 ///
 /// **Two: that is how many are in play at a time.**
 /// - A request asks about the buffer under the cursor.
-/// - The one caller with a second text is [`cursor`](super::cursor)'s `type_the_instance_variable`.
-///   It walks a *repaired* copy of that buffer (the half-typed call removed), alternating with the
-///   real one in a loop.
+/// - The one caller with a second text is completion. Its receiver's variables are read from a
+///   *repaired* copy of the buffer (the half-typed call removed, `cursor::Cursor::repaired`), while
+///   the other surfaces read the buffer itself.
 ///
 /// One slot would thrash between the two. A map keyed by document would need a bound, an eviction
 /// rule and a reason to trust both; decide that when a third text turns up.
@@ -196,19 +476,42 @@ thread_local! {
 /// `definition`, `hover` and `documentHighlight` all ask about the same cursor in a document the
 /// settle just parsed, and `documentHighlight` fires on every cursor move.
 fn scoped(source: &str) -> Rc<Scoped> {
-    // Looked up and released before the walk, not held across it. `Scoped::of` runs with no borrow
-    // of `WALKED` outstanding, so a future question that reached back in here could not panic on
-    // the `RefCell`.
-    let held = WALKED.with_borrow(|walked| {
+    scoped_in(&cursor::Parsed::new(source))
+}
+
+/// [`scoped`] for a text a request may already have parsed for another question
+/// ([`cursor::Parsed`]): a held walk asks for no parse, and a walk made here parses once for both.
+fn scoped_in(text: &cursor::Parsed<'_>) -> Rc<Scoped> {
+    let source = text.source();
+    held(source).unwrap_or_else(|| hold(source, Scoped::of(source, &text.result().node())))
+}
+
+/// Walk `source` from a tree a caller has already parsed, and hold the walk, so the next question
+/// about the same text does not parse it again. [`cursor::shapes`](super::cursor::shapes) hands
+/// its tree over, since it asks this module about the same text a moment later.
+pub(super) fn seed(source: &str, node: &Node<'_>) {
+    if held(source).is_none() {
+        hold(source, Scoped::of(source, node));
+    }
+}
+
+/// The walk of `source`, where the memo holds one.
+///
+/// Looked up and released before any walk, not held across it: [`Scoped::of`] runs with no borrow
+/// of `WALKED` outstanding, so a future question that reached back in here could not panic on the
+/// `RefCell`.
+fn held(source: &str) -> Option<Rc<Scoped>> {
+    WALKED.with_borrow(|walked| {
         walked
             .iter()
             .find(|(text, _)| &**text == source)
             .map(|(_, scoped)| Rc::clone(scoped))
-    });
-    if let Some(scoped) = held {
-        return scoped;
-    }
-    let fresh = Rc::new(Scoped::of(source));
+    })
+}
+
+/// Keep `walked` as the walk of `source`, dropping the oldest where the memo is full.
+fn hold(source: &str, walked: Scoped) -> Rc<Scoped> {
+    let fresh = Rc::new(walked);
     WALKED.with_borrow_mut(|walked| {
         if walked.len() == SOURCES_HELD {
             walked.pop();
@@ -237,21 +540,67 @@ fn forget() {
 }
 
 impl Scoped {
-    /// Parse, walk and sort: the work the memo exists to do once.
-    fn of(source: &str) -> Self {
-        let result = ruby_prism::parse(source.as_bytes());
+    /// Walk and sort one parsed text: the work the memo exists to do once.
+    fn of(source: &str, node: &Node<'_>) -> Self {
         let mut walk = Walk::new(source);
-        walk.visit(&result.node());
+        walk.visit(node);
         walk.found.sort_by_key(|(_, occurrence)| occurrence.start);
+        // A local names every value any of its writes gives it; one with none this walk can read
+        // (a block's parameter, a `rescue` binding) names every variable.
+        for (index, variable) in std::mem::take(&mut walk.named_by) {
+            walk.reflections[index].names = walk
+                .values
+                .get(&variable)
+                .filter(|values| !values.is_empty())
+                .cloned()
+                .unwrap_or_else(|| vec![Spelled::everything()]);
+        }
         Self {
             found: walk.found,
             sites: walk.sites,
+            spans: walk.spans,
+            loose: walk.loose_found,
+            setters: walk.setters,
+            readers: walk.readers,
+            reflections: walk.reflections,
+            class_reflections: walk.class_reflections,
         }
     }
 
+    /// Every variable with its occurrences, in order of first occurrence.
+    fn groups(&self) -> Vec<Group> {
+        let mut index: HashMap<&Variable, usize> = HashMap::new();
+        let mut groups: Vec<Group> = Vec::new();
+        for (variable, occurrence) in &self.found {
+            let at = *index.entry(variable).or_insert_with(|| {
+                let (name, scope, level) = match variable {
+                    Variable::Local { name, scope } => {
+                        (name.clone(), Some(self.spans[*scope as usize]), None)
+                    }
+                    Variable::Instance { name, owner } => {
+                        (name.clone(), None, owner.named().then_some(owner.level))
+                    }
+                };
+                groups.push(Group {
+                    name,
+                    scope,
+                    level,
+                    loose: Vec::new(),
+                    occurrences: Vec::new(),
+                });
+                groups.len() - 1
+            });
+            if self.loose.contains(&occurrence.start) {
+                groups[at].loose.push(occurrence.start);
+            }
+            groups[at].occurrences.push(occurrence.clone());
+        }
+        groups
+    }
+
     /// The name of the variable the cursor is on, and the occurrences sharing it.
-    fn under(&self, offset: u32) -> Option<(String, Vec<Occurrence>)> {
-        let (variable, _) = self
+    fn under(&self, offset: u32) -> Option<(String, Occurrence, Vec<Occurrence>)> {
+        let (variable, under) = self
             .found
             .iter()
             // Inclusive of the end, as in `locator::covers`: a cursor just past a name's last
@@ -263,12 +612,48 @@ impl Scoped {
         };
         Some((
             name,
+            under.clone(),
             self.found
                 .iter()
                 .filter(|(candidate, _)| candidate == variable)
                 .map(|(_, at)| at.clone())
                 .collect(),
         ))
+    }
+
+    /// See [`instance_family`].
+    fn family(&self, offset: u32) -> Option<(String, usize, Vec<Placed>)> {
+        let (variable, at) = self
+            .found
+            .iter()
+            .find(|(_, at)| at.start <= offset && offset <= at.end)?;
+        let Variable::Instance { name, owner } = variable else {
+            return None;
+        };
+        if !owner.named() {
+            return None;
+        }
+        let family: Vec<Placed> = self
+            .found
+            .iter()
+            .filter_map(|(candidate, occurrence)| match candidate {
+                Variable::Instance {
+                    name: spelled,
+                    owner: other,
+                } if spelled == name && other.path == owner.path => Some(Placed {
+                    occurrence: occurrence.clone(),
+                    level: other.level,
+                    loose: self.loose.contains(&occurrence.start),
+                }),
+                _ => None,
+            })
+            .collect();
+        // The family is in offset order and holds the cursor's own occurrence.
+        let cursor = family
+            .iter()
+            .take_while(|placed| placed.occurrence.start < at.start)
+            .count();
+        Some((name.clone(), cursor, family))
     }
 
     /// Every write to `@name` on an instance of `path`, in the order the file writes them.
@@ -343,7 +728,7 @@ impl Scoped {
 ///
 /// Entering `class << self` adds a step and a receiverless `def` takes one away. So `def self.b`
 /// and a `def c` inside `class << self` arrive at the same context, as in Ruby.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SelfContext {
     /// The lexical namespace path as written, so a class reopened in the same file under the same
     /// spelling keeps its instance variables together.
@@ -351,8 +736,16 @@ struct SelfContext {
     level: i32,
 }
 
+impl SelfContext {
+    /// Whether a namespace this file writes is what `self` hangs off: not the top level, and not
+    /// an island, whose path carries the `<offset>` [`Walk::island`] names it by.
+    fn named(&self) -> bool {
+        !self.path.is_empty() && !self.path.contains('<')
+    }
+}
+
 /// The identity two occurrences must share to be the same variable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Variable {
     /// A local, parameter or block-local, keyed by the scope Prism resolved it to.
     Local { name: String, scope: u32 },
@@ -378,6 +771,29 @@ struct Walk<'s> {
     /// is "which occurrences are the same variable"; a body offset in [`Variable`] would split a
     /// class reopened in one file into two variables.
     sites: Vec<(Occurrence, String, u32)>,
+    /// Where every local scope begins and ends, indexed by its number. The file's own is first.
+    spans: Vec<(u32, u32)>,
+    /// Whether `self` was last set by a namespace body, not a `def`: where a block's `self` stops
+    /// being known.
+    in_body: bool,
+    /// Whether the walk is inside a block or lambda written straight in a namespace body.
+    loose: bool,
+    /// Every instance-variable occurrence found while [`Self::loose`].
+    loose_found: std::collections::HashSet<u32>,
+    /// Every declared setter.
+    setters: Vec<Accessor>,
+    /// Every declared reader, outside a loose block.
+    readers: Vec<Accessor>,
+    /// Every reflective write.
+    reflections: Vec<Reflection>,
+    /// Every `class_variable_set`'s name.
+    class_reflections: Vec<Spelled>,
+    /// What every local can hold, for a reflective write that names its variable with one: each
+    /// write's value as a [`Spelled`], or the argument a method's parameter is.
+    values: HashMap<Variable, Vec<Spelled>>,
+    /// The reflective writes whose name is a local, by index into `reflections`: resolved once
+    /// every write of the local is known.
+    named_by: Vec<(usize, Variable)>,
 }
 
 impl<'s> Walk<'s> {
@@ -396,13 +812,25 @@ impl<'s> Walk<'s> {
             found: Vec::new(),
             body: None,
             sites: Vec::new(),
+            spans: vec![(0, source.len() as u32)],
+            in_body: true,
+            loose: false,
+            loose_found: std::collections::HashSet::new(),
+            setters: Vec::new(),
+            readers: Vec::new(),
+            reflections: Vec::new(),
+            class_reflections: Vec::new(),
+            values: HashMap::new(),
+            named_by: Vec::new(),
         }
     }
 
-    /// Run `body` inside a freshly numbered local scope.
-    fn scoped(&mut self, body: impl FnOnce(&mut Self)) {
+    /// Run `body` inside a freshly numbered local scope, written over `at`.
+    fn scoped(&mut self, at: &Location<'_>, body: impl FnOnce(&mut Self)) {
         self.scopes.push(self.next_scope);
         self.next_scope += 1;
+        self.spans
+            .push((at.start_offset() as u32, at.end_offset() as u32));
         body(self);
         self.scopes.pop();
     }
@@ -413,12 +841,34 @@ impl<'s> Walk<'s> {
     /// The two travel together because they are decided together. Every construct that changes
     /// `self` either opens a namespace body, keeps the one around it, or is an island with no body.
     /// Separating them is how one of the three would get missed.
-    fn as_self(&mut self, this: SelfContext, site: Option<u32>, run: impl FnOnce(&mut Self)) {
+    ///
+    /// `body` says whether the construct is a namespace body (`true`) or a `def` (`false`), which
+    /// decides whether a block inside it knows its `self` ([`Group::loose`]).
+    fn as_self(
+        &mut self,
+        this: SelfContext,
+        site: Option<u32>,
+        body: bool,
+        run: impl FnOnce(&mut Self),
+    ) {
         let outer = std::mem::replace(&mut self.this, this);
         let outside = std::mem::replace(&mut self.body, site);
+        let was_body = std::mem::replace(&mut self.in_body, body);
+        let was_loose = std::mem::replace(&mut self.loose, false);
         run(self);
         self.this = outer;
         self.body = outside;
+        self.in_body = was_body;
+        self.loose = was_loose;
+    }
+
+    /// Run `run` inside a block or lambda: its `self` is unknown when it is written straight in a
+    /// namespace body, since a DSL may run it on an instance or on the class.
+    fn closure(&mut self, run: impl FnOnce(&mut Self)) {
+        let was_loose = self.loose;
+        self.loose |= self.in_body && self.this.named();
+        run(self);
+        self.loose = was_loose;
     }
 
     /// The scope a local resolved `depth` steps out from the innermost one.
@@ -439,6 +889,15 @@ impl<'s> Walk<'s> {
             at,
             write,
         );
+    }
+
+    /// Note what a write gives a local, for [`Walk::values`].
+    fn holds(&mut self, name: &ConstantId<'_>, depth: u32, value: Spelled) {
+        let variable = Variable::Local {
+            name: spelled(name),
+            scope: self.scope_at(depth),
+        };
+        self.values.entry(variable).or_default().push(value);
     }
 
     /// A parameter, a block-local or `it`: declared in the innermost scope, with no depth to read
@@ -464,6 +923,9 @@ impl<'s> Walk<'s> {
                 spelling.clone(),
                 body,
             ));
+        }
+        if self.loose {
+            self.loose_found.insert(at.start_offset() as u32);
         }
         self.record(
             Variable::Instance {
@@ -527,8 +989,8 @@ impl<'pr> Visit<'pr> for Walk<'_> {
             self.visit(&superclass);
         }
         let this = self.namespace(&node.constant_path());
-        self.as_self(this, opens(node.body().as_ref()), |walk| {
-            walk.scoped(|walk| {
+        self.as_self(this, opens(node.body().as_ref()), true, |walk| {
+            walk.scoped(&node.location(), |walk| {
                 if let Some(body) = node.body() {
                     walk.visit(&body);
                 }
@@ -538,8 +1000,8 @@ impl<'pr> Visit<'pr> for Walk<'_> {
 
     fn visit_module_node(&mut self, node: &ModuleNode<'pr>) {
         let this = self.namespace(&node.constant_path());
-        self.as_self(this, opens(node.body().as_ref()), |walk| {
-            walk.scoped(|walk| {
+        self.as_self(this, opens(node.body().as_ref()), true, |walk| {
+            walk.scoped(&node.location(), |walk| {
                 if let Some(body) = node.body() {
                     walk.visit(&body);
                 }
@@ -563,8 +1025,8 @@ impl<'pr> Visit<'pr> for Walk<'_> {
         } else {
             (self.island(&node.location()), None)
         };
-        self.as_self(this, site, |walk| {
-            walk.scoped(|walk| {
+        self.as_self(this, site, true, |walk| {
+            walk.scoped(&node.location(), |walk| {
                 if let Some(body) = node.body() {
                     walk.visit(&body);
                 }
@@ -590,9 +1052,35 @@ impl<'pr> Visit<'pr> for Walk<'_> {
                 }
             }
         };
-        self.as_self(this, site, |walk| {
-            walk.scoped(|walk| {
+        let method = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+        self.as_self(this, site, false, |walk| {
+            walk.scoped(&node.location(), |walk| {
                 if let Some(parameters) = node.parameters() {
+                    // A positional parameter holds what the callers pass at its position.
+                    let positional = parameters
+                        .requireds()
+                        .iter()
+                        .chain(parameters.optionals().iter());
+                    for (index, parameter) in positional.enumerate() {
+                        let name = parameter
+                            .as_required_parameter_node()
+                            .map(|found| found.name())
+                            .or_else(|| {
+                                parameter
+                                    .as_optional_parameter_node()
+                                    .map(|found| found.name())
+                            });
+                        if let Some(name) = name {
+                            walk.holds(
+                                &name,
+                                0,
+                                Spelled::Argument {
+                                    method: method.clone(),
+                                    index,
+                                },
+                            );
+                        }
+                    }
                     walk.visit_parameters_node(&parameters);
                 }
                 if let Some(body) = node.body() {
@@ -605,12 +1093,122 @@ impl<'pr> Visit<'pr> for Walk<'_> {
     // A block and a lambda open a scope but not a `self`: `self` inside is what it was outside. So
     // `@v` in a block belongs to the enclosing method's object.
 
+    //
+    // **Except straight in a namespace body**, where a DSL decides: `before_action { }` runs on an
+    // instance and `included do` on the class. The variable is still grouped by the lexical
+    // `self`, and [`Group::loose`] says the grouping is a guess.
+
     fn visit_block_node(&mut self, node: &BlockNode<'pr>) {
-        self.scoped(|walk| ruby_prism::visit_block_node(walk, node));
+        self.closure(|walk| {
+            walk.scoped(&node.location(), |walk| {
+                ruby_prism::visit_block_node(walk, node)
+            });
+        });
     }
 
     fn visit_lambda_node(&mut self, node: &LambdaNode<'pr>) {
-        self.scoped(|walk| ruby_prism::visit_lambda_node(walk, node));
+        self.closure(|walk| {
+            walk.scoped(&node.location(), |walk| {
+                ruby_prism::visit_lambda_node(walk, node)
+            });
+        });
+    }
+
+    // An accessor declared on `self`: `attr_writer :name` writes an instance's `@name`, and
+    // `attr_reader :name` reads it.
+
+    fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+        let name = node.name();
+        let declares = matches!(
+            name.as_slice(),
+            b"attr_reader" | b"attr_writer" | b"attr_accessor"
+        ) && node
+            .receiver()
+            .is_none_or(|receiver| matches!(receiver, Node::SelfNode { .. }));
+        if declares && self.this.named() {
+            let writes = name.as_slice() != b"attr_reader";
+            let reads = name.as_slice() != b"attr_writer" && !self.loose;
+            let arguments = node.arguments();
+            for argument in arguments.iter().flat_map(|found| found.arguments().iter()) {
+                // The name's own start, inside the colon or the quotes: where rubydex files the
+                // method the accessor declares.
+                let start = argument.location().start_offset();
+                let spelled = argument
+                    .as_symbol_node()
+                    .map(|symbol| {
+                        let at = symbol
+                            .value_loc()
+                            .map_or(start, |value| value.start_offset());
+                        (symbol.unescaped().to_vec(), at)
+                    })
+                    .or_else(|| {
+                        argument.as_string_node().map(|string| {
+                            (
+                                string.unescaped().to_vec(),
+                                string.content_loc().start_offset(),
+                            )
+                        })
+                    });
+                if let Some((bytes, at)) = spelled {
+                    let declared = Accessor {
+                        name: format!("@{}", String::from_utf8_lossy(&bytes)),
+                        level: self.this.level - 1,
+                        at: at as u32,
+                    };
+                    if reads {
+                        self.readers.push(declared.clone());
+                    }
+                    if writes {
+                        self.setters.push(declared);
+                    }
+                }
+            }
+        }
+        if name.as_slice() == b"class_variable_set" {
+            // Only a literal says which: a local is not followed here, so it names every variable.
+            let first = node
+                .arguments()
+                .and_then(|arguments| arguments.arguments().iter().next());
+            self.class_reflections
+                .push(first.map_or_else(Spelled::everything, |first| spelled_by(&first)));
+        }
+        let removes = name.as_slice() == REFLECTIVE_WRITERS[1].as_bytes();
+        if removes || name.as_slice() == REFLECTIVE_WRITERS[0].as_bytes() {
+            let first = node
+                .arguments()
+                .and_then(|arguments| arguments.arguments().iter().next());
+            if let Some(first) = first {
+                let on_self = node
+                    .receiver()
+                    .is_none_or(|receiver| matches!(receiver, Node::SelfNode { .. }));
+                let on = if !on_self || self.this.path.contains('<') {
+                    Reflected::Other
+                } else if self.this.path.is_empty() {
+                    Reflected::Main
+                } else if self.loose {
+                    Reflected::Own(None)
+                } else {
+                    Reflected::Own(Some(self.this.level))
+                };
+                if let Some(local) = first.as_local_variable_read_node() {
+                    let variable = Variable::Local {
+                        name: spelled(&local.name()),
+                        scope: self.scope_at(local.depth()),
+                    };
+                    self.named_by.push((self.reflections.len(), variable));
+                }
+                self.reflections.push(Reflection {
+                    names: vec![spelled_by(&first)],
+                    on,
+                    removes,
+                    at: node
+                        .message_loc()
+                        .map_or(node.location().start_offset(), |at| at.start_offset())
+                        as u32,
+                });
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
     }
 
     // Locals: every one of these carries the depth that says which scope it belongs to.
@@ -621,20 +1219,24 @@ impl<'pr> Visit<'pr> for Walk<'_> {
 
     fn visit_local_variable_write_node(&mut self, node: &LocalVariableWriteNode<'pr>) {
         self.local(&node.name(), node.depth(), &node.name_loc(), true);
+        self.holds(&node.name(), node.depth(), spelled_by(&node.value()));
         ruby_prism::visit_local_variable_write_node(self, node);
     }
 
     fn visit_local_variable_target_node(&mut self, node: &LocalVariableTargetNode<'pr>) {
         self.local(&node.name(), node.depth(), &node.location(), true);
+        self.holds(&node.name(), node.depth(), Spelled::everything());
     }
 
     fn visit_local_variable_and_write_node(&mut self, node: &LocalVariableAndWriteNode<'pr>) {
         self.local(&node.name(), node.depth(), &node.name_loc(), true);
+        self.holds(&node.name(), node.depth(), spelled_by(&node.value()));
         ruby_prism::visit_local_variable_and_write_node(self, node);
     }
 
     fn visit_local_variable_or_write_node(&mut self, node: &LocalVariableOrWriteNode<'pr>) {
         self.local(&node.name(), node.depth(), &node.name_loc(), true);
+        self.holds(&node.name(), node.depth(), spelled_by(&node.value()));
         ruby_prism::visit_local_variable_or_write_node(self, node);
     }
 
@@ -643,6 +1245,7 @@ impl<'pr> Visit<'pr> for Walk<'_> {
         node: &LocalVariableOperatorWriteNode<'pr>,
     ) {
         self.local(&node.name(), node.depth(), &node.name_loc(), true);
+        self.holds(&node.name(), node.depth(), Spelled::everything());
         ruby_prism::visit_local_variable_operator_write_node(self, node);
     }
 
@@ -737,6 +1340,31 @@ fn opens(body: Option<&Node<'_>>) -> Option<u32> {
 }
 
 /// A name as Prism interned it. Source is `&str`, so the bytes are always valid UTF-8.
+/// The names a reflective call's first argument can spell ([`Spelled`]).
+pub(super) fn spelled_by(argument: &Node<'_>) -> Spelled {
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    if let Some(symbol) = argument.as_symbol_node() {
+        return Spelled::Exactly(text(symbol.unescaped()));
+    }
+    if let Some(string) = argument.as_string_node() {
+        return Spelled::Exactly(text(string.unescaped()));
+    }
+    let parts: Vec<Node<'_>> = if let Some(symbol) = argument.as_interpolated_symbol_node() {
+        symbol.parts().iter().collect()
+    } else if let Some(string) = argument.as_interpolated_string_node() {
+        string.parts().iter().collect()
+    } else {
+        Vec::new()
+    };
+    let literal = |part: &Node<'_>| part.as_string_node().map(|found| text(found.unescaped()));
+    let head: String = parts.iter().map_while(literal).collect();
+    let tail: Vec<String> = parts.iter().rev().map_while(literal).collect();
+    Spelled::Like {
+        head,
+        tail: tail.into_iter().rev().collect(),
+    }
+}
+
 fn spelled(name: &ConstantId<'_>) -> String {
     String::from_utf8_lossy(name.as_slice()).into_owned()
 }
@@ -745,6 +1373,370 @@ fn spelled(name: &ConstantId<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which spellings name only writers, and which can name one.
+    #[test]
+    fn a_writer_s_name_ends_in_an_equals_sign() {
+        let exactly = |name: &str| Spelled::Exactly(name.to_owned());
+        let like = |head: &str, tail: &str| Spelled::Like {
+            head: head.to_owned(),
+            tail: tail.to_owned(),
+        };
+        let argument = Spelled::Argument {
+            method: "set".to_owned(),
+            index: 0,
+        };
+        assert!(exactly("name=").names_a_writer());
+        assert!(!exactly("name").names_a_writer());
+        assert!(Spelled::writer().names_a_writer());
+        assert!(!Spelled::everything().names_a_writer());
+        assert!(!argument.names_a_writer());
+
+        assert!(Spelled::everything().may_name_a_writer());
+        assert!(like("set_", "").may_name_a_writer());
+        assert!(argument.may_name_a_writer());
+        assert!(like("", "=").may_name_a_writer());
+        assert!(!like("", "_id").may_name_a_writer());
+        assert!(!exactly("name").may_name_a_writer());
+        assert!(Spelled::writer().matches("title="));
+    }
+
+    /// Every variable at once, grouped as [`variable`] groups one, with the scope a local lives in.
+    ///
+    /// The scope is the construct's whole span: a `def`'s includes its parameters, a block's its
+    /// `|b|`. The file is a scope too. An instance variable has none, because it belongs to an object.
+    #[test]
+    fn every_variable_is_grouped_with_the_scope_it_lives_in() {
+        let source =
+            "x = 1\ndef f(a)\n  a\n  [1].each { |b| b; a }\nend\nclass K\n  def g = @v\nend\n";
+        let at = |text: &str| source.find(text).expect("in the fixture") as u32;
+        let def = (at("def f"), at("end\nclass") + 3);
+        let block = (at("{ |b|"), at("}") + 1);
+        type Summary = (String, Option<(u32, u32)>, Vec<u32>);
+        let groups: Vec<Summary> = every_variable(source)
+            .into_iter()
+            .map(|group| {
+                let starts = group.occurrences.iter().map(|it| it.start).collect();
+                (group.name, group.scope, starts)
+            })
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                ("x".to_owned(), Some((0, source.len() as u32)), vec![0]),
+                (
+                    "a".to_owned(),
+                    Some(def),
+                    vec![at("a)"), at("a\n"), at("a }")]
+                ),
+                ("b".to_owned(), Some(block), vec![at("b|"), at("b;")]),
+                ("@v".to_owned(), None, vec![at("@v")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_instance_variable_knows_how_far_above_an_instance_its_self_is() {
+        // 0 in an instance method, 1 on the class object, and nothing at the top level or on an
+        // island, where no namespace in the file names the object.
+        let source = "\
+class K
+  @body = 1
+  def a = @instance
+  def self.b = @class_side
+  class << self
+    def c = @also_class_side
+  end
+  def obj.d = @island
+end
+@top = 1
+";
+        let levels: Vec<(String, Option<i32>)> = every_variable(source)
+            .into_iter()
+            .map(|group| (group.name, group.level))
+            .collect();
+        assert_eq!(
+            levels,
+            vec![
+                ("@body".to_owned(), Some(1)),
+                ("@instance".to_owned(), Some(0)),
+                ("@class_side".to_owned(), Some(1)),
+                ("@also_class_side".to_owned(), Some(1)),
+                ("@island".to_owned(), None),
+                ("@top".to_owned(), None),
+            ]
+        );
+        // A local has no `self` to be above.
+        assert!(
+            every_variable("x = 1\n")
+                .iter()
+                .all(|group| group.level.is_none())
+        );
+    }
+
+    #[test]
+    fn a_block_straight_in_a_namespace_body_does_not_know_its_self() {
+        // `before_action { }` and `-> { }` in a class body run wherever a DSL runs them. Inside a
+        // `def`, a block keeps the method's `self`; a `def` inside the loose block knows its own.
+        let source = "\
+class K
+  before_action { @loose = 1 }
+  scope :x, -> { @lambda }
+  included do
+    def m = @known
+  end
+  def n
+    [1].each { @kept }
+  end
+end
+[1].each { @top }
+";
+        let at = |text: &str| source.find(text).expect("in the fixture") as u32;
+        let loose: Vec<(String, Vec<u32>)> = every_variable(source)
+            .into_iter()
+            .map(|group| (group.name, group.loose))
+            .collect();
+        assert_eq!(
+            loose,
+            vec![
+                ("@loose".to_owned(), vec![at("@loose")]),
+                ("@lambda".to_owned(), vec![at("@lambda")]),
+                ("@known".to_owned(), Vec::new()),
+                ("@kept".to_owned(), Vec::new()),
+                ("@top".to_owned(), Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_setter_declared_on_self_writes_the_instance_variable_it_names() {
+        let source = "\
+class K
+  attr_accessor :name, \"title\"
+  self.attr_writer :email
+  attr_reader :read_only
+  other.attr_writer :elsewhere
+  attr_writer NAMES
+  class << self
+    attr_accessor :config
+  end
+end
+attr_writer :top
+";
+        // The name's own start, one past the colon or the quote.
+        let at = |text: &str| source.find(text).expect("in the fixture") as u32 + 1;
+        assert_eq!(
+            setters(source),
+            vec![
+                Accessor {
+                    name: "@name".to_owned(),
+                    level: 0,
+                    at: at(":name"),
+                },
+                Accessor {
+                    name: "@title".to_owned(),
+                    level: 0,
+                    at: at("\"title\""),
+                },
+                Accessor {
+                    name: "@email".to_owned(),
+                    level: 0,
+                    at: at(":email"),
+                },
+                // `class << self` declares on the class object.
+                Accessor {
+                    name: "@config".to_owned(),
+                    level: 1,
+                    at: at(":config"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reader_declared_on_self_reads_the_instance_variable_it_names() {
+        // The same visit as the setters: `attr_accessor` is both, `attr_writer` is neither, and
+        // `class << self` reads the class object's variable. A reader in a block straight in a
+        // namespace body is left out: `included do` and `class_methods do` run on different
+        // objects, and the block does not say which. Its setter is still a write.
+        let source = "\
+class K
+  attr_reader :story, \"title\"
+  self.attr_accessor :both
+  attr_writer :written
+  other.attr_reader :elsewhere
+  class << self
+    attr_reader :config
+  end
+end
+
+module Concern
+  included do
+    attr_reader :loose
+    attr_accessor :loose_both
+  end
+end
+attr_reader :top
+";
+        // The name's own start, one past the colon or the quote.
+        let at = |text: &str| source.find(text).expect("in the fixture") as u32 + 1;
+        let accessor = |name: &str, level: i32, text: &str| Accessor {
+            name: name.to_owned(),
+            level,
+            at: at(text),
+        };
+        assert_eq!(
+            readers(source),
+            vec![
+                accessor("@story", 0, ":story"),
+                accessor("@title", 0, "\"title\""),
+                accessor("@both", 0, ":both"),
+                accessor("@config", 1, ":config"),
+            ]
+        );
+        assert_eq!(
+            setters(source),
+            vec![
+                accessor("@both", 0, ":both"),
+                accessor("@written", 0, ":written"),
+                accessor("@loose_both", 0, ":loose_both"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reflective_name_held_by_a_local_is_every_value_the_local_can_hold() {
+        let source = "\
+class K
+  def a(model, *rest)
+    var = :@one
+    var = \"@two_#{model}\" if model
+    model.instance_variable_set(var, 1)
+    rest.each { |name| model.instance_variable_set(name, 1) }
+    other ||= compute
+    model.instance_variable_set(other, 1)
+    (x, y = 1, 2)
+    model.instance_variable_set(x, 1)
+    z = 1
+    z += 1
+    model.instance_variable_set(z, 1)
+  end
+end
+";
+        let names: Vec<Vec<Spelled>> = reflections(source)
+            .into_iter()
+            .map(|reflection| reflection.names)
+            .collect();
+        let everything = || vec![Spelled::everything()];
+        assert_eq!(
+            names,
+            vec![
+                vec![
+                    Spelled::Exactly("@one".to_owned()),
+                    Spelled::Like {
+                        head: "@two_".to_owned(),
+                        tail: String::new(),
+                    },
+                ],
+                // A block's parameter holds nothing this walk can read.
+                everything(),
+                everything(),
+                everything(),
+                // A value that is not a literal name, and an operator write: any name.
+                vec![Spelled::everything(), Spelled::everything()],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_call_s_argument_is_read_where_the_call_s_name_starts() {
+        let source = "fill(record, :@tags)\nfill(*all, :@tags)\nfill(record)\nother\n";
+        let at = |text: &str| source.find(text).expect("in the fixture") as u32;
+        assert_eq!(
+            argument_at(source, at("fill(record, :@tags)"), 1),
+            Some(Spelled::Exactly("@tags".to_owned()))
+        );
+        // A splat before it, too few arguments, and no call there: nothing can be read.
+        assert_eq!(argument_at(source, at("fill(*all"), 1), None);
+        assert_eq!(argument_at(source, at("fill(record)\n"), 1), None);
+        assert_eq!(argument_at(source, at("other"), 0), None);
+    }
+
+    #[test]
+    fn a_reflective_write_knows_the_names_it_can_reach_and_whose_they_are() {
+        let source = "\
+class K
+  def a(v, key, name)
+    instance_variable_set(:@x, v)
+    self.instance_variable_set(\"@y\", v)
+    instance_variable_set(:\"@#{key}_cache\", v)
+    instance_variable_set(\"@pre_#{key}\", v)
+    instance_variable_set(name, v)
+    other.instance_variable_set(:@z, v)
+    remove_instance_variable(:@x)
+    instance_variable_set
+  end
+  included { instance_variable_set(:@loose, 1) }
+  def obj.f = instance_variable_set(:@island, 1)
+end
+instance_variable_set(:@top, 1)
+";
+        let at = |text: &str| source.find(text).expect("in the fixture") as u32;
+        let like = |head: &str, tail: &str| Spelled::Like {
+            head: head.to_owned(),
+            tail: tail.to_owned(),
+        };
+        let exactly = |name: &str| Spelled::Exactly(name.to_owned());
+        let found: Vec<(Spelled, Reflected, bool)> = reflections(source)
+            .into_iter()
+            .map(|reflection| {
+                (
+                    reflection.names[0].clone(),
+                    reflection.on,
+                    reflection.removes,
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (exactly("@x"), Reflected::Own(Some(0)), false),
+                (exactly("@y"), Reflected::Own(Some(0)), false),
+                (like("@", "_cache"), Reflected::Own(Some(0)), false),
+                (like("@pre_", ""), Reflected::Own(Some(0)), false),
+                (
+                    Spelled::Argument {
+                        method: "a".to_owned(),
+                        index: 2,
+                    },
+                    Reflected::Own(Some(0)),
+                    false,
+                ),
+                (exactly("@z"), Reflected::Other, false),
+                (exactly("@x"), Reflected::Own(Some(0)), true),
+                (exactly("@loose"), Reflected::Own(None), false),
+                (exactly("@island"), Reflected::Other, false),
+                (exactly("@top"), Reflected::Main, false),
+            ]
+        );
+        assert_eq!(reflections(source)[0].at, at("instance_variable_set(:@x"));
+
+        // A pattern matches what its literal parts allow, and no shorter name.
+        assert!(like("@", "_cache").matches("@warm_cache"));
+        assert!(!like("@", "_cache").matches("@count"));
+        assert!(!like("@warm", "_cache").matches("@warm"));
+        assert!(like("", "").matches("@anything"));
+        assert!(!like("@warm", "_cache").matches("@cold_cache"));
+        // A parameter's name, asked alone, could be any name: only its callers narrow it.
+        assert!(
+            Spelled::Argument {
+                method: "fill".to_owned(),
+                index: 1,
+            }
+            .matches("@anything")
+        );
+        assert!(exactly("@x").matches("@x") && !exactly("@x").matches("@y"));
+    }
 
     /// What the memo holds, and that holding it changes no answer.
     ///
@@ -761,7 +1753,7 @@ mod tests {
         let c = "class C\n  def c\n    @x = 3\n  end\nend\n";
         let at = |source: &str, name: &str| source.find(name).expect("the variable") as u32;
 
-        let cold = variable(a, at(a, "@v"));
+        let cold = variable(&cursor::Parsed::new(a), at(a, "@v"));
         assert!(
             cold.is_some(),
             "the fixture has a variable under the cursor"
@@ -770,12 +1762,12 @@ mod tests {
 
         // The same text again is answered from the memo: nothing added, and the answer is the
         // walk's.
-        assert_eq!(variable(a, at(a, "@v")), cold);
+        assert_eq!(variable(&cursor::Parsed::new(a), at(a, "@v")), cold);
         assert_eq!(walked(), vec![a.to_owned()]);
 
         // A second text joins it instead of replacing it: the reason for two slots.
-        // `cursor::Finder::type_the_instance_variable` alternates a buffer with a repaired copy of
-        // itself, and one slot would hold neither.
+        // Completion reads a repaired copy of the buffer while every other surface reads the
+        // buffer, and one slot would hold neither.
         assert_eq!(
             writes_to(b, "B", "@w").len(),
             1,
@@ -783,7 +1775,7 @@ mod tests {
         );
         assert_eq!(walked(), vec![b.to_owned(), a.to_owned()]);
         assert_eq!(
-            variable(a, at(a, "@v")),
+            variable(&cursor::Parsed::new(a), at(a, "@v")),
             cold,
             "the first is still there to answer"
         );
@@ -813,19 +1805,51 @@ mod tests {
 
         forget();
         let cold = (
-            variable(source, offset),
+            variable(&cursor::Parsed::new(source), offset),
             writes_to(source, "Story", "@views"),
             crossing(source, range.0, range.1),
             accessor_site(source, offset),
         );
         // Cold again, so two walks are compared instead of a walk with itself.
         forget();
-        assert_eq!(variable(source, offset), cold.0);
+        assert_eq!(variable(&cursor::Parsed::new(source), offset), cold.0);
         // Now warm: the three below are answered off the walk the line above stored.
         assert_eq!(writes_to(source, "Story", "@views"), cold.1);
         assert_eq!(crossing(source, range.0, range.1), cold.2);
         assert_eq!(accessor_site(source, offset), cold.3);
         assert_eq!(walked().len(), 1, "one text, one walk");
+    }
+
+    #[test]
+    fn an_instance_variable_s_family_is_its_name_in_its_own_namespace_at_every_level() {
+        // What a caller regroups a loose occurrence within: the cursor's name in the
+        // cursor's namespace, at any level, each marked loose or not. The same name in another
+        // class is another object's, and another name is another variable.
+        let source = "\
+class Widget
+  hook { @v }
+  def a = @v
+  def self.b = @v
+  def c = @w
+end
+
+class Other
+  def a = @v
+end
+";
+        let offset = source.find("@v }").expect("the loose read") as u32;
+        let (name, cursor, family) =
+            instance_family(&cursor::Parsed::new(source), offset).expect("a family");
+        assert_eq!(name, "@v");
+        let placed: Vec<(i32, bool)> = family
+            .iter()
+            .map(|placed| (placed.level, placed.loose))
+            .collect();
+        assert_eq!(placed, [(1, true), (0, false), (1, false)]);
+        assert_eq!(family[cursor].occurrence.start, offset);
+        // A local, and the top level's variable, have no namespace to be a family in.
+        assert_eq!(instance_family(&cursor::Parsed::new("x = 1\nx\n"), 6), None);
+        assert_eq!(instance_family(&cursor::Parsed::new("@top = 1\n"), 1), None);
     }
 
     /// The occurrences at the `~`, drawn over the source: `w` under a write, `r` under a read.

@@ -28,6 +28,7 @@
 pub mod annotations;
 pub mod code_actions;
 pub mod completion;
+pub mod coverage;
 pub mod cursor;
 pub mod diagnostics;
 mod environment;
@@ -69,6 +70,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -547,6 +549,16 @@ impl AnalysisHandle {
     }
 }
 
+/// The analysis thread's stack.
+///
+/// - **Rust's default is 2 MiB.** Real gem RBS (activerecord's, actionpack's, activesupport's) lets
+///   a receiver chain reach the depth `types.rs`' bounds allow (`BODY_HOPS`, `MAX_BRANCHES`,
+///   `MAX_WIDTH`), and installing a `.gem_rbs_collection` overflowed the default stack on the first
+///   `textDocument/inlayHint` that reached those gems.
+/// - **64 MiB is headroom.** `types`' test of a body chain at `BODY_HOPS` runs on a thread this
+///   size in a debug build, whose frames are larger than a release's, and needs under 4 MiB.
+pub(crate) const ANALYSIS_STACK: usize = 64 * 1024 * 1024;
+
 /// Start the analysis thread.
 ///
 /// `outgoing` is a clone of the LSP connection's sender: the analysis thread writes responses and
@@ -563,12 +575,7 @@ pub fn spawn(
     let (sender, receiver) = crossbeam_channel::unbounded();
     let thread = std::thread::Builder::new()
         .name("ya-lsp-analysis".to_owned())
-        // Rust's default is 2 MiB. Real gem RBS (activerecord's, actionpack's, activesupport's)
-        // lets a receiver chain reach the depth `types.rs`' bounds allow (`BODY_HOPS`,
-        // `MAX_BRANCHES`, `MAX_WIDTH`), and installing a `.gem_rbs_collection` overflows the
-        // default stack on the first `textDocument/inlayHint` that reaches those gems. 64 MiB is
-        // headroom over the reproduction, not a measured minimum.
-        .stack_size(64 * 1024 * 1024)
+        .stack_size(ANALYSIS_STACK)
         .spawn(move || {
             let mut analysis = Analysis::new(
                 workspace,
@@ -737,6 +744,10 @@ struct Analysis {
     /// the text, so it cannot go stale. See [`types::HeldExits`], which also explains why the
     /// `Rebase` is rebuilt per request instead of kept here.
     exits: types::HeldExits,
+    /// Whether the request being answered found the member under the cursor and nowhere to jump
+    /// to, so settling could not help it. Cleared before each dispatch, set by `definition`, read
+    /// by the deferred retry in `serve`.
+    unplaced: std::cell::Cell<bool>,
     /// Where the declarations ya-lsp wrote itself were really declared.
     ///
     /// Beside the graph, like the type table. The mapping exists before any generator does, because
@@ -753,6 +764,22 @@ struct Analysis {
     /// wrote last time with what it just wrote. Scoped to this pass on purpose: the table is
     /// shared, and pruning "everything I did not just write" would delete other recorders' entries.
     generated: HashSet<String>,
+    /// Of [`Self::generated`], the sources the modules that read open buffers wrote
+    /// ([`Wants::buffers`](crate::knowledge::Wants::buffers)), and the rest.
+    ///
+    /// Two sets, because opening a spec file re-runs only the first kind
+    /// ([`Analysis::reopened_only`]). A source written by both holds both kinds' facts in its
+    /// document, and re-recording one kind alone would drop the other's: see [`Self::shared`].
+    buffered: HashSet<String>,
+    /// The sources every other module wrote.
+    unbuffered: HashSet<String>,
+    /// What every other module wrote about each source the buffer-reading modules also wrote, at
+    /// the last whole pass: a spec support file with a `Struct.new` beside its shared groups.
+    ///
+    /// A reopening merges these back in, in the whole pass's order, so it writes what the whole
+    /// pass would. Nothing a reopening may skip can change them: it runs only where nothing but
+    /// reopened documents moved.
+    shared: crate::knowledge::Declared,
     /// The projection [`Analysis::synthesize`] last ran the generators on, for the pass gate.
     ///
     /// `None` until the first pass, the honest answer to "would it write the same thing again":
@@ -787,8 +814,22 @@ struct Analysis {
     /// refuses nearly everything, which falls back instead of answering in a coordinate system it
     /// does not share.
     indexed_text: HashMap<DocUri, String>,
+    /// Which of the registry's [`Wants::spells`](crate::knowledge::Wants::spells) texts each
+    /// indexed document's text holds, as the bits [`Self::spelling`] numbers; absent is none.
+    ///
+    /// Written wherever a text goes into the graph, by the indexer's workers or
+    /// [`Self::index_contained`], so it always describes the version the graph holds, which is
+    /// what the walk's memo is keyed on.
+    spelled: HashMap<UriId, u64>,
+    /// The texts [`Self::spelled`] is about, from the registry once: every build registers the
+    /// same modules.
+    spelling: Vec<&'static str>,
     /// Which documents were re-indexed since that pass, when exactly one is known.
     touched: HashSet<String>,
+    /// Of [`Self::touched`], the documents touched only because the editor opened or closed them
+    /// while a module reads them only when open ([`Analysis::touch_if_read_while_open`]). Their
+    /// text in the graph did not move; an edit to one takes it out again.
+    reopened: HashSet<String>,
     /// How many times the generators actually ran, rather than being gated out.
     ///
     /// The gate's instrument. Its claim is that it changes no answer, so counting the passes it
@@ -799,6 +840,11 @@ struct Analysis {
     /// `passes` cannot see this: the outer gate stops the generators but the projection they get is
     /// still rebuilt in full to decide that. Only a counter says whether a gated pass walked.
     walks: u64,
+    /// How many settles re-ran only the modules that read open files
+    /// ([`Analysis::reopened_only`]): the same kind of instrument, for the same reason.
+    reopenings: u64,
+    /// How many generated documents the placing step asked the graph about, over the session.
+    placings: u64,
 
     /// Every file that pass read, and its on-disk state when it did.
     ///
@@ -959,6 +1005,15 @@ struct Analysis {
     logging: crate::logging::Reload,
 }
 
+/// A template's markup, for what its view blanks out: the editor's buffer where one is
+/// open, else the file.
+impl types::Markup for Analysis {
+    fn markup(&self, uri: &str) -> Option<Rc<str>> {
+        let document = DocUri::from_graph_uri(uri)?;
+        self.with_source(&document, |text| Rc::from(text))
+    }
+}
+
 impl Analysis {
     /// How many source files every module has read (from disk or a buffer) and parsed.
     ///
@@ -975,7 +1030,19 @@ impl Analysis {
             .knowledge
             .of::<crate::knowledge::annotations::Annotations>()
             .map_or(0, |module| module.reads);
-        rails + annotated
+        let structs = self
+            .knowledge
+            .of::<crate::knowledge::structs::Structs>()
+            .map_or(0, |module| module.reads);
+        let defines = self
+            .knowledge
+            .of::<crate::knowledge::defines::Defines>()
+            .map_or(0, |module| module.reads);
+        let mixins = self
+            .knowledge
+            .of::<crate::knowledge::mixins::Mixins>()
+            .map_or(0, |module| module.reads);
+        rails + annotated + structs + defines + mixins
     }
 
     /// Every body of knowledge this build has, in the order they run.
@@ -987,7 +1054,13 @@ impl Analysis {
         crate::knowledge::Registry::new(vec![
             Box::new(crate::knowledge::rails::Rails::default()),
             Box::new(crate::knowledge::annotations::Annotations::default()),
-            Box::new(crate::knowledge::structs::Structs),
+            Box::new(crate::knowledge::structs::Structs::default()),
+            Box::new(crate::knowledge::rspec::RSpec::default()),
+            Box::new(crate::knowledge::factories::Factories::default()),
+            Box::new(crate::knowledge::singletons::Singletons),
+            Box::new(crate::knowledge::defines::Defines::default()),
+            Box::new(crate::knowledge::mixins::Mixins::default()),
+            Box::new(crate::knowledge::i18n::Translate::default()),
         ])
     }
 
@@ -1013,15 +1086,24 @@ impl Analysis {
             graph: indexed::Indexed::default(),
             types: types::Types::new(),
             exits: types::HeldExits::new(),
+            unplaced: std::cell::Cell::new(false),
             synthesized: Synthesized::new(),
             views: views::Views::default(),
             generated: HashSet::new(),
+            buffered: HashSet::new(),
+            unbuffered: HashSet::new(),
+            shared: crate::knowledge::Declared::new(),
             generated_from: None,
             walks: 0,
+            reopenings: 0,
+            placings: 0,
             contributions: HashMap::new(),
             knowledge: Self::registered(),
             indexed_text: HashMap::new(),
+            spelled: HashMap::new(),
+            spelling: Self::registered().spelled(),
             touched: HashSet::new(),
+            reopened: HashSet::new(),
             passes: 0,
             stamps: Vec::new(),
             touched_all: true,
@@ -1131,8 +1213,9 @@ impl Analysis {
         // would otherwise land its members on `Object`, as one in Ruby's own signatures would.
         let files = self.index_edited_signatures(files);
         let files = self.index_templates(files);
-        let batch = indexer::index_files(self.graph.graph_mut(), files);
+        let batch = indexer::index_files(self.graph.graph_mut(), files, &self.spelling);
         let indexed = started.elapsed();
+        self.note_spelled(&batch.spelled);
 
         for error in &batch.errors {
             tracing::warn!("indexing error: {error:?}");
@@ -1244,6 +1327,8 @@ impl Analysis {
 
         match task {
             Task::DidOpen { uri, text, version } => {
+                // The buffer answers for it now, not a text held while it was closed.
+                self.exits.forget_texts();
                 self.open.insert(
                     uri.clone(),
                     OpenDocument {
@@ -1255,6 +1340,7 @@ impl Analysis {
                     },
                 );
                 self.index_buffer(&uri, &text);
+                self.touch_if_read_while_open(&uri);
             }
             Task::DidChange {
                 uri,
@@ -1283,6 +1369,7 @@ impl Analysis {
                         return;
                     }
                     tracing::warn!("didChange for un-opened {uri}; treating it as an open");
+                    self.exits.forget_texts();
                     self.open.insert(
                         uri.clone(),
                         OpenDocument {
@@ -1344,6 +1431,7 @@ impl Analysis {
                     },
                     None => self.forget(&uri),
                 }
+                self.touch_if_read_while_open(&uri);
                 if was_beside {
                     self.publish_diagnostics();
                 }
@@ -1684,7 +1772,8 @@ impl Analysis {
             // and `mkmf-rice.rb` is a gem file.
             let batch = self.without_skipped(batch);
             let batch = self.index_edited_signatures(batch);
-            let outcome = indexer::index_files(self.graph.graph_mut(), batch);
+            let outcome = indexer::index_files(self.graph.graph_mut(), batch, &self.spelling);
+            self.note_spelled(&outcome.spelled);
             for error in &outcome.errors {
                 // Debug, not warn: a hundred-gem bundle always contains something that does not
                 // parse, and none of it is the user's problem.
@@ -1948,10 +2037,24 @@ impl Analysis {
     fn index_contained(&mut self, uri: &DocUri, source: &str, language: &LanguageId) -> bool {
         if indexer::index_source(self.graph.graph_mut(), uri.as_str(), source, language) {
             self.unskip(uri);
+            let spelled = indexer::spells(source, &self.spelling);
+            self.note_spelled(&[(uri.clone(), spelled)]);
             return true;
         }
         self.record_skip(uri);
         false
+    }
+
+    /// Record which texts each of these just-indexed documents spells ([`Self::spelled`]).
+    fn note_spelled(&mut self, indexed: &[(DocUri, u64)]) {
+        for (uri, spelled) in indexed {
+            let id = UriId::from(uri.as_str());
+            if *spelled == 0 {
+                self.spelled.remove(&id);
+            } else {
+                self.spelled.insert(id, *spelled);
+            }
+        }
     }
 
     /// Remember that indexing `uri` crashed, and say so.
@@ -2030,6 +2133,7 @@ impl Analysis {
         self.contributions.clear();
         // Every entry describes offsets into the graph being thrown away.
         self.indexed_text.clear();
+        self.spelled.clear();
         // Every module keeps its own parse memo. It is keyed by URI with the file's own freshness,
         // so it would survive a rebuild correctly, but a rebuild is a config change that can move
         // the workspace root and so every provenance line. Rebuilding the registry drops them
@@ -2147,7 +2251,7 @@ impl Analysis {
     ///   all that stands between one and the process.
     ///
     /// **Three outcomes, not two**: re-index a document, forget one, or neither. A
-    /// `db/structure.sql` is the third. `capabilities::watched_files` watches it (beside
+    /// `db/structure.sql` or a `config/database.yml` is the third. `capabilities::watched_files` watches it (beside
     /// `ya-lsp.toml`, which is watched and never indexed), `synthesize` reads it, and it must
     /// never reach rubydex, which would parse SQL as Ruby. So its branch invalidates and indexes
     /// nothing, and sits **above** the `Workspace::indexes` gate, which is `index.include` (Ruby
@@ -2177,16 +2281,31 @@ impl Analysis {
                 tracing::trace!("{uri} changed, but it is not this project's code to index");
                 continue;
             }
+            // A file a body of knowledge reads beside the graph (a locale file): the next settle
+            // reads it again. A `.rb` one is Ruby too, and goes on to the index below.
+            if let Some(path) = uri.to_file_path() {
+                let mut claimed = false;
+                for module in self.knowledge.modules_mut() {
+                    claimed |= module.touched(&path);
+                }
+                if claimed {
+                    self.mark_dirty();
+                    invalidated += 1;
+                    if !self.workspace.indexes(&path) {
+                        continue;
+                    }
+                }
+            }
             // Above the `is_file` test as well as the index gate, so one branch covers a dump being
             // written, edited or deleted: `synthesize` re-reads the directory every settle, so this
             // loop never needs to know which, and a deleted dump is pruned by `forget_stale`.
-            if self.workspace.features().schema
-                && uri
-                    .to_file_path()
-                    .is_some_and(|path| rails::is_structure(&path))
-            {
+            let features = self.workspace.features();
+            if uri.to_file_path().is_some_and(|path| {
+                (features.schema && rails::is_structure(&path))
+                    || (features.rails && rails::is_database_config(&path))
+            }) {
                 tracing::trace!(
-                    "{uri} changed; it is a schema dump, so the next settle re-reads it"
+                    "{uri} changed; the generators read it, so the next settle re-reads it"
                 );
                 self.mark_dirty();
                 invalidated += 1;
@@ -2278,11 +2397,41 @@ impl Analysis {
         self.graph.graph_mut().delete_document(uri.as_str());
         // The map describes offsets into a document that no longer exists.
         self.indexed_text.remove(uri);
+        self.spelled.remove(&UriId::from(uri.as_str()));
         // Whatever this file *implied* goes with it. A generated declaration left behind would
         // outlive the only thing that could refresh it: nothing re-reads a deleted file, so a
         // deleted `db/schema.rb`'s columns would answer forever.
         self.synthesized.forget(self.graph.graph_mut(), uri);
         self.mark_dirty();
+    }
+
+    /// Mark a document touched when a module reads it only while the editor holds it
+    /// ([`Wants::buffers`](crate::knowledge::Wants::buffers)): opening or closing it moves what the
+    /// pass reads, though the graph, holding the same text, moved nothing.
+    ///
+    /// **Reopened, unless an edit touched it**: `index_buffer` runs first, and marks the document
+    /// through [`Self::mark_dirty_for`] where the text it was handed differs from the graph's.
+    fn touch_if_read_while_open(&mut self, uri: &DocUri) {
+        let read = self.generated_from.as_ref().is_some_and(|context| {
+            self.knowledge
+                .wants()
+                .iter()
+                .filter(|row| row.buffers)
+                .any(|row| {
+                    context
+                        .documents(row.list)
+                        .binary_search_by(|held| held.as_str().cmp(uri.as_str()))
+                        .is_ok()
+                })
+        });
+        if read {
+            let edited =
+                self.touched.contains(uri.as_str()) && !self.reopened.contains(uri.as_str());
+            self.mark_dirty_for(uri);
+            if !edited {
+                self.reopened.insert(uri.as_str().to_owned());
+            }
+        }
     }
 
     /// Something changed and the pass cannot know what, so the next pass does all its work.
@@ -2295,6 +2444,8 @@ impl Analysis {
     /// The same, for the one route that knows which document moved.
     fn mark_dirty_for(&mut self, uri: &DocUri) {
         self.touched.insert(uri.as_str().to_owned());
+        // An edit outranks an open: the text this document holds in the graph may have moved.
+        self.reopened.remove(uri.as_str());
         self.dirty = true;
         self.resolve_at = Some(Instant::now() + resolve_debounce());
     }
@@ -2408,9 +2559,9 @@ impl Analysis {
     /// Both callers are bulk routes: a workspace's first index and a settle. Neither may run only
     /// two of the three.
     fn regenerate(&mut self) {
-        self.synthesize();
+        let rewritten = self.synthesize();
         self.resolve();
-        self.place_generated_members();
+        self.place_generated_members(rewritten.as_ref());
         // **One more step that needs the resolve first**, for a similar reason:
         // `alias_method :blank?, :empty?` is written in ActiveSupport and `empty?` declared in
         // `vendor/rbs`, so the row a Ruby alias copies exists only once every signature is
@@ -2439,6 +2590,9 @@ impl Analysis {
             #[cfg(test)]
             crash_the_next_resolve_if_asked();
             Resolver::new(self.graph.graph_mut()).resolve();
+            // Inside the seam: it rewrites chains the resolve just wrote, so a graph it broke is
+            // the resolve's failure unit too.
+            self.graph.repair_superclasses();
         }))
         .is_err();
         if !crashed {
@@ -2725,16 +2879,38 @@ impl Analysis {
     ///   straight to disk: an open buffer is authoritative, so a controller being edited types its
     ///   template before it is saved.
     /// - **It clones**, unlike every other accessor here: the text must outlive the borrow because
-    ///   a parse in another module reads it. Reached only where a *template* receiver was just a
-    ///   name, a path ordinary Ruby never takes.
+    ///   a parse in another module reads it.
     /// - **The [`Rebase`] finishes the thought.** Preferring the buffer is what lets an unsaved
     ///   controller answer, and also what puts its offsets out of step with the graph once someone
     ///   types. Both come from one `with_text` call, so text and map describe the same string.
-    fn read_of(&self, uri: &str) -> Option<(String, Rebase)> {
-        let uri = DocUri::from_graph_uri(uri)?;
-        self.with_text(&uri, |text| {
-            (text.text().to_owned(), self.rebase_for(&uri, text.text()))
-        })
+    /// - **A closed document read at the version the graph holds is kept across requests**
+    ///   ([`types::HeldExits::text`]): an instance variable's read asks every writer document of
+    ///   its object, a thousand files under one gem's base class, on every hover.
+    fn read_of(&self, uri: &str) -> Option<(Rc<str>, Rebase)> {
+        let indexed = self
+            .graph
+            .documents()
+            .get(&UriId::from(uri))
+            .map(|document| document.content_hash());
+        if let Some(hash) = indexed
+            && let Some(held) = self.exits.text(uri, hash)
+        {
+            return Some(held);
+        }
+        let document = DocUri::from_graph_uri(uri)?;
+        let (text, rebase) = self.with_text(&document, |text| {
+            (
+                Rc::<str>::from(text.text()),
+                self.rebase_for(&document, text.text()),
+            )
+        })?;
+        if let Some(hash) = indexed
+            && !self.open.contains_key(&document)
+            && xxh3_64(text.as_bytes()) == hash
+        {
+            self.exits.keep_text(uri, hash, &text, rebase);
+        }
+        Some((text, rebase))
     }
 
     /// What the type side reads besides the graph, built per request.
@@ -2743,32 +2919,35 @@ impl Analysis {
     /// `workspace/didChangeConfiguration` can change.
     fn sources<'a>(
         &'a self,
-        read: &'a dyn Fn(&str) -> Option<(String, Rebase)>,
+        read: &'a types::ReadText<'a>,
+        memo: &'a types::Memo<'a>,
     ) -> types::Sources<'a> {
         types::Sources {
             graph: &self.graph,
             types: &self.types,
             read,
+            markup: self,
             views: &self.views,
             guess: self.workspace.config().types.guess_from_names,
             features: self.workspace.features(),
             layout: self.layout(),
-            // One cursor, so the one arm placing its own offset walks the document once.
-            // `inlayHint` cannot afford that and passes its own memo (see `Sources::walked`).
-            walked: None,
+            memo,
             // Nothing followed yet. The one rung that raises it passes a copy down instead of
             // mutating this, so each request starts at zero.
             constant_hops: 0,
-            ancestor_hops: 0,
             body_hops: 0,
-            // One cursor, so a body or two at most is read, and a memo would hold what nothing asks
-            // twice. `inlayHint` asks once per `def` and passes its own (see
-            // `Sources::read_bodies`).
-            read_bodies: None,
+            // No body is being read yet, so no object's class narrows a read.
+            object: None,
+            // Nor for a call, so no parameter is bound to what one passed.
+            bound: None,
+            made: None,
+            extended: None,
             // The half of that memo that outlives the request, given to every surface: what a
             // document's `def`s return depends only on its text, and a single cursor re-reads the
             // same unchanged gem file `inlayHint` does.
-            held_exits: Some(&self.exits),
+            held_exits: &self.exits,
+            generated: &self.synthesized,
+            knowledge: &self.knowledge,
         }
     }
 
@@ -5216,5 +5395,65 @@ end
                 .is_own_code("file:///gems/activerecord-8.1.3.1/lib/active_record.rb"),
             "widening `is_own_code` must not have swallowed the gems it exists to exclude"
         );
+    }
+
+    #[test]
+    fn a_closed_document_is_read_once_per_version_the_graph_holds() {
+        // An instance variable's read asks every writer document of its object on every hover, so
+        // a closed one is held by the version the graph holds, not read from disk each time.
+        let mut harness = Harness::new();
+        let written = "class Story\n  def initialize\n    @title = \"x\"\n  end\nend\n";
+        let uri = harness.write("app/models/story.rb", written);
+        harness.index();
+        let read = |harness: &Harness| {
+            harness
+                .analysis
+                .read_of(uri.as_str())
+                .unwrap()
+                .0
+                .to_string()
+        };
+        assert_eq!(read(&harness), written);
+
+        // The disk moves on before anyone says so: the read keeps the text the graph holds, which
+        // is what every offset into it is measured against.
+        let moved = "class Story\nend\n";
+        harness.write("app/models/story.rb", moved);
+        assert_eq!(read(&harness), written);
+
+        // Once the graph holds the new version, so does the read.
+        harness.watch(&[&uri]);
+        assert_eq!(read(&harness), moved);
+
+        // A text first read after the disk moved is not the graph's, so it is not held: each read
+        // goes to the disk, as before.
+        let other = harness.write("app/models/tag.rb", "class Tag\nend\n");
+        harness.watch(&[&other]);
+        let read_other = |harness: &Harness| {
+            harness
+                .analysis
+                .read_of(other.as_str())
+                .unwrap()
+                .0
+                .to_string()
+        };
+        harness.write("app/models/tag.rb", "class Tag\n  # 2\nend\n");
+        assert_eq!(read_other(&harness), "class Tag\n  # 2\nend\n");
+        harness.write("app/models/tag.rb", "class Tag\n  # 3\nend\n");
+        assert_eq!(read_other(&harness), "class Tag\n  # 3\nend\n");
+
+        // An open buffer answers for itself, never the held text: opened as the disk has it, the
+        // graph's version is the held one's, and typing leaves the graph behind.
+        harness.open(&uri, moved);
+        assert_eq!(read(&harness), moved);
+        let typed = "class Story\n  # typed\nend\n";
+        harness.edit_without_indexing(
+            &uri,
+            vec![TextChange {
+                range: None,
+                text: typed.to_owned(),
+            }],
+        );
+        assert_eq!(read(&harness), typed);
     }
 }

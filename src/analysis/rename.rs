@@ -43,7 +43,7 @@ use ruby_prism::{ConstantWriteNode, LocalVariableWriteNode, Location, Visit};
 use rubydex::model::{declaration::Declaration, definitions::Definition, graph::Graph, ids::UriId};
 
 use super::{
-    environment,
+    cursor, environment,
     indexed::Indexed,
     locator::{self, Located, Target},
     references, render, scopes,
@@ -187,7 +187,7 @@ pub fn plan(
 ) -> Plan {
     // The scope walk is asked first, as in `highlight`: it is the half that can say no, claiming
     // the cursor only when it really is on a variable.
-    if let Some((name, occurrences)) = scopes::variable(source, offset) {
+    if let Some((name, _, occurrences)) = scopes::variable(&cursor::Parsed::new(source), offset) {
         return variable(uri, source, &name, &occurrences);
     }
     constant(graph, synthesized, UriId::from(uri), offset, own, layout)
@@ -352,14 +352,24 @@ fn decide(
     // `references` already answers exactly this question, drops fabricated references, and confines
     // it to the user's own code. `include_declaration` is required: a rename that changes every use
     // but not the `class` line is broken code.
-    let edits = references::find(graph, synthesized, located, &resolution, own, true)
-        .into_iter()
-        .map(|reference| Edit {
-            uri: reference.uri,
-            start: reference.start,
-            end: reference.end,
-        })
-        .collect();
+    // A method never reaches here (`rename_refuses_methods`), so no name handed as a symbol is
+    // asked for.
+    let edits = references::find(
+        graph,
+        synthesized,
+        located,
+        &resolution,
+        own,
+        true,
+        &references::unasked,
+    )
+    .into_iter()
+    .map(|reference| Edit {
+        uri: reference.uri,
+        start: reference.start,
+        end: reference.end,
+    })
+    .collect();
     Some(Plan::Edits {
         name,
         constant: true,

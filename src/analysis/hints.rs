@@ -1,7 +1,7 @@
 //! `textDocument/inlayHint`: a derived type, drawn without being asked for.
 //!
 //! The one request in the crate that shows an answer nobody requested, and that changes what may be
-//! said. A hover card is read after a deliberate keystroke, has room for a footnote, and is
+//! said. A hover card is read after a deliberate keystroke, has room to say it guessed, and is
 //! understood as ya-lsp's opinion. A hint is painted into the margin of every line, wanted or not,
 //! has room for nothing, and is read as fact. So the tier decides what may be drawn here, not just
 //! how it is labelled.
@@ -13,8 +13,8 @@
 //!   small enough to fix it. The refusal tests [`Tier`], not a list of shapes, so the next rung
 //!   added below the graph is refused by the same line instead of appearing in everybody's margin
 //!   the day it ships.
-//! - **Derived**: a signature, an assignment or a convention was followed. Drawn, with the footnote
-//!   in the tooltip, the only room a hint has for one.
+//! - **Derived**: a signature, an assignment or a convention was followed. Drawn, as the label
+//!   alone: no surface says how a type was found (decided 2026-09-29), so a hint has no tooltip.
 //! - **Resolved**: the code names the type. **Unreachable, by construction**, and that is the one
 //!   thing worth knowing about this module.
 //!
@@ -23,10 +23,8 @@
 //! refuses it as noise. Those are exactly the bindings whose type is resolved: **a type the code
 //! states is a type the margin need not repeat.**
 //!
-//! So every drawn hint is derived and has a tooltip, and there is no second kind on screen to tell
-//! it apart from, which is why labels carry no marker. `inlayHint/resolve` makes the tooltip cheap,
-//! not rare: the sentence is built only for the hint somebody points at, not for every line on
-//! every scroll.
+//! So every drawn hint is derived, and there is no second kind on screen to tell it apart from,
+//! which is why labels carry no marker.
 //!
 //! # Three families, and why not a fourth
 //!
@@ -36,7 +34,6 @@
 
 use std::collections::HashMap;
 
-use ruby_prism::{DefNode, Visit};
 use rubydex::model::{
     definitions::Definition,
     graph::Graph,
@@ -47,7 +44,7 @@ use crate::workspace::{DocUri, config::HintsConfig};
 
 use super::{
     cursor::{self, Binding, Receiver},
-    hover, locator, render,
+    locator, render,
     synthesized::generated_prefix,
     types::{self, Derivation, Sources, Tier},
 };
@@ -63,14 +60,14 @@ pub enum Family {
     Return,
 }
 
-/// Why a label is the type it is, in the shape a tooltip is rendered from.
+/// Why a label is the type it is: what decides its tier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Because {
     /// A receiver ya-lsp typed, and what it followed to get there. Empty means the resolved tier:
     /// the code named the type and nothing was followed.
     ///
-    /// **Boxed** because of the other variant: a [`Derivation`] carries a footnote's worth of text
-    /// for every rung (mostly `None` on any one answer), while the other variant carries nothing.
+    /// **Boxed** because of the other variant: a [`Derivation`] carries a name or a place for every
+    /// rung (mostly `None` on any one answer), while the other variant carries nothing.
     /// Hints are built one per binding across a visible range, so the enum's size is paid per
     /// label, not only by the few that followed anything.
     Followed(Box<Derivation>),
@@ -82,6 +79,8 @@ pub enum Because {
     /// [`annotations`](super::annotations) makes the same argument about the two hand-written
     /// syntaxes.
     Declared,
+    /// Every path through the `def` raises, which its own code says ([`types::never_returns`]).
+    Raises,
 }
 
 /// One label, and everything needed to draw it.
@@ -90,7 +89,7 @@ pub struct Hint {
     pub family: Family,
     /// Where the label goes, as a byte offset into the text this was read from.
     pub at: u32,
-    /// The label exactly as it is drawn, separator and footnote marker included.
+    /// The label exactly as it is drawn, separator included.
     pub label: String,
     pub because: Because,
 }
@@ -101,48 +100,16 @@ impl Hint {
     pub fn tier(&self) -> Tier {
         match &self.because {
             Because::Followed(derivation) => derivation.tier(),
-            Because::Declared => Tier::Derived,
-        }
-    }
-
-    /// The offset of the instance-variable assignment this type came from, if any.
-    ///
-    /// Returned as an offset, not rendered, for [`hover::markdown`]'s reason: an offset is only a
-    /// line once you have its text, and the caller drawing the tooltip holds it.
-    #[must_use]
-    pub fn assignment(&self) -> Option<u32> {
-        match &self.because {
-            Because::Followed(derivation) => derivation.assignment,
-            Because::Declared => None,
-        }
-    }
-
-    /// The footnote the marker promised, or `None` where the label carries no marker.
-    #[must_use]
-    pub fn note(&self, assignment_line: Option<u32>) -> Option<String> {
-        match &self.because {
-            Because::Followed(derivation) => {
-                let notes = hover::provenance(derivation, assignment_line);
-                (!notes.is_empty()).then(|| notes.join("\n\n"))
-            }
-            Because::Declared => Some(DECLARED.to_owned()),
+            Because::Declared | Because::Raises => Tier::Derived,
         }
     }
 }
 
-/// What a return hint's tooltip says.
-///
-/// Deliberately not one of `hover`'s lines: those all answer "what did ya-lsp follow to type the
-/// *receiver*", and this answers a different question about a different thing: what the method
-/// itself was declared to return, by a file other than the one being read.
-const DECLARED: &str = "Return type taken from a signature — what the method is declared to \
-                        return, not what this body was read to return.";
-
 /// Every hint for the part of `source` inside `within`, in source order.
 ///
 /// `within` is the range the editor has on screen, and it bounds the *work*, not the answer;
-/// [`cursor::bindings_in`] takes it for that reason. One parse either way; the range saves every
-/// graph lookup after it.
+/// [`cursor::margin`] takes it for that reason. One parse either way; the range saves every graph
+/// lookup after it.
 ///
 /// **The buffer's offsets are the graph's here, by the request, not by assumption.**
 /// `textDocument/inlayHint` is not one of the three requests that answer between a keystroke and
@@ -157,23 +124,16 @@ pub fn of(
     shown: &HintsConfig,
 ) -> Vec<Hint> {
     let uri_id = UriId::from(uri.as_str());
-    // Walked once per document, asked once per binding. `Scope::at` walks every definition in the
-    // document, so asking it per candidate is quadratic in the file; see [`types::Scope::bodies`],
-    // which exists for callers with many cursors, like this one. A memo instead of one walk,
-    // because the body rung reads other documents and needs the same question answered about each.
-    let walked = types::Walked::new();
-    // The second per-hint cost this avoids: the body rung reads a method's body from the document
-    // that declares it, once per `def`. Without the memo, each ask would re-read and re-parse the
-    // whole document; see `Sources::read_bodies`.
-    let read_bodies = types::ReadBodies::new();
-    // Both handed down, because `method_receiver` has an arm that places an offset of its own (a
-    // captured `self`) and would otherwise redo the hoisted walk once per hint.
-    let sources = &Sources {
-        walked: Some(&walked),
-        read_bodies: Some(&read_bodies),
-        ..*sources
-    };
-    let mut hints: Vec<Hint> = cursor::bindings_in(source, within)
+    // **One parse of the document for the whole request** ([`cursor::margin`]): the bindings, the
+    // `def`s, and the walk the type side reads next, unless it is held for this text already. The
+    // type side then finds it held and parses nothing.
+    let held = sources.held_exits;
+    let margin = cursor::margin(source, within, !held.holds(uri.as_str(), source));
+    if let Some(shapes) = margin.shapes {
+        held.keep(uri.as_str(), source, shapes);
+    }
+    let mut hints: Vec<Hint> = margin
+        .bindings
         .into_iter()
         .filter(|bound| match bound.binding {
             Binding::BlockParameter => shown.block_parameters,
@@ -196,7 +156,7 @@ pub fn of(
         .collect();
 
     if shown.returns {
-        hints.extend(returns(sources, uri, uri_id, source, within));
+        hints.extend(returns(sources, uri, uri_id, source, margin.defs));
     }
     // The bottom tier is refused here, once, after every family has answered: a test on the tier,
     // never on the shape that produced it. See the module docs.
@@ -216,7 +176,12 @@ pub fn of(
 /// arrives here as the one shape that can only come from a signature.
 fn worth_saying(was: &Receiver) -> bool {
     match was {
-        Receiver::Returned { .. } | Receiver::Yielded { .. } => true,
+        // A read of another variable names no class on this line either, whatever its writes say.
+        // What a block hands back is no more written on its line than a call's return.
+        Receiver::Returned { .. }
+        | Receiver::Yielded { .. }
+        | Receiver::Yield { .. }
+        | Receiver::Variable(_) => true,
         // The two wrappers are not shapes of their own: an instance variable carries where it was
         // written and a spelled local carries its name, and either is worth what it wraps.
         Receiver::Assigned { was, .. } | Receiver::Spelled { was, .. } => worth_saying(was),
@@ -225,20 +190,70 @@ fn worth_saying(was: &Receiver) -> bool {
         // wrap `cursor::bindings_in` applies would read as "not worth saying", and every
         // destructured target would go unlabelled, including those the tuple table answers.
         Receiver::Destructured { of, .. } => worth_saying(of),
-        _ => false,
+        // One side of `block_given?`, worth what it holds.
+        Receiver::BlockGiven { value, .. } => worth_saying(value),
+        // `lambda { }` and `proc { }` are calls, worth what a call is: nothing on the line says
+        // `Kernel#lambda` makes a `Proc`, and a class may define its own `proc`.
+        Receiver::Proc {
+            call: Some(call), ..
+        } => worth_saying(call),
+        // A conditional is worth what its branches are: `x = ok ? "a" : "b"` names `String` twice,
+        // and `x = ok ? a.b : c.d` names nothing.
+        Receiver::Either(arms) => arms.iter().any(worth_saying),
+        // The line names the class: a constant, `Foo.new`, a literal, `self`, the top level.
+        Receiver::Constant(_)
+        | Receiver::Instance { .. }
+        // `rescue Timeout::Error => e` names the class, and a bare `rescue => e` is
+        // `StandardError` by Ruby's rule.
+        | Receiver::Rescued(_)
+        | Receiver::Literal { .. }
+        // `->(x) { }` names `Proc` on its face.
+        | Receiver::Proc { call: None, .. }
+        | Receiver::SelfObject(_)
+        | Receiver::TopLevel
+        // `!x` is a `bool` on its face.
+        | Receiver::Negated(_)
+        // Not drawn: `super(...)`, `a || b` and a parameter's own read are labels nobody has
+        // decided on. Listed, not left to a wildcard, so a new shape is decided too.
+        | Receiver::Super { .. }
+        | Receiver::Shortcut { .. }
+        | Receiver::Parameter { .. }
+        | Receiver::ProcParameter { .. }
+        // A guess or nothing: never drawn (`hints.md`'s first rule).
+        | Receiver::Named(_)
+        | Receiver::Unknown => false,
     }
 }
 
 /// A label for the declaration a type resolved to, or `None` where there is nothing to draw.
 ///
-/// **Classes and modules only.** A singleton class is a *class object*'s type, which Ruby cannot
-/// spell (`Foo::<Foo>` is rubydex's name, `singleton(Foo)` RBS's), and a `Namespace::Todo` is a
-/// name nothing defines, so a label from one points at nothing a reader could check. Both are types
-/// this module cannot spell exactly, the same test [`annotations`](super::annotations) applies to
-/// what it declares.
+/// **Classes, modules and class objects only**, as [`render::typed`] spells them: a class object is
+/// `Foo:class`. A `Namespace::Todo` is a name nothing defines, so a label from one points at
+/// nothing a reader could check, and a module object has no spelling.
 fn label(graph: &Graph, typed: &types::Typed) -> Option<String> {
-    Some(format!(": {}", render::typed(graph, typed)?))
+    Some(format!(
+        ": {}",
+        readable(typed, render::typed(graph, typed)?)?
+    ))
 }
+
+/// A spelled type, unless it is a union over a concern's including classes too wide to read
+/// ([`MAX_INCLUDERS_SPELLED`]).
+fn readable(typed: &types::Typed, spelled: String) -> Option<String> {
+    let wide = spelled.matches(" | ").count() >= MAX_INCLUDERS_SPELLED;
+    (!(wide && typed.derivation.each.is_some())).then_some(spelled)
+}
+
+/// The widest union over a concern's including classes a margin spells. A label is
+/// read at a glance, and a scope in a concern two dozen models include is `Account::Relation |
+/// Block::Relation | …` there, which nobody reads. The card, with room for it, still shows every
+/// member.
+///
+/// - **Only such a union**, whose width is the number of includers, not the value's: a numeric
+///   tower (`BigDecimal | Integer | Float | Rational | Complex`) is drawn as before.
+/// - **Counted as spelled**, so a union that collapses into the class every member inherits from
+///   (`render::typed`) is one member however many it holds.
+const MAX_INCLUDERS_SPELLED: usize = 4;
 
 /// Every `def` in `within` whose return a signature declares and the source does not.
 ///
@@ -250,7 +265,7 @@ fn returns(
     uri: &DocUri,
     uri_id: UriId,
     source: &str,
-    within: (u32, u32),
+    defs: Vec<cursor::DefSite>,
 ) -> Vec<Hint> {
     let graph = sources.graph;
     let Some(document) = graph.documents().get(&uri_id) else {
@@ -276,16 +291,8 @@ fn returns(
     // `generated_prefix`.
     let written_here = generated_prefix(uri.as_str());
 
-    let parsed = ruby_prism::parse(source.as_bytes());
-    let mut walk = Defs {
-        within,
-        found: Vec::new(),
-    };
-    walk.visit(&parsed.node());
-
-    walk.found
-        .into_iter()
-        .filter_map(|(name, at)| {
+    defs.into_iter()
+        .filter_map(|cursor::DefSite { name, at, raises }| {
             if value_is_discarded(&source[name.0 as usize..name.1 as usize]) {
                 return None;
             }
@@ -298,32 +305,38 @@ fn returns(
             }) {
                 return None;
             }
-            // `Return::Same` is the receiver, which at a `def` is the class the label is already
-            // written inside; the two query-interface sentinels are names no file declares. None of
-            // the three is a class to draw; see `types::ELEMENT`.
-            let (declared, because) = match sources.types.declared_return(id) {
-                // A class, or the boolean pair; either way the facets the signature declared travel
-                // onto the label (`types::Typed::declared_as`).
-                Some(returns) => (
-                    types::Typed::declared_as(graph, returns)?,
-                    Because::Declared,
-                ),
-                // **The half about the method, not a receiver.** Nothing declares what an
-                // application's own `def` returns, so this reads the body instead. It is the same
-                // [`types::body_return`] a chain reaches through `from_body`, so a margin and a
-                // card cannot disagree, and it arrives as [`Because::Followed`], so the tier rule
-                // below still holds: a body whose exit was guessed is guessed, and a guess is never
-                // painted into a margin.
-                None => {
-                    let typed = types::body_return(sources, id)?;
-                    let because = Because::Followed(Box::new(typed.derivation.clone()));
-                    (typed, because)
-                }
+            // A signature, else the body, and the union where bodies dispute the signature: the
+            // same answer the card and a chain read ([`types::method_return`]). A body read arrives
+            // as [`Because::Followed`], so the tier rule below still holds: a body whose exit was
+            // guessed is guessed, and a guess is never painted into a margin.
+            // The method this `def` really defines, where rubydex filed it under another: an RSpec
+            // group's helper is its group's, not every spec's one `Object` method.
+            let id = types::own_def_member(sources, uri.as_str(), name).unwrap_or(id);
+            // **Every path raises**: nothing is handed back, and the margin says so.
+            if raises && types::never_returns(sources, id) {
+                return Some(Hint {
+                    family: Family::Return,
+                    at,
+                    label: " -> bot".to_owned(),
+                    because: Because::Raises,
+                });
+            }
+            let returned = types::method_return(sources, id)?;
+            let because = if returned.declared {
+                Because::Declared
+            } else {
+                Because::Followed(Box::new(returned.typed.derivation.clone()))
             };
+            let declared = returned.typed;
             Some(Hint {
                 family: Family::Return,
                 at,
-                label: format!(" -> {}", render::typed(graph, &declared)?),
+                // **`!` is this `def`'s own `raise`**, the one the label sits on: a reopened
+                // method's other `def`s have margins of their own.
+                label: format!(
+                    " -> {}",
+                    readable(&declared, render::returned(graph, &declared, raises)?)?
+                ),
                 because,
             })
         })
@@ -343,7 +356,7 @@ fn returns(
 ///   `obj[k] = v`, with no exceptions. The name ends in `=` and the byte before is not one of
 ///   `=<>!`, which is exactly Ruby's grammar for `title=` versus `==`, `!=`, `<=`, `>=`, `===`.
 ///
-/// **This is the margin's rule, not the module's.** `types::body_return` still answers for both, so
+/// **This is the margin's rule, not the module's.** `types::method_return` still answers for both, so
 /// a hover card on a setter still says what the body returns, and a chain through one still steps.
 /// The refusal lives here because a hint is the answer nobody asked for and has a higher bar than a
 /// card. Constructors hit it most, because their last line is usually an assignment, which returns
@@ -361,39 +374,6 @@ fn value_is_discarded(name: &str) -> bool {
     }
 }
 
-/// Where a `def`'s return label goes, for every `def` whose name starts inside the range.
-struct Defs {
-    within: (u32, u32),
-    /// The name span, and the offset the label is drawn at.
-    found: Vec<((u32, u32), u32)>,
-}
-
-impl<'pr> Visit<'pr> for Defs {
-    fn visit_def_node(&mut self, node: &DefNode<'pr>) {
-        let name = node.name_loc();
-        let name = (name.start_offset() as u32, name.end_offset() as u32);
-        // Past the closing parenthesis if there is one, past the parameters if written without any,
-        // and past the name if there are none: `def title(a)`, `def title a` and `def title` all
-        // end their signature differently, and a label at the name would land inside the first
-        // one's parameter list.
-        let at = node
-            .rparen_loc()
-            .map(|paren| paren.end_offset() as u32)
-            .or_else(|| {
-                node.parameters()
-                    .map(|parameters| parameters.location().end_offset() as u32)
-            })
-            .unwrap_or(name.1);
-        // From the name to where the label goes: the span this `def` occupies as far as a hint is
-        // concerned (see [`cursor::overlaps`]). Testing the name alone would miss a `def` whose
-        // label is in the window and whose name is one line above it.
-        if cursor::overlaps((name.0, at), self.within) {
-            self.found.push((name, at));
-        }
-        ruby_prism::visit_def_node(self, node);
-    }
-}
-
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
@@ -404,6 +384,18 @@ mod tests {
     ///
     /// `Typed` carries a generic's positions, and this is where the margin spells them:
     /// `"a,b".scan(",")` and `[1, 2].map { |n| "x" }` draw `Array[String]`, not a bare `Array`.
+    /// A `-> bot` label is drawn: its code says every path raises, which is no guess.
+    #[test]
+    fn a_label_on_a_method_that_never_returns_is_no_guess() {
+        let hint = Hint {
+            family: Family::Return,
+            at: 0,
+            label: " -> bot".to_owned(),
+            because: Because::Raises,
+        };
+        assert_eq!(hint.tier(), Tier::Derived);
+    }
+
     #[test]
     fn a_generic_is_drawn_holding_what_it_was_written_holding() {
         let source = "\
@@ -448,24 +440,7 @@ end
     }
 
     fn with_declared_types_and_config(source: &str, rbs: &str, config: &str) -> (Harness, DocUri) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let signatures = dir.path().join("sig");
-        std::fs::create_dir_all(signatures.join("core")).unwrap();
-        std::fs::write(
-            signatures.join("core/core.rbs"),
-            format!("{TYPED_RBS}\n{rbs}"),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("ya-lsp.toml"),
-            format!(
-                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n{config}",
-                signatures.display().to_string()
-            ),
-        )
-        .unwrap();
-
-        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        let mut harness = signed(&[("core/core.rbs", &format!("{TYPED_RBS}\n{rbs}"))], config);
         let uri = harness.write("app/report.rb", source);
         harness.index();
         harness.index_gems();
@@ -571,6 +546,205 @@ end
         );
     }
 
+    /// A `raise` is no exit's value, and a method whose own code writes one is marked `!`, after
+    /// any `?`. The mark is the method's: what it returned, held in a variable, is not marked.
+    #[test]
+    fn a_method_that_writes_raise_is_marked_and_keeps_its_type() {
+        let source = "\
+class Gate
+  def pick(x)
+    return \"a\" if x
+    raise ArgumentError, \"no\"
+  end
+
+  def either(x)
+    x ? \"a\" : fail(\"no\")
+  end
+
+  def guard(x)
+    raise ArgumentError unless x
+    \"a\"
+  end
+
+  def maybe(x)
+    return nil if x
+    raise \"no\" if x == 1
+    \"a\"
+  end
+
+  def listed(items)
+    items.each { |item| raise \"no\" if item }
+    \"a\"
+  end
+
+  def plain(x)
+    return \"a\" if x
+    \"b\"
+  end
+
+  def outer
+    def inner
+      raise \"no\"
+    end
+    \"a\"
+  end
+
+  def never
+    raise NotImplementedError
+  end
+
+  def declared
+    raise \"no\" if @off
+    1
+  end
+
+  def sure(x)
+    maybe(x) || raise(\"no\")
+  end
+
+  def gone
+    nil || raise(\"no\")
+  end
+
+  def use
+    held = maybe(1)
+    names = [1, 2].map { |n| n ? \"x\" : raise(\"no\") }
+    raised = [1, 2].map { raise(\"no\") }
+  end
+end
+";
+        // `either`'s signature says nothing of its return, so the card reads the body, and the
+        // mark is asked of both definitions: the signature's has no body, the `def`'s raises.
+        let (mut harness, uri) = with_declared_types(
+            source,
+            "class Gate\n  def declared: () -> Integer\n  def either: (untyped) -> untyped\nend\n",
+        );
+        let drawn = drawn_hints(source, &harness.hints_in(&uri));
+        assert_eq!(
+            drawn,
+            "  def pick(x) -> String!
+  def either(x) -> String!
+  def guard(x) -> String!
+  def maybe(x) -> String?!
+  def listed(items) -> String!
+  def plain(x) -> String
+  def outer -> String
+    def inner -> bot
+  def never -> bot
+  def declared -> Integer!
+  def sure(x) -> String!
+  def use -> Array!
+    held: String? = maybe(1)
+    names: Array[String] = [1, 2].map { |n| n ? \"x\" : raise(\"no\") }
+    names = [1, 2].map { |n: Integer| n ? \"x\" : raise(\"no\") }
+    raised: Array = [1, 2].map { raise(\"no\") }"
+        );
+
+        // The card says what the margin says, and so does a call's.
+        let card = card(&mut harness, &uri, source, "maybe(1)");
+        assert!(card.contains("Gate#maybe(x) -> String?!"), "{card}");
+        let signed = harness.hover_at(&uri, source, "either(x)");
+        let signed = signed["contents"]["value"].as_str().unwrap_or_default();
+        assert!(signed.contains("-> String!"), "{signed}");
+        let card = harness.hover_at(&uri, source, "plain(x)");
+        let card = card["contents"]["value"].as_str().unwrap_or_default();
+        assert!(card.contains("Gate#plain(x) -> String\n"), "{card}");
+    }
+
+    /// A hint request reads its document **once**: the bindings, every `def`'s label and what the
+    /// type side reads out of the text come from one parse, and a second request over the same
+    /// text parses it once more only for its window.
+    #[test]
+    fn a_hint_request_parses_its_document_once() {
+        let source = "\
+class Ledger
+  def total(x)
+    rows = [1, 2].map { |n| n.to_s }
+    rows.first
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(source, "");
+        cursor::parses_taken();
+        let first = harness.hints_in(&uri);
+        let cold = cursor::parses_taken();
+        let second = harness.hints_in(&uri);
+        let warm = cursor::parses_taken();
+        assert_eq!(first, second);
+        assert_eq!((cold, warm), (1, 1));
+    }
+
+    #[test]
+    fn a_union_over_many_including_classes_is_not_spelled_in_the_margin() {
+        // A value that is one of five classes is drawn: the width is the value's. The same width
+        // made of a concern's includers is not ([`MAX_INCLUDERS_SPELLED`]), and four of them are.
+        let (mut harness, _, _) = models_project("");
+        harness.write("app/models/application_record.rb", CONCERNS);
+        let concern = "\
+module Stamped
+  included do
+    before_save do
+      stamp = marker
+    end
+  end
+end
+";
+        let uri = harness.write("app/models/concerns/stamped.rb", concern);
+        let few = "\
+module Few
+  included do
+    before_save do
+      stamp = marker
+    end
+  end
+end
+";
+        let few_uri = harness.write("app/models/concerns/few.rb", few);
+        for (index, class) in ["Aa", "Bb", "Cc", "Dd", "Ee"].into_iter().enumerate() {
+            let included = if index < 4 {
+                "Stamped\n  include Few"
+            } else {
+                "Stamped"
+            };
+            harness.write(
+                &format!("app/models/{}.rb", class.to_lowercase()),
+                &format!(
+                    "class {class} < ApplicationRecord\n  include {included}\n\n  def marker\n    \
+                     {class}.new\n  end\nend\n"
+                ),
+            );
+        }
+        let numbers = "\
+class A; end
+class B; end
+class C; end
+class D; end
+class E; end
+
+def tower(n)
+  case n
+  when 1 then A.new
+  when 2 then B.new
+  when 3 then C.new
+  when 4 then D.new
+  else E.new
+  end
+end
+";
+        let tower = harness.write("lib/tower.rb", numbers);
+        harness.index();
+        assert_eq!(drawn_hints(concern, &harness.hints_in(&uri)), "null");
+        assert_eq!(
+            drawn_hints(few, &harness.hints_in(&few_uri)),
+            "      stamp: Aa | Bb | Cc | Dd = marker"
+        );
+        assert!(
+            drawn_hints(numbers, &harness.hints_in(&tower)).contains("def tower(n) ->"),
+            "{}",
+            drawn_hints(numbers, &harness.hints_in(&tower))
+        );
+    }
+
     #[test]
     fn a_type_matched_on_a_name_alone_is_never_drawn_in_the_margin() {
         // The refusal, asserted **by tier, not by example**: the same expression is asked twice, as
@@ -583,10 +757,7 @@ end
         let card = harness.hover_at(&uri, HINTS, "shout\n    from");
         let card = card["contents"]["value"].as_str().unwrap_or("null");
         assert!(card.contains("Person#shout"), "{card}");
-        assert!(
-            card.contains("Type guessed from the name `person` alone"),
-            "{card}"
-        );
+        assert!(card.contains("Guessed from name alone"), "{card}");
 
         assert!(
             !drawn_hints(HINTS, &harness.hints_in(&uri)).contains("guessed"),
@@ -604,27 +775,16 @@ end
         // The population moves, not the tier. Every such answer is a convention, therefore
         // *Derived*, which is already drawn; the refusal below is the same test on [`Tier`], in the
         // same file and request.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let signatures = dir.path().join("sig");
-        std::fs::create_dir_all(signatures.join("core")).unwrap();
-        std::fs::write(
-            signatures.join("core/core.rbs"),
-            format!(
-                "{TYPED_RBS}\nclass Story\n  def headline: () -> String\nend\n\n\
+        let mut harness = signed(
+            &[(
+                "core/core.rbs",
+                &format!(
+                    "{TYPED_RBS}\nclass Story\n  def headline: () -> String\nend\n\n\
                  class Person\n  def shout: () -> String\nend\n"
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("ya-lsp.toml"),
-            format!(
-                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
-                signatures.display().to_string()
-            ),
-        )
-        .unwrap();
-
-        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+                ),
+            )],
+            "",
+        );
         harness.write(
             "app/models/story.rb",
             "class Story\n  def headline\n  end\nend\n",
@@ -632,6 +792,10 @@ end
         harness.write(
             "app/models/person.rb",
             "class Person\n  def shout\n  end\nend\n",
+        );
+        harness.write(
+            "app/mailers/application_mailer.rb",
+            "class ApplicationMailer\nend\n",
         );
         harness.write(
             "app/mailers/user_mailer.rb",
@@ -653,51 +817,17 @@ end
     }
 
     #[test]
-    fn a_tooltip_is_the_card_s_footnote_and_is_built_only_when_asked_for() {
-        // Two halves of one contract. No hint ships its tooltip (every hint on screen would
-        // otherwise carry a paragraph of markdown), and every hint ships the `data` that fetches
-        // one, because every drawn hint is derived and has something to say.
-        //
-        // The tooltip reuses `hover::provenance`'s sentences on purpose: the margin and the card
-        // are never on screen together, so two wordings for one answer would be a difference nobody
-        // could notice.
+    fn a_hint_is_its_label_with_nothing_to_resolve() {
+        // No surface says how a type was found (decided 2026-09-29), so a hint carries neither a
+        // tooltip nor the `data` a client would send back to fetch one.
         let (mut harness, uri) = with_declared_types(HINTS, HINTS_RBS);
         let hints = harness.hints_in(&uri);
-        let hints = hints.as_array().expect("hints").clone();
-
-        for hint in &hints {
+        let hints = hints.as_array().expect("hints");
+        assert!(!hints.is_empty());
+        for hint in hints {
             assert_eq!(hint["tooltip"], serde_json::Value::Null, "{hint}");
-            assert!(hint["data"]["at"].is_number(), "{hint}");
+            assert_eq!(hint["data"], serde_json::Value::Null, "{hint}");
         }
-
-        // The one hint with two footnotes: a chain of signatures, and the instance-variable
-        // assignment the chain started from, named by the line a reader can go to (line 8 of this
-        // file), not an offset.
-        let ivar = hints
-            .iter()
-            .find(|hint| hint["position"]["line"] == 19)
-            .expect("the hint on `from_ivar`");
-        let resolved = harness.ask("inlayHint/resolve", ivar.clone());
-        assert_eq!(
-            resolved["tooltip"]["value"].as_str().unwrap_or("null"),
-            "Type derived through `String#upcase()` \u{2192} `String#length()` — from what those \
-             methods declare, not from this expression.\n\n\
-             Type taken from the assignment on line 8, which may not be the one that ran."
-        );
-
-        // And the third family's, which is not one of `hover`'s lines and could not be: those
-        // answer what was followed to type a *receiver*, and this answers what the method itself
-        // was declared to return, by a file other than the one being read.
-        let declared = hints
-            .iter()
-            .find(|hint| hint["position"]["line"] == 10)
-            .expect("the hint on `def headline`");
-        let resolved = harness.ask("inlayHint/resolve", declared.clone());
-        assert_eq!(
-            resolved["tooltip"]["value"].as_str().unwrap_or("null"),
-            "Return type taken from a signature — what the method is declared to return, not \
-             what this body was read to return."
-        );
     }
 
     #[test]
@@ -1024,13 +1154,14 @@ end
 
         assert_eq!(
             drawn_hints(source, &harness.hints_in(&uri)),
-            // `plus` draws nothing: two arms of one arity naming two classes is a union of names,
-            // which this module drops. Picking one would be confident and depend only on read
-            // order.
+            // `plus` is both documents' answers: two arms of one arity that nothing tells apart
+            // are joined (`types::join_arms`), so the label holds whichever document is right.
+            // Picking one would be confident and depend only on read order.
             //
             // The other two show this is a merge, not a refusal to read a method two documents
-            // mention: a name only one document declares still answers.
-            "  def only_the_first -> String
+            // mention: a name only one document declares still answers alone.
+            "  def both_declare_it -> String | Integer
+  def only_the_first -> String
   def only_the_second -> Integer"
         );
     }
@@ -1043,7 +1174,9 @@ end
         // declaration one name away in `vendor/rbs`.
         //
         // Both spellings are here because they are two Prism nodes with one meaning, and the
-        // singleton pair is here because `alias` can rename a `self.` method too.
+        // singleton pair is here because `alias` can rename a `self.` method too. An alias of a
+        // Ruby method nothing declares is that method too: a call of it reads the method's body,
+        // and an inherited one is found where the alias is written.
         let source = "class Reader
   def by_keyword
     Widget.new.renamed
@@ -1060,6 +1193,14 @@ end
   def of_nothing
     Widget.new.of_untyped
   end
+
+  def of_a_body
+    Widget.new.caption
+  end
+
+  def of_an_inherited_body
+    Widget.new.titled
+  end
 end
 ";
         let (mut harness, uri) = with_declared_types(
@@ -1068,9 +1209,15 @@ end
         );
         harness.write(
             "app/widget.rb",
-            "class Widget\n  alias renamed size\n  alias_method :called, :size\n\n  \
+            "class Widget < Base\n  alias renamed size\n  alias_method :called, :size\n\n  \
              class << self\n    alias built make\n  end\n\n  \
-             def anonymous\n    yield\n  end\n  alias of_untyped anonymous\nend\n",
+             def anonymous\n    yield\n  end\n  alias of_untyped anonymous\n\n  \
+             def label\n    \"x\"\n  end\n  alias_method :caption, :label\n  \
+             alias_method :titled, :title\nend\n",
+        );
+        harness.write(
+            "app/base.rb",
+            "class Base\n  def title\n    1\n  end\nend\n",
         );
         harness.index();
 
@@ -1080,7 +1227,9 @@ end
             // own row was never filed, so the alias gets nothing instead of a guess.
             "  def by_keyword -> Integer
   def by_call -> Integer
-  def on_the_singleton -> String"
+  def on_the_singleton -> String
+  def of_a_body -> String
+  def of_an_inherited_body -> Integer"
         );
     }
 
@@ -1250,14 +1399,17 @@ end
         // walks the chain: `Float#+` declares `(Numeric) -> Float`, and `1.5 + 1` hands it an
         // `Integer`.
         //
-        // The last five are refusals and must stay refusals:
+        // The next four pick no arm, and must not: one of the arms still runs, so each is the
+        // union of every arm that takes one argument (`types::join_arms`), never one of them.
         //
         // 1. An arm whose parameter this cannot read cannot be ruled out.
         // 2. An arm with an *optional* positional has no fixed position-to-parameter map.
         // 3. A call writing no argument has nothing to pick with.
         // 4. Two arms fitting alike are the disagreement the partition already refused, from the
         //    other side.
-        // 5. A splat is a count nothing here can know.
+        //
+        // The last is a refusal and must stay one: a splat is a count nothing here can know, so
+        // no set of arms is known to hold the answer.
         let source = "\
 class Reader
   def by_the_first
@@ -1324,7 +1476,11 @@ end
             drawn_hints(source, &harness.hints_in(&uri)),
             "  def by_the_first -> String
   def by_the_second -> Integer
-  def through_an_ancestor -> String"
+  def through_an_ancestor -> String
+  def one_arm_unreadable -> String | Integer
+  def an_optional_lines_up_with_nothing -> String | Integer
+  def nothing_to_pick_with -> String | Integer
+  def two_arms_fit_alike -> String | Float"
         );
     }
 
@@ -1605,6 +1761,2339 @@ end
   def not_nil -> true
   def double -> bool
   def blankish -> bool"
+        );
+    }
+
+    #[test]
+    fn a_read_is_every_write_that_can_reach_it() {
+        // The reaching-writes rule, drawn. A read's type is every write that can reach it, folded: a
+        // branch adds, a write on every path kills what is above it, a loop brings back what is
+        // below, and `nil` joins where nothing has run yet. One write nothing can type refuses
+        // the whole read, and a parameter belongs to its own `def` (#13).
+        let source = "\
+class Probe
+  def branch(c)
+    value = \"x\"
+    value = 1 if c
+    value
+  end
+
+  def maybe(c)
+    value = 1 if c
+    value
+  end
+
+  def relayed(thing)
+    value = \"x\"
+    value = thing
+    value
+  end
+
+  def straight
+    value = nil
+    value = 1
+    value
+  end
+
+  def counted(items)
+    total = 0
+    items.each { |i| total += 1 }
+    total
+  end
+
+  def in_block(items)
+    value = \"a\"
+    items.each { value = 1 }
+    value
+  end
+
+  def nested(c)
+    a = 1
+    a = \"s\" if c
+    b = a
+    b
+  end
+
+  def writes
+    user = \"x\"
+    user
+  end
+
+  def reads(user)
+    user
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(
+            source,
+            "class Integer\n  def +: (Integer) -> Integer\nend\n",
+        );
+        // `relayed` and `reads` are refused: `thing` and `user` are parameters nothing types, and
+        // `relayed`'s later write is the one that ran (#11). `writes`'s `user` is not `reads`'s
+        // (#13). `counted` settles its loop in two rounds: `0`, then `Integer#+` on it.
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def branch(c) -> String | Integer
+  def maybe(c) -> Integer?
+  def straight -> Integer
+  def counted(items) -> Integer
+  def in_block(items) -> String | Integer
+  def nested(c) -> Integer | String
+    b: Integer | String = a
+  def writes -> String"
+        );
+    }
+
+    #[test]
+    fn a_check_narrows_the_values_that_reach_a_read() {
+        // A check narrows each value that took effect before it, where the check holds:
+        // its branch, the right side of `&&` and `||`, and the rest of a statement list after a
+        // guard. A write below the check is its own value, a write in a lambda may run after the
+        // check, a loop brings back a write the check above it never saw, and a negated
+        // conjunction says nothing. A branch whose value starts at a read the check rules every
+        // value out of never runs, and adds nothing (`dead_ends`, `dead_branch`); such a read is no
+        // name to guess from either (`dead_else`: `object` is not an `Object`), and a value written
+        // from one never took effect (`dead_write`: `parts`). A braceless hash is keywords to a
+        // `def` taking `...`, never one more positional (`forwarded`).
+        let source = "\
+class Probe
+  def guard(c)
+    value = 1 if c
+    return unless value
+    a = value
+  end
+
+  def guard_nil(c)
+    value = 1 if c
+    raise \"no\" if value.nil?
+    value
+  end
+
+  def created(c)
+    user = \"x\" if c
+    user = \"y\" unless user
+    user
+  end
+
+  def branches(c)
+    value = 1 if c
+    if value
+      a = value
+    else
+      b = value
+    end
+    unless value == nil
+      d = value
+    end
+    value.nil? || (e = value)
+  end
+
+  def written_between(c, d)
+    value = 1 if c
+    if value
+      value = nil if d
+      a = value
+    end
+  end
+
+  def in_block(c, items)
+    value = 1 if c
+    return unless value
+    items.each { a = value }
+  end
+
+  def later(c)
+    value = 1 if c
+    reset = -> { value = nil }
+    raise \"no\" unless value
+    reset.call
+    value
+  end
+
+  def conjunction(c, d)
+    value = 1 if c
+    other = 1 if d
+    if value && other
+      a = value
+    else
+      b = value
+    end
+    raise \"no\" unless value && other
+    value
+  end
+
+  def negated(c)
+    value = 1 if c
+    raise \"no\" if !value
+    value
+  end
+
+  def kinds(thing)
+    case thing
+    when Hash
+      a = thing
+    when String, Symbol
+      b = thing
+    when \"x\"
+      c = thing
+    end
+    if thing.is_a?(Array)
+      d = thing
+    end
+    raise \"no\" unless thing.kind_of?(Integer)
+    thing
+  end
+
+  def mixed(c)
+    value = c ? 1 : \"s\"
+    if value.is_a?(Integer)
+      a = value
+    else
+      b = value
+    end
+    case value
+    when String
+      d = value
+    else
+      e = value
+    end
+  end
+
+  def checked_write
+    if (found = [1].first)
+      a = found
+    end
+  end
+
+  def looped(c, d)
+    value = 1 if c
+    raise \"no\" unless value
+    while d
+      a = value
+      value = nil
+    end
+  end
+
+  def parse(value)
+    return value if value.is_a?(Integer)
+    \"s\"
+  end
+
+  def pick(record)
+    record.is_a?(Array) ? record.first : record
+  end
+
+  def dead_ends
+    parse(\"x\")
+  end
+
+  def dead_branch
+    pick(\"x\")
+  end
+
+  def keys_of(object)
+    case object
+    when Integer
+      object
+    else
+      object
+    end
+  end
+
+  def dead_else
+    keys_of(1)
+  end
+
+  def extract(content)
+    return content unless content.is_a?(Array)
+    parts = content.first
+    parts
+  end
+
+  def dead_write
+    extract(\"x\")
+  end
+
+  def forwarding(target, ...)
+    target
+  end
+
+  def forwarded
+    forwarding(1, page: 2)
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(
+            source,
+            "class Symbol\nend\n\nclass Array[E]\n  def first: () -> E?\nend\n",
+        );
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def guard(c) -> Integer?
+    a: Integer = value
+  def guard_nil(c) -> Integer!
+  def created(c) -> String
+      a: Integer = value
+      b: nil = value
+      d: Integer = value
+    value.nil? || (e: Integer = value)
+  def written_between(c, d) -> Integer?
+      a: Integer? = value
+    items.each { a: Integer = value }
+  def later(c) -> Integer?!
+  def conjunction(c, d) -> Integer!
+      a: Integer = value
+      b: Integer? = value
+  def negated(c) -> Integer!
+  def kinds(thing) -> Integer!
+      a: Hash = thing
+      b: String | Symbol = thing
+      d: Array = thing
+  def mixed(c) -> String | Integer
+      a: Integer = value
+      b: String = value
+      d: String = value
+      e: Integer = value
+  def checked_write -> Integer?
+    if (found: Integer? = [1].first)
+      a: Integer = found
+      a: Integer? = value
+  def parse(value) -> String | Integer
+  def dead_ends -> String
+  def dead_branch -> String
+  def dead_else -> Integer
+  def dead_write -> String
+  def forwarded -> Integer"
+        );
+    }
+
+    #[test]
+    fn a_check_is_read_by_ruby_s_rules() {
+        // A check's other spellings. `!=`, `instance_of?`, an `elsif`, an `unless … else`, a
+        // ternary, parentheses, `and`/`or` guards, a `case` on a write with `when nil`, and the
+        // checks that say nothing: a module, a constant that names no class, a negated
+        // `instance_of?`, a check on a call, a `case` with no subject, and a `when` of literals
+        // (its `else` included).
+        let source = "\
+class Probe
+  def spellings(c, d)
+    value = 1 if c
+    unless value != nil
+      a = value
+    end
+    if value.nil?
+      b = value
+    elsif d
+      e = value
+    else
+      f = value
+    end
+    unless value
+      g = value
+    else
+      h = value
+    end
+    i = (value) ? value : 0
+  end
+
+  def guards(c, d)
+    value = 1 if c
+    value.nil? and raise \"no\"
+    a = value
+    other = 1 if d
+    other or raise \"no\"
+    b = other
+    third = 1 if d
+    third ||= 2
+    unless third
+      raise \"no\"
+    else
+      c = third
+    end
+    fourth = 1 if d
+    fourth or puts(1)
+    unless fourth
+      puts(2)
+    end
+    e = fourth
+  end
+
+  def kinds(thing, c)
+    if thing.instance_of?(Hash)
+      a = thing
+    end
+    unless thing.instance_of?(Hash)
+      b = thing
+    end
+    if thing.is_a?(Enumerable) || thing.is_a?(Missing)
+      d = thing
+    end
+    case (found = [c].first)
+    when nil
+      e = found
+    when Integer
+      f = found
+    end
+    value = [c].first
+    if value.is_a?(Kernel)
+      g = value
+    end
+    if value.is_a?(Object)
+      h = value
+    end
+    number = 1 if c
+    case
+    when number.nil?
+      i = number
+    end
+    case number
+    when \"one\"
+      j = number
+    else
+      k = number
+    end
+    case number
+    when Integer
+    when nil
+      l = number
+    end
+    unless number.is_a?(Kernel)
+      m = number
+    end
+    if number.nil? { 1 }
+      n = number
+    end
+    unless !number { 1 }
+      o = number
+    end
+  end
+end
+";
+        let (mut harness, uri) =
+            with_declared_types(source, "class Array[E]\n  def first: () -> E?\nend\n");
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def spellings(c, d) -> Integer
+      a: nil = value
+      b: nil = value
+      e: Integer = value
+      f: Integer = value
+      g: nil = value
+      h: Integer = value
+    i: Integer = (value) ? value : 0
+  def guards(c, d) -> Integer?!
+    a: Integer = value
+    b: Integer = other
+      c: Integer = third
+    e: Integer? = fourth
+  def kinds(thing, c) -> Integer?
+      a: Hash = thing
+      e: nil = found
+      f: Integer = found
+      h: Object = value
+      i: Integer? = number
+      j: Integer? = number
+      k: Integer? = number
+      l: nil = number
+      m: Integer? = number
+      n: Integer? = number
+      o: Integer? = number"
+        );
+    }
+
+    #[test]
+    fn a_check_keeps_what_a_class_can_be() {
+        // A check's class half: `is_a?` keeps a class below the one named, makes one above it
+        // (or a module) that class, and rules out one beside it, a class object included (`l`);
+        // its negation drops what is below.
+        // And the guards whose other branch writes, the checks that say nothing (`&.`, `!= 1`, a
+        // variable class, a module), and a write in the same block as its check.
+        let source = "\
+class Probe
+  def classes(c)
+    pet = Zoo.new.pet
+    if pet.is_a?(Dog)
+      a = pet
+    end
+    if pet.is_a?(Rock)
+      b = pet
+    end
+    unless pet.is_a?(Dog)
+      d = pet
+    end
+    if pet.is_a?(Walker)
+      e = pet
+    end
+    either = c ? Zoo.new.pet : Zoo.new.walker
+    if either.is_a?(Dog)
+      f = either
+    end
+    mixed = c ? Dog.new : Rock.new
+    unless mixed.is_a?(Dog)
+      g = mixed
+    end
+    flag = c ? true : false
+    if flag.is_a?(TrueClass)
+      h = flag
+    end
+    unless flag
+      i = flag
+    end
+    maybe = Zoo.new.pet if c
+    case maybe
+    when Dog, nil
+      j = maybe
+    else
+      k = maybe
+    end
+    holder = c ? Dog : Rock.new
+    if holder.is_a?(Rock)
+      l = holder
+    end
+  end
+
+  def nothing_said(c, klass, thing)
+    value = 1 if c
+    if value&.nil?
+      a = value
+    end
+    if value != 1
+      b = value
+    end
+    if value.is_a?(klass)
+      d = value
+    end
+    if thing
+      e = thing
+    end
+  end
+
+  def writing_guards(c, items)
+    a = 1 if c
+    a ||= 2 unless a
+    x = a
+    b = 1 if c
+    b &&= 2 if b
+    y = b
+    d = 1 if c
+    d += 1 unless d.nil?
+    z = d
+    e = 1 if c
+    e.nil? and e = 5
+    w = e
+    f = 1 if c
+    if f
+      n = 1
+    else
+      raise \"no\"
+    end
+    v = f
+    items.each do |item|
+      g = 1 if c
+      next unless g
+      u = g
+    end
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(
+            source,
+            "class Animal\nend\n\nclass Dog < Animal\nend\n\nclass Rock\nend\n\n\
+             module Walker\nend\n\n\
+             class Zoo\n  def pet: () -> Animal\n  def walker: () -> Walker\nend\n\n\
+             class Integer\n  def +: (Integer) -> Integer\nend\n",
+        );
+        // `y` and `z`: a modifier's body is written before its predicate and runs after it, so
+        // its own write is not narrowed by the check.
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def classes(c) -> Rock?
+    pet: Animal = Zoo.new.pet
+      a: Dog = pet
+      d: Animal = pet
+      e: Animal = pet
+    either: Animal | Walker = c ? Zoo.new.pet : Zoo.new.walker
+      f: Dog = either
+      g: Rock = mixed
+      h: true = flag
+      i: false = flag
+    maybe: Animal = Zoo.new.pet if c
+      j: Dog? = maybe
+      k: Animal = maybe
+      l: Rock = holder
+      a: Integer? = value
+      b: Integer? = value
+      d: Integer? = value
+    x: Integer = a
+    y: Integer? = b
+    z: Integer? = d
+    w: Integer = e
+    v: Integer = f
+      u: Integer = g"
+        );
+    }
+
+    #[test]
+    fn a_block_on_a_value_that_may_be_nil_is_handed_nil_too() {
+        // `nil.then { |v| }` hands `v` a `nil`, so a `T?` receiver hands the block a `T?` wherever
+        // `nil` has the method. Where it does not, `nil.each` raises and the block never runs on
+        // `nil`. A `&.` call never runs the block on `nil` at all (#4).
+        let source = "\
+class Shelf
+  def fetched
+    rows = maybe
+    rows.then { |v| v }
+  end
+
+  def skipped
+    rows = maybe
+    rows&.then { |v| v }
+  end
+
+  def listed
+    rows = named
+    rows.each { |r| r }
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(
+            source,
+            "class Shelf\n  def maybe: () -> Array[String]?\n  def named: () -> Array[String]?\nend\n\n\
+             class Object\n  def then: [U] () { (self) -> U } -> U\nend\n",
+        );
+        // `then`'s answer is the block's value whole, `?` included (#18).
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def fetched -> Array[String]?
+    rows: Array[String]? = maybe
+    rows.then { |v: Array[String]?| v }
+  def skipped -> Array[String]?
+    rows: Array[String]? = maybe
+    rows&.then { |v: Array[String]| v }
+  def listed -> Array[String]
+    rows: Array[String]? = named
+    rows.each { |r: String| r }"
+        );
+    }
+
+    #[test]
+    fn a_type_argument_that_is_not_exactly_a_class_is_not_claimed() {
+        // An argument is held as a bare class, so `String?` and `bool` cannot be held, and a
+        // position holding a guess at them would say its elements are never `nil` (#18). The
+        // position stays and is drawn `untyped`; the head is still right.
+        let source = "\
+class Shelf
+  def titles
+    rows = optional_names
+    rows.each { |row| row }
+  end
+
+  def flags
+    all = checks
+    all.each { |flag| flag }
+  end
+
+  def upper(rows)
+    rows.map { |row| row }
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(
+            source,
+            "class Shelf\n  def optional_names: () -> Array[String?]\n  def checks: () -> Array[bool]\nend\n",
+        );
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def titles -> Array
+    rows: Array = optional_names
+  def flags -> Array
+    all: Array = checks"
+        );
+    }
+
+    #[test]
+    fn a_parameter_is_what_its_declaration_says_and_never_its_default() {
+        // A default says what the parameter holds when the caller passed nothing, and a caller
+        // may pass anything (#15).
+        let source = "\
+class Shelf
+  def defaulted(limit = 10)
+    limit
+  end
+
+  def declared(limit)
+    limit
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(
+            source,
+            "class Shelf\n  def declared: (Integer limit) -> untyped\nend\n",
+        );
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def declared(limit) -> Integer"
+        );
+    }
+
+    #[test]
+    fn two_variables_that_feed_each_other_in_a_loop_settle_together() {
+        // `a` reads `b` and `b` reads `a` on the next turn: a cycle through two reads, where the
+        // inner one is answered only once the outer settles. `nil` alone is an answer too.
+        let source = "\
+class Mutual
+  def swap(items)
+    a = 1
+    b = \"s\"
+    items.each do
+      a = b
+      b = a
+    end
+    a
+  end
+
+  def only_nil(c)
+    x = nil if c
+    x
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(source, "");
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def swap(items) -> Integer | String
+      a: String = b
+      b: String = a
+  def only_nil(c) -> nil"
+        );
+    }
+
+    /// A workspace whose signatures are [`TYPED_RBS`], holding every file in `files`.
+    fn with_files(files: &[(&str, &str)]) -> (Harness, Vec<DocUri>) {
+        let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
+        let uris = files
+            .iter()
+            .map(|(path, source)| harness.write(path, source))
+            .collect();
+        harness.index();
+        harness.index_gems();
+        (harness, uris)
+    }
+
+    /// The hints drawn in `files[at]`.
+    fn drawn_in(files: &[(&str, &str)], at: usize) -> String {
+        let (mut harness, uris) = with_files(files);
+        drawn_hints(files[at].1, &harness.hints_in(&uris[at]))
+    }
+
+    const BASE_ITEM: (&str, &str) = (
+        "app/models/base_item.rb",
+        "\
+class BaseItem
+  def load
+    @label = \"x\"
+  end
+
+  def base_label
+    @label
+  end
+end
+",
+    );
+
+    const ITEM: (&str, &str) = (
+        "app/models/item.rb",
+        "\
+class Item < BaseItem
+  include Labelled
+
+  def count
+    @label = 1
+  end
+
+  def show
+    @label
+  end
+end
+",
+    );
+
+    const ITEM_EXTRAS: (&str, &str) = (
+        "app/models/item_extras.rb",
+        "\
+class Item
+  def weight
+    @label = 1.5
+  end
+end
+",
+    );
+
+    const LABELLED: (&str, &str) = (
+        "app/models/labelled.rb",
+        "\
+module Labelled
+  def tag
+    @label
+  end
+end
+",
+    );
+
+    #[test]
+    fn an_instance_variable_is_every_write_any_class_of_its_object_makes() {
+        // #16. An `Item` runs `BaseItem#load`, its own `count`, the `weight` another file reopens
+        // it with, and `Labelled#tag`: every write reaches every read, whichever class the read is
+        // written in. The superclass's read sees the subclass's writes too, because its object may
+        // be an `Item`; the module's, because every object it reaches is one.
+        let files = [BASE_ITEM, ITEM, ITEM_EXTRAS, LABELLED];
+        let every = "String? | Integer | Float";
+        assert_eq!(
+            drawn_in(&files, 1),
+            format!("  def count -> Integer\n  def show -> {every}")
+        );
+        assert_eq!(
+            drawn_in(&files, 0),
+            format!("  def load -> String\n  def base_label -> {every}")
+        );
+        assert_eq!(drawn_in(&files, 3), format!("  def tag -> {every}"));
+    }
+
+    #[test]
+    fn a_superclass_never_hears_about_a_subclass_it_cannot_be() {
+        // The fold is over the object's classes, not every class that spells the name: a sibling
+        // of `Item` writes its own `@label`, and no `Item` runs its methods.
+        let sibling = (
+            "app/models/other_item.rb",
+            "class OtherItem < BaseItem\n  def count\n    @label = [1]\n  end\nend\n",
+        );
+        let files = [BASE_ITEM, ITEM, ITEM_EXTRAS, LABELLED, sibling];
+        assert_eq!(
+            drawn_in(&files, 1),
+            "  def count -> Integer\n  def show -> String? | Integer | Float"
+        );
+        // The superclass's object may be either, so it hears both.
+        assert!(
+            drawn_in(&files, 0).contains("def base_label -> String? | Integer | Float | Array"),
+            "{}",
+            drawn_in(&files, 0)
+        );
+    }
+
+    #[test]
+    fn a_setter_writes_what_its_calls_pass_and_nothing_where_one_is_unplaced() {
+        // `attr_accessor :name` is a write no `@name =` spells, of whatever its calls pass
+        //. `initialize` writes a `String` and a call on an `Account` an `Integer`:
+        // both are drawn. A call on a receiver only its name guesses (`account`) may be on any
+        // object passing anything, so there nothing is claimed.
+        let account = (
+            "app/models/account.rb",
+            "\
+class Account
+  attr_accessor :name
+
+  def initialize
+    @name = \"x\"
+  end
+
+  def shout
+    @name
+  end
+end
+",
+        );
+        let typed = (
+            "app/services/renamer.rb",
+            "class Renamer\n  def rename\n    Account.new.name = 1\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[account, typed], 0),
+            "  def shout -> String | Integer"
+        );
+        let untyped = (
+            "app/services/renamer.rb",
+            "class Renamer\n  def rename(account)\n    account.name = 1\n  end\nend\n",
+        );
+        assert_eq!(drawn_in(&[account, untyped], 0), "null");
+
+        // Declared in another class of the object and never called, the setter adds nothing.
+        let base = (
+            "app/models/named.rb",
+            "class Named\n  attr_writer :title\nend\n",
+        );
+        let post = (
+            "app/models/post.rb",
+            "\
+class Post < Named
+  def initialize
+    @title = \"x\"
+  end
+
+  def title
+    @title
+  end
+end
+",
+        );
+        assert_eq!(drawn_in(&[base, post], 1), "  def title -> String");
+    }
+
+    #[test]
+    fn nil_is_left_out_only_when_every_class_of_the_object_initializes_the_variable() {
+        // `Child#initialize` runs `super` as a statement of its own body, so a `Child` has `@seed`
+        // set as surely as a `Parent`.
+        let parent = (
+            "app/models/parent.rb",
+            "\
+class Parent
+  def initialize
+    @seed = \"x\"
+  end
+
+  def seed
+    @seed
+  end
+end
+",
+        );
+        let child = (
+            "app/models/child.rb",
+            "\
+class Child < Parent
+  def initialize
+    super
+    @extra = 1
+  end
+end
+",
+        );
+        assert_eq!(drawn_in(&[parent, child], 0), "  def seed -> String");
+
+        // An `Orphan` never runs `Parent#initialize`, so `seed` on one is `nil`.
+        let orphan = (
+            "app/models/orphan.rb",
+            "\
+class Orphan < Parent
+  def initialize
+    @extra = 1
+  end
+end
+",
+        );
+        assert_eq!(
+            drawn_in(&[parent, child, orphan], 0),
+            "  def seed -> String?"
+        );
+    }
+
+    #[test]
+    fn an_ancestor_rubydex_could_not_resolve_refuses_the_read() {
+        // `Missing::Base` may write `@x`, and nothing here can say what with.
+        let widget = (
+            "app/models/widget.rb",
+            "\
+class Widget < Missing::Base
+  def load
+    @x = \"x\"
+  end
+
+  def x
+    @x
+  end
+end
+",
+        );
+        assert_eq!(drawn_in(&[widget], 0), "  def load -> String");
+    }
+
+    #[test]
+    fn a_subclass_only_the_suite_loads_is_not_one_the_application_s_object_can_be() {
+        let gadget = (
+            "app/models/gadget.rb",
+            "\
+class Gadget
+  def load
+    @x = \"x\"
+  end
+
+  def x
+    @x
+  end
+end
+",
+        );
+        let fake = (
+            "spec/support/fake_gadget.rb",
+            "class FakeGadget < Gadget\n  def fake\n    @x = 1\n  end\n\n  def peek\n    @x\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[gadget, fake], 0),
+            "  def load -> String\n  def x -> String?"
+        );
+        // Nor is a reopening the suite makes of the class itself.
+        let reopened = (
+            "spec/support/gadget_extras.rb",
+            "class Gadget\n  def hack\n    @x = [1]\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[gadget, fake, reopened], 0),
+            "  def load -> String\n  def x -> String?"
+        );
+        // The suite's own read is of an object the suite builds, which may be either.
+        assert_eq!(
+            drawn_in(&[gadget, fake], 1),
+            "  def fake -> Integer\n  def peek -> String? | Integer"
+        );
+    }
+
+    #[test]
+    fn a_class_object_s_variable_is_every_write_its_class_and_subclasses_make_on_that_side() {
+        // `SpecialRegistry.seed` writes the `@entries` of `SpecialRegistry`, which
+        // `Registry.entries` reads when called on the subclass. The instance's `@entries` is a
+        // different variable.
+        let registry = (
+            "app/models/registry.rb",
+            "\
+class Registry
+  def self.entries
+    @entries
+  end
+
+  def self.reset
+    @entries = 1
+  end
+
+  def entries
+    @entries
+  end
+
+  def fill
+    @entries = 1.5
+  end
+end
+",
+        );
+        let special = (
+            "app/models/special_registry.rb",
+            "class SpecialRegistry < Registry\n  def self.seed\n    @entries = \"x\"\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[registry, special], 0),
+            "  def self.entries -> Integer? | String
+  def self.reset -> Integer
+  def entries -> Float?
+  def fill -> Float"
+        );
+
+        // A subclass with no singleton method has no singleton class in the graph, and its class
+        // body still writes its own `@entries`, which `Registry.entries` reads when called on it.
+        let plain = (
+            "app/models/plain_registry.rb",
+            "class PlainRegistry < Registry\n  @entries = [1]\nend\n",
+        );
+        assert!(
+            drawn_in(&[registry, special, plain], 0)
+                .starts_with("  def self.entries -> Array? | Integer | String"),
+            "{}",
+            drawn_in(&[registry, special, plain], 0)
+        );
+    }
+
+    #[test]
+    fn a_module_s_method_read_for_one_class_hears_only_that_class_s_writes() {
+        // `Labelled#label` is shared by every includer, and one of them stores an `Integer`. Read
+        // for a `Plain`, the body runs on a `Plain`, which never runs `Counted#count`.
+        let labelled = (
+            "app/models/labelled.rb",
+            "module Labelled\n  def label\n    @label ||= \"x\"\n  end\nend\n",
+        );
+        let plain = (
+            "app/models/plain.rb",
+            "class Plain\n  include Labelled\nend\n",
+        );
+        let report = (
+            "app/report.rb",
+            "\
+class Report
+  def plain
+    Plain.new.label
+  end
+
+  def counted
+    Counted.new.label
+  end
+
+  def peek
+    Counted.new.peek
+  end
+
+  def shared
+    Counted.shared
+  end
+end
+",
+        );
+        let counted = (
+            "app/models/counted.rb",
+            "\
+class Counted
+  include Labelled
+
+  def count
+    @label = 1
+  end
+
+  def peek
+    @label
+  end
+
+  def self.shared
+    @shared ||= 1.5
+  end
+end
+",
+        );
+        // `peek` is `Counted`'s own, so the receiver narrows nothing; `shared` is the class
+        // object's, which a receiver never narrows.
+        assert_eq!(
+            drawn_in(&[labelled, plain, counted, report], 3),
+            "  def plain -> String\n  def counted -> String | Integer\n  def peek -> Integer? | String\n  def shared -> Float"
+        );
+        // Asked from the module itself, every includer's writes reach.
+        assert_eq!(
+            drawn_in(&[labelled, plain, counted, report], 0),
+            "  def label -> String | Integer"
+        );
+    }
+
+    #[test]
+    fn a_superclass_spelled_like_its_class_is_read_through_the_class_ruby_names() {
+        // Ruby reads `< ApplicationController` before `Admin::ApplicationController` exists, so
+        // the superclass is the top-level class, and its `@x = 1` reaches `show`. rubydex resolves
+        // the name to the class being opened and cuts the chain at a cycle;
+        // `Indexed::repair_superclasses` links it to the class Ruby names.
+        let base = (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController\n  def load\n    @x = 1\n  end\nend\n",
+        );
+        let admin = (
+            "app/controllers/admin/application_controller.rb",
+            "\
+module Admin
+  class ApplicationController < ApplicationController
+    def fill
+      @x = \"s\"
+    end
+
+    def show
+      @x
+    end
+  end
+end
+",
+        );
+        assert_eq!(
+            drawn_in(&[base, admin], 1),
+            "    def fill -> String\n    def show -> String? | Integer"
+        );
+
+        // The other direction: the top-level class gains `Admin::ApplicationController` as a
+        // descendant, so a read there sees its `@x = "s"`.
+        let base = (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController\n  def load\n    @x = 1\n  end\n\n  def show\n    @x\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[base, admin], 0),
+            "  def load -> Integer\n  def show -> String? | Integer"
+        );
+
+        // A module that includes itself is a cycle with no superclass to blame: its own reads
+        // refuse, and nothing else is.
+        let looping = (
+            "app/models/looping.rb",
+            "module Looping\n  include Looping\n\n  def set\n    @x = 1\n  end\n\n  def x\n    @x\n  end\nend\n",
+        );
+        assert_eq!(drawn_in(&[looping], 0), "  def set -> Integer");
+
+        // A class below the repaired one reads through it, and a top-level class of the same last
+        // name is untouched.
+        let admin_users = (
+            "app/controllers/admin/users_controller.rb",
+            "module Admin\n  class UsersController < Admin::ApplicationController\n    def z\n      @x\n    end\n  end\nend\n",
+        );
+        let users = (
+            "app/controllers/users_controller.rb",
+            "class UsersController\n  def load\n    @y = \"s\"\n  end\n\n  def y\n    @y\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[base, admin, admin_users, users], 2),
+            "    def z -> String? | Integer"
+        );
+        assert_eq!(
+            drawn_in(&[base, admin, admin_users, users], 3),
+            "  def load -> String\n  def y -> String?"
+        );
+
+        // A superclass Ruby could not find is left as rubydex cut it, and its reads still refuse.
+        let orphan = (
+            "app/models/admin/thing.rb",
+            "module Admin\n  class Thing < Thing\n    def set\n      @x = 1\n    end\n\n    def x\n      @x\n    end\n  end\nend\n",
+        );
+        assert_eq!(drawn_in(&[orphan], 0), "    def set -> Integer");
+    }
+
+    #[test]
+    fn a_top_level_variable_is_its_own_text_s_writes() {
+        // `main`'s instance variables belong to no class, so no hierarchy is asked: this text's
+        // writes. One nothing writes is refused, not `NilClass`. `nil` still joins: no method
+        // wrote it first, and the rule for a local's straight line is not applied here.
+        let script = (
+            "script/tally.rb",
+            "@count = 1\ntotal = @count\nother = @missing\n",
+        );
+        assert_eq!(drawn_in(&[script], 0), "total: Integer? = @count");
+    }
+
+    #[test]
+    fn an_initialize_written_twice_says_nothing_about_which_one_runs() {
+        let first = (
+            "app/models/twice.rb",
+            "class Twice\n  def initialize\n    @seed = \"x\"\n  end\n\n  def seed\n    @seed\n  end\nend\n",
+        );
+        let second = (
+            "app/models/twice_again.rb",
+            "class Twice\n  def initialize\n    @other = 1\n  end\nend\n",
+        );
+        assert_eq!(drawn_in(&[first, second], 0), "  def seed -> String?");
+    }
+
+    #[test]
+    fn a_variable_written_by_reflection_is_written_by_something_nothing_types() {
+        // #19. `instance_variable_set(:@x, v)` on `self` is `@x = v` with nothing to type `v` by.
+        let exact = (
+            "app/models/exact.rb",
+            "\
+class Exact
+  def initialize
+    @x = \"x\"
+  end
+
+  def load(v)
+    instance_variable_set(:@x, v)
+  end
+
+  def x
+    @x
+  end
+end
+",
+        );
+        assert_eq!(drawn_in(&[exact], 0), "null");
+
+        // An interpolated name reaches every variable it can spell, and no other.
+        let cached = (
+            "app/models/cached.rb",
+            "\
+class Cached
+  def fill(key, v)
+    instance_variable_set(\"@#{key}_cache\", v)
+  end
+
+  def warm
+    @warm_cache = 1
+  end
+
+  def warm_cache
+    @warm_cache
+  end
+
+  def count
+    @count = 1
+  end
+
+  def tally
+    @count
+  end
+end
+",
+        );
+        assert_eq!(
+            drawn_in(&[cached], 0),
+            "  def warm -> Integer\n  def count -> Integer\n  def tally -> Integer?"
+        );
+
+        // A removal writes `nil`, whatever `initialize` did first.
+        let removed = (
+            "app/models/removed.rb",
+            "\
+class Removed
+  def initialize
+    @seed = \"x\"
+  end
+
+  def reset
+    remove_instance_variable(:@seed)
+  end
+
+  def seed
+    @seed
+  end
+end
+",
+        );
+        assert_eq!(drawn_in(&[removed], 0), "  def seed -> String?");
+    }
+
+    #[test]
+    fn a_variable_another_object_writes_by_reflection_is_refused_wherever_it_is_read() {
+        // Nothing types `digest` in `call`, so the write may reach any object's `@topic`.
+        let digest = (
+            "app/mailers/digest.rb",
+            "class Digest\n  def initialize\n    @topic = \"t\"\n  end\n\n  def topic\n    @topic\n  end\nend\n",
+        );
+        let unsubscriber = (
+            "lib/unsubscriber.rb",
+            "class Unsubscriber\n  def call(digest)\n    digest.instance_variable_set(:@topic, 42)\n  end\nend\n",
+        );
+        assert_eq!(drawn_in(&[digest, unsubscriber], 0), "null");
+
+        // The suite pokes the application's objects too, but the application never runs it.
+        let poke = (
+            "spec/support/poke.rb",
+            "class Poke\n  def call(digest)\n    digest.instance_variable_set(:@topic, 42)\n  end\nend\n",
+        );
+        assert_eq!(drawn_in(&[digest, poke], 0), "  def topic -> String");
+        // A read the suite makes is of an object the suite may have poked.
+        let fake = (
+            "spec/support/fake_digest.rb",
+            "class FakeDigest\n  def initialize\n    @topic = \"t\"\n  end\n\n  def topic\n    @topic\n  end\nend\n",
+        );
+        assert_eq!(drawn_in(&[fake, poke], 0), "null");
+
+        // The top level's `self` is `main` (or a template's view), and only the top level reads its
+        // variables: a dynamic write there refuses the script's own reads and nobody else's.
+        let script = (
+            "script/tally.rb",
+            "instance_variable_set(\"@#{ARGV[0]}\", 1)\n@count = 1\ntotal = @count\n",
+        );
+        assert_eq!(drawn_in(&[digest, script], 0), "  def topic -> String");
+        assert_eq!(drawn_in(&[digest, script], 1), "null");
+    }
+
+    #[test]
+    fn a_reflective_name_held_by_a_local_or_passed_by_callers_reaches_only_those_names() {
+        let digest = (
+            "app/mailers/digest.rb",
+            "\
+class Digest
+  def initialize
+    @topic = \"t\"
+    @topic_token = \"x\"
+  end
+
+  def topic
+    @topic
+  end
+
+  def token
+    @topic_token
+  end
+end
+",
+        );
+        // A local assigned a pattern names what the pattern can spell.
+        let uploader = (
+            "lib/uploader.rb",
+            "\
+class Uploader
+  def token(model)
+    var = :\"@#{model.name}_token\"
+    model.instance_variable_set(var, 1)
+  end
+end
+",
+        );
+        assert_eq!(drawn_in(&[digest, uploader], 0), "  def topic -> String");
+
+        // A parameter names what its callers pass.
+        let preload = (
+            "lib/preload.rb",
+            "\
+class Preload
+  def self.fill(record, ivar)
+    record.instance_variable_set(ivar, [])
+  end
+
+  def self.warm(record)
+    fill(record, :@topic_token)
+  end
+end
+",
+        );
+        assert_eq!(drawn_in(&[digest, preload], 0), "  def topic -> String");
+
+        // With no caller to read, it names every variable.
+        let orphan = (
+            "lib/orphan.rb",
+            "class Orphan\n  def self.fill(record, ivar)\n    record.instance_variable_set(ivar, [])\n  end\nend\n",
+        );
+        assert_eq!(drawn_in(&[digest, orphan], 0), "null");
+
+        // A caller whose argument cannot be read (a splat) says any name, and so do more callers
+        // than are worth reading.
+        let splat = (
+            "lib/splat.rb",
+            "\
+class Splat
+  def self.fill(record, ivar)
+    record.instance_variable_set(ivar, [])
+  end
+
+  def self.warm(record, args)
+    fill(record, :@topic_token)
+    fill(*args)
+  end
+end
+",
+        );
+        assert_eq!(drawn_in(&[digest, splat], 0), "null");
+        let mut busy = String::from(
+            "class Busy\n  def self.fill(record, ivar)\n    record.instance_variable_set(ivar, [])\n  end\n\n  def self.warm(record)\n",
+        );
+        for _ in 0..=crate::analysis::types::CALL_SITES {
+            busy.push_str("    fill(record, :@topic_token)\n");
+        }
+        busy.push_str("  end\nend\n");
+        assert_eq!(
+            drawn_in(&[digest, ("lib/busy.rb", busy.as_str())], 0),
+            "null"
+        );
+
+        // The callers' answer is held between requests while their documents are unchanged, and
+        // answers the same.
+        let (mut harness, uris) = with_files(&[digest, preload]);
+        let once = drawn_hints(digest.1, &harness.hints_in(&uris[0]));
+        let again = drawn_hints(digest.1, &harness.hints_in(&uris[0]));
+        assert_eq!(
+            (once.as_str(), again.as_str()),
+            ("  def topic -> String", "  def topic -> String")
+        );
+
+        // A caller that changes what it passes is read again: the held answer was for the version
+        // it came from. Now `@topic` is the one refused.
+        let passes_topic = preload.1.replace(":@topic_token", ":@topic");
+        harness.open(&uris[1], preload.1);
+        harness.change(&uris[1], &passes_topic);
+        assert_eq!(
+            drawn_hints(digest.1, &harness.hints_in(&uris[0])),
+            "  def token -> String"
+        );
+    }
+
+    #[test]
+    fn a_library_s_render_is_not_a_renderer_of_the_application_s_templates() {
+        let (dir, _gem_home, env) = project_with_gem(
+            "module Shouty\n  def self.go\n    @story = 1\n    render template: \"stories/show\"\n  end\nend\n",
+        );
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("sig/core.rbs", TYPED_RBS);
+        harness.write(
+            "app/controllers/stories_controller.rb",
+            "class StoriesController\n  def show\n    @story = \"x\"\n  end\nend\n",
+        );
+        let template = "<% held = @story %>\n";
+        let view = harness.write("app/views/stories/show.html.erb", template);
+        harness.index();
+        harness.index_gems();
+        assert_eq!(
+            drawn_hints(template, &harness.hints_in(&view)),
+            "<% held: String? = @story %>"
+        );
+    }
+
+    #[test]
+    fn a_library_s_name_building_writes_on_its_includers_are_not_read() {
+        // A file that writes a variable by a name it builds is walked for every read of
+        // its objects, since it never spells the one read; a library's is not, for the reason
+        // above. actionpack's test helper removes every variable a controller has.
+        let (dir, _gem_home, env) = project_with_gem(
+            "module Shouty\n  def clear\n    instance_variables.each { |ivar| \
+             remove_instance_variable(ivar) }\n  end\n\n  def put(name, value)\n    \
+             instance_variable_set(\"@#{name}\", value)\n  end\nend\n",
+        );
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("sig/core.rbs", TYPED_RBS);
+        let source = "class Digest\n  include Shouty\n\n  def initialize\n    @topic = \"t\"\n  \
+                      end\n\n  def topic\n    @topic\n  end\nend\n";
+        let uri = harness.write("app/mailers/digest.rb", source);
+        harness.index();
+        harness.index_gems();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def topic -> String"
+        );
+    }
+
+    #[test]
+    fn a_library_s_own_reflective_writes_are_not_read() {
+        // A gem sets its own objects' state; reading its `obj.instance_variable_set` would refuse
+        // every variable its helpers could spell.
+        let (dir, _gem_home, env) = project_with_gem(
+            "module Shouty\n  def self.poke(obj)\n    obj.instance_variable_set(:@topic, 1)\n  end\nend\n",
+        );
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("sig/core.rbs", TYPED_RBS);
+        let source = "class Digest\n  def initialize\n    @topic = \"t\"\n  end\n\n  def topic\n    @topic\n  end\nend\n";
+        let uri = harness.write("app/mailers/digest.rb", source);
+        harness.index();
+        harness.index_gems();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def topic -> String"
+        );
+    }
+
+    #[test]
+    fn an_initialize_only_a_signature_declares_says_nothing_about_what_it_writes() {
+        // The first `initialize` up `Child`'s chain is `Base`'s, and only its signature is written:
+        // no body says it sets `@seed`.
+        let base_sig = (
+            "sig/base.rbs",
+            "class Base\n  def initialize: () -> void\nend\n",
+        );
+        let base = ("app/models/base.rb", "class Base\nend\n");
+        let child = (
+            "app/models/child.rb",
+            "class Child < Base\n  def load\n    @seed = \"x\"\n  end\n\n  def seed\n    @seed\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[base_sig, base, child], 2),
+            "  def load -> String\n  def seed -> String?"
+        );
+    }
+
+    #[test]
+    fn a_class_a_library_can_build_keeps_nil_whatever_its_initialize_writes() {
+        // #20. A library whose Ruby the class inherits from may build it with `allocate`, as Active
+        // Record builds a loaded record, and `initialize` has not run then.
+        let (dir, _gem_home, env) = project_with_gem(
+            "module Shouty\n  class Record\n    def self.load\n      allocate\n    end\n  end\nend\n",
+        );
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("sig/core.rbs", TYPED_RBS);
+        let source = "\
+class Story < Shouty::Record
+  def initialize
+    @views = \"x\"
+  end
+
+  def views
+    @views
+  end
+end
+";
+        let uri = harness.write("app/models/story.rb", source);
+        harness.index();
+        harness.index_gems();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def views -> String?"
+        );
+    }
+
+    #[test]
+    fn a_module_s_own_variable_is_the_module_s_whoever_includes_it() {
+        // `Config.value` runs on the module object alone: an includer's singleton methods are its
+        // own, and its `@value` is a different object's variable.
+        let config = (
+            "app/models/config.rb",
+            "\
+module Config
+  def self.value
+    @value
+  end
+
+  def self.set
+    @value = 1
+  end
+end
+",
+        );
+        let user = (
+            "app/models/user.rb",
+            "class User\n  include Config\n\n  def self.set\n    @value = \"s\"\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[config, user], 0),
+            "  def self.value -> Integer?\n  def self.set -> Integer"
+        );
+    }
+
+    #[test]
+    fn a_file_that_opens_two_classes_of_the_object_is_read_once() {
+        // Both classes are the object's, and the file holds both: each write is counted once.
+        let both = (
+            "app/models/both.rb",
+            "\
+class Base
+  def load
+    @x = 1
+  end
+end
+
+class Leaf < Base
+  def x
+    @x
+  end
+end
+",
+        );
+        assert_eq!(
+            drawn_in(&[both], 0),
+            "  def load -> Integer\n  def x -> Integer?"
+        );
+    }
+
+    #[test]
+    fn a_block_straight_in_a_class_body_may_run_on_either_side() {
+        // `before_action { }` runs on an instance and `included do` on the class, and nothing in
+        // the block says which. Its write reaches both, and its read claims neither.
+        let source = "\
+class StoriesController
+  before_action { @story = \"x\" }
+
+  def show
+    @story
+  end
+
+  def index
+    @story = 1
+  end
+end
+";
+        let files = [("app/controllers/stories_controller.rb", source)];
+        assert_eq!(
+            drawn_in(&files, 0),
+            "  def show -> String? | Integer\n  def index -> Integer"
+        );
+    }
+
+    #[test]
+    fn an_instance_variable_is_every_write_in_its_class_and_nil_until_one_has_run() {
+        // Methods run in any order, so every write of `@x` reaches every read (#12), and `nil`
+        // does too, except where no instance exists without one (`initialize` writes it as a
+        // statement of its own body) or the reading method has already written it.
+        let source = "\
+class Keeper
+  def initialize
+    @set = \"x\"
+  end
+
+  def load
+    @later = \"y\"
+  end
+
+  def set
+    @set
+  end
+
+  def later
+    @later
+  end
+
+  def here
+    @here = \"z\"
+    @here
+  end
+
+  def a
+    @v = 1
+  end
+
+  def b
+    @v = \"s\"
+  end
+
+  def c
+    @v
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(source, "");
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def load -> String
+  def set -> String
+  def later -> String?
+  def here -> String
+  def a -> Integer
+  def b -> String
+  def c -> Integer? | String"
+        );
+    }
+
+    #[test]
+    fn a_template_s_instance_variable_is_every_write_its_controller_makes() {
+        // Any action may have run before the template renders, so `index`'s write reaches `show`'s
+        // template as well as `show`'s (#12), and `nil` does too: no controller is built with it
+        // set. The old rung answered with the controller's last write.
+        let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
+        harness.write(
+            "app/controllers/stories_controller.rb",
+            "class StoriesController\n  def show\n    @story = \"x\"\n  end\n\n  def index\n    \
+             @story = 1\n  end\nend\n",
+        );
+        let template = "<% held = @story %>\n";
+        let view = harness.write("app/views/stories/show.html.erb", template);
+        harness.index();
+        harness.index_gems();
+        assert_eq!(
+            drawn_hints(template, &harness.hints_in(&view)),
+            "<% held: String? | Integer = @story %>"
+        );
+    }
+
+    #[test]
+    fn a_template_s_variable_is_every_write_of_every_class_that_renders_it() {
+        // #21. `FeedsController#show` renders `stories/show` too, so its `@story` reaches it.
+        let stories = (
+            "app/controllers/stories_controller.rb",
+            "class StoriesController\n  def show\n    @story = \"x\"\n  end\nend\n",
+        );
+        let feeds = (
+            "app/controllers/feeds_controller.rb",
+            "class FeedsController\n  def show\n    @story = 1\n    render \"stories/show\"\n  end\nend\n",
+        );
+        let template = ("app/views/stories/show.html.erb", "<% held = @story %>\n");
+        assert_eq!(
+            drawn_in(&[stories, feeds, template], 2),
+            "<% held: String? | Integer = @story %>"
+        );
+
+        // A partial of the same name is not this template, and the suite's render is not the
+        // application's.
+        let rows = (
+            "app/controllers/rows_controller.rb",
+            "class RowsController\n  def show\n    @story = [1]\n    render partial: \"stories/show\"\n    render \"pages/show\"\n  end\nend\n",
+        );
+        let suite = (
+            "spec/support/rerender.rb",
+            "class Rerender\n  def go\n    @story = 1.5\n    render \"stories/show\"\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[stories, feeds, rows, suite, template], 4),
+            "<% held: String? | Integer = @story %>"
+        );
+
+        // A name nothing can read may be this template's.
+        let dynamic = (
+            "app/controllers/dynamic_controller.rb",
+            "class DynamicController\n  def show(options)\n    @story = 1.5\n    render options\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[stories, dynamic, template], 2),
+            "<% held: String? | Float = @story %>"
+        );
+
+        // A concern's render is made by whichever controller includes it.
+        let concern = (
+            "app/controllers/concerns/reshows.rb",
+            "module Reshows\n  def reshow\n    render \"stories/show\"\n  end\nend\n",
+        );
+        let pages = (
+            "app/controllers/pages_controller.rb",
+            "class PagesController\n  include Reshows\n\n  def show\n    @story = [1]\n  end\nend\n",
+        );
+        assert!(
+            drawn_in(&[stories, concern, pages, template], 3).contains("Array"),
+            "{}",
+            drawn_in(&[stories, concern, pages, template], 3)
+        );
+
+        // A render on another object hands the template variables nobody writes, and so does a
+        // helper, which runs in whatever view called it.
+        let job = (
+            "app/jobs/digest_job.rb",
+            "class DigestJob\n  def perform\n    ApplicationController.render(template: \"stories/show\", assigns: {})\n  end\nend\n",
+        );
+        assert_eq!(drawn_in(&[stories, job, template], 2), "null");
+        let task = (
+            "lib/tasks/digest.rake",
+            "task :digest do\n  ApplicationController.render(template: \"stories/show\", assigns: {})\nend\n",
+        );
+        assert_eq!(drawn_in(&[stories, task, template], 2), "null");
+
+        // A helper renders into whichever view called it, so every class a view is rendered by
+        // is a renderer: here only `StoriesController`.
+        let helper = (
+            "app/helpers/stories_helper.rb",
+            "module StoriesHelper\n  def again\n    render template: \"stories/show\"\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[stories, helper, template], 2),
+            "<% held: String? = @story %>"
+        );
+    }
+
+    #[test]
+    fn a_partial_s_variable_is_every_write_of_every_class_a_view_is_rendered_by() {
+        // A partial is rendered from views, so its path names no class: `FeedsController`'s view
+        // may render `stories/_story` as well as `StoriesController`'s.
+        let stories = (
+            "app/controllers/stories_controller.rb",
+            "class StoriesController\n  def show\n    @story = \"x\"\n  end\nend\n",
+        );
+        let feeds = (
+            "app/controllers/feeds_controller.rb",
+            "class FeedsController\n  def index\n    @story = 1\n  end\nend\n",
+        );
+        let feed = ("app/views/feeds/index.html.erb", "<%= render @stories %>\n");
+        let partial = (
+            "app/views/stories/_story.html.erb",
+            "<% held = @story %>\n<% again = @story %>\n",
+        );
+        // `StoriesController` renders no view here, and a partial's own path renders nothing.
+        assert_eq!(
+            drawn_in(&[stories, feeds, feed, partial], 3),
+            "<% held: Integer? = @story %>\n<% again: Integer? = @story %>"
+        );
+        // With no view rendered at all, no object is there to read.
+        assert_eq!(drawn_in(&[stories, partial], 1), "null");
+        let show = ("app/views/stories/show.html.erb", "<%= render @story %>\n");
+        assert_eq!(
+            drawn_in(&[stories, feeds, feed, show, partial], 4),
+            "<% held: String? | Integer = @story %>\n<% again: String? | Integer = @story %>"
+        );
+        // A class with no view of its own renders none, and its writes do not reach.
+        let api = (
+            "app/controllers/api_controller.rb",
+            "class ApiController\n  def show\n    @story = 1.5\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[stories, feeds, feed, show, api, partial], 5),
+            "<% held: String? | Integer = @story %>\n<% again: String? | Integer = @story %>"
+        );
+        // A component's own `render` renders the component, with its own variables.
+        let component = (
+            "app/components/card_component.rb",
+            "class CardComponent\n  def call\n    @story = [1]\n    render(Other.new)\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[stories, feeds, feed, show, component, partial], 5),
+            "<% held: String? | Integer = @story %>\n<% again: String? | Integer = @story %>"
+        );
+        // With no class rendering a view, there is no object to read.
+        let lone = ("app/views/lone/_row.html.erb", "<% held = @story %>\n");
+        assert_eq!(drawn_in(&[lone], 0), "null");
+    }
+
+    #[test]
+    fn a_keyword_hash_is_one_more_positional_to_an_arm_that_takes_no_keywords() {
+        // Ruby hands `build(size: 1)` to `build(options)` as one `Hash`. An arm that declares
+        // that position as an `Integer` cannot receive it, and one that takes keywords reads them
+        // as keywords.
+        let rbs = "\
+class Widget
+  def self.build: (Hash[Symbol, untyped] options) -> Widget
+  def self.make: (Integer count) -> Widget
+  def self.shape: (?size: Integer) -> Widget
+end
+";
+        let source = "\
+class Widget
+end
+
+built = Widget.build(size: 1)
+made = Widget.make(size: 1)
+shaped = Widget.shape(size: 1)
+";
+        let (mut harness, uri) = with_declared_types(source, rbs);
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "built: Widget = Widget.build(size: 1)\nshaped: Widget = Widget.shape(size: 1)"
+        );
+    }
+
+    #[test]
+    fn a_class_declared_inside_a_singleton_class_is_not_drawn_under_a_name_ruby_cannot_spell() {
+        // `Params` is declared in `class << self`, so rubydex names it
+        // `Orchestrator::<Orchestrator>::Params`, and `Orchestrator::Params` is not it in Ruby
+        // either. A label must be a name a reader can write.
+        let source = "\
+class Orchestrator
+  class << self
+    class Params
+    end
+
+    def build
+      made = Params.new
+      made
+    end
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(source, "");
+        assert_eq!(drawn_hints(source, &harness.hints_in(&uri)), "null");
+    }
+
+    #[test]
+    fn a_class_object_is_drawn_as_the_class_with_colon_class() {
+        // `Widget` the constant is the class itself, not one of its instances, and `Widget:class`
+        // says so. A module object has no such spelling and is not drawn, and neither is a class
+        // declared inside `class << self` (`Box`), whose own name Ruby cannot write. `x = Widget`
+        // states its type on the line, so the local is not drawn. Each carries a class method,
+        // because rubydex gives a class object a type only once it has a singleton class. `own`'s
+        // `self.class` is a class nothing named, whose class object is not drawn; an instance of it
+        // (`make`) keeps the `Class.new` spelling it already had.
+        let source = "\
+class Widget
+  def self.build
+    new
+  end
+end
+
+module Named
+  def self.helper
+    1
+  end
+end
+
+class Holder
+  class << self
+    class Box
+      def self.make
+        new
+      end
+    end
+  end
+
+  def model
+    Widget
+  end
+
+  def mixin
+    Named
+  end
+
+  def box
+    Box
+  end
+
+  def read
+    klass = model
+    klass
+  end
+
+  def plain
+    klass = Widget
+    klass
+  end
+
+  def built
+    Class.new do
+      def self.make
+        new
+      end
+
+      def own
+        self.class
+      end
+    end
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(source, "");
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def self.build -> Widget
+  def self.helper -> Integer
+  def model -> Widget:class
+  def read -> Widget:class
+    klass: Widget:class = model
+  def plain -> Widget:class
+      def self.make -> Class.new"
+        );
+    }
+
+    #[test]
+    fn a_method_only_the_suite_mixes_in_is_not_the_application_s() {
+        // The suite `extend`s a helper into `Bus`, so rubydex's linearization of
+        // `Bus`'s singleton holds the helper's `publish` first. The application never loads it:
+        // its `Bus.publish` is the class's own. The suite's own call is the helper's.
+        // `publish` comes from a module `Bus` extends, as `MessageBus`'s does; a later `extend`
+        // goes ahead of it.
+        let bus = (
+            "lib/bus.rb",
+            "module BusImpl\n  def publish(channel)\n    1\n  end\nend\n\nmodule Bus\n  extend BusImpl\nend\n",
+        );
+        let helper = (
+            "spec/support/bus_helper.rb",
+            "module BusHelper\n  def publish(channel)\n    \"x\"\n  end\nend\n\nmodule Bus\n  extend BusHelper\nend\n",
+        );
+        let app = (
+            "app/jobs/notify.rb",
+            "class Notify\n  def call\n    Bus.publish(\"c\")\n  end\nend\n",
+        );
+        let spec = (
+            "spec/jobs/notify_spec.rb",
+            "class NotifySpec\n  def go\n    Bus.publish(\"c\")\n  end\nend\n",
+        );
+        assert_eq!(
+            drawn_in(&[bus, helper, app, spec], 2),
+            "  def call -> Integer"
+        );
+        assert_eq!(drawn_in(&[bus, helper, app, spec], 3), "  def go -> String");
+    }
+
+    #[test]
+    fn a_receiverless_call_in_a_helper_or_a_template_is_the_view_s() {
+        // `self` in a helper method and in a template is the view, which includes every
+        // helper: `shout` is `ApplicationHelper`'s, which `StoriesHelper` does not include. A card
+        // answered it through the view context; the margin now does too.
+        let application = (
+            "app/helpers/application_helper.rb",
+            "module ApplicationHelper\n  def shout\n    \"x\"\n  end\nend\n",
+        );
+        let stories = (
+            "app/helpers/stories_helper.rb",
+            "module StoriesHelper\n  def headline\n    shout\n  end\nend\n",
+        );
+        let controller = (
+            "app/controllers/stories_controller.rb",
+            "class StoriesController\n  def show\n  end\nend\n",
+        );
+        let template = ("app/views/stories/show.html.erb", "<% loud = shout %>\n");
+        let files = [application, stories, controller, template];
+        assert_eq!(drawn_in(&files, 1), "  def headline -> String");
+        assert_eq!(drawn_in(&files, 3), "<% loud: String = shout %>");
+    }
+
+    #[test]
+    fn a_guess_never_becomes_part_of_a_type_that_is_drawn() {
+        // A guess is kept out of the margin by its tier, and three rungs used to drop the tier on
+        // the way through: a block's value filling a generic (`map` gives `Array[U]`), an argument
+        // picking an overload (`1 + x`), and a left operand deciding which side of `||` runs. Each
+        // answer below would have carried the call's tier around a class read off a name.
+        //
+        // - `wrapped` is still an `Array`: only the element the guess named is dropped.
+        // - `summed` picks no arm, because the only thing telling `Integer#+`'s arms apart is a
+        //   guess. Every arm answers instead (`types::join_arms`), so the label is what the
+        //   signature allows, and the guess decides nothing.
+        // - `either` is refused with the guess, not answered with `"x"`'s `String`.
+        let source = "\
+class Ledger
+end
+
+class Probe
+  def self.prep(x)
+    ledger = x.frobnicate
+    ledger
+  end
+
+  def self.number(x)
+    float = x.frobnicate
+    float
+  end
+
+  def self.flagged(x)
+    nil_class = x.frobnicate
+    nil_class
+  end
+
+  def wrapped
+    [1].map { |v| Probe.prep(v) }
+  end
+
+  def summed
+    1 + Probe.number(2)
+  end
+
+  def either
+    Probe.flagged(1) || \"x\"
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(
+            source,
+            "class Integer\n  def +: (Integer) -> Integer\n       | (Float) -> Float\nend\n",
+        );
+
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def wrapped -> Array
+    [1].map { |v: Integer| Probe.prep(v) }
+  def summed -> Integer | Float"
+        );
+    }
+
+    #[test]
+    fn a_bang_over_a_guess_is_bool_because_ruby_says_so_not_the_guess() {
+        // `!` answers `true` or `false` whatever its operand is, so `!foo` is drawn `bool` when
+        // nothing types `foo`. A guess must not do worse than nothing: `admin` is typed `Admin`
+        // from its spelling alone, narrowing `!admin` to a guessed `false` would keep it out of
+        // the margin, and knowing more would lose the label. An operand a signature types still
+        // narrows.
+        let source = "\
+class Admin
+end
+
+class Ledger
+  def plain(foo)
+    !foo
+  end
+
+  def named(admin)
+    !admin
+  end
+
+  def twice(admin)
+    !!admin
+  end
+
+  def instance
+    !@admin
+  end
+
+  def declared
+    !\"x\".upcase
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(
+            source,
+            "class TrueClass\n  def !: () -> false\nend\n\n\
+             class FalseClass\n  def !: () -> true\nend\n",
+        );
+
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def plain(foo) -> bool
+  def named(admin) -> bool
+  def twice(admin) -> bool
+  def instance -> bool
+  def declared -> false"
+        );
+    }
+
+    /// Signatures for a value that may be `nil`, with the names `NilClass` answers differently.
+    ///
+    /// `Kernel` and `NilClass` disagree the way Ruby's core and ActiveSupport do: `nil?` and
+    /// `present?` are `false`/`true` on a record and the opposite on `nil`. `to_h` is `-> {}` on
+    /// `NilClass`, a record type the table drops, as in `vendor/rbs`; `to_a` is `-> []`, a tuple,
+    /// which is an `Array`.
+    const NILABLE_RBS: &str = "\
+module Kernel
+  def nil?: () -> false
+  def dup: () -> self
+  def then: [U] () { (self) -> U } -> U
+end
+
+class NilClass
+  def nil?: () -> true
+  def present?: () -> false
+  def blank?: () -> true
+  def to_i: () -> 0
+  def to_a: () -> []
+  def to_h: () -> {}
+  def to_s: () -> \"\"
+end
+
+class Symbol
+end
+
+class Record
+  def id: () -> Integer
+  def label: () -> String
+  def present?: () -> true
+  def blank?: () -> false
+  def to_i: () -> Integer
+  def to_a: () -> Array[String]
+  def to_h: () -> Hash[String, Integer]
+  def to_s: () -> Symbol
+end
+
+class Shelf
+  def maybe: () -> Record?
+  def named: () -> String?
+  def flag: () -> bool?
+end
+";
+
+    #[test]
+    fn a_call_on_a_value_that_may_be_nil_asks_nil_the_same_question() {
+        // A `Record?` is a record or `nil`, and the call runs on whichever it is. Asking only the
+        // record answers `x.nil?` with `Kernel#nil?`'s `false`, drawn as fact about a value that
+        // is `nil` half the time. `NilClass` is asked too, and the two answers fold: `false`
+        // beside `true` is `bool`, and `self` beside `nil` is `Record?`.
+        //
+        // Where `NilClass` has no answer, the record's stands, as it did before: Ruby raises on
+        // `nil` there, so there is no second value. Three ways to have none: no member
+        // (`label`), a private one (`id`, which the script below defines at the top level), and
+        // one the table cannot read (`to_h`). `to_a` is `[]` on `nil`, an `Array` with no element to
+        // agree with the record's, so the two halves are an `Array`.
+        let source = "\
+class Ledger
+  def checked
+    Shelf.new.maybe.nil?
+  end
+
+  def negated
+    !Shelf.new.maybe.nil?
+  end
+
+  def present
+    Shelf.new.maybe.present?
+  end
+
+  def blank
+    Shelf.new.maybe.blank?
+  end
+
+  def copy
+    Shelf.new.maybe.dup
+  end
+
+  def counted
+    Shelf.new.maybe.to_i
+  end
+
+  def spelled
+    Shelf.new.maybe.to_s
+  end
+
+  def piped
+    Shelf.new.maybe.then { 1 }
+  end
+
+  def named
+    Shelf.new.maybe.label
+  end
+
+  def private_on_nil
+    Shelf.new.maybe.id
+  end
+
+  def unreadable_on_nil
+    Shelf.new.maybe.to_h
+  end
+
+  def emptied_on_nil
+    Shelf.new.maybe.to_a
+  end
+
+  def maybe_body(flag)
+    Record.new if flag
+  end
+
+  def body_checked
+    maybe_body(1).nil?
+  end
+
+  def both_halves
+    Shelf.new.flag.nil?
+  end
+
+  def shortcut
+    Shelf.new.maybe.nil? && @mystery
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(source, NILABLE_RBS);
+        harness.write("script/tidy.rb", "def id\n  \"x\"\nend\n");
+        harness.index();
+
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            // Two halves naming two classes are a union, drawn and terminal like any other.
+            // `shortcut` is refused: a `bool` left side reaches `@mystery`, which nothing types.
+            // Before, a wrong `false` skipped it.
+            "  def checked -> bool
+  def negated -> bool
+  def present -> bool
+  def blank -> bool
+  def copy -> Record?
+  def counted -> Integer
+  def spelled -> Symbol | String
+  def piped -> Integer
+  def named -> String
+  def private_on_nil -> Integer
+  def unreadable_on_nil -> Hash[String, Integer]
+  def emptied_on_nil -> Array
+  def maybe_body(flag) -> Record?
+  def body_checked -> bool
+  def both_halves -> bool"
+        );
+    }
+
+    #[test]
+    fn a_safe_call_adds_nil_where_the_receiver_can_be_nil_and_skips_one_call() {
+        // `a&.m` is `nil` where `a` is, so on a `Record?` it answers `M?`, and `NilClass` is never
+        // asked: `x&.nil?` is `false` or `nil`, never `true`. Ruby skips that **one** call, so the
+        // next link is an ordinary call on an `M?` and asks `NilClass` like any other. A receiver
+        // with no mark is taken at its word.
+        let source = "\
+class Ledger
+  def id_or_nil
+    Shelf.new.maybe&.id
+  end
+
+  def checked
+    Shelf.new.maybe&.nil?
+  end
+
+  def next_link
+    Shelf.new.maybe&.label.nil?
+  end
+
+  def unmarked
+    Record.new&.id
+  end
+
+  def twice
+    !!Shelf.new.maybe&.present?
+  end
+
+  def spread
+    word, size = Shelf.new.named&.pair
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(source, NILABLE_RBS);
+
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def id_or_nil -> Integer?
+  def checked -> false?
+  def next_link -> bool
+  def unmarked -> Integer
+  def twice -> bool
+    word: String?, size = Shelf.new.named&.pair
+    word, size: Integer? = Shelf.new.named&.pair"
+        );
+    }
+
+    #[test]
+    fn without_a_nil_class_a_value_that_may_be_nil_answers_as_it_always_did() {
+        // `NilClass` comes from Ruby's core signatures. Where nothing declares it, there is no
+        // second half to ask, and the answer is the one the receiver's own class gives.
+        let mut harness = signed(
+            &[(
+                "core/core.rbs",
+                "module Kernel\n  def nil?: () -> false\nend\n\nclass Object\n  include Kernel\nend\n\n\
+                 class FalseClass\nend\n\n\
+                 class Record\nend\n\nclass Shelf\n  def maybe: () -> Record?\nend\n",
+            )],
+            "",
+        );
+        let source = "class Ledger\n  def checked\n    Shelf.new.maybe.nil?\n  end\nend\n";
+        let uri = harness.write("app/report.rb", source);
+        harness.index();
+        harness.index_gems();
+
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def checked -> false"
         );
     }
 

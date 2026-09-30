@@ -27,7 +27,7 @@ All three live in the `Makefile` and are enforced by `scripts/coverage.sh`.
 | --- | --- | --- |
 | `MIN_LINES` / `MIN_BRANCHES` | 95 | Project-wide |
 | `MIN_FILE_LINES` | 90 | Every file on its own. Lower than 95 because small files swing several points per line |
-| `COVERAGE_FLOORS` | 100 | 39 named modules |
+| `COVERAGE_FLOORS` | 100 | 53 named modules |
 
 - **There is no per-file branch bar.** Small files have about a dozen branches. Put a file that must
   be complete in `COVERAGE_FLOORS`.

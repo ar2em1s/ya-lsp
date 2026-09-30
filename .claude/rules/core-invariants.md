@@ -27,8 +27,8 @@ paths:
 2. **Call `Resolver::resolve` anywhere but `analysis::resolve`**, or rubydex's indexing entry points
    anywhere but `indexer::index_files` / `indexer::index_source`.
 3. **Take a `&mut Graph` except through `indexed::Indexed::graph_mut`.** It drops every side index
-   (the member index and `Placed`). `Indexed` implements `Deref`, deliberately not `DerefMut`, so a
-   forgotten invalidation fails to compile.
+   (the member index, `Placed`, the renderers and each large document's spans). `Indexed`
+   implements `Deref`, deliberately not `DerefMut`, so a forgotten invalidation fails to compile.
 4. **Remove the default panic hook, or set `panic = "abort"`** in any profile. The contained panics
    must still print rubydex's file and line.
 5. **Coalesce or reorder `didChange` changes.** Each range applies to the text the previous change

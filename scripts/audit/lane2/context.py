@@ -54,7 +54,7 @@ class Row:
 
     __slots__ = ("index", "site", "stratum", "shape", "path", "line", "column", "offset",
                  "word", "uri", "at", "hover", "card", "tier", "named", "found", "origins",
-                 "lit", "deferred", "after_card", "after", "listed", "offered",
+                 "lit", "deferred", "after_card", "after",
                  "referenced", "references", "asked_rename", "renaming",
                  "prepared", "items", "callers")
 
@@ -90,24 +90,9 @@ class Row:
         self.after = locations(rebased.get((index, "textDocument/definition"))) \
             if self.deferred else []
 
-        # **The one reply here lane 2 did not ask for.** `lane1.completion` poses it at these same
-        # cursors, in these coordinates, and writes it into this dict. Holding a card against the
-        # list beside it compares two of the server's own answers (lane 2's definition), but only
-        # lane 1 has a reason to send the second request. Asking again here would add a third
-        # request per position on the largest cost in the budget.
-        #
-        # **`listed` and `offered` are two facts; merging them loses the check.**
-        # - A cursor the key never posed (a bare word, a setter, `--no-key`) has no list.
-        # - A cursor it posed that got nothing back has an empty list, and that is an answer.
-        # Check 5 keeps `deferred` apart from its replies for the same reason.
-        offer = answers.get((index, "textDocument/completion")) if answers else None
-        self.listed = bool(answers) and (index, "textDocument/completion") in answers
-        items = offer.get("items") if isinstance(offer, dict) else offer
-        self.offered = items if isinstance(items, list) else []
-
-        # **The same two facts, one request over.** `references` is posted at three of the six
-        # shapes, and at every *n*th of those. So a position with no key here was **not asked**, and
-        # one with an empty list was asked and told nothing. Check 7 keeps them apart throughout:
+        # **Asked and answered are two facts.** `references` is posted at three of the six shapes,
+        # and at every *n*th of those. So a position with no key here was **not asked**, and
+        # one with an empty list was asked and told nothing. Check 6 keeps them apart throughout:
         # the first is the harness's choice and belongs in no denominator; the second is an answer
         # that can contradict `highlight` and `definition`.
         self.referenced = bool(answers) and (index, "textDocument/references") in answers
@@ -121,7 +106,7 @@ class Row:
         renaming = answers.get((index, "textDocument/prepareRename"))
         self.renaming = renaming if isinstance(renaming, dict) and "start" in renaming else None
 
-        # Check 9's two hops, kept apart for the same reason plus one: the second is posted only
+        # Check 8's two hops, kept apart for the same reason plus one: the second is posted only
         # where the first answered, so an empty `callers` beside a filled `items` is the call tree's
         # own answer, not an unasked question.
         prepared = (index, "textDocument/prepareCallHierarchy")

@@ -245,7 +245,7 @@ pub struct Routes {
 /// Whose routes file this is: the only thing that makes a `draw` receiver meaningful.
 ///
 /// The application's own file may draw into any route set, and every helper it names is one this
-/// project's classes call: solidus writes `Spree::Core::Engine.routes.draw` in its own
+/// project's classes call: an engine writes `Spree::Core::Engine.routes.draw` in its own
 /// `core/config/routes.rb` for its own routes, so reading receiver-blind is right there. **A gem's
 /// file is where the receiver carries information.** Some engines open with
 /// `Rails.application.routes.draw`, so their helpers land on the host application's controllers as
@@ -316,7 +316,7 @@ pub fn read_routes(source: &str, prefix: &[String], whose: Whose) -> Routes {
 ///
 /// 1. The framework's two base classes match exactly, because they are the hook Rails itself uses.
 /// 2. The `Controller` suffix reaches an application whose base is a **gem's** class (every
-///    application on solidus or spree: `Spree::StoreController < ActionController::Base` lives in a
+///    application on an engine like Spree: `Spree::StoreController < ActionController::Base` lives in a
 ///    gem), the same suffix rule a `Mailer` gets.
 /// 3. A mailer is [`convention_of`]'s already, asked here so the two cannot disagree about what a
 ///    mailer is.
@@ -404,6 +404,7 @@ impl Routes {
                     at: Some((helper.at, helper.name_at)),
                     from: Source::Convention,
                     overloads: Vec::new(),
+                    private: false,
                 });
             }
         }
@@ -996,6 +997,166 @@ fn normalize_name(path: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.replace('-', "_"))
 }
 
+/// The route set proxy every mounted engine's helper returns (`spree.admin_orders_path`), and
+/// `main_app`'s.
+pub const ROUTES_PROXY: &str = "ActionDispatch::Routing::RoutesProxy";
+
+/// What an engine class says it is mounted under: the name of the helper
+/// `RouteSet#define_mounted_helper` defines where it is mounted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineName {
+    /// `engine_name "spree"`.
+    Written(String),
+    /// `isolate_namespace ShopAdmin`, which calls `engine_name(generate_railtie_name(mod.name))`:
+    /// `shop_admin`. The candidates the constant can resolve to, innermost first; the caller
+    /// knows which one the application declares.
+    Isolated(Vec<String>),
+}
+
+/// One `class … < Rails::Engine` and the last thing its body says about its name, which is the one
+/// Rails keeps: an engine writes `isolate_namespace Spree` and then `engine_name "spree"`.
+#[derive(Debug)]
+pub struct Engine {
+    pub name: EngineName,
+    /// The call's own line, and the name or constant inside it.
+    pub at: (u32, u32),
+    pub name_at: (u32, u32),
+}
+
+/// Every engine class `source` writes, with its name. Text in, no graph and no I/O.
+///
+/// Statements only, and every `module`'s and `class`'s, since an engine is almost always nested
+/// (`module Spree; module Core; class Engine < ::Rails::Engine`). A class that says nothing about
+/// its name is left out: its default is its own class's, and nothing says it is mounted.
+#[must_use]
+pub fn read_engines(source: &str) -> Vec<Engine> {
+    let parsed = ruby_prism::parse(source.as_bytes());
+    let mut found = Vec::new();
+    engines_in(
+        source,
+        parsed
+            .node()
+            .as_program_node()
+            .map(|program| program.statements()),
+        &mut Vec::new(),
+        &mut found,
+    );
+    found
+}
+
+fn engines_in(
+    source: &str,
+    statements: Option<StatementsNode<'_>>,
+    nesting: &mut Vec<String>,
+    found: &mut Vec<Engine>,
+) {
+    for statement in statements
+        .iter()
+        .flat_map(|statements| statements.body().iter())
+    {
+        let (path, body, superclass) = if let Some(module) = statement.as_module_node() {
+            (module.constant_path(), module.body(), None)
+        } else if let Some(class) = statement.as_class_node() {
+            (class.constant_path(), class.body(), class.superclass())
+        } else {
+            continue;
+        };
+        nesting.push(constant_spelling(source, &path));
+        let body = body.and_then(|body| body.as_statements_node());
+        let engine = superclass.is_some_and(|superclass| {
+            constant_spelling(source, &superclass).trim_start_matches("::") == "Rails::Engine"
+        });
+        if engine && let Some(named) = engine_name(source, body.as_ref(), &nesting.join("::")) {
+            found.push(named);
+        }
+        engines_in(source, body, nesting, found);
+        nesting.pop();
+    }
+}
+
+/// The last `engine_name` or `isolate_namespace` an engine class's own body calls.
+fn engine_name(source: &str, body: Option<&StatementsNode<'_>>, owner: &str) -> Option<Engine> {
+    body?
+        .body()
+        .iter()
+        .filter_map(|statement| {
+            let call = statement.as_call_node()?;
+            if call.receiver().is_some() {
+                return None;
+            }
+            let argument = call.arguments()?.arguments().iter().next()?;
+            let at = super::syntax::header(&call)?;
+            let spot = argument.location();
+            let name_at = (spot.start_offset() as u32, spot.end_offset() as u32);
+            let name = match call.name().as_slice() {
+                b"engine_name" => EngineName::Written(symbol_or_string(source, &argument)?.0),
+                // A constant, and nothing else: `isolate_namespace self.class` is a value only
+                // running Ruby knows.
+                b"isolate_namespace"
+                    if argument.as_constant_read_node().is_some()
+                        || argument.as_constant_path_node().is_some() =>
+                {
+                    let written = constant_spelling(source, &argument);
+                    EngineName::Isolated(if super::syntax::absolute(&argument) {
+                        vec![written]
+                    } else {
+                        crate::generated::candidates(owner, &written)
+                    })
+                }
+                _ => return None,
+            };
+            Some(Engine { name, at, name_at })
+        })
+        .last()
+}
+
+/// The helper a mounted engine's name defines, on the module every controller, mailer and helper
+/// includes ([`ROUTE_HELPERS`]), placed at the call that names it.
+#[must_use]
+pub fn mounted_helper(file: &str, name: &str, engine: &Engine) -> Declared {
+    Declared {
+        owner: Owner::Module(ROUTE_HELPERS.to_owned()),
+        name: name.to_owned(),
+        returns: ROUTES_PROXY.to_owned(),
+        parameters: "()".to_owned(),
+        because: format!(
+            "From `{file}`: where this engine is mounted, Rails defines `{name}`, the proxy to its \
+             routes."
+        ),
+        at: Some((engine.at, engine.name_at)),
+        from: Source::Convention,
+        overloads: Vec::new(),
+        private: false,
+    }
+}
+
+/// `main_app`, which every application's own route set defines, and what a proxy answers.
+///
+/// **A proxy answers every helper [`ROUTE_HELPERS`] holds.** The project's own routes files are read
+/// whatever route set they draw into (`Whose::Own`), so which helpers belong to which engine is not
+/// kept, and `spree.orders_path` reaches the same list `orders_path` does. A helper the engine
+/// really lacks raises there, so the answer holds wherever the call returns.
+#[must_use]
+pub fn proxies() -> Facts {
+    let mut facts = Facts::default();
+    facts.declare(Declared {
+        owner: Owner::Module(ROUTE_HELPERS.to_owned()),
+        name: "main_app".to_owned(),
+        returns: ROUTES_PROXY.to_owned(),
+        parameters: "()".to_owned(),
+        because: "Rails defines `main_app`, the proxy to the application's own routes.".to_owned(),
+        at: None,
+        from: Source::Convention,
+        overloads: Vec::new(),
+        private: false,
+    });
+    facts.mixin(
+        Owner::Instance(ROUTES_PROXY.to_owned()),
+        ROUTE_HELPERS.to_owned(),
+    );
+    facts
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
@@ -1415,7 +1576,7 @@ namespace :x do\n  concerns :searchable\nend\n";
         assert!(names(engine, Whose::Gem).is_empty(), "an engine's own set");
 
         // The regression this rule could most easily cause, and why `Whose` is a parameter, not a
-        // check inside the reader: solidus writes exactly the declined spelling in its **own**
+        // check inside the reader: an engine writes exactly the declined spelling in its **own**
         // `core/config/routes.rb`, for its own routes.
         assert_eq!(names(engine, Whose::Own), vec!["query".to_owned()]);
 
@@ -1740,7 +1901,9 @@ namespace :x do\n  concerns :searchable\nend\n";
         harness.index();
         harness.index_gems();
 
-        let engine = harness.hover_at(&uri, source, "megaphone_path").to_string();
+        let engine = harness
+            .definition_at(&uri, source, "megaphone_path")
+            .to_string();
         assert!(
             engine.contains("shouty-1.2.3/config/routes.rb"),
             "the engine's helper is a method on this application's controller: {engine}"
@@ -1748,7 +1911,9 @@ namespace :x do\n  concerns :searchable\nend\n";
 
         // And the application's own routes file declares the name they share, so the jump lands in
         // the project, not in somebody's bundle.
-        let own = harness.hover_at(&uri, source, "stories_path").to_string();
+        let own = harness
+            .definition_at(&uri, source, "stories_path")
+            .to_string();
         assert!(
             own.contains("config/routes.rb") && !own.contains("shouty-1.2.3"),
             "the project's own file wins the collision: {own}"
@@ -1815,18 +1980,109 @@ namespace :x do\n  concerns :searchable\nend\n";
         let card = card(&mut harness, &controller, source, "story_path");
         // No return type: a hover card prints the signature and the provenance, never the
         // `-> String`, as for every card here.
-        assert!(card.contains("RouteHelpers#story_path"), "{card}");
+        assert!(card.contains("story_path"), "{card}");
+        assert!(!card.contains("RouteHelpers"), "{card}");
         assert!(
-            !card.contains("Matched on the method name alone"),
+            !card.contains("Guessed from name alone"),
             "the ancestry is exact, not a name match: {card}"
         );
-        assert!(card.contains("resources :stories"), "{card}");
 
         let jump = harness.definition_at(&controller, source, "story_path");
         let target = jump[0]["targetUri"].as_str().unwrap_or_default();
         assert!(target.ends_with("config/routes.rb"), "{jump}");
         let selected = &jump[0]["targetSelectionRange"];
         assert_eq!(selected["start"]["line"], 2, "the `resources` line: {jump}");
+    }
+
+    /// What an engine's body says about its name: an absolute constant is that constant alone, a
+    /// relative one every module it can resolve to, and a call about something else says nothing.
+    #[test]
+    fn an_engine_says_its_name_with_its_last_naming_call() {
+        let source = "module Tools\n  class Engine < Rails::Engine\n    isolate_namespace ::Tools\n    \
+                      initializer \"tools.setup\" do\n    end\n  end\nend\n\n\
+                      module Kit\n  class Engine < Rails::Engine\n    isolate_namespace Kit\n  end\nend\n\n\
+                      module Deep\n  class Engine < Rails::Engine\n    isolate_namespace ::Deep::Inner\n  end\n\
+                      end\n\nmodule Nested\n  class Engine < Rails::Engine\n    isolate_namespace Outer::Nested\n  \
+                      end\nend\n\nmodule Odd\n  class Engine < Rails::Engine\n    isolate_namespace self.class\n  \
+                      end\nend\n";
+        let names: Vec<EngineName> = read_engines(source)
+            .into_iter()
+            .map(|engine| engine.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                EngineName::Isolated(vec!["Tools".to_owned()]),
+                EngineName::Isolated(vec![
+                    "Kit::Engine::Kit".to_owned(),
+                    "Kit::Kit".to_owned(),
+                    "Kit".to_owned()
+                ]),
+                EngineName::Isolated(vec!["Deep::Inner".to_owned()]),
+                EngineName::Isolated(vec![
+                    "Nested::Engine::Outer::Nested".to_owned(),
+                    "Nested::Outer::Nested".to_owned(),
+                    "Outer::Nested".to_owned()
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mounted_engine_s_helper_is_a_proxy_to_the_route_helpers() {
+        // Each of the project's engines names the helper Rails defines where it is mounted:
+        // `engine_name` outright, or `isolate_namespace` through the module's name, the last one
+        // in the class winning, and only a receiverless call in a class that inherits
+        // `Rails::Engine` counts. `main_app` is every application's. The proxy answers the route
+        // helpers, and the helper jumps to the line that named it. Without the proxy's class in the
+        // bundle, none is declared.
+        let draw = |proxy: bool| {
+            let (mut harness, _uri) = routes_project("");
+            let shop = harness.write(
+                "lib/shop/engine.rb",
+                "module Shop\n  class Engine < ::Rails::Engine\n    isolate_namespace Shop\n  end\nend\n",
+            );
+            let back = harness.write(
+                "lib/back_office/engine.rb",
+                "module BackOffice\n  class Engine < Rails::Engine\n    isolate_namespace BackOffice\n    \
+                 engine_name \"backoffice\"\n    config.engine_name \"configured\"\n  end\nend\n\n\
+                 class Plain < Rails::Engine\nend\n\n\
+                 class NotAnEngine < Rails::Railtie\n  engine_name \"nope\"\nend\n",
+            );
+            let mut written = vec![shop, back];
+            if proxy {
+                written.push(harness.write(
+                    "lib/action_dispatch/routing/routes_proxy.rb",
+                    "module ActionDispatch\n  module Routing\n    class RoutesProxy\n    end\n  end\nend\n",
+                ));
+            }
+            let source = "class StoriesController < ApplicationController\n  def index\n    \
+                          a = shop.stories_path\n    b = backoffice.story_path\n    \
+                          c = main_app.root_path\n    d = nope.root_path\n  end\nend\n";
+            let controller = harness.write("app/controllers/stories_controller.rb", source);
+            written.push(controller.clone());
+            harness.watch(&written.iter().collect::<Vec<_>>());
+            let drawn = drawn_hints(source, &harness.hints_in(&controller));
+            let jump = proxy.then(|| harness.definition_at(&controller, source, "backoffice"));
+            (drawn, jump, harness.has("RouteHelpers#shop()"))
+        };
+        let (drawn, jump, declared) = draw(true);
+        assert!(declared);
+        assert_eq!(
+            drawn,
+            "    a: String = shop.stories_path\n    b: String = backoffice.story_path\n    \
+             c: String = main_app.root_path"
+        );
+        let jump = jump.unwrap_or_default();
+        assert!(
+            jump[0]["targetUri"]
+                .as_str()
+                .is_some_and(|target| target.ends_with("lib/back_office/engine.rb")),
+            "{jump}"
+        );
+        let (drawn, _, declared) = draw(false);
+        assert_eq!(drawn, "null");
+        assert!(!declared, "no proxy class, no helper returning one");
     }
 
     #[test]
@@ -1846,26 +2102,19 @@ namespace :x do\n  concerns :searchable\nend\n";
 
         let inside = card(&mut harness, &uri, helper, "story_path");
         assert!(
-            inside.contains("RouteHelpers#story_path"),
+            inside.contains("story_path") && !inside.contains("Guessed from name alone"),
             "a helper module is a host: {inside}"
         );
-        assert!(
-            !inside.contains("Matched on the method name alone"),
-            "{inside}"
-        );
+        assert!(!inside.contains("Guessed from name alone"), "{inside}");
 
         let in_template = card(&mut harness, &view, template, "story_path");
         assert!(
-            in_template.contains("RouteHelpers#story_path"),
+            in_template.contains("story_path") && !in_template.contains("RouteHelpers"),
             "{in_template}"
         );
         assert!(
-            !in_template.contains("Matched on the method name alone"),
+            !in_template.contains("Guessed from name alone"),
             "the view context reaches it through `StoriesHelper`, not by the name: {in_template}"
-        );
-        assert!(
-            in_template.contains("Reached through the view context"),
-            "and the card says which convention it came through: {in_template}"
         );
         let jump = harness.definition_at(&view, template, "story_path");
         assert!(
@@ -1928,7 +2177,7 @@ namespace :x do\n  concerns :searchable\nend\n";
         harness.watch(&[&plain]);
         let card = card(&mut harness, &plain, source, "story_path");
         assert!(
-            card.contains("Matched on the method name alone"),
+            card.contains("Guessed from name alone"),
             "the name rung, not the ancestry: {card}"
         );
     }

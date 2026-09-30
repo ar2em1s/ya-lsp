@@ -4,8 +4,11 @@
 //! framework: which spelling names a class, what each installs, and the `def` in the block that
 //! keeps its member.
 
-use super::{Counted, Declared, Declaring, ListId, Wants};
+use std::collections::{BTreeSet, HashMap};
+
+use super::{Counted, Declared, Declaring, Fresh, ListId, Sources, Wants};
 use crate::analysis::structs;
+use crate::generated::Facts;
 use crate::workspace::{DocUri, Features};
 
 /// Documents that reference the constant `Struct` or `Data`.
@@ -23,6 +26,7 @@ static WANTS: [Wants; 1] = [Wants {
     modules: &[],
     defines: &[],
     path: None,
+    spells: &[],
     tags: false,
     inherits: false,
     // `Point = Struct.new(:x)` in a gem's `app/` declares `Point#x`: the engine rule read straight.
@@ -31,11 +35,30 @@ static WANTS: [Wants; 1] = [Wants {
     engines: true,
     gems: false,
     reads_only: false,
+    buffers: false,
 }];
 
 /// The two constructors the language ships.
 #[derive(Debug, Default)]
-pub struct Structs;
+pub struct Structs {
+    /// What the reader made of each listed file, by URI ([`Held`]).
+    sources: HashMap<String, Held>,
+    /// How many files it has read.
+    pub reads: u64,
+}
+
+/// One file's facts, and what they were read against.
+///
+/// **Facts, not a parse**, against [`Knowledge::refresh`](super::Knowledge::refresh)'s advice,
+/// because the reader asks the projection one question while it parses: whether a class's name
+/// can be spelled ([`structs::read_asking`]). So the facts are held with every answer they rest
+/// on, and read again when the text moved or any answer did.
+#[derive(Debug)]
+struct Held {
+    fresh: Fresh,
+    asked: Vec<(String, bool)>,
+    facts: Facts,
+}
 
 impl super::Knowledge for Structs {
     fn name(&self) -> &'static str {
@@ -61,28 +84,61 @@ impl super::Knowledge for Structs {
     /// decides which documents on this list really write one; a file that mentions `Struct` and
     /// never calls it says nothing and is not recorded.
     ///
-    /// No memo, and that is the one difference. This reader ends at
-    /// [`generated::Facts`](crate::generated::Facts) like the annotations one, but few files
-    /// mention either constant, so a parse per settle is cheaper than a memo to keep fresh.
+    /// Held between passes ([`Held`]): re-reading every listed file each settle was a tenth of a
+    /// large app's pass.
     fn declare(&mut self, declaring: &Declaring<'_>, into: &mut Declared) -> Counted {
         let mut members = 0;
-        for uri in declaring
+        // A listed file with nothing held could not be read (it is gone).
+        for (held, uri) in declaring
             .context
             .documents(STRUCTS)
             .iter()
-            .filter_map(|uri| DocUri::from_graph_uri(uri))
+            .filter_map(|key| self.sources.get(key).zip(DocUri::from_graph_uri(key)))
         {
-            let Some(source) = (declaring.text)(&uri) else {
-                continue;
-            };
-            let facts = structs::read(
-                &source,
-                &(declaring.caption)(&uri),
-                &declaring.context.namespaces,
-            );
-            members += facts.len();
-            super::add(into, &uri, facts);
+            members += held.facts.len();
+            super::add(into, &uri, held.facts.clone());
         }
         vec![("struct members", members)]
+    }
+
+    fn refresh(&mut self, sources: &Sources<'_>) {
+        let listed: BTreeSet<&str> = sources
+            .context
+            .documents(STRUCTS)
+            .iter()
+            .map(String::as_str)
+            .collect();
+        // A file that has left the list keeps nothing here, as in the annotations module.
+        self.sources.retain(|uri, _| listed.contains(uri.as_str()));
+        let namespaces = &sources.context.namespaces;
+        for (key, uri) in listed
+            .into_iter()
+            .filter_map(|key| DocUri::from_graph_uri(key).map(|uri| (key, uri)))
+        {
+            let fresh = (sources.fresh)(&uri);
+            if self.sources.get(key).is_some_and(|held| {
+                held.fresh == fresh
+                    && held
+                        .asked
+                        .iter()
+                        .all(|(name, was)| namespaces.spellable(name) == *was)
+            }) {
+                continue;
+            }
+            let Some(text) = (sources.text)(&uri) else {
+                self.sources.remove(key);
+                continue;
+            };
+            self.reads += 1;
+            let (facts, asked) = structs::read_asking(&text, &(sources.caption)(&uri), namespaces);
+            self.sources.insert(
+                key.to_owned(),
+                Held {
+                    fresh,
+                    asked,
+                    facts,
+                },
+            );
+        }
     }
 }

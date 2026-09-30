@@ -22,23 +22,36 @@ use ruby_prism::CallNode;
 use super::ASSOCIATIONS;
 use super::inflect::{camelize, singularize};
 use super::models::Elsewhere;
-use super::relations::{Chained, relation_of};
+use super::relations::Chained;
 use super::syntax::{first_symbol_or_string, header, inherited, string_literal, symbol_or_string};
 use crate::generated::candidates;
 use crate::generated::{Declared, Facts, Owner, Source};
+use crate::generated::{SCOPED, collection_of};
 
 /// What a model macro returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
-    /// `belongs_to :user`: one record, non-`nil` since Rails 5 unless `optional: true`.
+    /// `belongs_to :user` or `has_one :profile`: one record or none, whatever the call or the
+    /// project's settings say. `optional: false` and `belongs_to_required_by_default`
+    /// are a validation run on save, not a promise on read: `Comment.new.story` is `nil`, and so is
+    /// a key pointing at a row deleted where no foreign key constrains it.
     One,
-    /// `has_one :profile`: one record or none, and nothing in the file says which.
-    Maybe,
     /// `has_many :comments`: a relation, which is a class this pass generates.
     Many,
     /// `scope :recent, -> { ... }`: a *class* method returning a relation of its own class.
     Scope,
 }
+
+/// What a `scope` hands back: its lambda's value where truthy, else the relation it was called on
+/// (`_exec_scope` is `instance_exec(*args, &block) || self`), which the types table reads at the
+/// call ([`SCOPED`]).
+fn scoped(relation: &str) -> String {
+    format!("{relation} | {SCOPED}")
+}
+
+/// What a collection association reads as: `ActiveRecord::Associations::CollectionProxy`, which
+/// a `has_many` whose class cannot be named still is.
+pub const COLLECTION_PROXY: &str = "ActiveRecord::Associations::CollectionProxy";
 
 /// Why an association's own call says no single class can be named.
 ///
@@ -120,7 +133,6 @@ pub(super) struct Association {
     ///
     /// [`candidates`]: Association::candidates
     undecided: Option<Undecided>,
-    optional: bool,
     /// The association this one reads through, when it is a `has_many :through`.
     through: Option<String>,
     at: (u32, u32),
@@ -154,8 +166,6 @@ pub(super) fn read<'pr>(
         candidates,
         kind: *kind,
         undecided,
-        optional: inherited(node, hosts, "optional")
-            .is_some_and(|value| value.as_true_node().is_some()),
         through: inherited(node, hosts, "through")
             .and_then(|value| Some(symbol_or_string(source, &value)?.0)),
         at: header(node)?,
@@ -287,6 +297,7 @@ impl Association {
             models,
             relations,
             includers,
+            framework,
             ..
         } = *elsewhere;
         // The one gate in this file that asks about the class the macro is written **on**, not the
@@ -353,7 +364,7 @@ impl Association {
                     Declared {
                         owner: Owner::Singleton(includer.clone()),
                         name: self.name.clone(),
-                        returns: relation_of(includer),
+                        returns: scoped(&collection_of(includer)),
                         parameters: "(*untyped)".to_owned(),
                         because: format!(
                             "From `{file}`, `{} :{}` in `{}`, which `{includer}` includes.",
@@ -362,6 +373,7 @@ impl Association {
                         at: Some((self.at, self.name_at)),
                         from: Source::Association,
                         overloads: Vec::new(),
+                        private: false,
                     },
                 );
             }
@@ -370,15 +382,21 @@ impl Association {
         let returns = match self.kind {
             // Before every other arm, and before the relation gate below: `untyped?` is not worth
             // writing and `untyped::Relation` is not a class.
+            // A collection is Rails' proxy whatever class it holds, where the bundle has one.
+            Kind::Many if self.undecided.is_some() && framework.contains(COLLECTION_PROXY) => {
+                COLLECTION_PROXY.to_owned()
+            }
             _ if self.undecided.is_some() => UNTYPED.to_owned(),
-            Kind::One if self.optional => format!("{target}?"),
-            Kind::One => target.to_owned(),
-            Kind::Maybe => format!("{target}?"),
+            Kind::One => format!("{target}?"),
             Kind::Many | Kind::Scope => {
                 if !relations.contains(target) {
                     return;
                 }
-                relation_of(target)
+                if self.kind == Kind::Scope {
+                    scoped(&collection_of(target))
+                } else {
+                    collection_of(target)
+                }
             }
         };
         // A scope is a class method, and rubydex files `def self.` on the singleton exactly as it
@@ -403,12 +421,16 @@ impl Association {
                 match (self.undecided, self.kind) {
                     (Some(why), _) => format!(", {}", why.because()),
                     (None, Kind::Scope) => String::new(),
+                    // A reader returning many records is not one: *which is a `Comment`* reads as
+                    // the reader's type.
+                    (None, Kind::Many) => format!(", a collection of `{target}`"),
                     (None, _) => format!(", which is a `{target}`"),
                 }
             ),
             at: Some((self.at, self.name_at)),
             from: Source::Association,
             overloads: Vec::new(),
+            private: false,
         };
         match self.kind {
             // The relation half; [`chainable`] has the argument. The gate it needs is the one
@@ -445,6 +467,7 @@ impl Association {
                 at: Some((self.at, self.name_at)),
                 from: Source::Association,
                 overloads: Vec::new(),
+                private: false,
             });
         };
         // **An undecidable class costs the type, never the member.** Everything the macro installs
@@ -455,12 +478,11 @@ impl Association {
             None => format!("{target}?"),
         };
         match self.kind {
-            Kind::One | Kind::Maybe => {
-                // **The writer is nilable whatever the reader is**, so the two are not copies:
-                // `belongs_to :user` reads a `User` because Rails 5 made the association required,
-                // yet `story.user = nil` is ordinary Ruby that raises nothing (the validation
-                // fails, at save). Assigning a subclass returns the subclass, so the declared type
-                // is a supertype of every value, not an approximation.
+            Kind::One => {
+                // **The writer is nilable as the reader is**: `story.user = nil` is ordinary Ruby
+                // that raises nothing, even on a required association (the validation fails, at
+                // save). Assigning a subclass returns the subclass, so the declared type is a
+                // supertype of every value, not an approximation.
                 installs(
                     format!("{}=", self.name),
                     format!("({assigned})"),
@@ -473,9 +495,8 @@ impl Association {
                 if self.undecided.is_some() {
                     return;
                 }
-                // **These are not nilable even where the reader is**, which differs from the reader
-                // in the other direction: `belongs_to :user, optional: true` reads a `User?`
-                // because the row may not exist, and `create_user` *makes* one.
+                // **These are not nilable although the reader is**: `belongs_to :user` reads a
+                // `User?` because the row may not exist, and `create_user` *makes* one.
                 for name in [
                     format!("build_{}", self.name),
                     format!("create_{}", self.name),
@@ -661,9 +682,9 @@ mod tests {
             "\
 class Story
   # From `app/models/story.rb`, `belongs_to :user`, which is a `User`.
-  def user: () -> User
+  def user: () -> User?
   # From `app/models/story.rb`, `belongs_to :user`, which also installs `user=`.
-  def user=: (User?) -> User?
+  def user=: (User? value) -> User?
   # From `app/models/story.rb`, `belongs_to :user`, which also installs `build_user`.
   def build_user: (*untyped) ?{ (User) -> untyped } -> User
   # From `app/models/story.rb`, `belongs_to :user`, which also installs `create_user`.
@@ -673,7 +694,7 @@ class Story
   # From `app/models/story.rb`, `belongs_to :parent_story`, which is a `Story`.
   def parent_story: () -> Story?
   # From `app/models/story.rb`, `belongs_to :parent_story`, which also installs `parent_story=`.
-  def parent_story=: (Story?) -> Story?
+  def parent_story=: (Story? value) -> Story?
   # From `app/models/story.rb`, `belongs_to :parent_story`, which also installs `build_parent_story`.
   def build_parent_story: (*untyped) ?{ (Story) -> untyped } -> Story
   # From `app/models/story.rb`, `belongs_to :parent_story`, which also installs `create_parent_story`.
@@ -683,47 +704,47 @@ class Story
   # From `app/models/story.rb`, `belongs_to :owner`, whose class a `_type` column names one row at a time.
   def owner: () -> untyped
   # From `app/models/story.rb`, `belongs_to :owner`, which also installs `owner=`.
-  def owner=: (untyped) -> untyped
+  def owner=: (untyped value) -> untyped
   # From `app/models/story.rb`, `has_one :draft`, which is a `Comment`.
   def draft: () -> Comment?
   # From `app/models/story.rb`, `has_one :draft`, which also installs `draft=`.
-  def draft=: (Comment?) -> Comment?
+  def draft=: (Comment? value) -> Comment?
   # From `app/models/story.rb`, `has_one :draft`, which also installs `build_draft`.
   def build_draft: (*untyped) ?{ (Comment) -> untyped } -> Comment
   # From `app/models/story.rb`, `has_one :draft`, which also installs `create_draft`.
   def create_draft: (*untyped) ?{ (Comment) -> untyped } -> Comment
   # From `app/models/story.rb`, `has_one :draft`, which also installs `create_draft!`.
   def create_draft!: (*untyped) ?{ (Comment) -> untyped } -> Comment
-  # From `app/models/story.rb`, `has_many :comments`, which is a `Comment`.
+  # From `app/models/story.rb`, `has_many :comments`, a collection of `Comment`.
   def comments: () -> Comment::Relation
   # From `app/models/story.rb`, `has_many :comments`, which also installs `comments=`.
-  def comments=: (untyped) -> untyped
+  def comments=: (untyped value) -> untyped
   # From `app/models/story.rb`, `has_many :comments`, which also installs `comment_ids`.
   def comment_ids: () -> Array[untyped]
   # From `app/models/story.rb`, `has_many :comments`, which also installs `comment_ids=`.
-  def comment_ids=: (untyped) -> untyped
-  # From `app/models/story.rb`, `has_many :taggings`, which is a `Tagging`.
+  def comment_ids=: (untyped value) -> untyped
+  # From `app/models/story.rb`, `has_many :taggings`, a collection of `Tagging`.
   def taggings: () -> Tagging::Relation
   # From `app/models/story.rb`, `has_many :taggings`, which also installs `taggings=`.
-  def taggings=: (untyped) -> untyped
+  def taggings=: (untyped value) -> untyped
   # From `app/models/story.rb`, `has_many :taggings`, which also installs `tagging_ids`.
   def tagging_ids: () -> Array[untyped]
   # From `app/models/story.rb`, `has_many :taggings`, which also installs `tagging_ids=`.
-  def tagging_ids=: (untyped) -> untyped
-  # From `app/models/story.rb`, `has_many :tags`, which is a `Tag`.
+  def tagging_ids=: (untyped value) -> untyped
+  # From `app/models/story.rb`, `has_many :tags`, a collection of `Tag`.
   def tags: () -> Tag::Relation
   # From `app/models/story.rb`, `has_many :tags`, which also installs `tags=`.
-  def tags=: (untyped) -> untyped
+  def tags=: (untyped value) -> untyped
   # From `app/models/story.rb`, `has_many :tags`, which also installs `tag_ids`.
   def tag_ids: () -> Array[untyped]
   # From `app/models/story.rb`, `has_many :tags`, which also installs `tag_ids=`.
-  def tag_ids=: (untyped) -> untyped
+  def tag_ids=: (untyped value) -> untyped
   # From `app/models/story.rb`, `scope :recent`.
-  def self.recent: (*untyped) -> Story::Relation
+  def self.recent: (*untyped) -> (Story::Relation | ScopedByItsLambda)
 end
 class Story::Relation
   # From `app/models/story.rb`, `scope :recent`.
-  def recent: (*untyped) -> Story::Relation
+  def recent: (*untyped) -> (Story::Relation | ScopedByItsLambda)
 end
 "
         );
@@ -833,30 +854,30 @@ end
             declarations.rbs,
             "\
 class Story
-  # From `app/models/story.rb`, `has_and_belongs_to_many :tags`, which is a `Tag`.
+  # From `app/models/story.rb`, `has_and_belongs_to_many :tags`, a collection of `Tag`.
   def tags: () -> Tag::Relation
   # From `app/models/story.rb`, `has_and_belongs_to_many :tags`, which also installs `tags=`.
-  def tags=: (untyped) -> untyped
+  def tags=: (untyped value) -> untyped
   # From `app/models/story.rb`, `has_and_belongs_to_many :tags`, which also installs `tag_ids`.
   def tag_ids: () -> Array[untyped]
   # From `app/models/story.rb`, `has_and_belongs_to_many :tags`, which also installs `tag_ids=`.
-  def tag_ids=: (untyped) -> untyped
-  # From `app/models/story.rb`, `has_and_belongs_to_many :people`, which is a `Person`.
+  def tag_ids=: (untyped value) -> untyped
+  # From `app/models/story.rb`, `has_and_belongs_to_many :people`, a collection of `Person`.
   def people: () -> Person::Relation
   # From `app/models/story.rb`, `has_and_belongs_to_many :people`, which also installs `people=`.
-  def people=: (untyped) -> untyped
+  def people=: (untyped value) -> untyped
   # From `app/models/story.rb`, `has_and_belongs_to_many :people`, which also installs `person_ids`.
   def person_ids: () -> Array[untyped]
   # From `app/models/story.rb`, `has_and_belongs_to_many :people`, which also installs `person_ids=`.
-  def person_ids=: (untyped) -> untyped
-  # From `app/models/story.rb`, `has_and_belongs_to_many :editors`, which is a `User`.
+  def person_ids=: (untyped value) -> untyped
+  # From `app/models/story.rb`, `has_and_belongs_to_many :editors`, a collection of `User`.
   def editors: () -> User::Relation
   # From `app/models/story.rb`, `has_and_belongs_to_many :editors`, which also installs `editors=`.
-  def editors=: (untyped) -> untyped
+  def editors=: (untyped value) -> untyped
   # From `app/models/story.rb`, `has_and_belongs_to_many :editors`, which also installs `editor_ids`.
   def editor_ids: () -> Array[untyped]
   # From `app/models/story.rb`, `has_and_belongs_to_many :editors`, which also installs `editor_ids=`.
-  def editor_ids=: (untyped) -> untyped
+  def editor_ids=: (untyped value) -> untyped
 end
 "
         );
@@ -909,11 +930,17 @@ end
             .render(&declaring(&[]))
             .rbs;
         assert!(rbs.contains("def users: () -> untyped"), "{rbs}");
-        assert!(rbs.contains("def users=: (untyped) -> untyped"), "{rbs}");
+        assert!(
+            rbs.contains("def users=: (untyped value) -> untyped"),
+            "{rbs}"
+        );
         // Singularized from the **association's own name**, as for a decidable collection: the
         // class was never where that name came from.
         assert!(rbs.contains("def user_ids: () -> Array[untyped]"), "{rbs}");
-        assert!(rbs.contains("def user_ids=: (untyped) -> untyped"), "{rbs}");
+        assert!(
+            rbs.contains("def user_ids=: (untyped value) -> untyped"),
+            "{rbs}"
+        );
         // And the absurd fall-through answer is nowhere in the document.
         assert!(
             !rbs.contains("def users: () -> Shop::Rule::Relation"),
@@ -1031,7 +1058,7 @@ end
             .render(&declaring(&["Spree"]))
             .rbs;
         assert!(
-            rbs.contains("def adjustment: () -> Spree::Adjustment\n"),
+            rbs.contains("def adjustment: () -> Spree::Adjustment?\n"),
             "{rbs}"
         );
         assert!(
@@ -1073,8 +1100,8 @@ end
             )
             .render(&declaring(&["Spree"]))
             .rbs;
-        assert!(rbs.contains("def nested: () -> Spree::Order\n"), "{rbs}");
-        assert!(rbs.contains("def absolute: () -> Order\n"), "{rbs}");
+        assert!(rbs.contains("def nested: () -> Spree::Order?\n"), "{rbs}");
+        assert!(rbs.contains("def absolute: () -> Order?\n"), "{rbs}");
     }
 
     /// `belongs_to` is not only ActiveRecord's, and a prefix must not rescue a name.
@@ -1285,7 +1312,7 @@ end
     }
 
     #[test]
-    fn a_hover_on_an_association_says_which_file_and_which_class_it_came_from() {
+    fn a_hover_on_an_association_names_the_member_and_what_it_holds() {
         // The provenance rule, and the boundary it holds: the card names the file, the macro and
         // the resolved class because the *generated RBS* carries a comment above the `def`. Nothing
         // in `hover.rs` knows the word `belongs_to`.
@@ -1293,9 +1320,7 @@ end
         let (mut harness, _story, uri) = models_project(source);
 
         let card = card(&mut harness, &uri, source, "parent_story");
-        assert!(card.contains("app/models/story.rb"), "{card}");
-        assert!(card.contains("belongs_to :parent_story"), "{card}");
-        assert!(card.contains("which is a `Story`"), "{card}");
+        assert_eq!(card, "```ruby\nStory#parent_story -> Story?\n```");
     }
 
     #[test]
@@ -1328,10 +1353,8 @@ end
 
         // And the card says which line, and why there is no type, instead of claiming one.
         let card = card(&mut harness, &uri, source, "owner");
-        assert!(card.contains("belongs_to :owner"), "{card}");
-        assert!(card.contains("`_type` column"), "{card}");
         assert!(
-            !card.contains("Matched on the method name alone"),
+            !card.contains("Guessed from name alone"),
             "the member is the answer, so the name rung is never reached: {card}"
         );
     }
@@ -1353,8 +1376,7 @@ end
             "{definition}"
         );
         let card = card(&mut harness, &uri, source, "keeper");
-        assert!(card.contains("belongs_to :keeper"), "{card}");
-        assert!(card.contains("not a literal"), "{card}");
+        assert_eq!(card, "```ruby\nStory#keeper\n```");
     }
 
     #[test]
@@ -1372,17 +1394,99 @@ end
         );
     }
 
+    /// A `belongs_to` reader is `T?` whatever the call or the project says (reversing
+    /// an earlier ruling): `optional: false`, `required: true` and `load_defaults` 5.0 are a
+    /// validation run on save, and `Comment.new.story` is `nil` all the same.
     #[test]
-    fn optional_is_what_makes_a_belongs_to_nilable_and_a_has_one_always_is() {
-        // The nullability half. Rails 5 made `belongs_to` non-`nil` by default, so the option is
-        // what makes the member optional; `has_one` is optional whatever anyone writes, because
-        // nothing in the file says the other record exists.
-        let (harness, _story, _uri) = models_project("");
-        let rbs = harness.generated_rbs("app/models/story.rb");
+    fn a_belongs_to_reader_is_nilable_whatever_the_call_or_the_project_says() {
+        let (mut harness, story, _uri) = models_project("");
+        harness.write(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n  belongs_to :story\n  \
+             belongs_to :parent, class_name: \"Comment\", optional: false\n  \
+             belongs_to :author, class_name: \"User\", required: true\n  \
+             belongs_to :editor, class_name: \"User\", optional: true\nend\n",
+        );
+        let application = harness.write(
+            "config/application.rb",
+            "module Shop\n  class Application < Rails::Application\n    config.load_defaults 8.0\n    \
+             config.active_record.belongs_to_required_by_default = true\n  end\nend\n",
+        );
+        harness.watch(&[&application]);
+        let comment = harness.generated_rbs("app/models/comment.rb");
+        for line in [
+            "def story: () -> Story?\n",
+            "def parent: () -> Comment?\n",
+            "def author: () -> User?\n",
+            "def editor: () -> User?\n",
+        ] {
+            assert!(comment.contains(line), "{line}{comment}");
+        }
+        let story = harness.generated_for(&story).unwrap_or_default();
+        assert!(story.contains("def user: () -> User?\n"), "{story}");
+        // `has_one` is the same: nothing in the file says the other record exists.
+        assert!(story.contains("def draft: () -> Comment?\n"), "{story}");
+    }
 
-        assert!(rbs.contains("def user: () -> User\n"), "{rbs}");
-        assert!(rbs.contains("def parent_story: () -> Story?\n"), "{rbs}");
-        assert!(rbs.contains("def draft: () -> Comment?\n"), "{rbs}");
+    /// A `has_many` whose class cannot be read is still Rails' collection proxy, where the bundle
+    /// declares it.
+    #[test]
+    fn a_collection_whose_class_cannot_be_read_is_still_a_proxy() {
+        let model = read_model(
+            "class Story < ApplicationRecord\n  has_many :things, class_name: THING\nend\n",
+        );
+        let known: BTreeSet<String> = ["Story"].into_iter().map(str::to_owned).collect();
+        let framework: BTreeSet<String> = [COLLECTION_PROXY.to_owned()].into_iter().collect();
+        let rbs = model
+            .signatures(
+                "app/models/story.rb",
+                &Elsewhere {
+                    known: &known,
+                    framework: &framework,
+                    models: &known,
+                    ..Elsewhere::nothing()
+                },
+            )
+            .render(&declaring(&[]))
+            .rbs;
+        assert!(
+            rbs.contains("def things: () -> ActiveRecord::Associations::CollectionProxy\n"),
+            "{rbs}"
+        );
+    }
+
+    /// A `scope` is its lambda's value where that is truthy, else the relation
+    /// (`instance_exec(…) || self`): a record, an `Array`, or the relation for a body that may be
+    /// `nil` or cannot be read.
+    #[test]
+    fn a_scope_is_what_its_lambda_hands_back_or_the_relation() {
+        let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
+        harness.write(
+            "app/models/story.rb",
+            "class Story < ApplicationRecord\n  scope :recent, -> { order(:id) }\n  \
+             scope :newest, -> { order(:id).first }\n  \
+             scope :maybe, -> { where(id: 1) if rand }\n  \
+             scope :grouped, lambda { pluck(:id) }\n  \
+             scope :odd, -> { Unknown.call }\n  scope :named, BODY\nend\n",
+        );
+        let source = "\
+a = Story.recent
+b = Story.newest
+c = Story.maybe
+d = Story.grouped
+e = Story.odd
+f = Story.named
+g = Story.all.newest
+";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "a: Story::Relation = Story.recent\nb: Story::Relation | Story = Story.newest\n\
+             c: Story::Relation = Story.maybe\nd: Array = Story.grouped\n\
+             e: Story::Relation = Story.odd\nf: Story::Relation = Story.named\n\
+             g: Story::Relation | Story = Story.all.newest"
+        );
     }
 
     /// The nesting walk, end to end, and the fixture is the point: both spellings exist.
@@ -1547,20 +1651,18 @@ end
         // only place both `Relation`s are visible.
         let rbs = harness.generated_rbs("app/models/concerns/expireable.rb");
         assert!(
-            rbs.contains("def self.expired: (*untyped) -> Poll::Relation"),
+            rbs.contains("def self.expired: (*untyped) -> (Poll::Relation | ScopedByItsLambda)"),
             "{rbs}"
         );
         assert!(
-            rbs.contains("def self.expired: (*untyped) -> Invite::Relation"),
+            rbs.contains("def self.expired: (*untyped) -> (Invite::Relation | ScopedByItsLambda)"),
             "{rbs}"
         );
 
         let poll = card(&mut harness, &uri, source, "expired()");
         assert!(poll.contains("Poll.expired"), "{poll}");
-        assert!(poll.contains("which `Poll` includes"), "{poll}");
         let invite = card(&mut harness, &uri, source, "expired\n");
         assert!(invite.contains("Invite.expired"), "{invite}");
-        assert!(invite.contains("which `Invite` includes"), "{invite}");
 
         // Both jump to the one `scope` line (line 4, the only line in the file that declares
         // anything), and neither lands in the model that includes the concern.
@@ -1692,16 +1794,11 @@ end
             recent.contains("Defined in 2 places"),
             "two places, and the card says so: {recent}"
         );
-        assert!(recent.contains("which `Poll` includes"), "{recent}");
-        assert!(
-            recent.contains("`app/models/poll.rb`, `scope :recent`"),
-            "{recent}"
-        );
 
         // One type, and the chain proves it: two declarations of one member disagreeing about their
         // return type is what the rank prevents, and here they cannot disagree.
         let first = card(&mut harness, &uri, source, "first");
-        assert!(first.contains("ActiveRecordRelation#first"), "{first}");
+        assert!(first.contains("ActiveRecord::Relation#first"), "{first}");
     }
 
     /// The writer half of an association, on both sides.
@@ -1724,7 +1821,7 @@ end
         for word in ["create!", "new"] {
             let card = card(&mut harness, &uri, source, word);
             assert!(
-                card.contains(&format!("ActiveRecordRelation#{word}")),
+                card.contains(&format!("ActiveRecord::Relation#{word}")),
                 "{card}"
             );
         }
@@ -1739,19 +1836,11 @@ end
         assert!(harness.has("Story#create_user!()"));
         let created = card(&mut harness, &uri, source, "create_user");
         assert!(created.contains("Story#create_user"), "{created}");
-        assert!(
-            created.contains("`belongs_to :user`"),
-            "the macro line is the place: {created}"
-        );
-        // It chains, and it is **not** nilable where the reader is:
-        // `belongs_to :parent_story, optional: true` reads a `Story?`, but `create_parent_story`
-        // makes one, so it is a `Story`.
+        // It chains, and it is **not** nilable where the reader is: `belongs_to :parent_story`
+        // reads a `Story?`, but `create_parent_story` makes one, so it is a `Story`.
         let chained = card(&mut harness, &uri, source, "comments");
         assert!(chained.contains("Story#comments"), "{chained}");
-        assert!(
-            !chained.contains("Matched on the method name alone"),
-            "{chained}"
-        );
+        assert!(!chained.contains("Guessed from name alone"), "{chained}");
 
         // A collection macro installs none of the three, because a collection's constructors are
         // the relation's, and `has_many :comments` is in the same file as the `belongs_to` above.
@@ -1779,15 +1868,11 @@ end
                       Story.first.comments.reload.first.story\n";
         let (mut harness, _story, uri) = models_project(source);
 
-        // The singular writer, nilable whatever the reader is: `belongs_to :user` is required, yet
-        // `story.user = nil` is ordinary Ruby; the validation fails, at save.
+        // The singular writer, nilable as the reader is: `story.user = nil` is ordinary Ruby even
+        // where the association is required; the validation fails, at save.
         assert!(harness.has("Story#user=()"));
         let written = card(&mut harness, &uri, source, "user =");
         assert!(written.contains("Story#user="), "{written}");
-        assert!(
-            written.contains("`belongs_to :user`"),
-            "the macro line is the place: {written}"
-        );
 
         // The collection's three. `has_many` singularizes the **association's own name**, not the
         // class it resolves to, as `has_many :tags, through: :taggings` shows: it collects a `Tag`
@@ -1804,7 +1889,7 @@ end
         // `has_many :tags, through: :taggings` collects a `Tag`, and `tag_ids` is singularized from
         // `tags`, not from the class.
         let ids = card(&mut harness, &uri, source, "tag_ids");
-        assert!(ids.contains("`has_many :tags`"), "{ids}");
+        assert!(ids.contains("Story#tag_ids -> Array"), "{ids}");
         // `Array[untyped]`, not a bare `untyped`. No hover card prints a return type, so the chain
         // states it: what a primary key holds is the schema's to say, in another generated document
         // this reader cannot ask, but the *array* is known and is what callers want.

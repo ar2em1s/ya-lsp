@@ -19,15 +19,14 @@ def report(corpus, counts, findings, elapsed, show):
     print(f"{corpus.name:10} {counts['positions']:5} positions  {elapsed:5.1f}s   "
           f"hover {counts['hover']}  definition {counts['definition']}  "
           f"highlight {counts['highlight']}")
-    if counts["hover"] and not (tiers["derived"] or tiers["guessed"]):
-        # The one way this lane can be wrong without failing: `hover.rs` rewords a footnote, nothing
-        # matches, every card reads as Resolved, and check 2 reports a flood or a zero that means
-        # nothing. Refuse to be believed instead.
-        print(f"{'':10} BROKEN   every card read as Resolved — the sentences in GUESSED and "
-              f"DERIVED no longer match hover.rs")
+    if counts["hover"] and not tiers["guessed"]:
+        # The one way this lane can be wrong without failing: `hover.rs` rewords its guess line,
+        # nothing matches, every card reads as sure, and check 2 reports a flood or a zero that
+        # means nothing. Refuse to be believed instead.
+        print(f"{'':10} BROKEN   every card read as sure — the line in GUESSED no longer matches "
+              f"hover.rs")
         return
-    print(f"{'':10} tiers    resolved {tiers['resolved']}  derived {tiers['derived']}  "
-          f"guessed {tiers['guessed']}")
+    print(f"{'':10} tiers    resolved {tiers['resolved']}  guessed {tiers['guessed']}")
     print(f"{'':10} places   {_places(counts)}")
     print(f"{'':10} described {places.line(counts)}")
     if counts.get("declarations"):

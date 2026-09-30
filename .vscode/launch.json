@@ -7,13 +7,20 @@
       "request": "launch",
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}/editors/vscode",
-        "${workspaceFolder}/tmp/corpora/discourse"
+        "${input:project}"
       ],
       "outFiles": ["${workspaceFolder}/editors/vscode/dist/**/*.js"],
       "preLaunchTask": "build the extension",
       "env": {
         "YA_LSP_LOG": "ya_lsp=debug"
       }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "project",
+      "type": "promptString",
+      "description": "The Ruby project to open in the extension host (a folder path)"
     }
   ]
 }

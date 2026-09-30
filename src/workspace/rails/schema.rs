@@ -17,7 +17,7 @@ use super::syntax::{
     constant_spelling, first_string, first_symbol_or_string, header, keyword, string_literal,
     symbol_or_string,
 };
-use super::{COLUMN_TYPES, NOT_COLUMNS, PRIMARY_KEY};
+use super::{COLUMN_TYPES, EITHER_TIME, NOT_COLUMNS, PRIMARY_KEY, WHOLE_DECIMAL, ZONED};
 use crate::generated::candidates;
 use crate::generated::{Declared, Facts, Owner, Source};
 
@@ -86,12 +86,17 @@ impl Schema {
     /// written into the provenance comment above every declaration. It is a parameter because there
     /// can be several files. A card saying `db/schema.rb` above a column from
     /// `db/animals_schema.rb` is the confidently wrong answer this avoids.
+    ///
+    /// `zoned` says the project keeps Rails' time-zone default: no file writes one of
+    /// [`TIME_ZONE_SETTINGS`](super::TIME_ZONE_SETTINGS). Without it, a [`ZONED`] column is
+    /// `untyped`.
     #[must_use]
     pub fn signatures(
         &self,
         file: &str,
         classes: &BTreeMap<String, Vec<String>>,
         retyped: &BTreeMap<String, BTreeSet<String>>,
+        zoned: bool,
     ) -> Facts {
         let mut facts = Facts::default();
         for table in &self.tables {
@@ -113,23 +118,27 @@ impl Schema {
                 {
                     continue;
                 }
+                let returns = rbs_type(column.read_as(), zoned, column.nullable, column.array);
                 facts.declare(Declared {
                     owner: Owner::Instance(class.clone()),
                     name: column.name.clone(),
-                    returns: rbs_type(&column.kind, column.nullable, column.array),
+                    returns,
                     parameters: "()".to_owned(),
                     // The provenance line carries nullability as well as the type. A hover card
                     // shows a declaration's *name*, not its RBS return type, so `String?` would
                     // otherwise be a fact nobody sees. And no Ruby tool tells you which columns can
                     // be `nil`.
                     because: format!(
-                        "From `{file}`, table `{}`, column `{}` (`{}{}`, {}).",
+                        "From `{file}`, table `{}`, column `{}` (`{}{}`{}, {}).",
                         table.name,
                         column.name,
                         column.kind,
                         // In the type slot, not a separate field: it is what pg_dump itself writes,
                         // and the card has one line to say "many of these".
                         if column.array { "[]" } else { "" },
+                        // Why a `decimal` answers `Integer`, which the card would otherwise leave
+                        // the reader to guess.
+                        if column.whole { " with no scale" } else { "" },
                         if column.nullable {
                             "may be `nil`"
                         } else {
@@ -139,11 +148,175 @@ impl Schema {
                     at: Some((column.at, column.name_at)),
                     from: Source::Column,
                     overloads: Vec::new(),
+                    private: false,
                 });
             }
         }
         facts
     }
+
+    /// What Rails' attribute methods define around every column [`Self::signatures`] declares:
+    /// `x?` and dirty tracking ([`attribute_methods`]), on the same classes, from the same lines.
+    ///
+    /// Apart from the readers because they are a different fact about the same column. `defined`
+    /// holds the instance methods each class's own file writes with `def`: such a `def` replaces
+    /// the one Rails would define, and what it returns is its body's business.
+    ///
+    /// Written straight into `facts`, the readers' table, not returned to be merged into it: a
+    /// merge declares every member a second time, four per column per settle.
+    pub fn attribute_methods(
+        &self,
+        file: &str,
+        classes: &BTreeMap<String, Vec<String>>,
+        retyped: &BTreeMap<String, BTreeSet<String>>,
+        defined: &BTreeMap<String, BTreeSet<String>>,
+        zoned: bool,
+        facts: &mut Facts,
+    ) {
+        for table in &self.tables {
+            let Some(classes) = classes.get(&table.name) else {
+                continue;
+            };
+            for (class, column) in classes
+                .iter()
+                .flat_map(|class| table.columns.iter().map(move |column| (class, column)))
+            {
+                let retyped = retyped
+                    .get(class)
+                    .is_some_and(|attributes| attributes.contains(&column.name));
+                let returns = rbs_type(column.read_as(), zoned, column.nullable, column.array);
+                let own = defined.get(class);
+                for (name, parameters, answers) in
+                    attribute_methods(&column.name, &returns, retyped)
+                {
+                    if own.is_some_and(|own| own.contains(&name)) {
+                        continue;
+                    }
+                    facts.declare(Declared {
+                        owner: Owner::Instance(class.clone()),
+                        because: format!(
+                            "From `{file}`, table `{}`, column `{}`: Rails defines `{name}` for \
+                             every column.",
+                            table.name, column.name
+                        ),
+                        name,
+                        returns: answers,
+                        parameters: parameters.to_owned(),
+                        at: Some((column.at, column.name_at)),
+                        from: Source::Column,
+                        overloads: Vec::new(),
+                        private: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// What each class's relation answers per column.
+#[derive(Debug, Default)]
+pub struct Picked {
+    /// `(column, pick's type, pluck's element type)` per class, in the order the table writes
+    /// them: `pick` is always `?` (no row is `nil`), `pluck` only where the column is nullable.
+    pub columns: BTreeMap<String, Vec<(String, String, String)>>,
+    /// The type of each class's primary key, where `create_table` names one column: what `ids`
+    /// hands back an `Array` of.
+    pub keys: BTreeMap<String, String>,
+}
+
+impl Schema {
+    /// What `pick(:column)` hands back on each class's relation: the column's type, or `nil`.
+    ///
+    /// - **Always `?`**, whatever `null: false` says: `pick` is `limit(1).pluck(...).first`, and a
+    ///   relation with no row hands back `nil`.
+    /// - **Only a column read through its own type.** `pluck` casts through the model's attribute
+    ///   types, so an `enum` answers its label and a `serialize` its coder's value. `recast` holds
+    ///   the columns a macro on that class re-types, and `anywhere` the names a module's macros
+    ///   do, which are refused on every class: the includers are not all known here.
+    /// - **Not an `untyped` column**: it says nothing an arm could.
+    /// - **`pluck` reads stored rows**, where a `null: false` column holds a value, so
+    ///   its element keeps the column's own `?`. The primary key is `ids`' element.
+    pub fn picked(
+        &self,
+        classes: &BTreeMap<String, Vec<String>>,
+        recast: &BTreeMap<String, BTreeSet<String>>,
+        anywhere: &BTreeSet<String>,
+        zoned: bool,
+        into: &mut Picked,
+    ) {
+        for table in &self.tables {
+            let Some(classes) = classes.get(&table.name) else {
+                continue;
+            };
+            for class in classes {
+                let columns = table.columns.iter().filter(|column| {
+                    !anywhere.contains(&column.name)
+                        && !recast
+                            .get(class)
+                            .is_some_and(|names| names.contains(&column.name))
+                });
+                for column in columns {
+                    let returns = rbs_type(column.read_as(), zoned, true, column.array);
+                    if returns == "untyped" {
+                        continue;
+                    }
+                    let plucked = rbs_type(column.read_as(), zoned, column.nullable, column.array);
+                    if table.key.as_ref() == Some(&column.name) {
+                        into.keys.insert(class.clone(), plucked.clone());
+                    }
+                    into.columns.entry(class.clone()).or_default().push((
+                        column.name.clone(),
+                        returns,
+                        plucked,
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// The methods Rails' attribute methods define around one column that this declares, and what
+/// each returns: `(name, parameters, returns)`.
+///
+/// - **`x?` is `query_attribute`**, which answers `true` or `false` for every value
+///   (`AttributeMethods::Query`).
+/// - **Dirty tracking's `x_changed?` and `saved_change_to_x?` are `bool`**, and `x_was` is the
+///   column's own type or `nil`, since there may be no earlier value (`ActiveModel::Dirty`,
+///   `ActiveRecord::AttributeMethods::Dirty`).
+/// - **The writer `x=` takes anything** (Rails casts what it is given through the column's type) and
+///   answers `untyped`: an assignment's value is its right-hand side whatever the writer returns.
+///   Declared so `self.user_id = nil` has the reader's card and place; without it the reader
+///   answered and the line beside it said nothing.
+/// - **A column another declaration re-types** (an `enum`, a typed `attribute`, `serialize`)
+///   keeps the predicates, which answer the same whatever the type, and loses `x_was`, whose type
+///   is that other declaration's, and the writer, which is that declaration's to give.
+///
+/// **Five of the fifteen Rails defines**, the ones the six corpora call: every one is a member
+/// completion offers beside the column, so each costs a line per column in every `record.` list.
+/// The other readers (`x_before_last_save`, `x_in_database`, `x_previously_was`), predicates
+/// (`x_previously_changed?`, `will_save_change_to_x?`) and tuples are not declared.
+fn attribute_methods(
+    column: &str,
+    returns: &str,
+    retyped: bool,
+) -> Vec<(String, &'static str, String)> {
+    let bool = || "bool".to_owned();
+    let mut methods = vec![
+        (format!("{column}?"), "()", bool()),
+        (format!("{column}_changed?"), "(**untyped)", bool()),
+        (format!("saved_change_to_{column}?"), "(**untyped)", bool()),
+    ];
+    if !retyped {
+        // `untyped` already holds `nil`, and a `?` already written is not written twice.
+        let earlier = if returns == "untyped" || returns.ends_with('?') {
+            returns.to_owned()
+        } else {
+            format!("{returns}?")
+        };
+        methods.push((format!("{column}_was"), "()", earlier));
+        methods.push((format!("{column}="), "(untyped)", "untyped".to_owned()));
+    }
+    methods
 }
 
 /// Everything one file says about the **name** of a table, rather than its columns.
@@ -177,14 +350,14 @@ pub struct TableNames {
     pub suffixes: Vec<(String, String)>,
     /// `isolate_namespace Spree`, as the candidate spellings of the module it names.
     ///
-    /// The **commoner** of the two spellings, and the one solidus and every discourse plugin use. A
+    /// The **commoner** of the two spellings, and the one engines and plugins use. A
     /// call, not a `def`, because the engine says it about a module somebody else wrote.
     ///
     /// Candidates and **no prefix**, which is why this is a second field. `Rails::Engine` installs
     /// `generate_railtie_name(mod.name)`, where `mod` is the module the constant *resolved to*, not
-    /// its spelling. discourse writes `isolate_namespace Provider` inside
-    /// `module DiscourseChatIntegration`, whose tables begin
-    /// `discourse_chat_integration_provider_`, not `provider_`. Only a caller that can settle the
+    /// its spelling. an application writes `isolate_namespace Provider` inside
+    /// `module ChatIntegration`, whose tables begin
+    /// `chat_integration_provider_`, not `provider_`. Only a caller that can settle the
     /// constant can name the prefix, then ask [`super::engine_prefix`].
     ///
     /// Kept apart from [`TableNames::prefixes`] for Rails' own precedence too:
@@ -241,8 +414,22 @@ pub(super) struct Column {
     /// `t.string "languages", array: true` returns an `Array[String]`, and every answer derived
     /// through `String` would be wrong for it.
     pub(super) array: bool,
+    /// Whether the column is a `decimal` with no digits after the point, which ActiveRecord reads
+    /// as an `Integer` ([`WHOLE_DECIMAL`]).
+    pub(super) whole: bool,
     pub(super) at: (u32, u32),
     pub(super) name_at: (u32, u32),
+}
+
+impl Column {
+    /// The word [`COLUMN_TYPES`] is asked with: the column's own, unless it is a whole `decimal`.
+    fn read_as(&self) -> &str {
+        if self.whole {
+            WHOLE_DECIMAL
+        } else {
+            &self.kind
+        }
+    }
 }
 
 /// One `create_table` block.
@@ -250,6 +437,10 @@ pub(super) struct Column {
 pub(super) struct Table {
     pub(super) name: String,
     pub(super) columns: Vec<Column>,
+    /// The primary key's column, where `create_table` writes one: `id:` and
+    /// `primary_key:` read. `None` for a composite key, `id: false`, and a SQL dump, whose
+    /// constraints are not read for it.
+    pub(super) key: Option<String>,
 }
 
 /// The RBS type a column of `kind` returns.
@@ -263,11 +454,19 @@ pub(super) struct Table {
 ///
 /// That is the only way this returns an optional over an unknown, and it is correct: the *array*
 /// may be `nil`, not its elements.
-pub(super) fn rbs_type(kind: &str, nullable: bool, array: bool) -> String {
+///
+/// A [`ZONED`] column is `untyped` unless `zoned` says the project keeps Rails' time-zone default.
+pub(super) fn rbs_type(kind: &str, zoned: bool, nullable: bool, array: bool) -> String {
     let ruby = COLUMN_TYPES
         .iter()
         .find(|(schema, _)| *schema == kind)
-        .map_or("untyped", |(_, ruby)| *ruby);
+        .map_or("untyped", |(schema, ruby)| {
+            if zoned || !ZONED.contains(schema) {
+                ruby
+            } else {
+                EITHER_TIME
+            }
+        });
     let returns = if array {
         format!("Array[{ruby}]")
     } else if ruby == "untyped" {
@@ -275,10 +474,11 @@ pub(super) fn rbs_type(kind: &str, nullable: bool, array: bool) -> String {
     } else {
         ruby.to_owned()
     };
-    if nullable {
-        format!("{returns}?")
-    } else {
-        returns
+    // A union takes `nil` as one more member: `A | B?` would make only `B` optional.
+    match (nullable, returns.contains(" | ")) {
+        (false, _) => returns,
+        (true, false) => format!("{returns}?"),
+        (true, true) => format!("{returns} | nil"),
     }
 }
 
@@ -316,7 +516,9 @@ impl Reader<'_> {
         let (name, name_at) = first_string(self.source, node)?;
         let body = node.block()?.as_block_node()?.body()?;
         let mut columns = Vec::new();
-        columns.extend(self.primary_key(node, name_at));
+        let primary = self.primary_key(node, name_at);
+        let key = primary.as_ref().map(|column| column.name.clone());
+        columns.extend(primary);
         // The columns are statements of the block: what the dumper writes, and the only shape this
         // reader claims to understand.
         for statement in body.as_statements_node()?.body().iter() {
@@ -326,7 +528,7 @@ impl Reader<'_> {
                 columns.push(column);
             }
         }
-        Some(Table { name, columns })
+        Some(Table { name, columns, key })
     }
 
     fn column(&self, node: &CallNode<'_>) -> Option<Column> {
@@ -341,9 +543,25 @@ impl Reader<'_> {
         if !is_column_name(&name) {
             return None;
         }
+        // A generated column holds its `type:`.
+        let kind = match keyword(node, "type").filter(|_| kind == "virtual") {
+            Some(written) => written.as_symbol_node().map_or_else(String::new, |symbol| {
+                String::from_utf8_lossy(symbol.unescaped()).into_owned()
+            }),
+            None => kind,
+        };
         let location = node.location();
+        // `precision:` with no `scale:` is what the dumper writes for `DecimalWithoutScale`. A
+        // hand-written `scale: 0` means the same, though no dumper writes it.
+        let whole = kind == "decimal"
+            && keyword(node, "precision").is_some()
+            && keyword(node, "scale").is_none_or(|scale| {
+                let at = scale.location();
+                self.source.get(at.start_offset()..at.end_offset()) == Some("0")
+            });
         Some(Column {
             name,
+            whole,
             kind,
             nullable: keyword(node, "null").is_none_or(|null| null.as_false_node().is_none()),
             // The dumper writes it as a keyword, not in the type, so this is where the Ruby side
@@ -384,6 +602,7 @@ impl Reader<'_> {
             nullable: false,
             // A primary key is one value, whatever `id:` retypes it to.
             array: false,
+            whole: false,
             at: header(node)?,
             name_at,
         })
@@ -445,17 +664,15 @@ impl Names<'_> {
                 || argument.as_constant_path_node().is_some())
         {
             let spelled = constant_spelling(self.source, &argument);
-            // `::Spree` is a path with no parent: Ruby's own escape from the lexical walk, the same
-            // one a `class_name:` gets. `constant_spelling` drops the colons, so the node says the
-            // name was absolute.
-            let absolute = argument
-                .as_constant_path_node()
-                .is_some_and(|path| path.parent().is_none());
-            self.found.isolated.push(if absolute {
-                vec![spelled]
-            } else {
-                candidates(&self.nesting.join("::"), &spelled)
-            });
+            // `::Spree` is Ruby's own escape from the lexical walk, the same one a `class_name:`
+            // gets, however many segments follow it.
+            self.found
+                .isolated
+                .push(if super::syntax::absolute(&argument) {
+                    vec![spelled]
+                } else {
+                    candidates(&self.nesting.join("::"), &spelled)
+                });
         }
     }
 
@@ -559,7 +776,7 @@ end
     #[test]
     fn the_rbs_a_schema_declares() {
         let signatures = read_schema(SCHEMA)
-            .signatures("db/schema.rb", &models(), &no_enums())
+            .signatures("db/schema.rb", &models(), &no_enums(), true)
             .render(&declaring(&[]));
         assert_eq!(
             signatures.rbs,
@@ -571,7 +788,7 @@ end
   # From `db/schema.rb`, table `stories`, column `description` (`text`, may be `nil`).
   def description: () -> String?
   # From `db/schema.rb`, table `stories`, column `created_at` (`datetime`, `null: false`).
-  def created_at: () -> Time
+  def created_at: () -> ActiveSupport::TimeWithZone
   # From `db/schema.rb`, table `stories`, column `is_expired` (`boolean`, `null: false`).
   def is_expired: () -> bool
   # From `db/schema.rb`, table `stories`, column `hotness` (`decimal`, may be `nil`).
@@ -595,44 +812,272 @@ end
         );
     }
 
-    /// The ten types, both ways round, plus an eleventh that is not a type at all.
+    /// Every type the table maps, both ways round, plus one that is not mapped at all.
     ///
     /// A wrong mapping must be a failing line here, not a surprise in an editor. `untyped` is never
-    /// optional: it already includes `nil`, and `untyped?` is not RBS.
+    /// optional: it already includes `nil`, and `untyped?` is not RBS. The last column is a project
+    /// that writes one of Rails' time-zone settings, where only `datetime` changes.
     #[test]
     fn every_column_type_and_what_it_returns() {
-        let rows: Vec<(&str, String, String)> = [
-            "string", "text", "binary", "integer", "bigint", "boolean", "float", "decimal",
-            "datetime", "date", "jsonb",
+        let rows: Vec<(&str, String, String, String)> = COLUMN_TYPES
+            .iter()
+            .map(|(kind, _)| *kind)
+            .chain(["jsonb"])
+            .map(|kind| {
+                (
+                    kind,
+                    rbs_type(kind, true, false, false),
+                    rbs_type(kind, true, true, false),
+                    rbs_type(kind, false, false, false),
+                )
+            })
+            .collect();
+
+        let expected: Vec<(&str, String, String, String)> = [
+            ("string", "String", "String?", "String"),
+            ("text", "String", "String?", "String"),
+            ("binary", "String", "String?", "String"),
+            ("integer", "Integer", "Integer?", "Integer"),
+            ("bigint", "Integer", "Integer?", "Integer"),
+            ("boolean", "bool", "bool?", "bool"),
+            ("float", "Float", "Float?", "Float"),
+            ("decimal", "BigDecimal", "BigDecimal?", "BigDecimal"),
+            (
+                "datetime",
+                "ActiveSupport::TimeWithZone",
+                "ActiveSupport::TimeWithZone?",
+                "ActiveSupport::TimeWithZone | Time",
+            ),
+            ("date", "Date", "Date?", "Date"),
+            ("uuid", "String", "String?", "String"),
+            ("citext", "String", "String?", "String"),
+            ("ltree", "String", "String?", "String"),
+            ("tsvector", "String", "String?", "String"),
+            ("xml", "String", "String?", "String"),
+            ("macaddr", "String", "String?", "String"),
+            ("bit", "String", "String?", "String"),
+            ("bit_varying", "String", "String?", "String"),
+            ("inet", "IPAddr", "IPAddr?", "IPAddr"),
+            ("cidr", "IPAddr", "IPAddr?", "IPAddr"),
+            (
+                "hstore",
+                "Hash[String, String?]",
+                "Hash[String, String?]?",
+                "Hash[String, String?]",
+            ),
+            ("money", "BigDecimal", "BigDecimal?", "BigDecimal"),
+            ("oid", "Integer", "Integer?", "Integer"),
+            ("serial", "Integer", "Integer?", "Integer"),
+            ("bigserial", "Integer", "Integer?", "Integer"),
+            // Time-zone aware only from Rails 5.1 and 7.1 on, and `timestamp` only on MySQL: either class.
+            (
+                "time",
+                "ActiveSupport::TimeWithZone | Time",
+                "ActiveSupport::TimeWithZone | Time | nil",
+                "ActiveSupport::TimeWithZone | Time",
+            ),
+            (
+                "timestamp",
+                "ActiveSupport::TimeWithZone | Time",
+                "ActiveSupport::TimeWithZone | Time | nil",
+                "ActiveSupport::TimeWithZone | Time",
+            ),
+            (
+                "timestamptz",
+                "ActiveSupport::TimeWithZone | Time",
+                "ActiveSupport::TimeWithZone | Time | nil",
+                "ActiveSupport::TimeWithZone | Time",
+            ),
+            ("timetz", "String", "String?", "String"),
+            (
+                "interval",
+                "ActiveSupport::Duration",
+                "ActiveSupport::Duration?",
+                "ActiveSupport::Duration",
+            ),
+            ("enum", "String", "String?", "String"),
+            (
+                "daterange",
+                "Range[untyped]",
+                "Range[untyped]?",
+                "Range[untyped]",
+            ),
+            (
+                "numrange",
+                "Range[untyped]",
+                "Range[untyped]?",
+                "Range[untyped]",
+            ),
+            (
+                "tsrange",
+                "Range[untyped]",
+                "Range[untyped]?",
+                "Range[untyped]",
+            ),
+            (
+                "tstzrange",
+                "Range[untyped]",
+                "Range[untyped]?",
+                "Range[untyped]",
+            ),
+            (
+                "int4range",
+                "Range[untyped]",
+                "Range[untyped]?",
+                "Range[untyped]",
+            ),
+            (
+                "int8range",
+                "Range[untyped]",
+                "Range[untyped]?",
+                "Range[untyped]",
+            ),
+            (
+                "point",
+                "ActiveRecord::Point",
+                "ActiveRecord::Point?",
+                "ActiveRecord::Point",
+            ),
+            ("line", "String", "String?", "String"),
+            ("lseg", "String", "String?", "String"),
+            ("box", "String", "String?", "String"),
+            ("path", "String", "String?", "String"),
+            ("polygon", "String", "String?", "String"),
+            ("circle", "String", "String?", "String"),
+            ("jsonb", "untyped", "untyped", "untyped"),
         ]
         .into_iter()
-        .map(|kind| {
+        .map(|(kind, plain, optional, unzoned)| {
             (
                 kind,
-                rbs_type(kind, false, false),
-                rbs_type(kind, true, false),
+                plain.to_owned(),
+                optional.to_owned(),
+                unzoned.to_owned(),
             )
         })
         .collect();
 
-        let expected: Vec<(&str, String, String)> = [
-            ("string", "String", "String?"),
-            ("text", "String", "String?"),
-            ("binary", "String", "String?"),
-            ("integer", "Integer", "Integer?"),
-            ("bigint", "Integer", "Integer?"),
-            ("boolean", "bool", "bool?"),
-            ("float", "Float", "Float?"),
-            ("decimal", "BigDecimal", "BigDecimal?"),
-            ("datetime", "Time", "Time?"),
-            ("date", "Date", "Date?"),
-            ("jsonb", "untyped", "untyped"),
-        ]
-        .into_iter()
-        .map(|(kind, plain, optional)| (kind, plain.to_owned(), optional.to_owned()))
-        .collect();
-
         assert_eq!(rows, expected);
+    }
+
+    /// What Rails' attribute methods define around each column (`x?`, `x_changed?`,
+    /// `saved_change_to_x?`, `x_was`, `x=`), from the column's own line.
+    ///
+    /// `x_was` is the column's type or `nil`. A column an `enum` re-types keeps the predicates and
+    /// loses `x_was` and the writer, and a name the model's own file defines is left to that `def`.
+    #[test]
+    fn the_attribute_methods_rails_defines_around_a_column() {
+        let source = r#"ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "stories", id: false, force: :cascade do |t|
+    t.string "title", null: false
+    t.integer "status"
+    t.boolean "hidden"
+  end
+end
+"#;
+        let retyped: BTreeMap<String, BTreeSet<String>> =
+            [("Story".to_owned(), ["status".to_owned()].into())].into();
+        let defined: BTreeMap<String, BTreeSet<String>> = [(
+            "Story".to_owned(),
+            ["hidden?".to_owned(), "hidden=".to_owned()].into(),
+        )]
+        .into();
+        let mut facts = Facts::default();
+        read_schema(source).attribute_methods(
+            "db/schema.rb",
+            &models(),
+            &retyped,
+            &defined,
+            true,
+            &mut facts,
+        );
+        let rbs = facts.render(&declaring(&[])).rbs;
+        let defs: Vec<&str> = rbs
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("def "))
+            .collect();
+        assert_eq!(
+            defs,
+            [
+                "title?: () -> bool",
+                "title_changed?: (**untyped) -> bool",
+                "saved_change_to_title?: (**untyped) -> bool",
+                "title_was: () -> String?",
+                "title=: (untyped value) -> untyped",
+                "status?: () -> bool",
+                "status_changed?: (**untyped) -> bool",
+                "saved_change_to_status?: (**untyped) -> bool",
+                "hidden_changed?: (**untyped) -> bool",
+                "saved_change_to_hidden?: (**untyped) -> bool",
+                "hidden_was: () -> bool?",
+            ]
+        );
+        assert!(
+            rbs.contains("column `title`: Rails defines `title?` for every column."),
+            "{rbs}"
+        );
+    }
+
+    /// A `decimal` with a precision and no scale is `DecimalWithoutScale`, an `Integer`: what the
+    /// dumper writes for `decimal(10)` and `decimal(10,0)`, in every adapter. A bare `decimal` and
+    /// one with digits after the point stay `BigDecimal`, and the card says which it read.
+    #[test]
+    fn a_decimal_with_no_scale_is_an_integer() {
+        let source = r#"ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "stories", force: :cascade do |t|
+    t.decimal "whole", precision: 10
+    t.decimal "zero", precision: 10, scale: 0
+    t.decimal "fraction", precision: 10, scale: 2
+    t.decimal "bare"
+  end
+end
+"#;
+        let rbs = read_schema(source)
+            .signatures("db/schema.rb", &models(), &no_enums(), true)
+            .render(&declaring(&[]))
+            .rbs;
+        assert_eq!(
+            rbs,
+            "\
+class Story
+  # From `db/schema.rb`, table `stories`, column `id` (`bigint`, `null: false`).
+  def id: () -> Integer
+  # From `db/schema.rb`, table `stories`, column `whole` (`decimal` with no scale, may be `nil`).
+  def whole: () -> Integer?
+  # From `db/schema.rb`, table `stories`, column `zero` (`decimal` with no scale, may be `nil`).
+  def zero: () -> Integer?
+  # From `db/schema.rb`, table `stories`, column `fraction` (`decimal`, may be `nil`).
+  def fraction: () -> BigDecimal?
+  # From `db/schema.rb`, table `stories`, column `bare` (`decimal`, may be `nil`).
+  def bare: () -> BigDecimal?
+end
+"
+        );
+    }
+
+    /// A generated column holds its `type:`, and one whose `type:` is not a symbol holds nothing
+    /// this can name.
+    #[test]
+    fn a_virtual_column_is_the_type_it_says() {
+        let source = r#"ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "stories", id: false, force: :cascade do |t|
+    t.virtual "slug", type: :string, as: "lower(title)", stored: true
+    t.virtual "odd", type: KIND, as: "1"
+    t.time "opens_at", array: true, null: false
+  end
+end
+"#;
+        let rbs = read_schema(source)
+            .signatures("db/schema.rb", &models(), &no_enums(), true)
+            .render(&declaring(&[]))
+            .rbs;
+        for line in [
+            "def slug: () -> String?\n",
+            "def odd: () -> untyped\n",
+            "def opens_at: () -> Array[ActiveSupport::TimeWithZone | Time]\n",
+        ] {
+            assert!(rbs.contains(line), "{line}{rbs}");
+        }
     }
 
     /// The second dimension, and the one row whose shape it changes.
@@ -649,8 +1094,8 @@ end
             .map(|kind| {
                 (
                     kind,
-                    rbs_type(kind, false, true),
-                    rbs_type(kind, true, true),
+                    rbs_type(kind, true, false, true),
+                    rbs_type(kind, true, true, true),
                 )
             })
             .collect();
@@ -674,7 +1119,7 @@ end
     #[test]
     fn each_declaration_points_at_the_line_that_declared_it() {
         let signatures = read_schema(SCHEMA)
-            .signatures("db/schema.rb", &models(), &no_enums())
+            .signatures("db/schema.rb", &models(), &no_enums(), true)
             .render(&declaring(&[]));
         let rows: Vec<(&str, &str, &str)> = signatures
             .spans
@@ -710,7 +1155,7 @@ end
                     "description"
                 ),
                 (
-                    "def created_at: () -> Time",
+                    "def created_at: () -> ActiveSupport::TimeWithZone",
                     "t.datetime \"created_at\", precision: nil, null: false",
                     "created_at"
                 ),
@@ -754,7 +1199,7 @@ end
     #[test]
     fn a_table_nobody_claims_declares_nothing() {
         assert_eq!(
-            read_schema(SCHEMA).signatures("db/schema.rb", &BTreeMap::new(), &no_enums()),
+            read_schema(SCHEMA).signatures("db/schema.rb", &BTreeMap::new(), &no_enums(), true),
             Facts::default()
         );
     }
@@ -783,7 +1228,7 @@ end
             .into_iter()
             .collect();
         let rbs = read_schema(source)
-            .signatures("db/schema.rb", &classes, &enums)
+            .signatures("db/schema.rb", &classes, &enums, true)
             .render(&declaring(&[]))
             .rbs;
         assert!(
@@ -805,7 +1250,7 @@ end
             .into_iter()
             .collect();
         assert_eq!(
-            read_schema(source).signatures("db/schema.rb", &classes, &no_enums()),
+            read_schema(source).signatures("db/schema.rb", &classes, &no_enums(), true),
             Facts::default()
         );
     }
@@ -825,7 +1270,7 @@ end
             .into_iter()
             .collect();
         let signatures = read_schema(source)
-            .signatures("db/schema.rb", &classes, &no_enums())
+            .signatures("db/schema.rb", &classes, &no_enums(), true)
             .render(&declaring(&[]));
         // `id` and `ok` only. Refused: a name that cannot be written into RBS, a call with no
         // arguments, a symbol where a string was needed, and a call on no receiver.
@@ -870,7 +1315,7 @@ end
         // - at both levels, a statement that is not a call, which the dumper never writes but a
         //   hand-edited schema might.
         let signatures = read_schema(source)
-            .signatures("db/schema.rb", &classes, &no_enums())
+            .signatures("db/schema.rb", &classes, &no_enums(), true)
             .render(&declaring(&[]));
         assert_eq!(
             signatures
@@ -891,7 +1336,7 @@ end
             .into_iter()
             .collect();
         let signatures = read_schema(source)
-            .signatures("db/schema.rb", &classes, &no_enums())
+            .signatures("db/schema.rb", &classes, &no_enums(), true)
             .render(&declaring(&[]));
         assert!(!signatures.rbs.contains("def id"), "{}", signatures.rbs);
         assert!(signatures.rbs.contains("def a:"), "{}", signatures.rbs);
@@ -1007,7 +1452,7 @@ end
   end
 end
 
-module DiscourseChatIntegration
+module ChatIntegration
   module Provider
     class Engine < ::Rails::Engine
       isolate_namespace Provider
@@ -1033,9 +1478,9 @@ end
         assert_eq!(
             read_table_names(source).isolated,
             vec![
-                // Innermost first, bare name last. That settles discourse's `Provider`: written
-                // inside `DiscourseChatIntegration`, it is that module's, and its tables begin
-                // `discourse_chat_integration_provider_`.
+                // Innermost first, bare name last. That settles a plugin's `Provider`: written
+                // inside `ChatIntegration`, it is that module's, and its tables begin
+                // `chat_integration_provider_`.
                 vec![
                     "Spree::Core::Engine::Spree".to_owned(),
                     "Spree::Core::Spree".to_owned(),
@@ -1043,9 +1488,9 @@ end
                     "Spree".to_owned(),
                 ],
                 vec![
-                    "DiscourseChatIntegration::Provider::Engine::Provider".to_owned(),
-                    "DiscourseChatIntegration::Provider::Provider".to_owned(),
-                    "DiscourseChatIntegration::Provider".to_owned(),
+                    "ChatIntegration::Provider::Engine::Provider".to_owned(),
+                    "ChatIntegration::Provider::Provider".to_owned(),
+                    "ChatIntegration::Provider".to_owned(),
                     "Provider".to_owned(),
                 ],
                 vec!["Deep::Foo::Bar".to_owned(), "Foo::Bar".to_owned()],
@@ -1065,10 +1510,7 @@ end
         // `generate_railtie_name` is `underscore(mod.name).tr("/", "_")`, so a namespaced module
         // becomes one word with the separator underscored away.
         assert_eq!(engine_prefix("Spree").as_deref(), Some("spree_"));
-        assert_eq!(
-            engine_prefix("DiscourseAi").as_deref(),
-            Some("discourse_ai_")
-        );
+        assert_eq!(engine_prefix("SearchAi").as_deref(), Some("search_ai_"));
         assert_eq!(engine_prefix("Foo::Bar").as_deref(), Some("foo_bar_"));
         // `underscore` wants an ASCII capital and there is no acronym table, as with every
         // inflection here: a miss costs an answer, never gives a wrong one.
@@ -1087,7 +1529,7 @@ end
         .into_iter()
         .collect();
         let rbs = read_schema(source)
-            .signatures("db/schema.rb", &classes, &no_enums())
+            .signatures("db/schema.rb", &classes, &no_enums(), true)
             .render(&declaring(&["Migration"]))
             .rbs;
         assert!(rbs.starts_with("class Dog\n"), "{rbs}");
@@ -1101,7 +1543,7 @@ end
     #[test]
     fn a_file_that_creates_no_tables() {
         assert_eq!(
-            read_schema("puts 'hello'\n").signatures("db/schema.rb", &models(), &no_enums()),
+            read_schema("puts 'hello'\n").signatures("db/schema.rb", &models(), &no_enums(), true),
             Facts::default()
         );
         assert!(read_table_names("puts 'hello'\n").overrides.is_empty());
@@ -1124,7 +1566,7 @@ end
             .into_iter()
             .collect();
         let rbs = read_schema(source)
-            .signatures("db/animals_schema.rb", &classes, &no_enums())
+            .signatures("db/animals_schema.rb", &classes, &no_enums(), true)
             .render(&declaring(&[]))
             .rbs;
         assert!(
@@ -1172,7 +1614,7 @@ end
     }
 
     #[test]
-    fn a_hover_on_a_column_says_which_file_and_which_table_it_came_from() {
+    fn a_hover_on_a_column_says_what_it_holds() {
         // What keeps this tier honest. On the fence line a schema-derived answer looks exactly like
         // a resolved one, so the card must say where it came from. It says so as the declaration's
         // *documentation*, which is how the RBS carries it, so no module outside `workspace::rails`
@@ -1182,29 +1624,27 @@ end
 
         let card = card(&mut harness, &uri, source, "title");
         assert!(card.contains("Story#title"), "{card}");
-        assert!(card.contains("db/schema.rb"), "{card}");
-        assert!(card.contains("table"), "{card}");
-        assert!(card.contains("stories"), "{card}");
-        assert!(card.contains("string"), "{card}");
+        assert!(card.contains("-> String"), "{card}");
     }
 
     #[test]
     fn a_nullable_column_says_so_and_a_null_false_one_does_not() {
         // Many real columns can be `nil`, and RBS is the one output format in reach that can say
-        // which. So the two columns are declared differently, and since a hover card shows a name,
-        // not a return type, the provenance line is where a person sees it.
+        // which. So the two columns are declared differently, and the card's return says it.
         let source = "Story.new.description.upcase\n";
         let (mut harness, _schema, uri) = rails_project(source);
 
         let nullable = card(&mut harness, &uri, source, "description");
-        assert!(nullable.contains("may be `nil`"), "{nullable}");
+        assert!(
+            nullable.contains("Story#description -> String?"),
+            "{nullable}"
+        );
 
         let stated = "Story.new.title\n";
         let other = harness.write("app/other.rb", stated);
         harness.watch(&[&other]);
         let stated = card(&mut harness, &other, stated, "title");
-        assert!(stated.contains("`null: false`"), "{stated}");
-        assert!(!stated.contains("may be `nil`"), "{stated}");
+        assert!(stated.contains("Story#title -> String\n"), "{stated}");
 
         // The chain is typed either way: an optional return is still a `String` to whoever asks
         // what comes next, as in Ruby's own signatures.

@@ -136,8 +136,16 @@ COVERAGE_FLOORS ?= \
   analysis/environment.rs=100:100 \
   analysis/structs.rs=100:100 \
   analysis/hints.rs=100:100 \
+  workspace/rails/adapters.rs=100:100 \
+  workspace/rspec.rs=100:100 \
+  workspace/factories.rs=100:100 \
+  workspace/singletons.rs=100:100 \
+  workspace/defines.rs=100:100 \
+  workspace/mixins.rs=100:100 \
+  workspace/i18n.rs=100:100 \
   workspace/rails/conventions.rs=100:100 \
   workspace/rails/inflect.rs=100:100 \
+  workspace/rails/layouts.rs=100:100 \
   workspace/rails/schema.rs=100:100 \
   workspace/rails/structure.rs=100:100 \
   workspace/rails/attributes.rs=100:100 \
@@ -149,9 +157,15 @@ COVERAGE_FLOORS ?= \
   workspace/rails/enums.rs=100:100 \
   workspace/rails/entrypoints.rs=100:100 \
   workspace/rails/framework.rs=100:100 \
+  workspace/rails/blocks.rs=100:100 \
+  workspace/rails/migrations.rs=100:100 \
   workspace/rails/routes.rs=100:100 \
+  workspace/rails/renders.rs=100:100 \
   workspace/rails/syntax.rs=100:100 \
   workspace/rails/tail.rs=100:100 \
+  workspace/rails/callbacks.rs=100:100 \
+  workspace/rails/current.rs=100:100 \
+  workspace/rails/mod.rs=100 \
   analysis/synthesized.rs=100:100 \
   generated.rs=100:100 \
   workspace/uri.rs=100 \
@@ -422,7 +436,7 @@ AUDIT_RUN ?= tmp/audit-run.json
 
 # `ARGS` reaches `score`, **not** `report`: the two take different flags (`-n` means nothing to a
 # report), and the record already holds only the corpora that were swept, so
-# `ARGS=--only lobsters` restricts the diff by restricting what there is to diff.
+# `ARGS=--only <name>` restricts the diff by restricting what there is to diff.
 ## audit: sweep all six corpora, then diff against the committed baseline
 .PHONY: audit
 audit: release

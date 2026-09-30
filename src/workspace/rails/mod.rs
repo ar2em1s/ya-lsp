@@ -36,6 +36,10 @@
 //! - [`framework`]: what the framework's own singletons return, and the rows left out. The one
 //!   generator with almost no input: it reads a class name from `config/application.rb` and takes
 //!   the rest from a table.
+//! - [`migrations`]: what a migration's `method_missing` sends to its connection, and the column
+//!   methods `define_column_methods` writes, both read out of activerecord's own files.
+//! - [`layouts`]: which layout a controller's or a mailer's views are rendered in, from the
+//!   `layout` each class wrote and the layout templates that exist.
 //!
 //! # What they all share
 //!
@@ -47,62 +51,119 @@
 //! wrongly about the file the user is looking at, and one reaching nothing looks exactly like a
 //! project that does not follow it.
 
+mod adapters;
 mod associations;
 mod attributes;
+mod blocks;
+mod callbacks;
 mod concerns;
 mod conventions;
+mod current;
 mod delegates;
 mod entrypoints;
 mod enums;
 mod framework;
 mod inflect;
+mod layouts;
+mod migrations;
 mod models;
 mod relations;
+mod renders;
 mod routes;
 mod schema;
 mod structure;
 mod syntax;
 mod tail;
 
+pub use adapters::{
+    Connection, DatabaseConfig, Registered, Resolver, adapter_constants, connection_rows,
+    is_database_config, read_database_config, read_registered,
+};
+pub use callbacks::{
+    Actions as CallbackActions, Before, Callbacks, Skip as CallbackSkip,
+    absorb as absorb_callbacks, runs_before,
+};
 pub use concerns::{
     CLASS_METHODS, ClassMethod as ConcernMethod, From as ConcernSource,
     declare as declare_concern_members, installed as concern_members,
 };
 pub use conventions::{
     autoloaded_constant, autoloaded_namespaces, confirmed_spelling, controller_of, is_helper,
-    is_routes, is_schema, is_structure, mailer_of, named_constant, same_constant,
+    is_jbuilder, is_routes, is_schema, is_structure, mailer_in, mailer_of, named_constant,
+    renders_its_own_variables, same_constant, template_of,
 };
-pub use entrypoints::{Entrypoints, MESSAGE_DELIVERY, convention_of, is_mailer, read_entrypoints};
-pub use framework::{application_class, read_framework, singleton_classes};
+pub use current::{BASE as CURRENT_ATTRIBUTES, CurrentAttribute};
+pub use entrypoints::{
+    Entrypoints, MESSAGE_DELIVERY, TemplatePath, convention_of, is_mailer, read_entrypoints,
+};
+pub use framework::{
+    RAILTIE_CONFIGURATION, application_class, config_facts, framework_constants,
+    read_config_writes, read_framework,
+};
 pub use inflect::{camelize, helper_module, table_of};
+pub use layouts::{Layout, Layouts, Link, Said as LayoutSaid, is_layout, layouts_of};
+pub use migrations::{migration_constants, migration_sources, read_migrations};
 pub use models::{Elsewhere, Model, RECORD_BASE, is_record_base, read_model};
 pub use relations::{
-    RAILS_CLASS_SIDE, RAILS_RELATION, RELATION_BASE, element_of, relation_base, relation_of,
+    PROMISE, RAILS_CLASS_SIDE, RAILS_RELATION, RELATION_BASE, WHERE_CHAIN, relation_base,
 };
-pub use routes::{Routes, Whose, hosts_routes, mixins, read_routes};
-pub use schema::{Schema, TableNames, engine_prefix, read_schema, read_table_names};
+pub use renders::{
+    Default, JBUILDER, Local, Locals, Name, RENDER_CALLS, Render, StrictLocals, Value, partial_of,
+    read_renders, strict_locals,
+};
+pub use routes::{
+    Engine, EngineName, ROUTES_PROXY, Routes, Whose, hosts_routes, mixins, mounted_helper, proxies,
+    read_engines, read_routes,
+};
+pub use schema::{Picked, Schema, TableNames, engine_prefix, read_schema, read_table_names};
 pub use structure::read_structure;
 
+pub use associations::COLLECTION_PROXY;
 use associations::Kind;
 use entrypoints::Convention;
 use tail::Installs;
 
-/// The ten column types real schemas are made of, and the Ruby class each returns.
+/// The column types a schema dumper writes, and the Ruby class ActiveRecord reads each as.
 ///
-/// Ten entries, not a subsystem. Two deserve a sentence:
+/// Checked against ActiveRecord's type maps (abstract, PostgreSQL, MySQL, SQLite) in Rails 7.2,
+/// 8.0, 8.1 and main, where each type's `cast` or `deserialize` says what a stored value becomes.
+/// Four rows deserve a sentence:
 ///
-/// - **`datetime` is `Time`, not `ActiveSupport::TimeWithZone`.** Rails returns the latter when
-///   `time_zone_aware_attributes` is on (the default, stated in no file), so the honest common
-///   denominator is the class the other delegates to. Every answer derived through `Time` is right
-///   for both, and `Time` is in Ruby's own signatures, so it is in the graph even for a project
-///   with no Rails in its bundle.
+/// - **`datetime` is [`TIME_WITH_ZONE`], not `Time`.** Rails' railtie sets
+///   `time_zone_aware_attributes`, and a `datetime` column's value is `in_time_zone`'d on the way
+///   out. `Time` is the class that one delegates to, and a label saying it is wrong: `+`, `ago` and
+///   `beginning_of_day` hand back a `TimeWithZone` too. The default is written in no project file,
+///   and the four settings that change it are ([`TIME_ZONE_SETTINGS`]); a project writing one
+///   gets no class for these columns ([`ZONED`]).
+/// - **`decimal` is `BigDecimal` only where it has digits after the point.** A precision with no
+///   scale is `DecimalWithoutScale`, an `Integer`; see [`WHOLE_DECIMAL`].
 /// - **`binary` is `String`**, because that is what ActiveRecord returns: bytes in a `String`, not
 ///   an IO.
+/// - **PostgreSQL's own types** hold one class whatever the version: `uuid`, `citext` and the
+///   other string types are `String` subclasses in ActiveRecord, `inet` and `cidr` an `IPAddr`,
+///   `hstore` a `Hash` of strings, `money` a `BigDecimal` and `oid` an `Integer`.
+/// - **`serial` and `bigserial` are an `integer` and a `bigint`** with a sequence behind them. They
+///   are how PostgreSQL's dumper spells such a column (`id: :serial`), not a type of their own:
+///   the column reads as its integer type.
 ///
-/// Anything else (`jsonb`, `uuid`, `inet`, types not seen in practice) is declared `untyped`, not
-/// skipped: a member that exists with no type, versus no member at all, and the schema is judged by
-/// member lookups that would otherwise fail. A mapping is a claim; `untyped` is the absence of one.
-const COLUMN_TYPES: [(&str, &str); 10] = [
+/// - **`time`, `timestamp` and `timestamptz` are [`EITHER_TIME`]**: time-zone aware
+///   only from Rails 5.1 and 7.1 on, `timestamp` on MySQL and not on PostgreSQL, so the class
+///   depends on what this reader cannot see, and either is right. PostgreSQL's `timetz` has no
+///   ActiveRecord type, so it reads as the `String` the driver hands back.
+/// - **PostgreSQL's other types** (checked in 7.2 and 8.1's `initialize_type_map`): `interval` is
+///   an `ActiveSupport::Duration` (6.1 on), an `enum` its label, each range a `Range`, `point` an
+///   `ActiveRecord::Point`, and the other geometric types the `String` PostgreSQL writes. A
+///   `virtual` column is read as its `type:`.
+///
+/// Anything else is declared `untyped`, not skipped: a member that exists with no type, versus no
+/// member at all, and the schema is judged by member lookups that would otherwise fail. A mapping
+/// is a claim; `untyped` is the absence of one. The one left untyped on purpose: **`json` and
+/// `jsonb`**, which hold whatever JSON decodes to.
+///
+/// On PostgreSQL a `date` or `datetime` column can hold `'infinity'`, which ActiveRecord reads as
+/// `Float::INFINITY`. A project stores that on purpose, and every column would otherwise be a
+/// union, so the table names the class every other value has.
+const COLUMN_TYPES: [(&str, &str); 44] = [
     ("string", "String"),
     ("text", "String"),
     ("binary", "String"),
@@ -111,9 +172,80 @@ const COLUMN_TYPES: [(&str, &str); 10] = [
     ("boolean", "bool"),
     ("float", "Float"),
     ("decimal", "BigDecimal"),
-    ("datetime", "Time"),
+    ("datetime", TIME_WITH_ZONE),
     ("date", "Date"),
+    ("uuid", "String"),
+    ("citext", "String"),
+    ("ltree", "String"),
+    ("tsvector", "String"),
+    ("xml", "String"),
+    ("macaddr", "String"),
+    ("bit", "String"),
+    ("bit_varying", "String"),
+    ("inet", "IPAddr"),
+    ("cidr", "IPAddr"),
+    ("hstore", "Hash[String, String?]"),
+    ("money", "BigDecimal"),
+    ("oid", "Integer"),
+    ("serial", "Integer"),
+    ("bigserial", "Integer"),
+    ("time", EITHER_TIME),
+    ("timestamp", EITHER_TIME),
+    ("timestamptz", EITHER_TIME),
+    ("timetz", "String"),
+    ("interval", "ActiveSupport::Duration"),
+    ("enum", "String"),
+    ("daterange", "Range[untyped]"),
+    ("numrange", "Range[untyped]"),
+    ("tsrange", "Range[untyped]"),
+    ("tstzrange", "Range[untyped]"),
+    ("int4range", "Range[untyped]"),
+    ("int8range", "Range[untyped]"),
+    ("point", "ActiveRecord::Point"),
+    ("line", "String"),
+    ("lseg", "String"),
+    ("box", "String"),
+    ("path", "String"),
+    ("polygon", "String"),
+    ("circle", "String"),
 ];
+
+/// What a time-zone-aware time reads as in a Rails application.
+const TIME_WITH_ZONE: &str = "ActiveSupport::TimeWithZone";
+
+/// What a time column reads as where whether it is time-zone aware is not read: `time` and
+/// `timestamptz` are from 5.1 and 7.1 on, `timestamp` on MySQL and not on PostgreSQL, and a
+/// `datetime` is not where a project writes one of [`TIME_ZONE_SETTINGS`]. Either class is right.
+const EITHER_TIME: &str = "ActiveSupport::TimeWithZone | Time";
+
+/// The [`COLUMN_TYPES`] whose class rests on Rails' time-zone default.
+const ZONED: [&str; 1] = ["datetime"];
+
+/// The settings that move Rails' time-zone default, as the setters a project calls.
+///
+/// - `time_zone_aware_attributes = false` turns the conversion off, and
+///   `skip_time_zone_conversion_for_attributes` turns it off for some columns of one model.
+/// - `time_zone_aware_types` decides which column types it applies to.
+/// - PostgreSQL's `datetime_type = :timestamptz` makes a `timestamp without time zone` column a
+///   `:timestamp`, which is not converted, while a `structure.sql` still spells it as a `datetime`.
+///
+/// Written anywhere in the project's own code, one of them makes [`ZONED`] columns `untyped`: which
+/// class they hold is then a value this reader does not follow.
+pub const TIME_ZONE_SETTINGS: [&str; 4] = [
+    "time_zone_aware_attributes=",
+    "skip_time_zone_conversion_for_attributes=",
+    "time_zone_aware_types=",
+    "datetime_type=",
+];
+
+/// What a `decimal` with no digits after the point reads as.
+///
+/// ActiveRecord registers `DecimalWithoutScale`, an `ActiveModel::Type::BigInteger`, for a
+/// `decimal(p)` or `decimal(p,0)` in every adapter (`extract_scale` answers 0 for both), and the
+/// dumper then writes `precision:` with no `scale:`. A bare `decimal` has no precision and stays a
+/// `BigDecimal`. MySQL always reports one, so its bare `decimal` is dumped with `precision: 10` and
+/// is this.
+const WHOLE_DECIMAL: &str = "integer";
 
 /// What the schema dumper writes inside a `create_table` block that is not a column.
 ///
@@ -201,7 +333,14 @@ const IRREGULAR: [(&str, &str); 11] = [
 /// member-naming macro", declining there because there is nowhere to put it. `helper` names no
 /// member at all; it `include`s a module into the view context, which this crate models but never
 /// declares.
-pub const MACROS: [&str; 35] = [
+///
+/// `layout` is here for `helper`'s reason: it declares nothing, and [`Model::layouts`] reads which
+/// layout the class's views are rendered in, which `analysis::views` asks to find the classes a
+/// layout template's variables and exports come from.
+///
+/// The callback macros ([`callbacks::NAMES`]) for `layout`'s reason: none declares anything, and
+/// [`Model::callbacks`] reads what each runs before an action.
+pub const MACROS: [&str; 48] = [
     "belongs_to",
     "has_one",
     "has_many",
@@ -237,6 +376,19 @@ pub const MACROS: [&str; 35] = [
     "delegated_type",
     "helper_method",
     "helper",
+    "layout",
+    "before_action",
+    "prepend_before_action",
+    "append_before_action",
+    "skip_before_action",
+    "skip_callback",
+    "reset_callbacks",
+    "after_action",
+    "prepend_after_action",
+    "append_after_action",
+    "around_action",
+    "prepend_around_action",
+    "append_around_action",
 ];
 
 /// Every receiverless name that puts a document in front of [`models::read_model`].
@@ -315,16 +467,18 @@ const LONG_TAIL: [(&str, Installs); 29] = [
     ("normalizes", Installs::Nothing),
 ];
 
-/// Every class a [`LONG_TAIL`] macro names that a **gem** declares, not this application.
+/// Every class a generated row names that a **gem** declares, not this application.
 ///
-/// Three, and they are everything [`LONG_TAIL`] needs from a bundle. `Context` looks each up in the
-/// graph once per pass, and a workspace whose bundle lacks Active Storage declares no
-/// `has_one_attached` at all, instead of one typed as an unreachable class.
+/// The three a [`LONG_TAIL`] macro needs from a bundle, [`WHERE_CHAIN`], which a bare `where`
+/// returns, and [`ROUTES_PROXY`], which a mounted engine's helper does. `Context` looks each up in the graph once per pass, and a workspace whose bundle lacks
+/// Active Storage declares no `has_one_attached` at all, instead of one typed as an unreachable
+/// class.
 #[must_use]
 pub fn framework_classes() -> Vec<&'static str> {
     LONG_TAIL
         .iter()
         .filter_map(|(_, installs)| tail::gem_class(*installs))
+        .chain([WHERE_CHAIN, PROMISE, COLLECTION_PROXY, ROUTES_PROXY])
         .collect()
 }
 
@@ -338,11 +492,11 @@ pub fn framework_classes() -> Vec<&'static str> {
 ///   to say.
 /// - `delegate` names a *method* whose class is two hops away, so [`delegates`] reads it in a
 ///   second phase, and its `to:` is not a class name.
-/// - `attribute` names a **cast type**, not a class: the ten it may name are [`COLUMN_TYPES`], the
-///   registry a migration writes into, not constants an application defines.
+/// - `attribute` names a **cast type**, not a class: one of Rails' type registries
+///   ([`attributes`]), not constants an application defines.
 const ASSOCIATIONS: [(&str, Kind); 5] = [
     ("belongs_to", Kind::One),
-    ("has_one", Kind::Maybe),
+    ("has_one", Kind::One),
     ("has_many", Kind::Many),
     // Rails' own last line of the macro is `has_many name, scope, **hm_options, &extension`, so
     // declaring it a collection is not an approximation of the framework but exactly what it does:
@@ -387,17 +541,31 @@ const BASES: [(&str, Convention); 2] = [
 /// An application defining the constant itself meant something by it, and this pass then says
 /// nothing: the `Comment::Relation` rule, applied to a module.
 ///
-/// **The name is top-level, on purpose.** Every route helper's hover card prints its owner, so
-/// moving the constant would rename what users read at every call site; the collision it would
-/// prevent does not happen in practice; and there is no honest namespace to move it to (Rails' own
-/// is anonymous, so a qualified name would either misattribute it to `ActionDispatch` or invent a
-/// namespace for one constant).
+/// **The name is top-level, on purpose.** The collision a namespace would prevent does not happen
+/// in practice, and there is no honest namespace to move it to (Rails' own is anonymous, so a
+/// qualified name would either misattribute it to `ActionDispatch` or invent a namespace for one
+/// constant). No reader sees it: [`SHOWN`] spells a route helper as the bare name it is called by.
 ///
-/// **Unlike `MessageDelivery`, everything in it is mapped.** The whole point is that `story_path`
+/// **Unlike `MessageDelivery`, every route helper in it is mapped** (`main_app`, the one proxy
+/// no file names, is not). The whole point is that `story_path`
 /// jumps to `resources :stories`, so the safety argument cannot be "no mapping means no place"; it
 /// has to be the reader's exactness, which is why [`routes`] is checked against the real router,
 /// not a reading of it.
 pub const ROUTE_HELPERS: &str = "RouteHelpers";
+
+/// What a reader sees for each namespace this directory invents (`Knowledge::shown`).
+///
+/// - [`RELATION_BASE`] holds the query interface a relation answers, which Rails writes onto
+///   `ActiveRecord::Relation` (`relation.rb`'s `include`s), so that is the class a card names.
+/// - [`ROUTE_HELPERS`] stands for a module Rails never names, so a helper is shown alone, as it is
+///   called: `story_path`, not a module a reader cannot find.
+/// - [`HELPER_PROXY`](framework::HELPER_PROXY) is an instance of an unnamed
+///   `Class.new(ActionView::Base)`, so the class it is shown as is the one it subclasses.
+pub const SHOWN: [(&str, &str); 3] = [
+    (RELATION_BASE, RAILS_RELATION[0]),
+    (ROUTE_HELPERS, ""),
+    (framework::HELPER_PROXY, framework::VIEW),
+];
 
 /// The framework's own half of a view context: the modules `ActionView::Base` includes.
 ///
@@ -499,7 +667,7 @@ mod tests {
 
     /// The tables above are one list written twice, and this is the seam between them.
     ///
-    /// The three names [`MACROS`] has that neither [`ASSOCIATIONS`] nor [`LONG_TAIL`] has are
+    /// The five names [`MACROS`] has that neither [`ASSOCIATIONS`] nor [`LONG_TAIL`] has are
     /// spelled out here, not exempted, so a reader added without a table entry fails instead of
     /// quietly widening the exemption.
     ///
@@ -525,6 +693,10 @@ mod tests {
         // [`LONG_TAIL`] has nothing to say about it, but the file must still be opened because
         // `analysis::views` reads what it says.
         all.push("helper");
+        // And `layout` for the same reason: it names no member, and `analysis::views` reads it.
+        all.push("layout");
+        // And the callbacks, which `analysis::views` reads too.
+        all.extend(callbacks::NAMES);
         all.sort_unstable();
         let mut macros = MACROS.to_vec();
         macros.sort_unstable();
@@ -584,11 +756,12 @@ mod tests {
         assert_eq!(names.len(), held, "a macro is in `LONG_TAIL` twice");
     }
 
-    /// The classes [`LONG_TAIL`] asks the graph for are exactly the ones its own table names.
+    /// The classes the generators ask the graph for are exactly the ones their rows name.
     ///
     /// [`framework_classes`] is read by `Context` and drives a lookup per pass; a class listed
-    /// there but not in [`LONG_TAIL`] would be a lookup for a gate nothing consults, and one in
-    /// [`LONG_TAIL`] but not there would be a macro that silently never declares.
+    /// there that no row names would be a lookup for a gate nothing consults, and one a row names
+    /// but not there would be a row that silently never declares. The first three are
+    /// [`LONG_TAIL`]'s, and the last is what a bare `where` returns.
     #[test]
     fn every_gem_class_the_table_names_is_asked_for() {
         assert_eq!(
@@ -597,6 +770,10 @@ mod tests {
                 "ActiveStorage::Attached::One",
                 "ActiveStorage::Attached::Many",
                 "ActionText::RichText",
+                WHERE_CHAIN,
+                PROMISE,
+                COLLECTION_PROXY,
+                ROUTES_PROXY,
             ]
         );
     }

@@ -1,4 +1,4 @@
-"""Check 8: the margin types a binding that the card at a call on it does not.
+"""Check 7: the margin types a binding that the card at a call on it does not.
 
 # What it counts
 
@@ -12,12 +12,16 @@ be seen on the wire:
 - a drawn label carries no tier marker, because every surviving hint is derived.
 The unit test in `hints.rs` is where that invariant lives.
 
-**The one trace the wire does keep is counted apart.** A card saying *guessed from the name `x`
-alone* means the receiver fell to the name rung, so a label over that binding is the nearest thing
-to a margin guess a transcript can show. It is evidence, not proof (the two rungs are different
-code), so it gets its own line. The rows it has raised were `cursor::receiver` missing a rung the
-margin has, not guesses in the margin: for example, a block parameter the margin types from the
-block's signature while the card at a call on it guesses from the name.
+**Which guesses contradict the label is asked of `typeDefinition`**, since a card says only that it
+guessed (decided 2026-09-29), not whether the receiver or the member was the guess. At the
+receiver's own occurrence `typeDefinition` answers the class the receiver is, and refuses a guess:
+- it answers: the receiver is typed and the member is not on it, a claim about the member;
+- it answers nothing: the receiver has no type, or only one read off its name, which the label
+  beside it contradicts. The rows this has raised were `cursor::receiver` missing a rung the margin
+  has, not guesses in the margin: a block parameter the margin types from the block's signature
+  while the card at a call on it guesses from the name.
+- A receiver typed as a union answers nothing too (`Typed::one`), so a guessed card at a call on
+  one is read as untyped: the one way this can call a consistent pair a finding.
 
 # What is compared
 
@@ -26,10 +30,10 @@ The label sits at a **binding**: the `user` of `user = post.user`, the `post` of
 local variable has no card, and `cursor::bindings_in` answers only the inlay hint's question.
 
 So the comparison is the one `a_type_matched_on_a_name_alone_is_never_drawn_in_the_margin` makes: a
-**call on the labelled binding**. `person.shout` cards as `Person#shout` with *Type guessed from the
-name `person` alone*, and the margin beside `person` is empty. That card's tier says how the
-receiver was typed, which is the label's question reached through `cursor::receiver` instead of
-`bindings_in`.
+**call on the labelled binding**. `person.shout` cards as `Person#shout` with *Guessed from name
+alone.*, and the margin beside `person` is empty. That card's tier, with `typeDefinition` at the
+receiver, says how the receiver was typed, which is the label's question reached through
+`cursor::receiver` instead of `bindings_in`.
 
 Finding the calls needs no parser. `documentHighlight` at the binding lights every occurrence of the
 variable (the scope walk), and a `.name` right after one of those spans is a call on it.
@@ -54,7 +58,8 @@ filter by what the wire says, not by what happens to be true of today's reply.
 
 # Cost
 
-One request per sampled file, one highlight per **binding** label, and one hover per call on one.
+One request per sampled file, one highlight per **binding** label, and one hover and one
+`typeDefinition` per call on one.
 Small, because a hint is drawn only where the code does not already say the type.
 - Filtering to the binding families keeps it small: a return label per `def` would add a highlight
   and a hover per method.
@@ -64,26 +69,11 @@ Small, because a hint is drawn only where the code does not already say the type
 import re
 
 from audit import site
-from audit.answers import card_of, spans, tier
+from audit.answers import card_of, locations, spans, tier
 from audit.client import open_document, uri
 from audit.ruby import line_starts
 
 FINDINGS = ("margin-guessed",)
-
-# **Which guesses contradict a margin.** `hover.rs` writes four sentences that `answers.tier` reads
-# as the bottom tier, and they say different things about the *receiver*:
-# - *the receiver's type is unknown*, and *guessed from the name … alone* in both spellings: no
-#   trusted type. These contradict a label.
-# - the other two: the receiver **is** a `Person` with no such method. That is about the member, not
-#   the margin.
-#
-# The two that contradict a label are counted apart:
-# - *No type at all* is the asymmetry this check reports.
-# - *Guessed from the name* is the receiver reaching its last rung: the wire's only trace of the
-#   invariant in the module doc.
-NO_TYPE = ("the receiver's type is unknown",)
-NAME_MATCHED = ("guessed from the name",)
-UNTYPED = NO_TYPE + NAME_MATCHED
 
 # **Which hints this check reads, told apart by the only thing on the wire that can.** All three
 # `hints.rs` families ship as `InlayHintKind::TYPE` with no `data` naming the family. So the
@@ -116,7 +106,7 @@ def counters():
     return {"margin-files": 0, "margin-labels": 0, "margin-returns": 0, "margin-foreign": 0,
             "margin-reassigned": 0, "margin-uses": 0, "margin-calls": 0,
             "margin-cards": 0, "margin-unread": 0, "margin-untyped": 0,
-            "margin-name-matched": 0, "margin-named": 0, "margin-tiers": {}}
+            "margin-named": 0, "margin-tiers": {}}
 
 
 def ask(client, corpus, drawn, answers, opened):
@@ -147,10 +137,15 @@ def ask(client, corpus, drawn, answers, opened):
         # `fold` with all its calls unanswered and lands in `margin-unread`.
         if _reassigned(answered):
             continue
-        for at_line, at_column in _calls(_read(corpus, path), spans(answered)):
+        for at_line, at_column, (on_line, on_column) in _calls(_read(corpus, path),
+                                                               spans(answered)):
             cards.append((("margin-card", path, at_line, at_column), "textDocument/hover",
                           {"textDocument": {"uri": uri(corpus.dir / path)},
                            "position": {"line": at_line, "character": at_column}}))
+            cards.append((("margin-type", path, at_line, at_column),
+                          "textDocument/typeDefinition",
+                          {"textDocument": {"uri": uri(corpus.dir / path)},
+                           "position": {"line": on_line, "character": on_column}}))
     return {**hinted, **lit, **_post(client, cards)}
 
 
@@ -234,7 +229,9 @@ def _drawn(hinted):
 
 
 def _calls(lines, occurrences):
-    """Every `.name` written straight after one of the binding's occurrences."""
+    """Every `.name` written straight after one of the binding's occurrences: the name's line and
+    column, and where the occurrence (the call's receiver) starts.
+    """
     out = []
     for span in occurrences:
         at = span.get("end") or {}
@@ -243,7 +240,9 @@ def _calls(lines, occurrences):
             continue
         after = CALLED.match(lines[line][column:])
         if after:
-            out.append((line, column + after.start(1)))
+            start = span.get("start") or {}
+            out.append((line, column + after.start(1),
+                        (start.get("line", line), start.get("character", column))))
     return out
 
 
@@ -276,7 +275,7 @@ def fold(place, drawn, answers, counts, findings):
         calls = _calls(lines, occurrences)
         counts["margin-calls"] += len(calls)
         read = False
-        for at_line, at_column in calls:
+        for at_line, at_column, _ in calls:
             card = card_of(answers.get(("margin-card", path, at_line, at_column)))
             if not card:
                 continue
@@ -286,19 +285,17 @@ def fold(place, drawn, answers, counts, findings):
             counts["margin-tiers"][said] = counts["margin-tiers"].get(said, 0) + 1
             if said != "guessed":
                 continue
-            if not any(clause in card for clause in UNTYPED):
-                # The receiver is typed and the member is not on it: a claim about the member, which
-                # is check 6's subject. Counted so the denominator above stays readable beside the
-                # one below.
+            if locations(answers.get(("margin-type", path, at_line, at_column))):
+                # The receiver is typed and the member is not on it: a claim about the member, not
+                # the margin. Counted so the denominator above stays readable beside the one below.
                 counts["margin-named"] += 1
                 continue
-            matched = any(clause in card for clause in NAME_MATCHED)
-            counts["margin-name-matched" if matched else "margin-untyped"] += 1
+            counts["margin-untyped"] += 1
             at = site(path, _offset(place, path, at_line, at_column))
-            said = ("types it by its name alone" if matched else "has no type for it")
             findings.append(("margin-guessed", at,
                              f"label at {path}:{line + 1} over `{_named(lines, line, column)}`, "
-                             f"and the card at the call on line {at_line + 1} {said}"))
+                             f"and the card at the call on line {at_line + 1} guesses with no "
+                             f"type for it"))
         if not read:
             # No call on the binding, or none that answered: the label stands and nothing in the
             # transcript speaks to it. Counted, because a check with an invisible blind spot reads
@@ -338,12 +335,6 @@ summary = line
 
 def under(counts):
     said = []
-    if counts["margin-cards"]:
-        # **Printed at 0 too; that is why it is a counter.** It is the wire's only trace of *a guess
-        # is never drawn in the margin*. A line that appears only when broken leaves the next reader
-        # unable to tell a held invariant from a check that stopped asking.
-        said.append(f"invariant {counts['margin-name-matched']} of those cards type the receiver "
-                    f"by its name alone — the only trace the wire keeps of a guess in the margin")
     if counts["margin-unread"]:
         said.append(f"unread    {counts['margin-unread']} labels with no call on them to card")
     if counts["margin-named"]:

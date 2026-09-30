@@ -198,7 +198,7 @@ fn detail_of(
 ) -> Option<String> {
     let detail = match definition {
         Definition::Method(method) => {
-            let parameters = render::parameter_list(graph, method.signatures());
+            let parameters = render::parameter_list(graph, method.signatures(), &[]);
             match method.visibility() {
                 rubydex::model::visibility::Visibility::Public => parameters,
                 // **An outline row is one `def`, so the reread is asked of that `def`, not of the

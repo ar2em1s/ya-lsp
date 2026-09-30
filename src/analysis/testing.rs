@@ -862,6 +862,7 @@ impl Harness {
                     rbs: rbs.to_owned(),
                     mappings,
                     named: Vec::new(),
+                    ran: Vec::new(),
                 }],
             )
             .into_iter()
@@ -886,6 +887,25 @@ impl Harness {
                 "textDocument": { "uri": uri.as_str() },
                 "position": position_of(source, needle),
             }),
+        )
+    }
+
+    /// What the cursor at `needle` resolves to, spelled (`Radio#shout`) and sorted: the rows a list
+    /// card no longer shows, which `definition` answers with places instead.
+    pub(crate) fn candidates_at(
+        &mut self,
+        uri: &DocUri,
+        source: &str,
+        needle: &str,
+    ) -> Vec<String> {
+        let at = position_of(source, needle);
+        self.analysis.resolved_names(
+            uri,
+            lsp_types::Position {
+                line: u32::try_from(at["line"].as_u64().unwrap_or_default()).unwrap_or_default(),
+                character: u32::try_from(at["character"].as_u64().unwrap_or_default())
+                    .unwrap_or_default(),
+            },
         )
     }
 
@@ -1695,35 +1715,117 @@ class OptionParser
 end
 ";
 
-/// A workspace with the signatures above indexed, plus the project's own `lib/person.rb`.
-pub(crate) fn with_signatures(source: &str) -> (Harness, DocUri) {
+/// An empty workspace whose signature root holds `files` (`core/core.rbs`, a stdlib path), with gems
+/// off and `config` appended to `ya-lsp.toml`: where every fixture with its own signatures starts.
+pub(crate) fn signed(files: &[(&str, &str)], config: &str) -> Harness {
     let dir = tempfile::tempdir().expect("tempdir");
     let signatures = dir.path().join("sig");
     std::fs::create_dir_all(signatures.join("core")).unwrap();
-    std::fs::create_dir_all(signatures.join("stdlib/optparse/0")).unwrap();
-    std::fs::write(signatures.join("core/string.rbs"), CORE_RBS).unwrap();
-    std::fs::write(signatures.join("core/coordinate.rbs"), OVERLOAD_RBS).unwrap();
-    std::fs::write(
-        signatures.join("stdlib/optparse/0/optparse.rbs"),
-        STDLIB_RBS,
-    )
-    .unwrap();
+    for (path, text) in files {
+        let full = signatures.join(path);
+        std::fs::create_dir_all(full.parent().expect("a file in the root")).unwrap();
+        std::fs::write(full, text).unwrap();
+    }
     std::fs::write(
         dir.path().join("ya-lsp.toml"),
         format!(
-            "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
+            "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n{config}",
             signatures.display().to_string()
         ),
     )
     .unwrap();
+    Harness::at(dir, PositionEncoding::Utf16)
+}
 
-    let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+/// A workspace with the signatures above indexed, plus the project's own `lib/person.rb`.
+pub(crate) fn with_signatures(source: &str) -> (Harness, DocUri) {
+    let mut harness = signed(
+        &[
+            ("core/string.rbs", CORE_RBS),
+            ("core/coordinate.rbs", OVERLOAD_RBS),
+            ("stdlib/optparse/0/optparse.rbs", STDLIB_RBS),
+        ],
+        "",
+    );
     harness.write("lib/person.rb", LIBRARY);
     let uri = harness.write("lib/main.rb", source);
     harness.index();
     harness.index_gems();
     (harness, uri)
 }
+
+/// The part of rspec-core the RSpec module asks the bundle for: the namespace it files groups
+/// under, the base class, and the classes a block is handed.
+pub(crate) const RSPEC_CORE: &str = "\
+module RSpec
+  module ExampleGroups
+  end
+
+  module Core
+    class ExampleGroup
+    end
+
+    class Example
+      class Procsy
+      end
+    end
+
+    class Configuration
+    end
+  end
+end
+";
+
+/// rspec-expectations' and rspec-mocks' classes, as the gems declare them: every method this
+/// crate writes about is defined at run time, so none is here.
+pub(crate) const RSPEC_SYNTAX: &str = "\
+module RSpec
+  module Matchers
+  end
+
+  module Expectations
+    class ExpectationTarget
+    end
+
+    class ValueExpectationTarget < ExpectationTarget
+    end
+
+    class BlockExpectationTarget < ExpectationTarget
+    end
+  end
+
+  module Mocks
+    module ExampleMethods
+    end
+
+    class TargetBase
+    end
+
+    class ExpectationTarget < TargetBase
+    end
+
+    class AllowanceTarget < TargetBase
+    end
+
+    class AnyInstanceExpectationTarget < TargetBase
+    end
+
+    class AnyInstanceAllowanceTarget < TargetBase
+    end
+
+    module Matchers
+      class Receive
+      end
+
+      class ReceiveMessages
+      end
+
+      class ReceiveMessageChain
+      end
+    end
+  end
+end
+";
 
 /// Signatures with return types, which is what the return-type table is built from.
 ///
@@ -1813,20 +1915,7 @@ MYSTERY: Ghost
 
 /// A workspace whose only signatures are [`TYPED_RBS`], plus one file of the user's code.
 pub(crate) fn with_types(source: &str) -> (Harness, DocUri) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let signatures = dir.path().join("sig");
-    std::fs::create_dir_all(signatures.join("core")).unwrap();
-    std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
-    std::fs::write(
-        dir.path().join("ya-lsp.toml"),
-        format!(
-            "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
-            signatures.display().to_string()
-        ),
-    )
-    .unwrap();
-
-    let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+    let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
     let uri = harness.write("lib/main.rb", source);
     harness.index();
     harness.index_gems();
@@ -2078,20 +2167,7 @@ pub(crate) fn span(text: &str, needle: &str) -> (u32, u32) {
 /// So these tests play a generator, handing over exactly what [`Analysis::synthesize`] hands over:
 /// RBS text, and one span of it per line that implied it.
 pub(crate) fn synthetic_project(caller: &str) -> (Harness, DocUri, DocUri) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let signatures = dir.path().join("sig");
-    std::fs::create_dir_all(signatures.join("core")).unwrap();
-    std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
-    std::fs::write(
-        dir.path().join("ya-lsp.toml"),
-        format!(
-            "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
-            signatures.display().to_string()
-        ),
-    )
-    .unwrap();
-
-    let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+    let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
     harness.write("app/models/story.rb", "class Story\nend\n");
     let schema = harness.write("db/legacy.rb", SCHEMA);
     let uri = harness.write("app/main.rb", caller);
@@ -2136,20 +2212,7 @@ end
 ";
 
 pub(crate) fn rails_project(caller: &str) -> (Harness, DocUri, DocUri) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let signatures = dir.path().join("sig");
-    std::fs::create_dir_all(signatures.join("core")).unwrap();
-    std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
-    std::fs::write(
-        dir.path().join("ya-lsp.toml"),
-        format!(
-            "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
-            signatures.display().to_string()
-        ),
-    )
-    .unwrap();
-
-    let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+    let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
     harness.write("app/models/story.rb", "class Story\nend\n");
     let schema = harness.write("db/schema.rb", SCHEMA_RB);
     let uri = harness.write("app/main.rb", caller);
@@ -2183,20 +2246,7 @@ CREATE INDEX index_stories_on_title ON public.stories USING btree (title);
 
 /// The same project, dumped as SQL instead of as Ruby.
 pub(crate) fn sql_project(caller: &str) -> (Harness, DocUri, DocUri) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let signatures = dir.path().join("sig");
-    std::fs::create_dir_all(signatures.join("core")).unwrap();
-    std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
-    std::fs::write(
-        dir.path().join("ya-lsp.toml"),
-        format!(
-            "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
-            signatures.display().to_string()
-        ),
-    )
-    .unwrap();
-
-    let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+    let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
     harness.write("app/models/story.rb", "class Story\nend\n");
     let dump = harness.write("db/structure.sql", STRUCTURE_SQL);
     let uri = harness.write("app/main.rb", caller);
@@ -2211,20 +2261,7 @@ pub(crate) fn sql_project(caller: &str) -> (Harness, DocUri, DocUri) {
 /// relation class per element type" observable. `Tag` gives a `has_many :through` an intermediate
 /// to find. `Ghost` is named by nothing and defined by nothing: where every wrong inflection ends.
 pub(crate) fn models_project(caller: &str) -> (Harness, DocUri, DocUri) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let signatures = dir.path().join("sig");
-    std::fs::create_dir_all(signatures.join("core")).unwrap();
-    std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
-    std::fs::write(
-        dir.path().join("ya-lsp.toml"),
-        format!(
-            "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
-            signatures.display().to_string()
-        ),
-    )
-    .unwrap();
-
-    let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+    let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
     let story = harness.write(
         "app/models/story.rb",
         "class Story < ApplicationRecord\n  \

@@ -36,6 +36,10 @@ HASH_KEY = re.compile(r"(?<![:\w])([a-z_][A-Za-z0-9_]*):(?!:)")
 # leave `active?` (the spelling the position is actually on) still keyed.
 ENUM_SUFFIXES = ("", "?", "!")
 COLUMN = re.compile(r"^\s*t\.\w+\s+[\"']([a-z_][A-Za-z0-9_]*)[\"']", re.M)
+# What Rails installs for each column: the reader, the writer, and the query method, which Rails
+# defines for **every** column, not only a boolean one. Without `?`, a column's predicate was keyed
+# to an unrelated `def` of the same name, and a server answering the column scored wrong.
+COLUMN_SUFFIXES = ("", "=", "?")
 # The same columns, read from a database's own SQL dump, because `COLUMN` reads `schema.rb` and not
 # every corpus has one. Otherwise a name that is both a column and a serializer `def` becomes
 # scorable with the serializer as its only right answer, while a server answering `structure.sql`

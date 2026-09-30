@@ -6,6 +6,9 @@ paths:
   - "src/analysis/types.rs"
   - "src/analysis/views.rs"
   - "src/workspace/rails/**"
+  - "src/workspace/rspec.rs"
+  - "src/workspace/factories.rs"
+  - "src/workspace/i18n.rs"
   - "src/knowledge/**"
 ---
 
@@ -13,19 +16,22 @@ paths:
 
 ## The keys
 
-Eight keys turn off a **body of knowledge**. Three say **where the project keeps its test and
+Eleven keys turn off a **body of knowledge**. Three say **where the project keeps its test and
 migration trees**.
 
 | Key | Gates | Seam |
 | --- | --- | --- |
-| `rails.enabled` | all the rails keys below, plus the framework singletons and file-move renames | registered-row filter |
+| `rails.enabled` | all the rails keys below, plus the framework singletons, the controller context, the framework's block rows and `config`, what a migration sends to its connection, the connection adapter (`config/database.yml`), and file-move renames | registered-row filter |
 | `rails.schema` | `db/*schema.rb`, `db/*structure.sql`, `table_name` | `Schemas` + `Renamed` |
 | `rails.models` | associations, `enum`, `attribute`, `delegate`, the 17 tail macros, the query interface, concern class methods | `Models` + `Concerns` |
 | `rails.routes` | `config/routes.rb` and the helper module | `Routes` |
 | `rails.entrypoints` | mailers, jobs, Sidekiq workers | `Entrypoints` |
-| `rails.views` | the view context and the view→renderer type rung | `views.rs`, `types::from_renderer` |
+| `rails.views` | the view context and the view→renderer type rung | `views.rs`, `types::rendered_by` |
 | `types.structs` | `Struct.new`, `Data.define` | `Structs` |
 | `types.annotations` | a Sorbet `sig`, a YARD `@return` | `Annotated` |
+| `types.factories` | FactoryBot's strategies, by the class each factory builds | `knowledge::factories` |
+| `rspec.enabled` | example groups, `let`/`subject`, what `self` is in their blocks, `config.include` (`auto`: the lockfile locks `rspec-core`) | `knowledge::rspec` |
+| `i18n.enabled` | translation keys (types, jump, hover, completion) and i18n's own returns (`auto`: the lockfile locks `i18n`); `i18n.locale` names the one locale read, `i18n.paths` replaces the project's own files | `knowledge::i18n` |
 | `trees.test` | `TEST_TREES`, replaces the default | `environment::Names` |
 | `trees.test_support` | `TEST_SUPPORT`, extends the default | `environment::Names` |
 | `trees.migration` | `db`/`migrat` pairs, replaces the default | `environment::Names` |
@@ -37,12 +43,13 @@ migration trees**.
 2. **Gate twice in the pass:** `contribution`'s loop (cheap) and the `retain` after the walk
    (correct). A model with no macros joins `rails::MODELS` only in the `retain`.
 3. **Gate every rung outside the pass on its specific flag, never on `features.rails`:**
-   - `Return::Element` / `Return::Collection` in `types::resolved`, on `models`
-   - `types::from_renderer` and `views::Views::reachable`, on `views`
+   - `Return::Element` / `Return::Collection` in `types::resolved`, and a relation handing its
+     model a name it lacks (`types::delegated`), on `models`
+   - `types::rendered_by` and `views::Views::reachable`, on `views`
    - the `is_structure` watch arm in `analysis/mod.rs`, on `schema`
 
    `Features::resolve` has already folded the umbrella flag into each of them.
-4. **Never gate the inflector** (`rails::camelize`, `rails::element_of`). Singularising a name is not
+4. **Never gate the inflector** (`rails::camelize`, `generated::element_of`). Singularising a name is not
    a Rails feature.
 5. **Never make a request method switchable.** Capabilities are the wire contract, and
    `capabilities::server_capabilities` takes only the encoding. A switch changes what an answer is
@@ -56,7 +63,11 @@ migration trees**.
   belongs to no single body of knowledge. Never give it a key of its own.
 - **`Views::default()` is off.** When empty, its renderer half would still query paths. The type
   rung asks `Views::rendered_by` instead of reading the flag a second time.
-- **`knowledge/rspec.rs` has no key.** It is `#[cfg(test)]`, and there is nothing to decline.
+- **`i18n` is its own table too**, for the same reason: i18n is its own gem. `i18n.paths` replaces
+  the project's list (`[]` reads none of it; the gems' files are read either way) and says in its
+  description that a wrong list can give a wrong type.
+- **`rspec.enabled` is its own table, not a Rails key**: RSpec runs outside Rails, and a Rails
+  project on Minitest has nothing for it to read. Its `auto` reads the lockfile alone.
 
 ## `rails.enabled = "auto"`, the default
 

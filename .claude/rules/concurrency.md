@@ -53,7 +53,13 @@ paths:
 
 1. **`didChange` records the edit and indexes nothing.** `completion`, `hover` and `definition` answer
    against the last settled graph, through a `Rebase`. A refused offset settles and retries, so
-   deferring never makes an answer worse.
+   deferring never makes an answer worse. **Not a jump that found its member with no place**
+   (`Analysis::unplaced`, RSpec's `describe`): a settle finds the same nowhere, and paying one per
+   ask cost the audit 193 settles. It answers the last settled graph, as a placed member does.
+   **Not a document just opened whose own facts wait on the settle** either (`Analysis::reopened`,
+   `requests::reopens`): the last settled graph never held a spec's groups, so a non-empty answer
+   there is a name guess one settle short of the right one. It settles first, once, the cheap
+   reopening kind. Held by `a_spec_just_opened_is_answered_after_its_groups`.
 2. **`indexed_text` records what the index *accepted*.** After a contained panic the graph keeps its
    old version, and so must the map. It is recorded even when indexing is skipped.
 3. **Everything that becomes a graph key goes through the map, including a `Receiver`.** An

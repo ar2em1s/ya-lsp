@@ -2343,14 +2343,10 @@ end
         );
 
         // The chain is the assertion, not the declaration: `upcase` resolves only because the table
-        // read `-> String` from a gem's own signature, and the card names the signature it
-        // followed.
+        // read `-> String` from a gem's own signature.
         let markdown = card(&mut harness, &uri, source, "upcase");
         assert!(markdown.contains("String#upcase"), "{markdown}");
-        assert!(
-            markdown.contains("Shouty::Megaphone#shout()"),
-            "the card has to name the gem signature it followed: {markdown}"
-        );
+        assert!(!markdown.contains("Guessed from name alone"), "{markdown}");
 
         let found = harness.declarations_at(&uri, "Shouty::Megaphone.new.shout.~\n");
         assert!(found.contains(&"upcase".to_owned()), "{found:?}");

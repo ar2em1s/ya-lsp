@@ -136,6 +136,56 @@ pub struct Limits {
     pub untyped_candidates: usize,
 }
 
+/// The keys one segment on from what a literal key already says: inside
+/// `t("users.|")`, the keys under `users`, replacing the segment being written. A key the table
+/// holds more keys under is a segment; the rest end the key.
+fn keyed(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    text: &cursor::Parsed<'_>,
+    offset: u32,
+    rebase: &Rebase,
+    limits: Limits,
+) -> Option<Completion> {
+    let source = text.source();
+    let (literal, member) = locator::resolve_keyed(sources, uri_id, text, offset, rebase)?;
+    let typed =
+        source.get(literal.start as usize..(offset as usize).max(literal.start as usize))?;
+    let (parent, start) = match typed.rfind('.') {
+        Some(at) => (&typed[..at], literal.start + at as u32 + 1),
+        None => ("", literal.start),
+    };
+    let children = sources
+        .knowledge
+        .modules()
+        .find_map(|module| module.keyed_under(&member, parent))?;
+    let incomplete = children.len() > limits.items;
+    let items = children
+        .into_iter()
+        .take(limits.items)
+        .map(|child| Item {
+            label: child.name,
+            detail: Some(child.shown.lines().next().unwrap_or_default().to_owned()),
+            kind: if child.branch {
+                Kind::Module
+            } else {
+                Kind::Field
+            },
+            documentation: None,
+            deprecated: false,
+            declaration: None,
+        })
+        .collect();
+    Some(Completion {
+        items,
+        incomplete,
+        start,
+        end: offset,
+        precise: true,
+        guess: None,
+    })
+}
+
 /// What can be written at `offset`.
 ///
 /// `None` where nothing can: inside a comment or literal, or in a document the graph has never
@@ -150,9 +200,35 @@ pub(super) fn complete(
     placed: &Placed,
     rebase: &Rebase,
 ) -> Option<Completion> {
+    // One parse of the buffer for both questions asked of it here ([`cursor::Parsed`]).
+    let text = cursor::Parsed::new(source);
+    // **Inside a literal key a member looks up**, the keys under what it already says.
+    if let Some(keys) = keyed(sources, uri_id, &text, offset, rebase, limits) {
+        return Some(keys);
+    }
     let graph = sources.graph;
-    let cursor = cursor::at(source, offset)?;
+    let cursor = cursor::at(&text, offset)?;
     let prefix = &source[cursor.start as usize..cursor.end as usize];
+
+    // **The receiver's variables are answered from the repaired text.** Which variable a read is
+    // depends on the file's structure, and the half-typed call re-nests everything below it (see
+    // `Cursor::repaired`). The repaired text has the buffer's offsets, so `rebase` still maps it.
+    let own = graph
+        .documents()
+        .get(&uri_id)
+        .map(|document| document.uri().to_owned());
+    let repaired = cursor.repaired.as_deref().map(std::rc::Rc::<str>::from);
+    let repaired_read = |uri: &str| match (&repaired, &own) {
+        (Some(repaired), Some(own)) if own == uri => Some((std::rc::Rc::clone(repaired), *rebase)),
+        _ => (sources.read)(uri),
+    };
+    // Its own memo: the request's read the buffer, and this reads the repaired text.
+    let memo = types::Memo::new(&repaired_read, sources.held_exits);
+    let sources = &Sources {
+        read: &repaired_read,
+        memo: &memo,
+        ..*sources
+    };
 
     // **The coordinate change, the only one completion needs.** Everything above reads `source`
     // (the buffer); everything below keys the graph, whose offsets index the text last given to the
@@ -190,41 +266,39 @@ pub(super) fn complete(
     let private_ok = context.allows_private();
     // Empty until a candidate rubydex calls private arrives, which most lists never have, so only
     // the lists the repair is about pay for it.
-    let modifiers = locator::Modifiers::new(sources.read);
+    let modifiers = &sources.memo.modifiers;
     // Read from the layout, not passed as a ninth argument: `Sources` already carries the value
     // every fencing surface takes, and letting the halves of a fence drift apart is a defect this
     // crate has had before.
     let locality = Locality::at(graph, uri_id, placed, sources.layout);
     let mut precise = true;
     let mut guess = None;
-    let (items, incomplete) = match receiver_for(sources, uri_id, &context, &scope) {
-        Some((receiver, only, derivation)) => {
+    let (items, incomplete) = match receiver_for(sources, uri_id, &context, &scope, lo) {
+        Some((receivers, only, derivation)) => {
             // The tier travels with the list: it belongs to the *receiver*, and every row was
             // offered for the same one. A guessed receiver still offers a real class's members
             // (better than matching every method by name), and each card must still say where the
             // class came from.
             guess = derivation.guess;
-            // Collected before ranking, because the ranking reads two of the three, and merged
-            // after it (see [`Beside`]). `Extended` is built once and read twice: its walk answers
-            // both what a concern extends onto a class object and how far out it sits.
-            let beside = Beside {
-                extended: Extended::at(graph, &receiver),
-                view: in_view(sources, uri_id, &cursor.context),
-                closure: InClosure::at(graph, &scope, cursor.in_a_closure),
-            };
-            let ranking = Ranking {
+            // Each receiver's own chain is numbered in `from_graph`, which sets `distance`.
+            let mut ranking = Ranking {
                 prefix,
-                distance: Distance::from_receiver(
-                    graph,
-                    &receiver,
-                    beside.extended.as_ref(),
-                    &beside.view,
-                ),
+                distance: Distance::none(),
                 locality,
                 private_ok,
-                modifiers: Some(&modifiers),
+                modifiers: Some(modifiers),
             };
-            from_graph(graph, receiver, only, limits.items, &ranking, &beside)
+            let view = in_view(sources, uri_id, &cursor.context);
+            let closure = InClosure::at(graph, &scope, cursor.in_a_closure);
+            from_graph(
+                graph,
+                receivers,
+                only,
+                limits.items,
+                &mut ranking,
+                &view,
+                closure.as_ref(),
+            )
         }
         // Only one context arrives here with anything to say: a `.` on an untyped receiver. `foo::`
         // and a non-namespace receiver have no honest answer.
@@ -277,18 +351,27 @@ enum Only {
     Constants,
 }
 
-/// Turn a classified cursor into the question rubydex answers.
+/// How many classes a union receiver may be and still complete: a sanity guard.
+///
+/// A union is asked of rubydex once per class, so this bounds the walks one keystroke makes. It
+/// sits above the widest union the corpora complete on, a concern's `self` (one class per
+/// includer). Past it the receiver is untyped and the name rung answers, as for every union
+/// before.
+const MAX_UNION_CLASSES: usize = 64;
+
+/// Turn a classified cursor into the questions rubydex answers: one, or one per class of a union.
 ///
 /// `None` means no exact question: an unknown receiver, or a `::` on something that is not a
-/// namespace.
+/// namespace. `at` is the cursor in graph coordinates.
 fn receiver_for(
     sources: &Sources<'_>,
     uri_id: UriId,
     context: &Context,
     scope: &Scope,
-) -> Option<(CompletionReceiver, Only, Derivation)> {
+    at: u32,
+) -> Option<(Vec<CompletionReceiver>, Only, Derivation)> {
     let graph = sources.graph;
-    match context {
+    let (receiver, only, derivation) = match context {
         // `caller`, not `scope.self_id`, by necessity: rubydex's `expression_completion` needs a
         // `self` type, and with `None` it collects no methods and no instance variables at all,
         // which would break the commonest completion. The nesting's own declaration must be passed.
@@ -312,14 +395,14 @@ fn receiver_for(
             // The same evidence the jump reads: a keyword argument from a `def` a block filed on
             // `Object` would be a parameter list the call cannot take. `locator::Blocks` is empty
             // until a hit lands on a root, so other cursors pay nothing.
-            let blocks = locator::Blocks::new(sources.read);
+            let blocks = &sources.memo.blocks;
             let receiver = match locator::precise_call(
                 graph,
                 uri_id,
                 *name,
                 sources.layout,
                 locator::Privacy::Allowed,
-                &blocks,
+                blocks,
             ) {
                 Some(method_decl_id) => CompletionReceiver::MethodArgument {
                     self_decl_id: scope.caller(graph),
@@ -347,10 +430,14 @@ fn receiver_for(
                 //
                 // `Receiver::Named` joins them: a name is at best an instance, and both rungs that
                 // read one answer with a class, not a namespace.
-                Receiver::Instance(_)
+                Receiver::Instance { .. }
                 | Receiver::Literal { .. }
                 | Receiver::Returned { .. }
                 | Receiver::Yielded { .. }
+                | Receiver::Yield { .. }
+                | Receiver::BlockGiven { .. }
+                | Receiver::Proc { .. }
+                | Receiver::ProcParameter { .. }
                 | Receiver::Assigned { .. }
                 | Receiver::Destructured { .. }
                 | Receiver::Spelled { .. }
@@ -363,7 +450,13 @@ fn receiver_for(
                 // `!x::Bar` parses too, and `!x` is `true` or `false`: a value, and the least
                 // likely values to be a namespace.
                 | Receiver::Negated(_)
+                // `(c ? A : B)::X` and an exception caught are values, like a shortcut.
+                | Receiver::Either(_)
+                | Receiver::Rescued(_)
                 | Receiver::Parameter { .. }
+                // A variable holds a value, and `x::Bar` is a namespace only if its writes were
+                // constants, which reads of it spell as `Foo::Bar` instead.
+                | Receiver::Variable(_)
                 | Receiver::Named(_) => return None,
                 // `::Foo` asks for the top level, which is `Object`, but rubydex's namespace walk
                 // deliberately stops *before* Object's own members, so `String::` does not list
@@ -371,10 +464,10 @@ fn receiver_for(
                 // reaches them, and dropping non-constants leaves what `::` can be followed by.
                 Receiver::TopLevel => {
                     return Some((
-                        CompletionReceiver::Expression {
+                        vec![CompletionReceiver::Expression {
                             self_decl_id: None,
                             nesting_name_id: object_name(graph),
-                        },
+                        }],
                         Only::Constants,
                         Derivation::default(),
                     ));
@@ -393,40 +486,222 @@ fn receiver_for(
         // Every arm lives in `types::method_receiver`, because navigation asks the same question
         // and the two must agree: what `person.` is cannot depend on whether the user typed or
         // hovered.
+        //
+        // **A union offers every class's members** (decided 2026-09-30). A call on it runs on each
+        // class that has the member (`types::narrowed`), and Ruby raises on the rest, so each row
+        // is right for the values that have it; the detail names its class. `nil` stays folded
+        // out, as for a `T?`.
         Context::MethodCall { receiver } => {
             let typed = types::method_receiver(sources, uri_id, receiver, scope)?;
-            Some((
-                CompletionReceiver::MethodCall {
-                    self_decl_id: scope.caller(graph),
-                    // A union offers nothing: no single class can answer a `.`
-                    // (`types::Typed::one`).
-                    receiver_decl_id: typed.one()?,
-                },
-                Only::Everything,
-                typed.derivation,
-            ))
+            let classes = typed.classes();
+            if classes.len() > MAX_UNION_CLASSES {
+                return None;
+            }
+            let self_decl_id = scope.caller(graph);
+            let receivers = classes
+                .iter()
+                .map(|&receiver_decl_id| CompletionReceiver::MethodCall {
+                    self_decl_id,
+                    receiver_decl_id,
+                })
+                .collect();
+            return Some((receivers, Only::Everything, typed.derivation));
         }
+    }?;
+    let mut receivers = vec![receiver];
+    if matches!(context, Context::Expression | Context::Argument { .. }) {
+        receivers.extend(rebound(sources, uri_id, at, scope.nesting));
     }
+    Some((receivers, only, derivation))
 }
 
-/// Everything rubydex offers for a receiver, filtered to the prefix and capped.
+/// The classes a block around a bare word runs against, as receivers beside the lexical one.
+///
+/// - **Hover asks them first** (`locator::rebound_call`, [`types::rebound_self`]): an RSpec example
+///   group and what `config.include` adds to it, a concern's `included do`, a signature's
+///   `[self: T]`. So `let` in a `describe` block and `eq` in an example are on the list.
+/// - **Merged as a union's are** ([`one_row_per_name`]), each row naming its class. The lexical
+///   rows stay: hover falls back to them where the rebound `self` lacks the name.
+/// - **Refused (`Some(None)`) or wider than [`MAX_UNION_CLASSES`] adds nothing**, and the lexical
+///   list stands, as hover's lexical answer does.
+fn rebound(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    at: u32,
+    nesting: NameId,
+) -> Vec<CompletionReceiver> {
+    types::rebound_self(sources, uri_id, at)
+        .flatten()
+        .filter(|typed| typed.classes().len() <= MAX_UNION_CLASSES)
+        .map(|typed| {
+            typed
+                .classes()
+                .iter()
+                .map(|&class| CompletionReceiver::Expression {
+                    self_decl_id: Some(class),
+                    nesting_name_id: nesting,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Everything rubydex offers for the receivers, filtered to the prefix and capped.
+///
+/// One receiver, except on a union: then each class is asked with its own chain numbered
+/// (`ranking.distance` is set per receiver), and [`one_row_per_name`] merges the lists.
 ///
 /// The flag is `Completion::incomplete`: true where the cap dropped rows, and true where there was
 /// nothing to say at all, which differs from "the answer is empty".
 fn from_graph(
     graph: &Graph,
-    receiver: CompletionReceiver,
+    receivers: Vec<CompletionReceiver>,
     only: Only,
     limit: usize,
+    ranking: &mut Ranking,
+    view: &[views::Reached],
+    closure: Option<&InClosure>,
+) -> (Vec<Item>, bool) {
+    let union = receivers.len() > 1;
+    let mut ranked = Vec::new();
+    let mut answered = false;
+    for receiver in receivers {
+        // Collected before ranking, because the ranking reads two of the three, and merged after
+        // it (see [`Beside`]). `Extended` is built once and read twice: its walk answers both what
+        // a concern extends onto a class object and how far out it sits.
+        let beside = Beside {
+            extended: Extended::at(graph, &receiver),
+            view,
+            closure,
+        };
+        ranking.distance =
+            Distance::from_receiver(graph, &receiver, beside.extended.as_ref(), beside.view);
+        if let Some(rows) = ranked_for(graph, receiver, only, ranking, &beside) {
+            ranked.extend(rows);
+            answered = true;
+        }
+    }
+    if !answered {
+        return (Vec::new(), true);
+    }
+    let twins = if union {
+        let (rows, twins) = one_row_per_name(ranked);
+        ranked = rows;
+        twins
+    } else {
+        HashMap::new()
+    };
+    let truncated = take_best(&mut ranked, limit);
+    let mut items = spelled_out(graph, ranked);
+    for item in &mut items {
+        let others = twins.get(&item.label).into_iter().flatten();
+        for declaration in others.filter_map(|id| graph.declarations().get(id)) {
+            let detail = item.detail.get_or_insert_with(String::new);
+            detail.push_str(" | ");
+            detail.push_str(&render::qualified_name(graph, declaration.name()));
+        }
+    }
+    (items, truncated)
+}
+
+/// One row per name on a union, and the other classes' declarations of each name, for the detail.
+///
+/// - **The row kept is the best by [`order`], ranked at the farthest distance any class gave the
+///   name.** A name every class has is mostly what every object has, and the nearest would be the
+///   shortest chain's: an `Array`'s `Object` sits three steps out, a model's sixty, so `frozen?`
+///   would rank above the model's own `save`. Each class's own members keep their own distance.
+/// - **A name two classes declare apart** (`as_json` on a model and on an `Array`) is one row,
+///   whose detail names both: the label is what is inserted, and a list of twins is noise.
+fn one_row_per_name(ranked: Vec<Ranked>) -> (Vec<Ranked>, HashMap<String, Vec<DeclarationId>>) {
+    let mut named: HashMap<String, Vec<Ranked>> = HashMap::new();
+    for entry in ranked {
+        named
+            .entry(entry.item.label.clone())
+            .or_default()
+            .push(entry);
+    }
+    let mut twins = HashMap::new();
+    let rows = named
+        .into_iter()
+        .map(|(label, mut rows)| {
+            let farthest = rows.iter().map(|row| row.distance).fold(0, u16::max);
+            rows.sort_by(order);
+            // Never empty: a name is here because a row carried it.
+            let mut kept = rows.remove(0);
+            kept.distance = farthest;
+            let mut seen: HashSet<DeclarationId> = kept.item.declaration.into_iter().collect();
+            let others = rows
+                .iter()
+                .filter_map(|row| row.item.declaration)
+                .filter(|id| seen.insert(*id))
+                .collect();
+            twins.insert(label, others);
+            kept
+        })
+        .collect();
+    (rows, twins)
+}
+
+/// Whether `id` is a module, whose instance is some class's.
+fn is_module(graph: &Graph, id: DeclarationId) -> bool {
+    matches!(
+        graph.declarations().get(&id),
+        Some(Declaration::Namespace(Namespace::Module(_)))
+    )
+}
+
+/// `Object`, asked beside a module's instance.
+///
+/// - **A module's instance is some class's, and every class descends from `Object`**, so the
+///   member lookup asks `Object` where the module lacks a name (`types::member_of`), and `self.class`
+///   in a module's `def` is `Kernel#class`. rubydex's walk of the module stops at its own ancestors.
+/// - **Its rows fill gaps and never shadow** (in [`ranked_for`]): a name the module has is the
+///   module's. They are numbered past the module's chain ([`Distance::from_receiver`]), so they
+///   follow the module's own.
+/// - **A bare word in a module's `def` has the same `self`**, so it is asked as an expression on
+///   `Object`: private `Kernel` methods (`format`, `raise`) are what a bare word may call.
+fn objects_side(graph: &Graph, receiver: &CompletionReceiver) -> Option<CompletionReceiver> {
+    let object = DeclarationId::from("Object");
+    match receiver {
+        CompletionReceiver::MethodCall {
+            self_decl_id,
+            receiver_decl_id,
+        } => is_module(graph, *receiver_decl_id).then_some(CompletionReceiver::MethodCall {
+            self_decl_id: *self_decl_id,
+            receiver_decl_id: object,
+        }),
+        CompletionReceiver::Expression {
+            self_decl_id: Some(module),
+            nesting_name_id,
+        }
+        | CompletionReceiver::MethodArgument {
+            self_decl_id: Some(module),
+            nesting_name_id,
+            ..
+        } => is_module(graph, *module).then_some(CompletionReceiver::Expression {
+            self_decl_id: Some(object),
+            nesting_name_id: *nesting_name_id,
+        }),
+        _ => None,
+    }
+}
+
+/// One receiver's rows, before the cap: rubydex's answer and the lists beside it. `None` where
+/// rubydex could not answer for it.
+fn ranked_for(
+    graph: &Graph,
+    receiver: CompletionReceiver,
+    only: Only,
     ranking: &Ranking,
     beside: &Beside,
-) -> (Vec<Item>, bool) {
+) -> Option<Vec<Ranked>> {
+    let object = objects_side(graph, &receiver);
     let candidates = match query::completion_candidates(graph, CompletionContext::new(receiver)) {
         Ok(candidates) => candidates,
         Err(error) => {
             // A receiver that is not a namespace after all. Nothing to say, nothing broken.
             tracing::debug!("no completion candidates: {error}");
-            return (Vec::new(), true);
+            return None;
         }
     };
 
@@ -436,6 +711,26 @@ fn from_graph(
         .enumerate()
         .filter_map(|(sequence, candidate)| rank(graph, candidate, sequence, ranking))
         .collect();
+    let held: HashSet<u64> = ranked
+        .iter()
+        .map(|entry| StringId::from(&entry.item.label).get())
+        .collect();
+    let objects: Vec<CompletionCandidate> = object
+        .into_iter()
+        .flat_map(|object| {
+            query::completion_candidates(graph, CompletionContext::new(object))
+                .into_iter()
+                .flatten()
+        })
+        .collect();
+    ranked.extend(
+        objects
+            .iter()
+            .filter(|candidate| only.accepts(graph, candidate))
+            .enumerate()
+            .filter_map(|(sequence, candidate)| rank(graph, candidate, sequence, ranking))
+            .filter(|entry| !held.contains(&StringId::from(&entry.item.label).get())),
+    );
     // Before the cap, never after: these rows compete with the graph's on one key, and appending
     // after `take_best` would return `limit` plus however many a concern holds.
     if let Some(extended) = &beside.extended {
@@ -450,14 +745,13 @@ fn from_graph(
     }
     // The view context's rows, added the same way and place for the same reason: before the cap,
     // competing with the graph's own on one key.
-    add_view(graph, &mut ranked, ranking, &beside.view);
+    add_view(graph, &mut ranked, ranking, beside.view);
     // Last of the three. A template has no class body to write a block in, so this and the view
     // context never both have rows. What the order does state: the concern edge is already merged,
     // so a name a concern extends onto the class object is held against this like any name the
     // graph's own walk found.
-    add_closure(graph, &mut ranked, ranking, beside.closure.as_ref());
-    let truncated = take_best(&mut ranked, limit);
-    (spelled_out(graph, ranked), truncated)
+    add_closure(graph, &mut ranked, ranking, beside.closure);
+    Some(ranked)
 }
 
 /// The lists that join the graph's own answer before the cap.
@@ -468,10 +762,10 @@ fn from_graph(
 /// class body may run against. Resolution can ask each as a second question, because it takes one
 /// answer. Completion must **collect**, so they are merged into the ranked rows before `take_best`,
 /// not appended after it.
-struct Beside {
+struct Beside<'a> {
     extended: Option<Extended>,
-    view: Vec<views::Reached>,
-    closure: Option<InClosure>,
+    view: &'a [views::Reached],
+    closure: Option<&'a InClosure>,
 }
 
 /// What a bare word in a **template** can complete to.
@@ -487,9 +781,7 @@ fn in_view(sources: &Sources<'_>, uri_id: UriId, context: &Context) -> Vec<views
     if !matches!(context, Context::Expression | Context::Argument { .. }) {
         return Vec::new();
     }
-    sources
-        .views
-        .reachable(sources.graph, uri_id)
+    types::view_context(sources, uri_id)
         .map(|reachable| reachable.members(sources.graph))
         .unwrap_or_default()
 }
@@ -800,7 +1092,13 @@ impl Distance {
         match receiver {
             CompletionReceiver::MethodCall {
                 receiver_decl_id, ..
-            } => distance.chain(graph, *receiver_decl_id),
+            } => {
+                let past = distance.chain_from(graph, *receiver_decl_id, 0);
+                // `Object`'s chain after the module's own ([`objects_side`]).
+                if is_module(graph, *receiver_decl_id) {
+                    distance.chain_from(graph, DeclarationId::from("Object"), past);
+                }
+            }
             CompletionReceiver::NamespaceAccess {
                 namespace_decl_id, ..
             } => {
@@ -825,7 +1123,11 @@ impl Distance {
                 // lexical nesting, a walk outwards through owners. Both are seeded, so a class's
                 // own methods and its sibling constants are both near.
                 if let Some(id) = self_decl_id.or(nesting) {
-                    distance.chain(graph, id);
+                    let past = distance.chain_from(graph, id, 0);
+                    // `Object`'s chain after a module's own ([`objects_side`]).
+                    if is_module(graph, id) {
+                        distance.chain_from(graph, DeclarationId::from("Object"), past);
+                    }
                 }
                 if let Some(id) = nesting {
                     distance.chain(graph, id);
@@ -856,16 +1158,24 @@ impl Distance {
 
     /// Number one linearized ancestor chain, outwards from the receiver.
     fn chain(&mut self, graph: &Graph, id: DeclarationId) {
+        self.chain_from(graph, id, 0);
+    }
+
+    /// [`Self::chain`] numbered from `start`, answering the step after its last rung.
+    fn chain_from(&mut self, graph: &Graph, id: DeclarationId, start: usize) -> usize {
         let Some((_, namespace)) = namespace(graph, id) else {
-            return;
+            return start;
         };
-        for (step, ancestor) in namespace.ancestors().iter().enumerate() {
+        let mut next = start;
+        for ancestor in namespace.ancestors().iter() {
             // A rung rubydex could not linearize is still a rung: whatever lies past it is further
             // away, named or not.
             if let Ancestor::Complete(ancestor_id) = ancestor {
-                self.record(*ancestor_id, step);
+                self.record(*ancestor_id, next);
             }
+            next += 1;
         }
+        next
     }
 
     /// The one seed that is not a walk rubydex is about to make.
@@ -1960,15 +2270,214 @@ mod tests {
             "a derived row still gets its card: {derived}"
         );
         assert!(
-            !derived.contains("Matched on the method name"),
+            !derived.contains("Guessed from name alone"),
             "and must not be presented as a guess: {derived}"
         );
 
         let guessed = resolve(&mut harness, &guessed);
         assert!(
-            guessed.contains("Matched on the method name alone"),
+            guessed.contains("Guessed from name alone"),
             "a name-matched row has to say so: {guessed}"
         );
+    }
+
+    #[test]
+    fn a_local_completes_where_the_member_after_the_dot_is_already_written() {
+        // The receiver's variables are read in the repaired text, and blanking a written member's
+        // `.` there left `name upcase` or `name scan("a")`: a call to a method `name`, no local,
+        // and the name-based list (or none) at the commonest edit of a method name.
+        let (mut harness, uri) = with_types("");
+        for (marked, member) in [
+            ("name = \"hi\"\nname.~upcase\n", "upcase"),
+            ("name = \"hi\"\nname.up~case\n", "upcase"),
+            ("name = \"hi\"\nname.scan~(\"a\")\n", "scan"),
+            ("items = [1]\nitems.first~ do |i|\n  i\nend\n", "first"),
+            ("items = [1]\nitems.first~ { |i| i }\n", "first"),
+        ] {
+            let (labels, precise) = offered(&harness.complete(&uri, marked));
+            assert!(
+                precise && labels.iter().any(|label| label == member),
+                "{marked:?} offered {labels:?}, precise: {precise}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_union_offers_every_classs_members_each_marked_with_its_class() {
+        // A call on a union runs on each class that has the member (`types::narrowed`), so the
+        // list is every class's, and the detail says which. Before, a union offered nothing: the
+        // commonest receiver in a controller, `@invite = Invite.find(params[:id])`, is one.
+        let (mut harness, uri) = with_types("");
+        let answer = harness.complete(
+            &uri,
+            "class Cat\n  def speak = \"meow\"\n  def purr = 1\nend\n\
+             class Dog\n  def speak = \"woof\"\nend\n\
+             pet = rand ? Cat.new : Dog.new\npet.~\n",
+        );
+        let (labels, precise) = offered(&answer);
+        assert!(precise, "a union is typed, not the name list: {labels:?}");
+        let detail = |label: &str| {
+            let rows: Vec<&str> = answer["items"]
+                .as_array()
+                .expect("a list")
+                .iter()
+                .filter(|item| item["label"] == label)
+                .map(|item| item["detail"].as_str().unwrap_or("(none)"))
+                .collect();
+            rows.join(" / ")
+        };
+        assert_eq!(detail("purr"), "Cat#purr", "one class's member names it");
+        // Two classes declaring the name apart: one row, both named.
+        assert_eq!(detail("speak"), "Cat#speak | Dog#speak");
+        // Every object's member: one row, for one declaration.
+        assert_eq!(detail("tap"), "Kernel#tap");
+        // Each class's own members rank before what every object has, at the farthest chain's
+        // distance, not the nearest.
+        let at = |label: &str| labels.iter().position(|row| row == label).expect(label);
+        assert!(
+            at("purr") < at("tap") && at("speak") < at("tap"),
+            "{labels:?}"
+        );
+        // The case that needs it: `Kernel` is two steps from a `String` and five from `Deep`, and
+        // `Deep`'s inherited `ancient`, three steps out, still leads it.
+        let (labels, _) = offered(&harness.complete(
+            &uri,
+            "class Root\n  def ancient = 1\nend\nclass Mid < Root\nend\nclass Low < Mid\nend\n\
+             class Deep < Low\nend\n\
+             thing = rand ? Deep.new : \"x\"\nthing.~\n",
+        ));
+        let at = |label: &str| labels.iter().position(|row| row == label).expect(label);
+        assert!(at("ancient") < at("tap"), "{labels:?}");
+
+        // Literals too, and `nil` stays folded out, as for a `T?`.
+        let (labels, precise) =
+            offered(&harness.complete(&uri, "value = rand ? \"a\" : (rand ? 1 : nil)\nvalue.~\n"));
+        assert!(precise, "{labels:?}");
+        for member in ["upcase", "succ", "tap"] {
+            assert!(
+                labels.iter().any(|label| label == member),
+                "{member}: {labels:?}"
+            );
+        }
+        assert!(!labels.iter().any(|label| label == "nil?"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_modules_instance_lists_objects_members_after_its_own() {
+        // `self` in a module's `def` is some class's instance, and every class descends from
+        // `Object` (`types::member_of`): hover resolves `self.class` to `Kernel#class`, so the list
+        // offers `Object`'s members too, after the module's own, and a name the module defines
+        // stays the module's.
+        let (mut harness, uri) = with_types("");
+        let (labels, precise) = offered(&harness.complete(
+            &uri,
+            "module Cached\n  def key = 1\n  def run\n    self.~\n  end\nend\n",
+        ));
+        assert!(precise, "{labels:?}");
+        let at = |label: &str| labels.iter().position(|row| row == label).expect(label);
+        assert!(at("key") < at("tap") && at("run") < at("tap"), "{labels:?}");
+        let answer = harness.complete(
+            &uri,
+            "module Cached\n  def tap = 2\n  def run\n    self.~\n  end\nend\n",
+        );
+        let details: Vec<&str> = answer["items"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .filter(|item| item["label"] == "tap")
+            .map(|item| item["detail"].as_str().unwrap_or("(none)"))
+            .collect();
+        assert_eq!(details, ["Cached#tap"]);
+    }
+
+    #[test]
+    fn a_bare_word_in_a_rebound_block_lists_what_the_block_runs_against() {
+        // Hover asks a bare word on the `self` a signature gives the block first
+        // (`locator::rebound_call`); the list offers the same members, beside the lexical ones.
+        // RSpec's example groups and a concern's `included do` reach here the same way.
+        let mut harness = signed(
+            &[
+                ("core/core.rbs", TYPED_RBS),
+                (
+                    "core/app.rbs",
+                    "class Settings\n  def name: () -> String\nend\n\n\
+                     class App\n  def configure: () { () [self: Settings] -> void } -> void\nend\n",
+                ),
+            ],
+            "",
+        );
+        let uri = harness.write("lib/main.rb", "");
+        harness.index();
+        harness.index_gems();
+        let answer = harness.complete(&uri, "App.new.configure do\n  na~\nend\n");
+        let (labels, precise) = offered(&answer);
+        assert!(
+            precise && labels.iter().any(|label| label == "name"),
+            "{labels:?}"
+        );
+        let detail = answer["items"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .find(|item| item["label"] == "name")
+            .and_then(|item| item["detail"].as_str())
+            .map(str::to_owned);
+        assert_eq!(detail.as_deref(), Some("Settings#name"));
+        // Outside the block the lexical `self` alone answers.
+        let (labels, _) = offered(&harness.complete(&uri, "App.new.configure do\nend\nna~\n"));
+        assert!(!labels.iter().any(|label| label == "name"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_bare_word_in_a_modules_def_lists_objects_members_too() {
+        // The `.`-less half of the rule above: `format` in a helper module's `def` is
+        // `Kernel#format` on hover, so the list offers it, private as a bare word may call it.
+        let mut harness = signed(
+            &[
+                ("core/core.rbs", TYPED_RBS),
+                (
+                    "core/private.rbs",
+                    "module Kernel\n  private\n\n  def shout: () -> Integer\nend\n",
+                ),
+            ],
+            "",
+        );
+        let uri = harness.write("lib/main.rb", "");
+        harness.index();
+        harness.index_gems();
+        let fixture = "module Report\n  def row\n    ~\n  end\nend\n";
+        for (typed, member) in [("sh", "shout"), ("ta", "tap")] {
+            let (labels, precise) =
+                offered(&harness.complete(&uri, &fixture.replace('~', &format!("{typed}~"))));
+            assert!(
+                precise && labels.iter().any(|label| label == member),
+                "{typed}: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_union_wider_than_the_cap_is_declined_as_every_union_was() {
+        // `MAX_UNION_CLASSES` bounds the walks one keystroke makes: at the cap each class is
+        // listed, one past it the receiver is not typed and the name rung answers, as for every
+        // union before.
+        let (mut harness, uri) = with_types("");
+        let wide = |count: usize| {
+            let classes: String = (0..count)
+                .map(|at| format!("class C{at}\n  def own{at} = 1\nend\n"))
+                .collect();
+            let returns: String = (0..count)
+                .map(|at| format!("  return C{at}.new if rand\n"))
+                .collect();
+            format!("{classes}def pick\n{returns}  nil\nend\npick.~\n")
+        };
+        let (labels, precise) = offered(&harness.complete(&uri, &wide(MAX_UNION_CLASSES)));
+        assert!(
+            precise && labels.iter().any(|label| label == "own0"),
+            "{labels:?}"
+        );
+        let (labels, precise) = offered(&harness.complete(&uri, &wide(MAX_UNION_CLASSES + 1)));
+        assert!(!precise, "{labels:?}");
     }
 
     #[test]
@@ -2687,12 +3196,10 @@ end
     ///   `unlock` the name rung would add is gone), and the singleton's own are not.
     #[test]
     fn a_constant_that_holds_an_object_is_not_a_class_object() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let signatures = dir.path().join("sig");
-        std::fs::create_dir_all(signatures.join("core")).unwrap();
-        std::fs::write(
-            signatures.join("core/s.rbs"),
-            "module Vault
+        let mut harness = signed(
+            &[(
+                "core/s.rbs",
+                "module Vault
   module Store
     def unlock: () -> String
   end
@@ -2700,17 +3207,9 @@ end
 
              HOLDER: Vault::Store
 ",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("ya-lsp.toml"),
-            format!(
-                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
-                signatures.display().to_string()
-            ),
-        )
-        .unwrap();
-        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+            )],
+            "",
+        );
         let uri = harness.write(
             "app/main.rb",
             "class Decoy
@@ -2823,28 +3322,18 @@ end
         //
         // The fixture is `stdlib/securerandom/0/securerandom.rbs` written out: most `extend`s in
         // the vendored signatures are qualified, and this is the commonest.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let signatures = dir.path().join("sig");
-        std::fs::create_dir_all(signatures.join("core")).unwrap();
-        std::fs::write(
-            signatures.join("core/s.rbs"),
-            "module Random\n  module Formatter\n    def hex: (?Integer) -> String\n  end\nend\n\n\
+        let mut harness = signed(
+            &[(
+                "core/s.rbs",
+                "module Random\n  module Formatter\n    def hex: (?Integer) -> String\n  end\nend\n\n\
              module Joined::Deep\n  def joined: () -> String\nend\n\n\
              module Flat\n  def flat: () -> String\nend\n\n\
              module SecureRandom\n  extend Random::Formatter\nend\n\n\
              module JoinExt\n  extend Joined::Deep\nend\n\n\
              module FlatExt\n  extend Flat\nend\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("ya-lsp.toml"),
-            format!(
-                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
-                signatures.display().to_string()
-            ),
-        )
-        .unwrap();
-        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+            )],
+            "",
+        );
         // The same edge written in Ruby, which rubydex resolves itself and must keep resolving: the
         // repair must never be the only answer for a shape rubydex handles.
         harness.write(
@@ -2870,7 +3359,7 @@ end
                 "{needle} is still a candidate list: {found}"
             );
             assert!(
-                !found.contains("Matched on the method name alone"),
+                !found.contains("Guessed from name alone"),
                 "{needle} resolves rather than guessing: {found}"
             );
         }
@@ -2941,7 +3430,7 @@ end
             let found = card(&mut harness, &uri, source, needle);
             if !found.contains(owner)
                 || found.contains("possible definitions")
-                || found.contains("Matched on the method name alone")
+                || found.contains("Guessed from name alone")
             {
                 wrong.push(format!("{needle}: {found}"));
             }
@@ -2984,18 +3473,17 @@ end
         // `Widget#spin` is dropped.
         let narrowed = card(&mut harness, &uri, source, "spin\n");
         assert!(narrowed.contains("2 possible definitions"), "{narrowed}");
-        assert!(narrowed.contains("Gadget.spin"), "{narrowed}");
-        assert!(narrowed.contains("Spinner#spin"), "{narrowed}");
-        assert!(
-            !narrowed.contains("Widget#spin"),
-            "an instance method of an unrelated class is not reachable here: {narrowed}"
+        assert_eq!(
+            harness.candidates_at(&uri, source, "spin\n"),
+            ["Gadget.spin", "Spinner#spin"],
+            "an instance method of an unrelated class is not reachable here"
         );
 
-        // Never emptied. `whirl` is only a class's instance method, and where the graph holds only
-        // those, a guess is still the honest answer.
-        let kept = card(&mut harness, &uri, source, "whirl");
-        assert!(kept.contains("Widget#whirl"), "{kept}");
-        assert!(kept.contains("Matched on the method name alone"), "{kept}");
+        // Emptied where that is the truth. `whirl` is only another class's instance method, which
+        // `Story`'s class object cannot reach, so there is no card rather than a guess that is
+        // never right: a `Settings::General.app_domain` landed on a configuration setting.
+        let emptied = harness.hover_at(&uri, source, "whirl");
+        assert!(emptied.is_null(), "{emptied}");
     }
 
     #[test]
@@ -3086,7 +3574,7 @@ end
         // resolve, precisely, to a method Ruby raises on.
         let found = card(&mut harness, &uri, source, "valid?");
         assert!(
-            found.contains("Matched on the method name alone"),
+            found.contains("Guessed from name alone"),
             "the name rung is the honest answer here: {found}"
         );
 
@@ -3259,11 +3747,7 @@ end
             .unwrap_or_default()
             .to_owned();
         assert!(
-            card.contains("in `class_methods do` in `Tallyable`, which `Ledger` includes"),
-            "the card says which concern installed it and onto what: {card}"
-        );
-        assert!(
-            !card.contains("Matched on the method name alone"),
+            !card.contains("Guessed from name alone"),
             "not the name rung: {card}"
         );
     }
@@ -3406,9 +3890,38 @@ end
         );
         harness.watch(&[&model]);
 
+        // The table's members include what Rails' attribute methods define around each column
+        // (`x=`, `x?`, `x_changed?`, `x_was`, `saved_change_to_x?`), from the same schema line.
         assert_eq!(
             harness.declarations_at(&uri, "Story.new.~\n"),
-            vec!["summary", "description", "id", "tags", "title", "tap"]
+            vec![
+                "summary",
+                "description",
+                "description=",
+                "description?",
+                "description_changed?",
+                "description_was",
+                "id",
+                "id=",
+                "id?",
+                "id_changed?",
+                "id_was",
+                "saved_change_to_description?",
+                "saved_change_to_id?",
+                "saved_change_to_tags?",
+                "saved_change_to_title?",
+                "tags",
+                "tags=",
+                "tags?",
+                "tags_changed?",
+                "tags_was",
+                "title",
+                "title=",
+                "title?",
+                "title_changed?",
+                "title_was",
+                "tap"
+            ]
         );
     }
 
@@ -3675,7 +4188,7 @@ end
         //
         // The two bodies nest, so the innermost decides. Reading the innermost `def`
         // unconditionally would offer the base's instance members and not the DSL, which is why
-        // anyone writes the block (seen on chatwoot at a `define_method` inside one, where the list
+        // anyone writes the block (seen in a corpus at a `define_method` inside one, where the list
         // was a single row: `define_singleton_method`, from `Object`).
         const ANONYMOUS: &str = "\
 class Base
@@ -3863,9 +4376,7 @@ end
 
         assert_eq!(
             card(&mut harness, &uri, &source, "secret\n"),
-            "```ruby\nprivate Base#secret\n```\n\n*Found on an instance of `Parser` — `self` in \
-             a block written into a class body is the class object unless whoever takes the \
-             block re-binds it, and this name is only on an instance.*"
+            "```ruby\nprivate Base#secret\n```"
         );
         assert_eq!(
             card(&mut harness, &uri, &source, "shared\n"),
@@ -4292,20 +4803,11 @@ thing.zebra    1: zebra_stripe"
         // of the lists built the same way.
         //
         // It gates that arm only: a receiver the graph can name is not a guess.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let signatures = dir.path().join("sig");
-        std::fs::create_dir_all(signatures.join("core")).unwrap();
-        std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
-        std::fs::write(
-            dir.path().join("ya-lsp.toml"),
-            format!(
-                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n\n\
+        let mut off = signed(
+            &[("core/core.rbs", TYPED_RBS)],
+            "\n\
                  [types]\nguess_from_names = false\n",
-                signatures.display().to_string()
-            ),
-        )
-        .unwrap();
-        let mut off = Harness::at(dir, PositionEncoding::Utf16);
+        );
         let uri = off.write("lib/main.rb", "");
         off.index();
         off.index_gems();
@@ -4522,12 +5024,8 @@ end
             .to_owned();
         assert!(card.contains("Person#shout"), "{card}");
         assert!(
-            card.contains("Type guessed from the name `person` alone"),
-            "{card}"
-        );
-        assert!(
-            !card.contains("Matched on the method name alone"),
-            "the rows are a real class's members, and this is the other guess: {card}"
+            card.contains("Guessed from name alone"),
+            "the rows are a real class's members, and the class was a guess: {card}"
         );
     }
 }

@@ -86,9 +86,9 @@ COLUMN_SQL = re.compile(r"^\s{4}([a-z_][A-Za-z0-9_]*)\s+[a-zA-Z]", re.M)
 WORD = re.compile(r"[a-z_][A-Za-z0-9_]*")
 ASSIGNED = re.compile(r"^[ \t]*([a-z_][A-Za-z0-9_]*)\s*(?:\|\||&&)?=[^=~]", re.M)
 BLOCK_PARAMS = re.compile(r"\|([^|\n]*)\|")
-# `(?![?!])` drops `deleted_at?`: the predicate is a different generated name from the column, and
-# the cursor would land inside a token this key did not claim.
-BARE_READ = re.compile(r"(?<![.:@$\w])([a-z_][A-Za-z0-9_]*)(?![\w:(?!])")
+# `\??` takes `deleted_at?` whole, a name this key claims for every column (`build`). A `!` after
+# the name still drops the match: that is another method, which this key does not claim.
+BARE_READ = re.compile(r"(?<![.:@$\w])([a-z_][A-Za-z0-9_]*\??)(?![\w:(?!])")
 
 IRREGULAR = {"person": "people", "man": "men", "woman": "women", "child": "children",
              "foot": "feet", "tooth": "teeth", "goose": "geese", "mouse": "mice",
@@ -271,6 +271,9 @@ def build(corpus):
         names = macro_names(text)
         for column in tables.get(pluralize(underscore(klass)), set()):
             names.setdefault(column, "column")
+            # Rails' query method, which it defines for every column, not only a boolean one. The
+            # admissible places are the column's own.
+            names.setdefault(column + "?", "predicate")
         if not names:
             continue
         # Anything the model writes a `def` for is a plain method: the neutral key's scale, not this
@@ -350,8 +353,7 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
         rung = tier(card)
         if card:
             counts["card"] += 1
-            # The tier *is* the hedge. A Derived or Guessed card says it followed something; a
-            # Resolved one asserts. Reading `answers.tier`, not a list of hedge strings, keeps one
+            # The tier *is* the hedge. A Guessed card says it is one; any other card asserts. Reading `answers.tier`, not a list of hedge strings, keeps one
             # definition of the tier in this harness.
             if rung != "resolved":
                 counts["hedged"] += 1

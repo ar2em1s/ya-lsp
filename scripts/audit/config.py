@@ -21,7 +21,7 @@ SERVER_TOML = Path(__file__).resolve().parent / "server.toml"
 #   it is a decision of its own, with its own reason.
 # - **A check that costs more than about a minute takes a fixed subset**, not a bigger budget.
 #   `lane2.references.STRIDE` is that subset, for checks 7 and 9.
-# - **Memory is the cost this cannot see.** Check 7's places sit in one `answers` map for a whole
+# - **Memory is the cost this cannot see.** Check 6's places sit in one `answers` map for a whole
 #   corpus.
 #
 # The sum of `QUEUE_WEIGHT` is the last serial sweep's cost. Compare it with this.

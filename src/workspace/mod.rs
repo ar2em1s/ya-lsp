@@ -2,11 +2,17 @@
 
 pub mod bundler;
 pub mod config;
+pub mod defines;
+pub mod factories;
 pub mod features;
 pub mod gems;
+pub mod i18n;
+pub mod mixins;
 pub mod rails;
 pub mod rbs;
+pub mod rspec;
 pub mod ruby_version;
+pub mod singletons;
 pub mod uri;
 
 use std::path::{Path, PathBuf};
@@ -141,6 +147,12 @@ impl Workspace {
     pub fn gems(&mut self) -> &Gems {
         self.gems
             .get_or_insert_with(|| gems::discover(&self.root, &self.config.gems, &self.env))
+    }
+
+    /// The gems discovery found, where it has run: none before the first [`Self::gems`].
+    #[must_use]
+    pub fn gems_found(&self) -> &[Gem] {
+        self.gems.as_ref().map_or(&[], |gems| gems.gems.as_slice())
     }
 
     /// Find Ruby's own signatures, once. Cached until the configuration reloads.
@@ -685,8 +697,8 @@ mod tests {
 
     #[test]
     fn no_ignore_file_hides_a_file_any_more_wherever_it_is_written() {
-        // **Why ignore files are not read**: a `.gitignore` can name a **tracked** file. Lobsters'
-        // names `app/views/about/about.*`, which the project ships and a deployment replaces.
+        // **Why ignore files are not read**: a `.gitignore` can name a **tracked** file. One
+        // corpus's names `app/views/about/about.*`, which the project ships and a deployment replaces.
         // Honouring it would leave the template answering nothing, and a rename of a constant it
         // uses would leave it behind: the outcome `renaming.md` exists to prevent.
         //

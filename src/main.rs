@@ -19,6 +19,13 @@ ya-lsp — a standalone Ruby language server
 
 USAGE:
     ya-lsp [--stdio]
+    ya-lsp coverage [DIR]
+
+COMMANDS:
+    coverage [DIR] Index the project at DIR (the current directory by default) with its gems, and
+                   print what share of the calls its own code makes ya-lsp can type: 2,000 calls
+                   sampled, with the sample's 95% error. Test and migration folders are left out,
+                   as ya-lsp.toml's [trees] says. Progress goes to stderr, the result to stdout.
 
 OPTIONS:
     --stdio        Communicate over stdin/stdout (the default, and currently the only transport).
@@ -34,8 +41,33 @@ ENVIRONMENT:
 
 fn main() -> ExitCode {
     let mut stdio = false;
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
 
-    for argument in std::env::args().skip(1) {
+    // A command, not a server: it indexes the project itself and prints one line. Logs only where
+    // YA_LSP_LOG asks for them, so progress is the whole of stderr otherwise.
+    if let Some(("coverage", rest)) = arguments
+        .split_first()
+        .map(|(first, rest)| (first.as_str(), rest))
+    {
+        if let Ok(filter) = std::env::var("YA_LSP_LOG") {
+            let (sinks, _) = ya_lsp::logging::install(Some(filter));
+            tracing_subscriber::registry().with(sinks).init();
+        }
+        let terminal = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let measured = ya_lsp::analysis::coverage::command(
+            rest,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+            terminal,
+        );
+        return if measured {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    for argument in arguments {
         match argument.as_str() {
             "--stdio" => stdio = true,
             "-V" | "--version" => {

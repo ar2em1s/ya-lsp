@@ -2,7 +2,7 @@
   "name": "yalsp",
   "displayName": "ya-lsp",
   "description": "A standalone Ruby language server. No Ruby runtime required.",
-  "version": "0.6.0",
+  "version": "1.0.0",
   "license": "MIT",
   "icon": "images/logo.png",
   "publisher": "ar2em1s",
@@ -207,6 +207,13 @@
             "markdownDescription": "Read a Sorbet `sig` and a YARD `@return` as the type they declare, where the Ruby itself cannot say. Off, a method annotated and not signed hovers as unknown. Overridden by `[types] annotations` in a workspace `ya-lsp.toml`.",
             "scope": "resource",
             "order": 3
+          },
+          "ya-lsp.types.factories": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Read FactoryBot factories, so `create(:user)` hovers and completes as a `User`. Overridden by `[types] factories` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 4
           }
         }
       },
@@ -528,8 +535,74 @@
         }
       },
       {
-        "title": "Trees",
+        "title": "RSpec",
         "order": 8,
+        "properties": {
+          "ya-lsp.rspec.enabled": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "on",
+              "off"
+            ],
+            "enumDescriptions": [
+              "On when Gemfile.lock locks rspec-core.",
+              "Always on, for a project detection does not recognise.",
+              "Never. Nothing in this project is read as RSpec."
+            ],
+            "default": "auto",
+            "markdownDescription": "Read RSpec's example groups, so inside an `it` a `let(:user) { create(:user) }` completes and hovers as what its block returns, `described_class` and `subject` are typed, and a hook's `self` is the example. Overridden by `[rspec] enabled` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 1
+          }
+        }
+      },
+      {
+        "title": "Translations (i18n)",
+        "order": 9,
+        "properties": {
+          "ya-lsp.i18n.enabled": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "on",
+              "off"
+            ],
+            "enumDescriptions": [
+              "On when Gemfile.lock locks i18n.",
+              "Always on, for a project detection does not recognise.",
+              "Never. No locale file is read."
+            ],
+            "default": "auto",
+            "markdownDescription": "Read the project's locale files, so `t(\"users.show.title\")` completes its keys, hovers with the translation, jumps to the line in the YAML file, and is typed by what the key holds (a `String`, a `Hash` for a subtree). Overridden by `[i18n] enabled` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 1
+          },
+          "ya-lsp.i18n.locale": {
+            "type": "string",
+            "default": "en",
+            "markdownDescription": "The one locale ya-lsp reads: completion lists its keys, hover shows its text, and a jump goes to its file. What other locales hold is not read. Overridden by `[i18n] locale` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 2
+          },
+          "ya-lsp.i18n.paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "**/config/locales/**/*.yml",
+              "**/config/locales/**/*.rb"
+            ],
+            "markdownDescription": "Globs, relative to the workspace, of the project's own locale files. This **replaces** the built-in list; the gems' locale files are read either way. A key read from these files is typed as they say, so leaving out a file that redefines one can give a wrong type. Overridden by `[i18n] paths` in a workspace `ya-lsp.toml`.",
+            "scope": "resource",
+            "order": 3
+          }
+        }
+      },
+      {
+        "title": "Trees",
+        "order": 10,
         "properties": {
           "ya-lsp.trees.test": {
             "type": "array",
@@ -572,7 +645,7 @@
       },
       {
         "title": "Indexing",
-        "order": 9,
+        "order": 11,
         "properties": {
           "ya-lsp.index.include": {
             "type": "array",

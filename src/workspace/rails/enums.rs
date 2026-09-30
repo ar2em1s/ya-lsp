@@ -34,9 +34,9 @@
 use ruby_prism::{AssocNode, CallNode, Node};
 
 use super::inflect::pluralize;
-use super::relation_of;
 use super::relations::Chained;
 use super::syntax::{header, symbol_or_string};
+use crate::generated::collection_of;
 use crate::generated::{Declared, Facts, Owner, Source};
 
 /// One attribute one `enum` call declares.
@@ -333,6 +333,7 @@ impl Enum {
             at: whole,
             from: Source::Enum,
             overloads: Vec::new(),
+            private: false,
         });
         facts.declare(Declared {
             owner: instance.clone(),
@@ -346,6 +347,7 @@ impl Enum {
             at: whole,
             from: Source::Enum,
             overloads: Vec::new(),
+            private: false,
         });
         // `singleton_class.define_method(name.pluralize) { enum_values }`. The real class is
         // `ActiveSupport::HashWithIndifferentAccess`, which a project without Rails in its bundle
@@ -363,6 +365,7 @@ impl Enum {
             at: whole,
             from: Source::Enum,
             overloads: Vec::new(),
+            private: false,
         });
 
         for label in &self.labels {
@@ -380,6 +383,7 @@ impl Enum {
                     at,
                     from: Source::Enum,
                     overloads: Vec::new(),
+                    private: false,
                 });
                 facts.declare(Declared {
                     owner: instance.clone(),
@@ -393,6 +397,7 @@ impl Enum {
                     at,
                     from: Source::Enum,
                     overloads: Vec::new(),
+                    private: false,
                 });
             }
             if !(self.scopes && relation) {
@@ -414,7 +419,7 @@ impl Enum {
                     Declared {
                         owner: singleton.clone(),
                         name,
-                        returns: relation_of(class),
+                        returns: collection_of(class),
                         parameters: "()".to_owned(),
                         because: format!(
                             "From `{file}`, `enum :{}`: every record whose `{}` {sense} `{}`.",
@@ -423,6 +428,7 @@ impl Enum {
                         at,
                         from: Source::Enum,
                         overloads: Vec::new(),
+                        private: false,
                     },
                 );
             }
@@ -492,7 +498,7 @@ class Story
   # From `app/models/story.rb`, `enum :status`. The label, not the stored value.
   def status: () -> String?
   # From `app/models/story.rb`, `enum :status`. Takes a label or the value behind it.
-  def status=: (untyped) -> untyped
+  def status=: (untyped value) -> untyped
   # From `app/models/story.rb`, `enum :status`. Every label, and the value it stores.
   def self.statuses: () -> Hash[String, untyped]
   # From `app/models/story.rb`, `enum :status`, value `draft`.
@@ -878,11 +884,8 @@ end
         assert!(harness.has("Article::<Article>#not_published()"));
 
         let value = card(&mut harness, &uri, caller, "published?");
-        assert!(
-            value.contains("`enum :status`, value `published`"),
-            "{value}"
-        );
-        assert!(!value.contains("guessed from the name"), "{value}");
+        assert!(value.contains("Article#published? -> bool"), "{value}");
+        assert!(!value.contains("Guessed from name alone"), "{value}");
 
         // It answers `bool`, which a hover card cannot show: no card prints a return type, and
         // `bool` is `true | false`, a union `class_of` declines. So it is read off the document the
@@ -965,7 +968,7 @@ end
         );
         // Scoped to the class that wrote the `enum`, so another table's `status` is untouched.
         let widget = card(&mut harness, &uri, source, "status");
-        assert!(widget.contains("`enum :status`"), "{widget}");
+        assert!(widget.contains("Story#status -> String?"), "{widget}");
         assert!(harness.has("Widget#status()"));
     }
 }

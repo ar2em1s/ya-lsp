@@ -8,15 +8,15 @@
 //! Everything here is pure formatting, shared by `hover` and `documentSymbol` so the two never
 //! disagree about what a construct is called.
 
-use super::types;
+use super::{cursor::ParameterSlot, synthesized::GENERATED_SCHEME, types};
 use rubydex::model::{
     comment::Comment,
-    declaration::{Declaration, Namespace},
+    declaration::{Ancestor, Declaration, Namespace},
     definitions::{Parameter, Signatures},
     graph::Graph,
     ids::DeclarationId,
 };
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::OnceLock};
 
 /// A **type** as a reader sees it, which is not the same as a class name.
 ///
@@ -42,21 +42,57 @@ use std::borrow::Cow;
 /// `(String | Integer)?` are the same type, and the first needs no brackets in a margin with no
 /// room for them.
 ///
+/// **A union holding a class that every other member inherits from is spelled as that class**
+///. stdlib's `URI.parse` returns ten classes, `URI::Generic` and nine of its
+/// subclasses, and every value it answers is a `URI::Generic`. The label says that; the type
+/// itself keeps every member, so a call reaches the members only a subclass has.
+///
 /// `None` where any class is not a class (a name resolving to something else, or one of the query
 /// interface's two sentinels): the gate a margin has always applied, and why a raw rubydex key
 /// never reaches a reader.
 #[must_use]
 pub fn typed(graph: &Graph, typed: &types::Typed) -> Option<String> {
-    let mut spelled = Vec::with_capacity(typed.classes().len());
-    for id in typed.classes() {
+    label(graph, typed, false)
+}
+
+/// A method's return as a label, marked `!` where the method's own body writes `raise` or `fail`
+/// (`cursor::raises_in`).
+///
+/// **The mark sits where `?` does** (decided 2026-09-25), after it: `String!`, `String?!`,
+/// `Article?! | Article:class`. It is the method's, not the value's, so only a return is spelled
+/// with it: a variable holding what the method returned is spelled by [`typed`].
+#[must_use]
+pub fn returned(graph: &Graph, typed: &types::Typed, raises: bool) -> Option<String> {
+    label(graph, typed, raises)
+}
+
+fn label(graph: &Graph, typed: &types::Typed, raises: bool) -> Option<String> {
+    let shared = common_superclass(graph, typed.classes());
+    let classes = shared.as_slice();
+    let classes = if classes.is_empty() {
+        typed.classes()
+    } else {
+        classes
+    };
+    let mut spelled = Vec::with_capacity(classes.len());
+    for id in classes {
         let declaration = graph.declarations().get(id)?;
-        if !matches!(
-            declaration,
-            Declaration::Namespace(Namespace::Class(_) | Namespace::Module(_))
-        ) {
+        let name = match declaration {
+            Declaration::Namespace(Namespace::Class(_) | Namespace::Module(_)) => {
+                qualified_name(graph, declaration.name())
+            }
+            Declaration::Namespace(Namespace::SingletonClass(_)) => {
+                class_object(graph, declaration)?
+            }
+            _ => return None,
+        };
+        // A class declared inside `class << self` is filed under a singleton segment
+        // (`Orchestrator::<Orchestrator>::Params`), a name neither Ruby nor RBS can write. A label
+        // must be one a reader can type.
+        if name.contains('<') {
             return None;
         }
-        spelled.push(qualified_name(graph, declaration.name()));
+        spelled.push(name);
     }
     // Wherever the name stands, not only at the head: `TrueClass` is the carrier the boolean fold
     // leaves, and a union can put it anywhere (`bool | String` is one exit that answered a
@@ -74,13 +110,79 @@ pub fn typed(graph: &Graph, typed: &types::Typed) -> Option<String> {
         *name = word.to_owned();
     }
     let (head, rest) = spelled.split_first()?;
-    let mark = if typed.nilable { "?" } else { "" };
-    let mut label = format!("{head}{}{mark}", held_by(graph, typed));
+    let nil = if typed.nilable { "?" } else { "" };
+    let raise = if raises { "!" } else { "" };
+    // What a union's head holds is that member's, not the shared class's. A bound `Method` holds
+    // the method it runs, which is what a reader wants of it: `Method[Widget#shout]`.
+    let held = if shared.is_some() {
+        String::new()
+    } else if let Some(method) = typed
+        .bound_method()
+        .and_then(|method| graph.declarations().get(&method))
+    {
+        format!("[{}]", qualified_name(graph, method.name()))
+    } else {
+        held_by(graph, typed)
+    };
+    let mut label = format!("{head}{held}{nil}{raise}");
     for other in rest {
         label.push_str(" | ");
         label.push_str(other);
     }
     Some(label)
+}
+
+/// The member of a union every other member inherits from, where there is one.
+///
+/// Only a class, only a union, and only ancestry rubydex completed: a partial chain may hide the
+/// link, and then the union is spelled whole. Never `Object` or `BasicObject`: every class inherits
+/// them, so `String | Object` spelled `Object` would say nothing about the `String`.
+fn common_superclass(graph: &Graph, classes: &[DeclarationId]) -> Option<DeclarationId> {
+    if classes.len() < 2 {
+        return None;
+    }
+    let inherits = |class: &DeclarationId, from: &DeclarationId| {
+        graph
+            .declarations()
+            .get(class)
+            .and_then(Declaration::as_namespace)
+            .is_some_and(|namespace| {
+                namespace
+                    .ancestors()
+                    .iter()
+                    .any(|ancestor| matches!(ancestor, Ancestor::Complete(id) if id == from))
+            })
+    };
+    classes.iter().copied().find(|candidate| {
+        matches!(
+            graph.declarations().get(candidate),
+            Some(declaration @ Declaration::Namespace(Namespace::Class(_)))
+                if !matches!(declaration.name(), "Object" | "BasicObject")
+        ) && classes
+            .iter()
+            .all(|other| other == candidate || inherits(other, candidate))
+    })
+}
+
+/// A **class object**'s type, spelled `Foo:class`: what `Foo` and `foo.class` are.
+///
+/// - **Why this spelling** (decided 2026-09-24): rubydex's name is `Foo::<Foo>` and RBS's is
+///   `singleton(Foo)`. `Foo:class` reads as "the class `Foo` itself", beside `Foo` for one of its
+///   instances.
+/// - **A named class's own singleton only.** A module object, a singleton's singleton, and a class
+///   nothing named answer `None`, as every name this module cannot spell does.
+///
+/// Spelled first, then taken apart (`navigation.md`): an anonymous class spells as `Class.new`, which
+/// declares nothing, so it answers `None` here instead of a label for a class nobody named.
+fn class_object(graph: &Graph, declaration: &Declaration) -> Option<String> {
+    let spelled = spelled(graph, declaration.name());
+    let attached = class_object_of(&spelled)?;
+    let class = types::declared(graph, attached)?;
+    matches!(
+        graph.declarations().get(&class),
+        Some(Declaration::Namespace(Namespace::Class(_)))
+    )
+    .then(|| format!("{attached}:class"))
 }
 
 /// What the head was written holding: `[String]` of an `Array[String]`, and `""` for the vast
@@ -126,24 +228,67 @@ fn held_by(graph: &Graph, typed: &types::Typed) -> String {
 ///
 /// The graph is here for the other name rubydex invents: an anonymous `Class.new`, keyed by number,
 /// which must be looked up before it can be spelled. See [`spelled`].
+///
+/// **A namespace a body of knowledge invented is spelled as it says** ([`shown_as`]):
+/// `ActiveRecordRelation#where` is `ActiveRecord::Relation#where`, and a route helper, whose module
+/// Rails never names, is `story_path` alone.
 #[must_use]
 pub fn qualified_name(graph: &Graph, name: &str) -> String {
     let name = &*spelled(graph, name);
     let Some((owner, method)) = name.rsplit_once('#') else {
-        return name.to_owned();
+        return shown_as(graph, name)
+            .filter(|shown| !shown.is_empty())
+            .map_or_else(|| name.to_owned(), str::to_owned);
     };
     let method = method.strip_suffix("()").unwrap_or(method);
 
-    match singleton_parts(owner) {
+    let (owner, separator) = match singleton_parts(owner) {
         // The path, not the last segment: an instance method of `Foo::Bar` is `Foo::Bar#baz`, so
         // its singleton method must be `Foo::Bar.baz`, not `Bar.baz`. Only a top-level class has no
         // path, and there `singleton` is the whole name.
-        Some((prefix, singleton)) => {
-            let owner = if prefix.is_empty() { singleton } else { prefix };
-            format!("{owner}.{method}")
-        }
-        None => format!("{owner}#{method}"),
+        Some((prefix, singleton)) => (if prefix.is_empty() { singleton } else { prefix }, '.'),
+        None => (owner, '#'),
+    };
+    match shown_as(graph, owner) {
+        Some("") => method.to_owned(),
+        Some(shown) => format!("{shown}{separator}{method}"),
+        None => format!("{owner}{separator}{method}"),
     }
+}
+
+/// What a reader sees in place of `namespace`, where a body of knowledge invented it
+/// ([`Knowledge::shown`](crate::knowledge::Knowledge::shown)): the class Ruby really builds, or `""`
+/// where the object has no name and a member stands alone.
+///
+/// **Only where every definition of the name is generated.** A project that declares the name
+/// itself meant something by it, and the generator then writes nothing there (the collision rule
+/// in `workspace/rails/`), so its class is spelled as written.
+fn shown_as(graph: &Graph, namespace: &str) -> Option<&'static str> {
+    let (_, shown) = invented()
+        .iter()
+        .find(|(invented, _)| *invented == namespace)?;
+    let definitions = graph
+        .declarations()
+        .get(&DeclarationId::from(namespace))?
+        .definitions();
+    let generated = definitions.iter().all(|id| {
+        graph
+            .definitions()
+            .get(id)
+            .and_then(|definition| graph.documents().get(definition.uri_id()))
+            .is_some_and(|document| document.uri().starts_with(GENERATED_SCHEME))
+    });
+    (generated && !definitions.is_empty()).then_some(*shown)
+}
+
+/// Every name the build's bodies of knowledge invent, with what a reader sees for it.
+///
+/// A constant of the build, not of one server: the registry is the same list everywhere
+/// (`Analysis::registered`), and each module's table is `'static`. Read once, on the first name
+/// spelled.
+fn invented() -> &'static [(&'static str, &'static str)] {
+    static INVENTED: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+    INVENTED.get_or_init(|| super::Analysis::registered().shown())
 }
 
 /// Split a declaration name into the pair a symbol list shows: the label, and the container printed
@@ -330,21 +475,32 @@ pub fn last_segment(name: &str) -> &str {
     simple_name(tail)
 }
 
-/// A method's parameter list, rendered as Ruby: `(volume = ..., *rest, sep:, **opts, &blk)`.
+/// A method's parameter list, rendered as Ruby: `(volume = 10, *rest, sep:, **opts, &blk)`.
 ///
-/// Empty for a method taking nothing, so `Person#shout` reads the way it is called. Default
-/// *values* are not available (rubydex records that a parameter is optional, not what it defaults
-/// to), so `= ...` stands in for the expression.
+/// Empty for a method taking nothing, so `Person#shout` reads the way it is called.
+///
+/// **A default is printed as the `def` writes it** where `written` holds it
+/// ([`types::written_defaults`]) and it fits on the line ([`LONGEST_DEFAULT`], one line). Anywhere
+/// else `= ...` stands in: rubydex records that a parameter is optional, not what it defaults to,
+/// and RBS writes no default at all.
 #[must_use]
-pub fn parameter_list(graph: &Graph, signatures: &Signatures) -> String {
+pub fn parameter_list(
+    graph: &Graph,
+    signatures: &Signatures,
+    written: &[(ParameterSlot, String)],
+) -> String {
     // Ruby has exactly one signature per method; overloads only come from RBS.
     signatures
         .as_slice()
         .first()
         .map_or_else(String::new, |signature| {
-            signature_label(graph, "", signature).label
+            labelled(graph, "", signature, written).label
         })
 }
+
+/// The longest default a signature line prints, in characters. A longer one is `...`: the line is
+/// the method's shape, and a default that needs a reader's attention is in the `def`.
+const LONGEST_DEFAULT: usize = 32;
 
 /// A method's signature as Ruby, and where inside it each parameter was written.
 ///
@@ -360,6 +516,16 @@ pub fn parameter_list(graph: &Graph, signatures: &Signatures) -> String {
 /// (`def приветствие(имя)` is legal), so the two counts really differ.
 #[must_use]
 pub fn signature_label(graph: &Graph, name: &str, signature: &[Parameter]) -> Signature {
+    labelled(graph, name, signature, &[])
+}
+
+/// [`signature_label`], with the defaults a `def` writes ([`parameter_list`]).
+fn labelled(
+    graph: &Graph,
+    name: &str,
+    signature: &[Parameter],
+    written: &[(ParameterSlot, String)],
+) -> Signature {
     let mut label = name.to_owned();
     let mut at = utf16_len(name);
     if signature.is_empty() {
@@ -372,12 +538,31 @@ pub fn signature_label(graph: &Graph, name: &str, signature: &[Parameter]) -> Si
     let mut parameters = Vec::with_capacity(signature.len());
     label.push('(');
     at += 1;
+    // [`ParameterSlot::Positional`] counts required then optional positionals, as the `def`'s
+    // defaults were keyed.
+    let mut positional = 0;
     for (index, parameter) in signature.iter().enumerate() {
         if index > 0 {
             label.push_str(", ");
             at += 2;
         }
-        let written = spell(graph, parameter);
+        let name = graph
+            .strings()
+            .get(parameter.inner().str())
+            .map_or_else(String::new, |string| string.as_str().to_owned());
+        let slot = match parameter {
+            Parameter::RequiredPositional(_) | Parameter::OptionalPositional(_) => {
+                positional += 1;
+                Some(ParameterSlot::Positional(positional - 1))
+            }
+            Parameter::OptionalKeyword(_) => Some(ParameterSlot::Keyword(name.clone())),
+            _ => None,
+        };
+        let default = slot
+            .and_then(|slot| written.iter().find(|(held, _)| *held == slot))
+            .map(|(_, text)| text.as_str())
+            .filter(|text| !text.contains('\n') && text.chars().count() <= LONGEST_DEFAULT);
+        let written = spell(parameter, name, default);
         let width = utf16_len(&written);
         parameters.push((at, at + width));
         label.push_str(&written);
@@ -396,18 +581,15 @@ pub struct Signature {
     pub parameters: Vec<(u32, u32)>,
 }
 
-/// One parameter, as Ruby writes it.
-fn spell(graph: &Graph, parameter: &Parameter) -> String {
-    let name = graph
-        .strings()
-        .get(parameter.inner().str())
-        .map_or_else(String::new, |string| string.as_str().to_owned());
+/// One parameter, as Ruby writes it, with its default where the `def`'s text gave one.
+fn spell(parameter: &Parameter, name: String, default: Option<&str>) -> String {
+    let default = default.unwrap_or("...");
     match parameter {
         Parameter::RequiredPositional(_) | Parameter::Post(_) => name,
-        Parameter::OptionalPositional(_) => format!("{name} = ..."),
+        Parameter::OptionalPositional(_) => format!("{name} = {default}"),
         Parameter::RestPositional(_) => sigil("*", &name),
         Parameter::RequiredKeyword(_) => format!("{name}:"),
-        Parameter::OptionalKeyword(_) => format!("{name}: ..."),
+        Parameter::OptionalKeyword(_) => format!("{name}: {default}"),
         Parameter::RestKeyword(_) => sigil("**", &name),
         Parameter::Block(_) => sigil("&", &name),
         Parameter::Forward(_) => "...".to_owned(),
@@ -449,6 +631,10 @@ pub fn documentation(comments: &[Comment]) -> Option<String> {
     // untouched.
     let leading = lines.iter().take_while(|line| is_directive(line)).count();
     lines.drain(..leading);
+    // RDoc's note of the file a comment was extracted from, as one HTML comment on its own line:
+    // `<!-- rdoc-file=string.rb -->` above most of Ruby's own class docs. A reader never sees it in
+    // RDoc's output, and escaped here it would be the card's first line.
+    lines.retain(|line| !is_rdoc_file(line));
 
     let call_seq = take_rdoc_header(&mut lines);
 
@@ -467,6 +653,13 @@ pub fn documentation(comments: &[Comment]) -> Option<String> {
         return Some(body);
     }
     Some(format!("```ruby\n{}\n```\n\n{body}", call_seq.join("\n")))
+}
+
+/// `<!-- rdoc-file=hash.c -->`, the whole line: where RDoc read a comment from, which the
+/// multi-line header [`take_rdoc_header`] reads carries inside it instead.
+fn is_rdoc_file(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("<!-- rdoc-file=") && line.ends_with("-->")
 }
 
 /// RDoc's markup, as markdown a client will actually render.
@@ -1028,6 +1221,49 @@ Option examples:
     }
 
     #[test]
+    fn an_invented_name_is_shown_as_its_body_of_knowledge_says_only_where_it_is_generated() {
+        // Where the graph holds no such namespace, or holds one no generator wrote (here, with no
+        // definition at all), the name is the project's own and is spelled as written. A generated
+        // one is spelled as its table says: the relations, route and view tests reach that half.
+        assert_eq!(
+            qualified_name(&no_graph(), "RouteHelpers#story_path()"),
+            "RouteHelpers#story_path"
+        );
+        let declared = graph_holding(
+            "ActiveRecordRelation",
+            Namespace::Class(Box::new(ClassDeclaration::new(
+                "ActiveRecordRelation".to_owned(),
+                DeclarationId::from("Object"),
+            ))),
+        );
+        assert_eq!(
+            qualified_name(&declared, "ActiveRecordRelation#where()"),
+            "ActiveRecordRelation#where"
+        );
+        assert_eq!(
+            qualified_name(&declared, "ActiveRecordRelation"),
+            "ActiveRecordRelation"
+        );
+    }
+
+    #[test]
+    fn rdocs_note_of_its_source_file_is_not_documentation() {
+        // One line, above most of Ruby's own class docs; escaped, it was the card's first line.
+        assert_eq!(
+            documentation(&comments(&[
+                "# <!-- rdoc-file=hash.c -->",
+                "# `ENV` is a Hash-like accessor.",
+            ]))
+            .as_deref(),
+            Some("`ENV` is a Hash-like accessor.")
+        );
+        // Only the whole-line comment: an opening with no close is some other HTML.
+        assert!(is_rdoc_file("  <!-- rdoc-file=string.rb -->"));
+        assert!(!is_rdoc_file("<!-- rdoc-file=string.rb"));
+        assert!(!is_rdoc_file("<!-- a note -->"));
+    }
+
+    #[test]
     fn a_method_with_no_signature_at_all_renders_no_parameter_list() {
         // `Signatures` is `Simple(one)` or `Overloaded(many)`, and the second is a boxed slice the
         // type allows to be empty, even though rubydex builds it from RBS overloads and never
@@ -1035,7 +1271,7 @@ Option examples:
         // for `def shout`, not an index out of range.
         let graph = Graph::new();
         assert_eq!(
-            parameter_list(&graph, &Signatures::Overloaded(Box::default())),
+            parameter_list(&graph, &Signatures::Overloaded(Box::default()), &[]),
             ""
         );
     }
@@ -1059,8 +1295,8 @@ Option examples:
     fn a_singleton_class_is_named_by_the_class_it_hangs_off() {
         // The same three cases `qualified_name` has for a singleton *method*, asked of the class
         // itself: a nested one answers the path, a top-level one the whole name, and anything else
-        // is not a singleton. `locator::missed` is the caller: a card saying what a receiver turned
-        // out to be must name something a reader can open, and `Person::<Person>` is not that.
+        // is not a singleton. A class object's name must be one a reader can open, and
+        // `Person::<Person>` is not that.
         assert_eq!(class_object_of("Foo::Bar::<Bar>"), Some("Foo::Bar"));
         assert_eq!(class_object_of("<Person>"), Some("Person"));
         assert_eq!(class_object_of("Person"), None);

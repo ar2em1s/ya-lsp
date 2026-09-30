@@ -1796,26 +1796,15 @@ end
         // signatures indexed, `Object` and `Comparable` come from real `.rbs` files and the chain
         // reaches the top. `module Comparable` in a supertype list is the answer's most surprising
         // claim and its most correct: a linearized chain is what Ruby means by `ancestors`.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let signatures = dir.path().join("sig");
-        std::fs::create_dir_all(signatures.join("core")).unwrap();
-        std::fs::write(
-            signatures.join("core/object.rbs"),
-            "class BasicObject\nend\n\nmodule Kernel\nend\n\nclass Object < BasicObject\n  \
+        let mut harness = signed(
+            &[(
+                "core/object.rbs",
+                "class BasicObject\nend\n\nmodule Kernel\nend\n\nclass Object < BasicObject\n  \
              include Kernel\nend\n\nmodule Comparable\nend\n\nclass Numeric < Object\n  \
              include Comparable\nend\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("ya-lsp.toml"),
-            format!(
-                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
-                signatures.display().to_string()
-            ),
-        )
-        .unwrap();
-
-        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+            )],
+            "",
+        );
         let source = "class Money < Numeric\nend\n";
         let uri = harness.write("lib/money.rb", source);
         harness.index();
@@ -1972,7 +1961,13 @@ end
             .as_str()
             .expect("markdown")
             .to_owned();
-        assert!(markdown.contains("Shape#area"), "{markdown}");
+        assert!(markdown.contains("Guessed from name alone"), "{markdown}");
+        assert!(
+            harness
+                .candidates_at(&caller, source, "area")
+                .contains(&"Shape#area".to_owned()),
+            "{markdown}"
+        );
     }
 
     #[test]
@@ -2172,7 +2167,10 @@ end
             .expect("markdown")
             .to_owned();
         assert!(markdown.contains("Story#title"), "{markdown}");
-        assert!(markdown.contains("guess"), "the card says so: {markdown}");
+        assert!(
+            markdown.contains("Guessed from name alone"),
+            "the card says so: {markdown}"
+        );
         assert!(
             harness
                 .implementation_at(&caller, source, "title")
@@ -2210,7 +2208,6 @@ end
             precise: true,
             redirected: false,
             derivation: crate::analysis::types::Derivation::default(),
-            missed: None,
             receiver: None,
         };
 
@@ -2239,6 +2236,53 @@ end
             harness
                 .implementation_at(&caller, source, "comment")
                 .is_null()
+        );
+    }
+
+    #[test]
+    fn a_class_rubydex_resolved_as_its_own_superclass_sits_where_ruby_puts_it() {
+        // A class rubydex resolved as its own superclass, repaired by
+        // `Indexed::repair_superclasses`: both lists read
+        // the chain Ruby builds, and so does the search for overrides.
+        let mut harness = Harness::new();
+        let base = "class ApplicationController\n  def authenticate\n  end\nend\n";
+        let base_uri = harness.write("app/controllers/application_controller.rb", base);
+        let admin = "\
+module Admin
+  class ApplicationController < ApplicationController
+    def authenticate
+    end
+  end
+
+  class UsersController < ApplicationController
+  end
+end
+";
+        let admin_uri = harness.write("app/controllers/admin/base.rb", admin);
+        harness.index();
+        assert_eq!(
+            harness.hierarchy_rows(
+                "typeHierarchy/supertypes",
+                &admin_uri,
+                admin,
+                "UsersController"
+            ),
+            "class Admin::ApplicationController — base.rb\n\
+             class ApplicationController — application_controller.rb"
+        );
+        assert_eq!(
+            harness.hierarchy_rows(
+                "typeHierarchy/subtypes",
+                &base_uri,
+                base,
+                "ApplicationController"
+            ),
+            "class Admin::ApplicationController — base.rb\n\
+             class Admin::UsersController — base.rb"
+        );
+        assert_eq!(
+            harness.implementation_list(&base_uri, base, "authenticate"),
+            ["application_controller.rb:1:6", "base.rb:2:8"]
         );
     }
 }

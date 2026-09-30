@@ -74,9 +74,9 @@ paths:
 1. **Run headless, from inside the corpus**, never from this repo (the default include drops
    `tmp/**`):
    ```bash
-   cd tmp/corpora/lobsters && PATH="$REPO/target/release:$PATH" \
+   cd tmp/corpora/<name> && PATH="$REPO/target/release:$PATH" \
      claude -p --plugin-dir "$REPO/editors/claude-code" --allowedTools LSP \
-     --output-format stream-json --verbose "hover on story.rb line 12 column 9; print the raw result"
+     --output-format stream-json --verbose "hover on <file> line <n> column <m>; print the raw result"
    ```
    These runs are pre-approved.
 2. **In an interactive session, after a rebuild, run `pkill -f 'ya-lsp --stdio'`.** The next request

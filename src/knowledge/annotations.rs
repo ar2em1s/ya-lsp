@@ -21,12 +21,14 @@ static WANTS: [Wants; 1] = [Wants {
     modules: &[],
     defines: &[],
     path: None,
+    spells: &[],
     tags: true,
     inherits: false,
     // a `@return` an engine's author wrote is about the engine's own method
     engines: true,
     gems: false,
     reads_only: false,
+    buffers: false,
 }];
 
 /// What somebody wrote down by hand.

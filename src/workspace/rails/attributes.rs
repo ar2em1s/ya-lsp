@@ -2,8 +2,8 @@
 //!
 //! Each call names one member (and its writer). What is declared depends on the second positional
 //! argument:
-//! - **a symbol naming one of [`super::COLUMN_TYPES`]** (the ten a migration writes, the registry
-//!   Rails looks a cast type up in): the member, typed, on any host;
+//! - **a symbol naming one of [`CAST_TYPES`]** (Rails' type registries, which a cast type is looked
+//!   up in): the member, typed, on any host;
 //! - **anything else, or nothing**: the member as `untyped`, and only on a host the project treats
 //!   as a model (a model class or a module), and only where no column already holds the name.
 //!
@@ -46,17 +46,47 @@
 
 use ruby_prism::{CallNode, Node};
 
-use super::COLUMN_TYPES;
 use super::syntax::{header, symbol_or_string};
+use super::{EITHER_TIME, TIME_WITH_ZONE};
 use crate::generated::{Declared, Facts, Owner, Source};
 
-/// The cast type a call wrote, where this crate has a class for it.
+/// The cast types `attribute` may name, and the class each reads as.
+///
+/// **Rails' type registries, not a migration's vocabulary.** A cast type is looked up in
+/// `ActiveModel::Type`'s registry, which `ActiveRecord::Type`'s repeats and extends with `text` and
+/// `json` (`activemodel/lib/active_model/type.rb`, `activerecord/lib/active_record/type.rb`). So
+/// `:big_integer` and `:immutable_string` are cast types no schema writes, and `:bigint`, which a
+/// schema writes, raises.
+///
+/// - **`datetime` rests on the host**, so its class is `None` here. On an ActiveRecord model Rails
+///   converts it to the time zone, as it does a column ([`super::COLUMN_TYPES`]); on an
+///   `ActiveModel::Attributes` class nothing does, and it is a `Time`. [`Attribute::declare`] is
+///   told which it is.
+/// - **`time` and `json` are left out**, though both are registered. Neither has a class to give
+///   (`time` is converted only from Rails 5.1 on, and `json` holds whatever JSON decodes to), and
+///   both are plausible second names in `jsonapi-serializer`'s list form, so they get the host gate
+///   an unknown symbol gets.
+const CAST_TYPES: [(&str, Option<&str>); 11] = [
+    ("big_integer", Some("Integer")),
+    ("binary", Some("String")),
+    ("boolean", Some("bool")),
+    ("date", Some("Date")),
+    ("datetime", None),
+    ("decimal", Some("BigDecimal")),
+    ("float", Some("Float")),
+    ("immutable_string", Some("String")),
+    ("integer", Some("Integer")),
+    ("string", Some("String")),
+    ("text", Some("String")),
+];
+
+/// The cast type a call wrote, where it is one of [`CAST_TYPES`].
 #[derive(Debug)]
 pub(super) struct Cast {
     /// As written (`integer`), for the provenance line.
     written: String,
-    /// The class it names: `Integer`.
-    returns: &'static str,
+    /// The class it names (`Integer`), or `None` where [`CAST_TYPES`] cannot name one alone.
+    returns: Option<&'static str>,
 }
 
 /// One `attribute` call.
@@ -71,6 +101,12 @@ pub(super) struct Attribute {
     /// type is declined, never the name, because `ActiveModel::AttributeMethods` defines the pair
     /// whatever the cast is.
     cast: Option<Cast>,
+    /// Whether the call wrote **any** type: a second positional that is not the keyword hash.
+    ///
+    /// Wider than [`Self::cast`]. `attribute :price, :money` and
+    /// `attribute :price, Money::Type.new` name a type this crate has no class for, and Rails
+    /// still replaces the column's with it, so the column's answer is wrong from then on.
+    typed: bool,
     /// The whole `attribute ...` header, and the member's own name inside it.
     at: (u32, u32),
     name_at: (u32, u32),
@@ -85,9 +121,13 @@ pub(super) fn read(source: &str, node: &CallNode<'_>) -> Option<Attribute> {
     let at = header(node)?;
     let mut arguments = node.arguments()?.arguments().iter();
     let (name, name_at) = symbol_or_string(source, &arguments.next()?)?;
+    let written = arguments.next();
     Some(Attribute {
         name,
-        cast: cast(source, arguments.next()),
+        typed: written
+            .as_ref()
+            .is_some_and(|written| written.as_keyword_hash_node().is_none()),
+        cast: cast(source, written),
         at,
         name_at,
     })
@@ -104,8 +144,11 @@ fn cast(source: &str, node: Option<Node<'_>>) -> Option<Cast> {
     let (written, _) = node
         .filter(|node| node.as_symbol_node().is_some())
         .and_then(|node| symbol_or_string(source, &node))?;
-    let (_, returns) = COLUMN_TYPES.iter().find(|(kind, _)| *kind == written)?;
-    Some(Cast { written, returns })
+    let (_, returns) = CAST_TYPES.iter().find(|(kind, _)| *kind == written)?;
+    Some(Cast {
+        written,
+        returns: *returns,
+    })
 }
 
 impl Attribute {
@@ -116,10 +159,12 @@ impl Attribute {
 
     /// The column this call re-types, where it re-types one.
     ///
-    /// Only a written cast type does. `attributes.rb` says a call without one uses "the previously
-    /// defined type (if any)", which is the column, so an untyped call withdraws nothing.
+    /// Only a written type does. `attributes.rb` says a call without one uses "the previously
+    /// defined type (if any)", which is the column, so an untyped call withdraws nothing. A type
+    /// this crate cannot name still re-types ([`Self::typed`]): the column then answers nothing,
+    /// where it answered wrong.
     pub(super) fn retypes(&self) -> Option<&str> {
-        self.cast.as_ref().map(|_| self.name.as_str())
+        self.typed.then_some(self.name.as_str())
     }
 
     /// Say the member.
@@ -136,7 +181,18 @@ impl Attribute {
     /// neither serializer gem's macro can produce. Without one there is no shape left, so the
     /// caller decides by the **host** (a `module`, or a class the project treats as a model) and by
     /// whether a column already holds the name.
-    pub(super) fn declare(&self, facts: &mut Facts, file: &str, owner: &Owner, admitted: bool) {
+    ///
+    /// `zoned` says the host is an ActiveRecord model in a project that keeps Rails' time-zone
+    /// default, where a `datetime` is converted as a column is. Anywhere else the member is
+    /// declared with no type: a module may be included into either kind of class.
+    pub(super) fn declare(
+        &self,
+        facts: &mut Facts,
+        file: &str,
+        owner: &Owner,
+        admitted: bool,
+        zoned: bool,
+    ) {
         let Some(cast) = self.cast.as_ref() else {
             if !admitted {
                 return;
@@ -161,14 +217,25 @@ impl Attribute {
                     at: Some((self.at, self.name_at)),
                     from: Source::Attribute,
                     overloads: Vec::new(),
+                    private: false,
                 });
             }
             return;
         };
+        // Only a [`ZONED`] type has no class of its own, and converted or not it is one of the two
+        //.
+        let class = cast
+            .returns
+            .unwrap_or(if zoned { TIME_WITH_ZONE } else { EITHER_TIME });
+        let returns = if class.contains(" | ") {
+            format!("{class} | nil")
+        } else {
+            format!("{class}?")
+        };
         facts.declare(Declared {
             owner: owner.clone(),
             name: self.name.clone(),
-            returns: format!("{}?", cast.returns),
+            returns,
             parameters: "()".to_owned(),
             because: format!(
                 "From `{file}`, `attribute :{}, :{}`.",
@@ -177,6 +244,7 @@ impl Attribute {
             at: Some((self.at, self.name_at)),
             from: Source::Attribute,
             overloads: Vec::new(),
+            private: false,
         });
     }
 }
@@ -247,17 +315,73 @@ end
         );
     }
 
-    /// All ten of [`COLUMN_TYPES`], because a cast type is looked up in the registry a migration
-    /// writes into, and a divergence between the two would be silent.
+    /// Every cast type in Rails' registries, and what it reads as on either kind of host.
+    ///
+    /// A `datetime` is time-zone converted on an ActiveRecord model and on nothing else, so only a
+    /// model in a project that keeps the default gets a class for it. `:bigint` is a schema's word
+    /// and no cast type: Rails raises on it, and here it is the untyped call it looks like.
     #[test]
-    fn every_column_type_is_a_cast_type() {
-        for (kind, ruby) in super::COLUMN_TYPES {
-            let declared = rbs(&format!("  attribute :thing, :{kind}\n"));
-            assert!(
-                declared.contains(&format!("def thing: () -> {ruby}?")),
-                "{kind}: {declared}"
-            );
-        }
+    fn every_cast_type_and_what_it_reads_as() {
+        let reads = |declared: String| {
+            declared
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("def thing: () -> "))
+                .unwrap_or("(none)")
+                .to_owned()
+        };
+        let unzoned = |body: &str| {
+            read_model(&format!("class Story < ApplicationRecord\n{body}end\n"))
+                .signatures(
+                    "app/models/story.rb",
+                    &Elsewhere {
+                        known: &owned(&["Story"]),
+                        models: &owned(&["Story"]),
+                        zoned: false,
+                        ..Elsewhere::nothing()
+                    },
+                )
+                .render(&declaring(&[]))
+                .rbs
+        };
+        let rows: Vec<(&str, String, String, String)> = super::CAST_TYPES
+            .iter()
+            .map(|(kind, _)| *kind)
+            .chain(["bigint"])
+            .map(|kind| {
+                let body = format!("  attribute :thing, :{kind}\n");
+                (
+                    kind,
+                    reads(rbs(&body)),
+                    reads(on_a_model(&body)),
+                    reads(unzoned(&body)),
+                )
+            })
+            .collect();
+        let expected: Vec<(&str, String, String, String)> = [
+            ("big_integer", "Integer?", "Integer?", "Integer?"),
+            ("binary", "String?", "String?", "String?"),
+            ("boolean", "bool?", "bool?", "bool?"),
+            ("date", "Date?", "Date?", "Date?"),
+            (
+                "datetime",
+                "(ActiveSupport::TimeWithZone | Time | nil)",
+                "ActiveSupport::TimeWithZone?",
+                "(ActiveSupport::TimeWithZone | Time | nil)",
+            ),
+            ("decimal", "BigDecimal?", "BigDecimal?", "BigDecimal?"),
+            ("float", "Float?", "Float?", "Float?"),
+            ("immutable_string", "String?", "String?", "String?"),
+            ("integer", "Integer?", "Integer?", "Integer?"),
+            ("string", "String?", "String?", "String?"),
+            ("text", "String?", "String?", "String?"),
+            ("bigint", "(none)", "untyped", "untyped"),
+        ]
+        .into_iter()
+        .map(|(kind, plain, model, unzoned)| {
+            (kind, plain.to_owned(), model.to_owned(), unzoned.to_owned())
+        })
+        .collect();
+        assert_eq!(rows, expected);
     }
 
     /// The serializer gems in one test, on a host that is not a model.
@@ -303,7 +427,7 @@ end
             let declared = on_a_model(call);
             assert!(declared.contains("def thing: () -> untyped\n"), "{call}");
             assert!(
-                declared.contains("def thing=: (untyped) -> void\n"),
+                declared.contains("def thing=: (untyped value) -> void\n"),
                 "{call}"
             );
         }
@@ -373,6 +497,21 @@ end
         assert_eq!(
             model.retyped_columns().collect::<Vec<_>>(),
             [("Story", "price")]
+        );
+    }
+
+    /// A type this crate has no class for still replaces the column's, so the column is withdrawn;
+    /// no type, or only keywords, keeps it.
+    #[test]
+    fn any_written_type_re_types_the_column() {
+        let model = read_model(
+            "class Story < ApplicationRecord\n  attribute :price, :money\n  \
+             attribute :total, Money::Type.new\n  attribute :note\n  \
+             attribute :count, default: 0\nend\n",
+        );
+        assert_eq!(
+            model.retyped_columns().collect::<Vec<_>>(),
+            [("Story", "price"), ("Story", "total")]
         );
     }
 
@@ -478,6 +617,5 @@ end
 
         let card = card(&mut harness, &uri, source, "nickname");
         assert!(card.contains("Defined in 2 places"), "{card}");
-        assert!(card.contains("`attribute :nickname, :string`"), "{card}");
     }
 }

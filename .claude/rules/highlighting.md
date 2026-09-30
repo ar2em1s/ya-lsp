@@ -30,15 +30,23 @@ paths:
   - `crossing` gives the locals a range reads and the writes that outlive it. Extract-method uses it.
   - `accessor_site` says where an `attr_` accessor would go. It returns `None` wherever an accessor
     would read a different variable.
+  - `setters` and `readers` place each declared accessor's variable, at its name's own start.
+    `types` reads a reader as that variable; a reader in a loose block is left out.
 
 ## Who answers a cursor, in order
 
 1. **The scope walk first**, because it can say no. It claims only a real variable. For
    `@name = 1` it must win: the graph would return only the write and none of the reads.
    `definition` and `hover` ask the same walk through `locator::variable_at`, so a jump and a
-   highlight never disagree.
+   highlight never disagree. Both regroup a loose occurrence (`scopes::instance_family`) by what
+   its block's call says `self` is (`Asked::rebound`); `scopes` itself still sees no
+   graph. Where the file writes the variable nowhere by name, the writes `definition` lands on in
+   this file (an `instance_variable_set`, an `attr_writer`) are lit as writes
+   (`Asked::unspelled`, `types::instance_writes`).
 2. **Then the graph (`locate`).**
-3. **A macro's `:symbol` last.** rubydex does not record call arguments. Add the symbol's own span
+3. **A symbol naming an instance variable** (`Asked::variable`): itself and this
+   file's writes of it, which is where `definition` lands.
+4. **A macro's `:symbol` last.** rubydex does not record call arguments. Add the symbol's own span
    by hand, as a read, when the macro only *names* a method. Otherwise `definition` lands on a span
    that nothing highlighted.
 

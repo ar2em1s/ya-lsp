@@ -12,7 +12,11 @@
 //!
 //! The rule for the whole file is [`reply`]: an absent answer is `null`, never an empty list.
 
-use std::{borrow::Cow, collections::HashMap, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use lsp_server::{ErrorCode, Request, RequestId, Response};
 use lsp_types::{
@@ -20,13 +24,12 @@ use lsp_types::{
     CodeActionKind, CodeActionOrCommand, CompletionItem, CompletionItemKind, CompletionItemTag,
     CompletionList, CompletionResponse, CompletionTextEdit, DocumentHighlight, DocumentLink,
     DocumentSymbolResponse, Documentation, FoldingRange, GotoDefinitionResponse, Hover,
-    HoverContents, InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip, Location,
-    LocationLink, MarkupContent, MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier,
-    PrepareRenameResponse, SelectionRange, SemanticToken, SemanticTokens, SignatureHelp,
-    SymbolInformation, TextDocumentEdit, TextEdit, TypeHierarchyItem, WorkspaceEdit,
-    WorkspaceSymbolResponse,
+    HoverContents, InlayHint, InlayHintKind, InlayHintLabel, Location, LocationLink, MarkupContent,
+    MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier, PrepareRenameResponse,
+    SelectionRange, SemanticToken, SemanticTokens, SignatureHelp, SymbolInformation,
+    TextDocumentEdit, TextEdit, TypeHierarchyItem, WorkspaceEdit, WorkspaceSymbolResponse,
 };
-use rubydex::model::ids::{DeclarationId, UriId};
+use rubydex::model::ids::{DeclarationId, StringId, UriId};
 
 use super::{
     Analysis, MAX_COMPLETION_ITEMS, MAX_INCOMING_CALLS, MAX_REFERENCES, MAX_SUBTYPES,
@@ -34,7 +37,7 @@ use super::{
     completion, cursor, environment, erb, hierarchy, highlight, hints, hover, locator,
     locator::Site,
     position::{self, ByteSpan, TextDocument},
-    ranges, references, rename, requires, search, signature_help, symbols, tokens, types,
+    ranges, references, rename, requires, search, signature_help, symbols, tokens, types, views,
 };
 use crate::messages;
 use crate::workspace::DocUri;
@@ -108,9 +111,15 @@ impl Analysis {
             //   a *narrower* question than `needs_the_graph` below: an index a keystroke behind
             //   costs one code action; an unstarted server costs the whole menu.
             // - **The third is *deferred*, not exempt**; the retry below is the difference.
-            let deferred = self.dirty && defers(&method);
+            //
+            // **A document just opened whose own facts wait on the settle** is answered after them
+            // (`reopens`): the deferred path would read a graph that never held them, and answer a
+            // spec's `let` with a name guess one settle short of its one place. The settle is the
+            // cheap kind (RSpec alone), paid once: nothing is reopened after it.
+            let fresh = defers(&method) && self.reopens(&request.params);
+            let deferred = self.dirty && defers(&method) && !fresh;
             let mut settled = false;
-            if self.dirty && settles(&method) && !defers(&method) {
+            if self.dirty && settles(&method) && (!defers(&method) || fresh) {
                 self.settle();
                 settled = true;
             }
@@ -126,6 +135,7 @@ impl Analysis {
             // `workspace/symbol` come back just as empty.
             let cold = !self.stage.is_ready() && needs_the_graph(&method);
             let again = (deferred || cold).then(|| request.params.clone());
+            self.unplaced.set(false);
             let mut response = self.dispatch(&id, request);
             let mut retried = false;
             let mut drained = false;
@@ -141,7 +151,13 @@ impl Analysis {
                 // So the deferred path answers *sooner* than the eager one and never *less*, which
                 // is what makes it safe to leave on. Without this it would trade a real answer for
                 // a fast empty list.
-                if deferred {
+                //
+                // **Except where the cursor was read and its member has no place** (`unplaced`,
+                // RSpec's `describe`): nothing was refused, and a settle finds the same member with
+                // the same nowhere to go. The answer is the last settled graph's, as it is where a
+                // stale member has a place, and the debounce settles as it would have. Paying a
+                // settle for it cost the audit 193 settles.
+                if deferred && !self.unplaced.get() {
                     self.settle();
                     response = self.dispatch(&id, asked_again(&id, &method, params.clone()));
                     settled = true;
@@ -243,7 +259,6 @@ impl Analysis {
             "callHierarchy/incomingCalls" => reply(id, self.incoming_calls(request.params)),
             "callHierarchy/outgoingCalls" => reply(id, self.outgoing_calls(request.params)),
             "textDocument/inlayHint" => reply(id, self.inlay_hints(request.params)),
-            "inlayHint/resolve" => reply(id, self.resolve_inlay_hint(request.params)),
             "textDocument/signatureHelp" => reply(id, self.signature_help(request.params)),
             "textDocument/codeAction" => reply(id, self.code_actions(request.params)),
             "textDocument/prepareRename" => reply(id, self.prepare_rename(request.params)),
@@ -272,7 +287,7 @@ impl Analysis {
         // At most one reread of this document, and only if it declares a private method: the
         // outline prints the word, and rubydex's record is wrong for one shape of it.
         let read = |uri: &str| self.read_of(uri);
-        let modifiers = locator::Modifiers::new(&read);
+        let modifiers = locator::Modifiers::new(&read, &self.exits);
         let symbols = self.with_text(&uri, |text| {
             symbols::document_symbols(&self.graph, &modifiers, UriId::from(uri.as_str()), text)
         })?;
@@ -294,107 +309,221 @@ impl Analysis {
         let uri = DocUri::from_lsp(&params.text_document_position_params.text_document.uri)?;
 
         let read = |uri: &str| self.read_of(uri);
-        let sources = self.sources(&read);
-        let modifiers = locator::Modifiers::new(&read);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
+        let modifiers = &memo.modifiers;
         self.with_text(&uri, |text| {
+            let parsed = cursor::Parsed::new(text.text());
             let offset = text.offset_at(position);
             // The graph may be a keystroke behind the buffer, so the cursor goes *in* through the
             // map and every span comes back *out* through it.
             let rebase = self.rebase_for(&uri, text.text());
             let at = rebase.to_graph(offset)?;
             let uri_id = UriId::from(uri.as_str());
-            // The scope walk first, in the same order as `definition` and `documentHighlight`. What
-            // an instance variable *is* is what ya-lsp derived, and the footnote naming the
-            // assignment is the other half of that answer.
+            let answer = |value: String, (start, end): (u32, u32)| Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: Some(text.range_at(start, end)),
+            };
+            // The scope walk first, in the same order as `definition` and `documentHighlight`: what
+            // an instance variable holds is what ya-lsp derived, and its card is the variable with
+            // that type, never the card of the class it holds.
             //
             // It falls through when nothing could be derived, like the `find_map` below: at a
             // write, the graph still has rubydex's declaration for the assignment, and
             // `Shelf::Book#@title` beats no card.
-            if let Some((variable, resolution)) =
-                locator::resolve_variable(&sources, uri_id, text.text(), offset, at, &rebase)
-                && let Some(markdown) = hover::markdown(
+            if let Some((variable, typed)) =
+                locator::variable_type(&sources, uri_id, &parsed, offset, at, &rebase)
+                && let Some(markdown) = hover::variable(
                     &self.synthesized,
-                    &modifiers,
                     &sources,
-                    &resolution,
-                    resolution
-                        .derivation
-                        .assignment
-                        .map(|at| text.position_at(at).line + 1),
+                    locator::variable_declaration(&sources, uri_id, &variable, &rebase),
+                    text.text()
+                        .get(variable.start as usize..variable.end as usize)
+                        .unwrap_or_default(),
+                    Some(&typed),
                     Some(uri.as_str()),
                 )
             {
-                return Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: markdown,
-                    }),
-                    range: Some(text.range_at(variable.start, variable.end)),
-                });
+                return Some(answer(markdown, (variable.start, variable.end)));
             }
+            // An instance variable a symbol names (`instance_variable_get(:@x)`, a macro's
+            // `:@x`), which no read spells: the card a read of it gets.
+            if let Some((symbol, named)) =
+                locator::named_variable(&sources, uri_id, &parsed, offset, &rebase)
+                && let Some(markdown) = hover::variable(
+                    &self.synthesized,
+                    &sources,
+                    types::named_writes(&sources, uri_id, &named).declaration,
+                    &named.name,
+                    types::named_read(&sources, uri_id, &named).as_ref(),
+                    Some(uri.as_str()),
+                )
+            {
+                return Some(answer(markdown, (symbol.start, symbol.end)));
+            }
+            // A bare name in a partial that its render calls pass as a local: a
+            // variable's card, before the graph, as Ruby reads the local before any method.
+            if let Some(local) = locator::partial_local(&sources, uri_id, &parsed, offset)
+                && let Some(markdown) = hover::variable(
+                    &self.synthesized,
+                    &sources,
+                    None,
+                    text.text()
+                        .get(local.span.0 as usize..local.span.1 as usize)
+                        .unwrap_or_default(),
+                    Some(&local.typed),
+                    Some(uri.as_str()),
+                )
+            {
+                return Some(answer(markdown, local.span));
+            }
+            // What the call under the cursor returns, for a method that declares nothing of its own
+            //. `None` off a call's name.
+            let at_this_call = locator::call_type(&sources, uri_id, &parsed, offset, at, &rebase);
             // Several targets can share the narrowest span; take the first with something to say,
             // not the first that exists.
-            let found = locator::locate(&self.graph, uri_id, at)
-                .into_iter()
-                .find_map(|located| {
-                    let found = rebase.span_to_buffer(ByteSpan {
-                        start: located.start,
-                        end: located.end,
-                    })?;
-                    let (start, end) = (found.start, found.end);
-                    let resolution = locator::resolve_typed(
-                        &sources,
-                        uri_id,
-                        text.text(),
-                        &located,
-                        start,
-                        &rebase,
-                    )?;
-                    // The card names a line, and this is where the text is (see `hover::markdown`).
-                    // The offset is already the buffer's (provenance `cursor` read from the buffer,
-                    // not a graph key), so it is not mapped.
-                    let line = resolution
-                        .derivation
-                        .assignment
-                        .map(|at| text.position_at(at).line + 1);
-                    let markdown = hover::markdown(
-                        &self.synthesized,
-                        &modifiers,
-                        &sources,
-                        &resolution,
-                        line,
-                        Some(uri.as_str()),
-                    )?;
-                    Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: markdown,
-                        }),
-                        range: Some(text.range_at(start, end)),
-                    })
-                });
-            // A macro's `:symbol`, after the graph, not before, as in `definition`. The card is the
-            // declaration's own plus one footnote: which macro shows this symbol is a name at all.
-            found.or_else(|| {
-                let (symbol, resolution) =
-                    locator::resolve_symbol(&self.graph, uri_id, text.text(), offset, at)?;
+            let located =
+                locator::locate_written(&self.graph, uri_id, at, &parsed, offset, &rebase);
+            let found = located.into_iter().find_map(|located| {
+                let found = rebase.span_to_buffer(ByteSpan {
+                    start: located.start,
+                    end: located.end,
+                })?;
+                let (start, end) = (found.start, found.end);
+                let resolution =
+                    locator::resolve_typed(&sources, uri_id, &parsed, &located, start, &rebase)?;
                 let markdown = hover::markdown(
                     &self.synthesized,
-                    &modifiers,
+                    modifiers,
                     &sources,
                     &resolution,
-                    None,
                     Some(uri.as_str()),
+                    at_this_call.as_ref(),
                 )?;
-                Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: markdown,
-                    }),
-                    range: Some(text.range_at(symbol.start, symbol.end)),
+                Some(answer(markdown, (start, end)))
+            });
+            // A call rubydex recorded nothing for (`a.b::C`, an upstream defect), read from the
+            // parse, where the graph held nothing at the cursor.
+            let found = found.or_else(|| {
+                let (message, resolution) =
+                    locator::resolve_misplaced(&sources, uri_id, &parsed, offset, &rebase)?;
+                let markdown = hover::markdown(
+                    &self.synthesized,
+                    modifiers,
+                    &sources,
+                    &resolution,
+                    Some(uri.as_str()),
+                    at_this_call.as_ref(),
+                )?;
+                Some(answer(markdown, message))
+            });
+            // A macro's `:symbol`, after the graph, not before, as in `definition`.
+            found
+                .or_else(|| {
+                    let (symbol, resolution) =
+                        locator::symbol_at(&sources, uri_id, &parsed, offset, at, &rebase)?;
+                    let markdown = hover::markdown(
+                        &self.synthesized,
+                        modifiers,
+                        &sources,
+                        &resolution,
+                        Some(uri.as_str()),
+                        None,
+                    )?;
+                    Some(answer(markdown, (symbol.start, symbol.end)))
                 })
-            })
+                // A literal key a member looks up: what the main locale holds there.
+                .or_else(|| {
+                    let (literal, member) =
+                        locator::resolve_keyed(&sources, uri_id, &parsed, offset, &rebase)?;
+                    let entry = self.keyed_entry(&literal, &member)?;
+                    Some(answer(
+                        hover::keyed(&entry.shown),
+                        (literal.start, literal.end),
+                    ))
+                })
+                // Last, after every rung that reads the graph at the cursor: an instance variable
+                // read nothing typed gets the card its write gets, where `definition` jumps.
+                .or_else(|| {
+                    let (variable, resolution) =
+                        locator::written_variable(&sources, uri_id, &parsed, offset, &rebase)?;
+                    let markdown = hover::markdown(
+                        &self.synthesized,
+                        modifiers,
+                        &sources,
+                        &resolution,
+                        Some(uri.as_str()),
+                        None,
+                    )?;
+                    Some(answer(markdown, (variable.start, variable.end)))
+                })
         })?
+    }
+
+    /// The declarations the cursor's call or constant resolves to, spelled as a card spells them
+    /// and sorted: what a list card counts, and what its rows said before it lost them. The graph
+    /// half of [`Self::hover`] only, for tests.
+    #[cfg(test)]
+    pub(crate) fn resolved_names(
+        &self,
+        uri: &DocUri,
+        position: lsp_types::Position,
+    ) -> Vec<String> {
+        let read = |uri: &str| self.read_of(uri);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
+        self.with_text(uri, |text| {
+            let parsed = cursor::Parsed::new(text.text());
+            let offset = text.offset_at(position);
+            let rebase = self.rebase_for(uri, text.text());
+            let at = rebase.to_graph(offset)?;
+            let uri_id = UriId::from(uri.as_str());
+            let resolution =
+                locator::locate_written(&self.graph, uri_id, at, &parsed, offset, &rebase)
+                    .into_iter()
+                    .find_map(|located| {
+                        let start = rebase
+                            .span_to_buffer(ByteSpan {
+                                start: located.start,
+                                end: located.end,
+                            })?
+                            .start;
+                        locator::resolve_typed(&sources, uri_id, &parsed, &located, start, &rebase)
+                    })?;
+            let mut names: Vec<String> = resolution
+                .declarations
+                .iter()
+                .filter_map(|id| self.graph.declarations().get(id))
+                .map(|declaration| super::render::qualified_name(&self.graph, declaration.name()))
+                .collect();
+            names.sort();
+            names.dedup();
+            Some(names)
+        })
+        .flatten()
+        .unwrap_or_default()
+    }
+
+    /// What the body of knowledge keeping a member's keys says about the literal key a call passes
+    /// it ([`crate::knowledge::Knowledge::keyed_entry`]).
+    fn keyed_entry(
+        &self,
+        literal: &cursor::KeyedLiteral,
+        member: &str,
+    ) -> Option<crate::knowledge::KeyedEntry> {
+        let asked = crate::knowledge::Keyed {
+            member,
+            key: &literal.key,
+            keywords: &literal.keywords,
+            // Where a key is written does not hang on what the call hands its value to.
+            block: false,
+        };
+        self.knowledge
+            .modules()
+            .find_map(|module| module.keyed_entry(&asked))
     }
 
     /// `textDocument/signatureHelp`.
@@ -407,7 +536,7 @@ impl Analysis {
         let uri = DocUri::from_lsp(&params.text_document_position_params.text_document.uri)?;
 
         let read = |uri: &str| self.read_of(uri);
-        let modifiers = locator::Modifiers::new(&read);
+        let modifiers = locator::Modifiers::new(&read, &self.exits);
         let blocks = locator::Blocks::new(&read);
         self.with_text(&uri, |text| {
             let call = cursor::call_at(text.text(), text.offset_at(position))?;
@@ -436,14 +565,50 @@ impl Analysis {
         let position = params.text_document_position_params.position;
         let uri = DocUri::from_lsp(&params.text_document_position_params.text_document.uri)?;
 
+        let read = |uri: &str| self.read_of(uri);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
         let found = self.with_text(&uri, |text| {
+            let parsed = cursor::Parsed::new(text.text());
+            let uri_id = UriId::from(uri.as_str());
+            let offset = text.offset_at(position);
+            let rebase = self.rebase_for(&uri, text.text());
+            let named = || locator::resolve_named(&sources, uri_id, &parsed, offset, &rebase);
+            let handed = |names: &[StringId], scope: &HashSet<UriId>| self.named_uses(names, scope);
+            let rebound = locator::rebinding(&sources, uri_id, &rebase);
+            let variable = || {
+                let (symbol, named) =
+                    locator::named_variable(&sources, uri_id, &parsed, offset, &rebase)?;
+                let here: Vec<(u32, u32)> = types::named_writes(&sources, uri_id, &named)
+                    .places
+                    .into_iter()
+                    .find(|(written, _)| written == uri.as_str())
+                    .map(|(_, spans)| spans)
+                    .unwrap_or_default();
+                Some((symbol, here))
+            };
+            let unspelled = |read: u32| {
+                types::instance_writes(&sources, uri_id, read)
+                    .places
+                    .into_iter()
+                    .find(|(written, _)| written == uri.as_str())
+                    .map(|(_, spans)| spans)
+                    .unwrap_or_default()
+            };
             let found = highlight::find(
                 &self.graph,
                 &self.synthesized,
-                UriId::from(uri.as_str()),
-                text.text(),
-                text.offset_at(position),
+                uri_id,
+                &parsed,
+                offset,
                 self.layout(),
+                &highlight::Asked {
+                    named: &named,
+                    handed: &handed,
+                    rebound: &rebound,
+                    variable: &variable,
+                    unspelled: &unspelled,
+                },
             );
             found
                 .into_iter()
@@ -552,7 +717,8 @@ impl Analysis {
         let uri = DocUri::from_lsp(&params.text_document_position_params.text_document.uri)?;
 
         let read = |uri: &str| self.read_of(uri);
-        let sources = self.sources(&read);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
 
         // The scope walk first, for `highlight::find`'s reason: an instance variable is the one
         // ordinary thing the graph does not model, and at `@name = 1` (the one span both could
@@ -564,10 +730,13 @@ impl Analysis {
         // - **The name comes back beside the links** because the fall-through needs it and the
         //   buffer is open here: a template's writes are in another document, and re-reading this
         //   one to spell `@story` would blank the whole file again for six bytes.
-        if let Some((origin, name, links)) = self
+        if let Some((origin, name, read, links)) = self
             .with_text(&uri, |text| {
+                let parsed = cursor::Parsed::new(text.text());
                 let offset = text.offset_at(position);
-                let variable = locator::variable_at(text.text(), offset)?;
+                let rebase = self.rebase_for(&uri, text.text());
+                let rebound = locator::rebinding(&sources, UriId::from(uri.as_str()), &rebase);
+                let variable = locator::variable_at(&parsed, offset, &rebound)?;
                 let origin = text.range_at(variable.start, variable.end);
                 let name = text
                     .text()
@@ -589,7 +758,7 @@ impl Analysis {
                         target_selection_range: text.range_at(start, end),
                     })
                     .collect();
-                Some((origin, name, links))
+                Some((origin, name, variable.start, links))
             })
             .flatten()
         {
@@ -605,15 +774,61 @@ impl Analysis {
             if let Some(links) = self.template_variable_links(&uri, origin, &name, &sources) {
                 return self.definition_response(links);
             }
+            // And into every file of the object's classes: the writes the type side folds for this
+            // read, a parent's, a concern's or a subclass's, or every renderer's for a
+            // template.
+            let writes = types::instance_writes(&sources, UriId::from(uri.as_str()), read);
+            if let Some(links) = self.links_to_writes(origin, writes.places) {
+                return self.definition_response(links);
+            }
+        }
+        // An instance variable a symbol names, which no read spells: where it is written, as for a
+        // read of it. The graph holds nothing at the symbol, so nothing is displaced.
+        if let Some((origin, places)) = self
+            .with_text(&uri, |text| {
+                let parsed = cursor::Parsed::new(text.text());
+                let uri_id = UriId::from(uri.as_str());
+                let rebase = self.rebase_for(&uri, text.text());
+                let offset = text.offset_at(position);
+                let (symbol, named) =
+                    locator::named_variable(&sources, uri_id, &parsed, offset, &rebase)?;
+                Some((
+                    text.range_at(symbol.start, symbol.end),
+                    types::named_writes(&sources, uri_id, &named).places,
+                ))
+            })
+            .flatten()
+            && let Some(links) = self.links_to_writes(origin, places)
+        {
+            return self.definition_response(links);
+        }
+        // A bare name in a partial that its render calls pass as a local: where each passes it
+        //, before the graph, which would answer a method of the name.
+        if let Some((origin, places)) = self
+            .with_text(&uri, |text| {
+                let parsed = cursor::Parsed::new(text.text());
+                let offset = text.offset_at(position);
+                let local =
+                    locator::partial_local(&sources, UriId::from(uri.as_str()), &parsed, offset)?;
+                Some((text.range_at(local.span.0, local.span.1), local.places))
+            })
+            .flatten()
+            && let Some(links) = self.links_to_writes(origin, places)
+        {
+            return self.definition_response(links);
         }
 
         let (origin, sites) = self.with_text(&uri, |text| {
+            let parsed = cursor::Parsed::new(text.text());
             let offset = text.offset_at(position);
             let rebase = self.rebase_for(&uri, text.text());
             let at = rebase.to_graph(offset)?;
 
             let uri_id = UriId::from(uri.as_str());
-            for located in locator::locate(&self.graph, uri_id, at) {
+            let mut unplaced = false;
+            for located in
+                locator::locate_written(&self.graph, uri_id, at, &parsed, offset, &rebase)
+            {
                 let found = rebase.span_to_buffer(ByteSpan {
                     start: located.start,
                     end: located.end,
@@ -621,24 +836,51 @@ impl Analysis {
                 let (start, end) = (found.start, found.end);
                 // The same rung hover reads. A jump and a card disagreeing about what `person.` is
                 // would be worse than either being absent.
-                let resolved = locator::resolve_typed(
-                    &sources,
-                    uri_id,
-                    text.text(),
-                    &located,
-                    start,
-                    &rebase,
-                )?
-                .declarations;
+                let resolved =
+                    locator::resolve_typed(&sources, uri_id, &parsed, &located, start, &rebase)?
+                        .declarations;
+                let mut sites: Vec<Site> = locator::all_places(
+                    &self.graph,
+                    &self.synthesized,
+                    self.layout(),
+                    resolved.clone(),
+                    Some(uri.as_str()),
+                );
+                // A member with no place of its own whose first argument names one:
+                // `create(:user)` goes to the `factory :user` call.
+                if sites.is_empty() {
+                    sites = self.literal_places(&resolved, text.text(), start);
+                }
+                // One whose code a gem writes in a `def` rubydex files elsewhere: RSpec's
+                // `expect` goes to rspec-expectations' `def expect`.
+                if sites.is_empty() {
+                    sites = self.written_places(&resolved, uri.as_str());
+                }
+                if !sites.is_empty() {
+                    return Some((text.range_at(start, end), sites));
+                }
+                unplaced |= !resolved.is_empty();
+            }
+            // **Found, with nowhere to go**: a member Ruby defines at run time. Settling cannot
+            // give it a place, so the deferred retry would pay a settle to answer nothing again.
+            // Said only once every target covering the cursor was read: a refused rebase above
+            // returns first and keeps its retry.
+            self.unplaced.set(unplaced);
+
+            // A call rubydex recorded nothing for (`a.b::C`, an upstream defect), read from the
+            // parse by the rungs hover reads it with.
+            if let Some((message, resolution)) =
+                locator::resolve_misplaced(&sources, uri_id, &parsed, offset, &rebase)
+            {
                 let sites: Vec<Site> = locator::all_places(
                     &self.graph,
                     &self.synthesized,
                     self.layout(),
-                    resolved,
+                    resolution.declarations,
                     Some(uri.as_str()),
                 );
                 if !sites.is_empty() {
-                    return Some((text.range_at(start, end), sites));
+                    return Some((text.range_at(message.0, message.1), sites));
                 }
             }
 
@@ -651,7 +893,7 @@ impl Analysis {
             // declaration, possibly in another file, and `link` moves each into its own document's
             // coordinates, as for a constant.
             if let Some((symbol, resolution)) =
-                locator::resolve_symbol(&self.graph, uri_id, text.text(), offset, at)
+                locator::symbol_at(&sources, uri_id, &parsed, offset, at, &rebase)
             {
                 let sites: Vec<Site> = locator::all_places(
                     &self.graph,
@@ -663,6 +905,20 @@ impl Analysis {
                 if !sites.is_empty() {
                     return Some((text.range_at(symbol.start, symbol.end), sites));
                 }
+            }
+
+            // A literal key a member looks up (`t("users.title")`): where the key is written, in a
+            // file the graph does not hold.
+            if let Some((literal, member)) =
+                locator::resolve_keyed(&sources, uri_id, &parsed, offset, &rebase)
+                && let Some(entry) = self.keyed_entry(&literal, &member)
+            {
+                let site = Site {
+                    uri: entry.uri,
+                    full: entry.at,
+                    selection: entry.at,
+                };
+                return Some((text.range_at(literal.start, literal.end), vec![site]));
             }
 
             let require = requires::at(text.text(), offset)?;
@@ -678,6 +934,134 @@ impl Analysis {
         )
     }
 
+    /// Whether a request asks about a document the editor just opened whose own generated facts
+    /// wait on the next settle ([`Analysis::reopened`]: a spec's groups, which are built only for
+    /// the files the editor holds).
+    fn reopens(&self, params: &serde_json::Value) -> bool {
+        params
+            .get("textDocument")
+            .and_then(|document| document.get("uri"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|written| written.parse::<lsp_types::Uri>().ok())
+            .and_then(|written| DocUri::from_lsp(&written))
+            .is_some_and(|uri| self.reopened.contains(uri.as_str()))
+    }
+
+    /// Every method name in `scope`'s documents handed as a symbol to a call that takes one
+    /// (`send(:shout)`, `try(:shout)`, `method(:shout)`), whose name is one of `names`: the uses
+    /// of a method no call reference records ([`references::Named`]).
+    ///
+    /// - **By name, as a method's other references are**: the call is matched by what it is
+    ///   spelled, not by what it resolves to ([`types::naming_calls`]).
+    /// - **Only a document that makes such a call is read**, found in the graph's own call index,
+    ///   and read as the graph holds it (`read_of`); a place is moved back into the graph's
+    ///   coordinates, where every other reference is, or dropped where an edit moved it.
+    /// - **Read once per version** ([`types::HeldExits::handed`]): a references request on a
+    ///   common name would otherwise parse every file that calls `send` or `respond_to?`.
+    fn named_uses(&self, names: &[StringId], scope: &HashSet<UriId>) -> Vec<references::Reference> {
+        let calls = types::naming_calls(&self.graph, &self.types);
+        // The documents that make such a call, from the graph's own index of calls by name, held
+        // for the graph (`Indexed::calls_named`): walking every document's calls on every request
+        // cost the largest corpus's references a quarter of their time.
+        let mut documents: Vec<UriId> = calls
+            .iter()
+            .flat_map(|call| {
+                self.graph
+                    .calls_named(call)
+                    .iter()
+                    .map(|(uri_id, _, _)| *uri_id)
+                    .filter(|uri_id| scope.contains(uri_id))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        documents.sort_unstable();
+        documents.dedup();
+        let mut found = Vec::new();
+        for (uri_id, document) in documents
+            .into_iter()
+            .filter_map(|uri_id| Some((uri_id, self.graph.documents().get(&uri_id)?)))
+        {
+            let uri = document.uri();
+            let read = || -> Option<types::HeldHanded> {
+                let (source, rebase) = self.read_of(uri)?;
+                Some(
+                    cursor::symbols_handed(&source)
+                        .into_iter()
+                        .filter_map(|(call, name, start, end)| {
+                            Some((call, name, rebase.to_graph(start)?, rebase.to_graph(end)?))
+                        })
+                        .collect(),
+                )
+            };
+            let Some(handed) = self.exits.handed(uri_id, document.content_hash(), read) else {
+                continue;
+            };
+            for (call, name, start, end) in handed.iter() {
+                if calls.contains(call) && names.contains(&StringId::from(name.as_str())) {
+                    found.push(references::Reference {
+                        uri: uri.to_owned(),
+                        start: *start,
+                        end: *end,
+                        write: false,
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    /// Where the Symbol a call passes to a generated member is written, as the body of knowledge
+    /// that declared the member knows ([`crate::knowledge::Knowledge::literal_place`]).
+    fn literal_places(&self, resolved: &[DeclarationId], source: &str, name: u32) -> Vec<Site> {
+        let Some(literal) = cursor::first_symbol(source, name) else {
+            return Vec::new();
+        };
+        resolved
+            .iter()
+            .filter_map(|id| {
+                let declaration = self.graph.declarations().get(id)?;
+                let (owner, method) = declaration.name().rsplit_once('#')?;
+                let method = method.trim_end_matches("()");
+                let (uri, (full, selection)) = self
+                    .knowledge
+                    .modules()
+                    .find_map(|module| module.literal_place(owner, method, &literal))?;
+                Some(Site {
+                    uri,
+                    full,
+                    selection,
+                })
+            })
+            .collect()
+    }
+
+    /// Where a gem writes the code of a generated member with no place, as the body of knowledge
+    /// that declared the member knows ([`crate::knowledge::Knowledge::written_in`]): that
+    /// declaration's own places, fenced as every jump's are.
+    fn written_places(&self, resolved: &[DeclarationId], cursor: &str) -> Vec<Site> {
+        let written: Vec<DeclarationId> = resolved
+            .iter()
+            .filter_map(|id| {
+                let declaration = self.graph.declarations().get(id)?;
+                let (owner, method) = declaration.name().rsplit_once('#')?;
+                let method = method.trim_end_matches("()");
+                let name = self
+                    .knowledge
+                    .modules()
+                    .find_map(|module| module.written_in(owner, method))?;
+                // A declaration the bundle lacks has no places, so it adds none.
+                Some(DeclarationId::from(name.as_str()))
+            })
+            .collect();
+        locator::all_places(
+            &self.graph,
+            &self.synthesized,
+            self.layout(),
+            written,
+            Some(cursor),
+        )
+    }
+
     /// Where a *template's* instance variable is written, which is never the cursor's file.
     ///
     /// - **The second half of the scope walk above, not a second mechanism.** A template has no
@@ -686,10 +1070,11 @@ impl Analysis {
     ///   answers almost no template reads that the card answers.
     /// - **The same rung as the card, so they cannot disagree.** `types::renderer_writes` and the
     ///   card's reader share one function for the class and its documents (the controller a
-    ///   template's directory names, or the mailer when there is none). Where the convention names
-    ///   nothing (`shared/_header.html.erb`, rendered by several controllers), both answer nothing
-    ///   instead of picking one. The tier stays *Derived*: a jump built on a path convention is not
-    ///   promoted for having a `Location`.
+    ///   template's directory names, or the mailer when there is none). Where the path's class
+    ///   writes nothing, or it names none (a partial), the jump falls to every renderer's writes,
+    ///   the card's fold (`types::instance_writes`), and lists them rather than picking
+    ///   one. The tier stays *Derived*: a jump built on a path convention is not promoted for
+    ///   having a `Location`.
     /// - **Nothing is rebased**, the walk's rule with two texts: the origin span is measured in the
     ///   template's buffer and each target in the renderer's, each in the text it came from.
     /// - **The renderer is read twice** (writes, then position encoding), both through `with_text`,
@@ -704,11 +1089,21 @@ impl Analysis {
         // A path test first. This runs for every `definition` at an instance variable the file
         // never writes (including a subclass reading a superclass's), and an ordinary Ruby file
         // should pay only a look at its own name for a rung it can never reach.
-        if !erb::is_template_uri(uri) {
+        if !uri.to_file_path().is_some_and(|path| views::is_view(&path)) {
             return None;
         }
         let uri_id = UriId::from(uri.as_str());
-        let links: Vec<LocationLink> = types::renderer_writes(sources, uri_id, name)
+        self.links_to_writes(origin, types::renderer_writes(sources, uri_id, name))
+    }
+
+    /// One link per write, by document, each landing on the variable's name: what was navigated to
+    /// is where the variable is written, not the expression. `None` for no link at all.
+    fn links_to_writes(
+        &self,
+        origin: lsp_types::Range,
+        writes: Vec<(String, Vec<(u32, u32)>)>,
+    ) -> Option<Vec<LocationLink>> {
+        let links: Vec<LocationLink> = writes
             .into_iter()
             .filter_map(|(target, writes)| {
                 let target = DocUri::from_graph_uri(&target)?;
@@ -750,15 +1145,19 @@ impl Analysis {
         let uri = DocUri::from_lsp(&params.text_document_position_params.text_document.uri)?;
 
         let read = |uri: &str| self.read_of(uri);
-        let sources = self.sources(&read);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
 
         let (origin, sites) = self.with_text(&uri, |text| {
+            let parsed = cursor::Parsed::new(text.text());
             let offset = text.offset_at(position);
             let rebase = self.rebase_for(&uri, text.text());
             let at = rebase.to_graph(offset)?;
 
             let uri_id = UriId::from(uri.as_str());
-            for located in locator::locate(&self.graph, uri_id, at) {
+            for located in
+                locator::locate_written(&self.graph, uri_id, at, &parsed, offset, &rebase)
+            {
                 let found = rebase.span_to_buffer(ByteSpan {
                     start: located.start,
                     end: located.end,
@@ -766,14 +1165,8 @@ impl Analysis {
                 let (start, end) = (found.start, found.end);
                 // The same rung `definition` and `hover` read, so this list's first row and
                 // `definition`'s only row agree on what the call reaches.
-                let resolved = locator::resolve_typed(
-                    &sources,
-                    uri_id,
-                    text.text(),
-                    &located,
-                    start,
-                    &rebase,
-                )?;
+                let resolved =
+                    locator::resolve_typed(&sources, uri_id, &parsed, &located, start, &rebase)?;
                 if !resolved.precise || !jumpable(resolved.derivation.tier()) {
                     continue;
                 }
@@ -827,16 +1220,18 @@ impl Analysis {
         let uri = DocUri::from_lsp(&params.text_document_position_params.text_document.uri)?;
 
         let read = |uri: &str| self.read_of(uri);
-        let sources = self.sources(&read);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
 
         let (origin, sites) = self.with_text(&uri, |text| {
+            let parsed = cursor::Parsed::new(text.text());
             let offset = text.offset_at(position);
             let rebase = self.rebase_for(&uri, text.text());
             let at = rebase.to_graph(offset)?;
 
             let uri_id = UriId::from(uri.as_str());
             let ((start, end), resolution) =
-                locator::type_of(&sources, uri_id, text.text(), offset, at, &rebase)?;
+                locator::type_of(&sources, uri_id, &parsed, offset, at, &rebase)?;
             if !jumpable(resolution.derivation.tier()) {
                 return None;
             }
@@ -890,15 +1285,19 @@ impl Analysis {
         let uri = DocUri::from_lsp(&params.text_document_position_params.text_document.uri)?;
 
         let read = |uri: &str| self.read_of(uri);
-        let sources = self.sources(&read);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
 
         let (origin, sites) = self.with_text(&uri, |text| {
+            let parsed = cursor::Parsed::new(text.text());
             let offset = text.offset_at(position);
             let rebase = self.rebase_for(&uri, text.text());
             let at = rebase.to_graph(offset)?;
 
             let uri_id = UriId::from(uri.as_str());
-            for located in locator::locate(&self.graph, uri_id, at) {
+            for located in
+                locator::locate_written(&self.graph, uri_id, at, &parsed, offset, &rebase)
+            {
                 let found = rebase.span_to_buffer(ByteSpan {
                     start: located.start,
                     end: located.end,
@@ -906,14 +1305,8 @@ impl Analysis {
                 let (start, end) = (found.start, found.end);
                 // The same rung `definition` reads, so the signature here belongs to the `def` the
                 // other jump lands in.
-                let resolved = locator::resolve_typed(
-                    &sources,
-                    uri_id,
-                    text.text(),
-                    &located,
-                    start,
-                    &rebase,
-                )?;
+                let resolved =
+                    locator::resolve_typed(&sources, uri_id, &parsed, &located, start, &rebase)?;
                 if !resolved.precise || !jumpable(resolved.derivation.tier()) {
                     continue;
                 }
@@ -1028,11 +1421,17 @@ impl Analysis {
         let include_declaration = params.context.include_declaration;
         let scope = self.scope_rooted_in(Some(&uri));
 
+        let read = |uri: &str| self.read_of(uri);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
+        let handed = |names: &[StringId], scope: &HashSet<UriId>| self.named_uses(names, scope);
         let mut found = self.with_text(&uri, |text| {
+            let parsed = cursor::Parsed::new(text.text());
             let offset = text.offset_at(position);
+            let uri_id = UriId::from(uri.as_str());
             // As in goto-definition: several targets can share the narrowest span, so take the
             // first with something to say.
-            locator::locate(&self.graph, UriId::from(uri.as_str()), offset)
+            let found = locator::locate(&self.graph, uri_id, offset)
                 .into_iter()
                 .find_map(|located| {
                     let resolution = locator::resolve(
@@ -1053,9 +1452,27 @@ impl Analysis {
                         &resolution,
                         &scope,
                         include_declaration,
+                        &handed,
                     );
                     (!found.is_empty()).then_some(found)
-                })
+                });
+            // **A symbol argument, which the graph holds no target for**, as `definition` asks:
+            // `send(:shout)`'s `:shout` is a use of `shout`, and so are the rest of its uses.
+            found.or_else(|| {
+                let rebase = self.rebase_for(&uri, text.text());
+                let at = rebase.to_graph(offset)?;
+                let (symbol, resolution) =
+                    locator::symbol_at(&sources, uri_id, &parsed, offset, at, &rebase)?;
+                let found = references::to_member(
+                    &self.graph,
+                    &self.synthesized,
+                    &symbol.name,
+                    &resolution.declarations,
+                    &scope,
+                    &handed,
+                );
+                (!found.is_empty()).then_some(found)
+            })
         })??;
 
         if found.len() > MAX_REFERENCES {
@@ -1419,7 +1836,8 @@ impl Analysis {
         let uri = DocUri::from_lsp(&params.text_document.uri)?;
 
         let read = |uri: &str| self.read_of(uri);
-        let sources = self.sources(&read);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
         let found = self.with_text(&uri, |text| {
             let within = (
                 text.offset_at(params.range.start),
@@ -1433,53 +1851,19 @@ impl Analysis {
                 &self.workspace.config().hints,
             )
             .into_iter()
-            .map(|hint| self.inlay_hint(&uri, text, &hint))
+            .map(|hint| Self::inlay_hint(text, &hint))
             .collect::<Vec<_>>()
         })?;
 
         (!found.is_empty()).then_some(found)
     }
 
-    /// `inlayHint/resolve` — the footnote the label's marker promised.
+    /// One hint in the wire shape: the label and nothing else. There is no tooltip to resolve,
+    /// so no `data`.
     ///
-    /// The hint is recomputed for the one position it sits at rather than carried across the two
-    /// requests, which is what a `data` big enough to hold a derivation would have meant: the
-    /// tooltip would then ship eagerly inside every hint, which is the cost this request exists
-    /// to avoid. A resolved hint carries no `data` at all and never arrives here.
-    fn resolve_inlay_hint(&self, params: serde_json::Value) -> Option<InlayHint> {
-        let mut hint: InlayHint = parse_params(params)?;
-        let data = hint.data.clone()?;
-        let at = u32::try_from(data.get("at")?.as_u64()?).ok()?;
-        let uri = DocUri::from_graph_uri(data.get("uri")?.as_str()?)?;
-
-        let read = |uri: &str| self.read_of(uri);
-        let sources = self.sources(&read);
-        hint.tooltip = self.with_text(&uri, |text| {
-            let found = hints::of(
-                &sources,
-                &uri,
-                text.text(),
-                (at, at),
-                &self.workspace.config().hints,
-            );
-            let found = found.iter().find(|found| found.at == at)?;
-            let line = found.assignment().map(|at| text.position_at(at).line + 1);
-            Some(InlayHintTooltip::MarkupContent(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: found.note(line)?,
-            }))
-        })?;
-        Some(hint)
-    }
-
-    /// One hint in the wire shape.
-    ///
-    /// - **`data` on every hint**, because every drawn hint is derived and has a footnote to fetch
-    ///   (see [`hints`] for why the resolved tier cannot occur here). Resolving builds the sentence
-    ///   for the hint someone pointed at, not for every line on screen each scroll.
-    /// - **`TYPE` for all three families.** The protocol's `PARAMETER` means argument labels at a
-    ///   *call site*, a different feature.
-    fn inlay_hint(&self, uri: &DocUri, text: &TextDocument, hint: &hints::Hint) -> InlayHint {
+    /// **`TYPE` for all three families.** The protocol's `PARAMETER` means argument labels at a
+    /// *call site*, a different feature.
+    fn inlay_hint(text: &TextDocument, hint: &hints::Hint) -> InlayHint {
         InlayHint {
             position: text.position_at(hint.at),
             label: InlayHintLabel::String(hint.label.clone()),
@@ -1488,7 +1872,7 @@ impl Analysis {
             tooltip: None,
             padding_left: None,
             padding_right: None,
-            data: Some(serde_json::json!({ "uri": uri.as_str(), "at": hint.at })),
+            data: None,
         }
     }
 
@@ -1583,8 +1967,10 @@ impl Analysis {
             return Vec::new();
         }
         let read = |uri: &str| self.read_of(uri);
-        let sources = self.sources(&read);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
         let found = self.with_text(uri, |text| {
+            let parsed = cursor::Parsed::new(text.text());
             let offset = text.offset_at(position);
             let rebase = self.rebase_for(uri, text.text());
             let at = rebase.to_graph(offset)?;
@@ -1597,7 +1983,7 @@ impl Analysis {
                 let resolved = locator::resolve_typed(
                     &sources,
                     uri_id,
-                    text.text(),
+                    &parsed,
                     &located,
                     found.start,
                     &rebase,
@@ -1623,7 +2009,7 @@ impl Analysis {
             // `Guessed` here. The gate refuses names *matched* across the graph, and this rung
             // never matches.
             let (_, resolution) =
-                locator::resolve_symbol(&self.graph, uri_id, text.text(), offset, at)?;
+                locator::symbol_at(&sources, uri_id, &parsed, offset, at, &rebase)?;
             let documents = self.generated_documents(&resolution.declarations);
             (!documents.is_empty()).then_some(documents)
         });
@@ -2023,7 +2409,8 @@ impl Analysis {
         }
 
         let read = |uri: &str| self.read_of(uri);
-        let sources = self.sources(&read);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
         let (completion, range) = self.with_text(&uri, |text| {
             let offset = text.offset_at(position);
             // How this buffer's offsets relate to the graph's: the identity unless indexing was
@@ -2103,14 +2490,15 @@ impl Analysis {
     fn resolve_completion(&self, params: serde_json::Value) -> Option<CompletionItem> {
         let mut item: CompletionItem = parse_params(params)?;
         let read = |uri: &str| self.read_of(uri);
-        let modifiers = locator::Modifiers::new(&read);
-        let sources = self.sources(&read);
+        let memo = types::Memo::new(&read, &self.exits);
+        let sources = self.sources(&read, &memo);
+        let modifiers = &memo.modifiers;
 
         let markdown =
             completion_target(item.data.as_ref()).and_then(|(declaration, precise, guess)| {
                 hover::markdown(
                     &self.synthesized,
-                    &modifiers,
+                    modifiers,
                     &sources,
                     &locator::Resolution {
                         declarations: vec![declaration],
@@ -2124,17 +2512,15 @@ impl Analysis {
                             guess,
                             ..types::Derivation::default()
                         },
-                        // A completion row is not a failed member lookup: the list was built *from*
-                        // the receiver, so there is no class the name is missing from.
-                        missed: None,
                         // Nothing here reads it (a card is about one declaration), and the item has
                         // no class id to fill it with.
                         receiver: None,
                     },
-                    None,
                     // `completionItem/resolve` gets an item, not a position, so there is no cursor
                     // to read a test tree from. `None` is unfenced, which can only keep a place,
                     // never invent one, and the row was already ranked by a list that did ask.
+                    None,
+                    // Nor a call, so no call's own type.
                     None,
                 )
             });
@@ -2162,6 +2548,7 @@ impl Analysis {
             names: environment::Names::of(&self.workspace.config().trees),
             own: &self.own_prefixes,
             foreign: &self.foreign_prefixes,
+            held: Some(self.graph.paths()),
         }
     }
 
@@ -3236,7 +3623,7 @@ mod tests {
         // hover" produce identical logs, and the second is what a document selector one folder too
         // narrow really does. One pair per request, whatever the request was worth.
         let methods = dispatched_methods();
-        assert_eq!(methods.len(), 30, "{methods:?}");
+        assert_eq!(methods.len(), 29, "{methods:?}");
 
         let mut harness = Harness::new();
         let source = "class Story\n  def title\n  end\nend\n";

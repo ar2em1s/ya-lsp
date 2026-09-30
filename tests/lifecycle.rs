@@ -282,9 +282,10 @@ fn full_lifecycle_over_stdio() {
     // Both hierarchies, against the real binary: they are announced by two different mechanisms,
     // and a client needs each to offer its own command.
     assert_eq!(result["capabilities"]["callHierarchyProvider"], true);
+    // A hint is its label: no tooltip, so nothing to resolve.
     assert_eq!(
         result["capabilities"]["inlayHintProvider"]["resolveProvider"],
-        true
+        false
     );
     assert_eq!(result["capabilities"]["workspaceSymbolProvider"], true);
     // The one capability `lsp-types` has no field for, added on the way to JSON. Asserted here as
@@ -2633,10 +2634,13 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
         watchers,
         vec![
             spelled("ya-lsp.toml"),
-            // The second constant, and the only non-Ruby file this server reads: watched so an
-            // editor's save of `db/structure.sql` re-settles, never indexed, and spelled here
-            // because this is the wire.
+            // The second and third constants, the non-Ruby files this server reads: watched so an
+            // editor's save of `db/structure.sql` or `config/database.yml` re-settles, never
+            // indexed, and spelled here because this is the wire.
             spelled("db/*structure.sql"),
+            spelled("config/database.yml"),
+            // The fourth, the main locale's YAML: read beside the pass, never indexed.
+            spelled("**/config/locales/**/*.yml"),
             spelled("**/*.rb"),
             spelled("**/*.erb"),
             // Rails' three other template handlers, plain Ruby and never blanked. On the wire
@@ -3001,4 +3005,55 @@ fn has_parse_error(published: &serde_json::Value) -> bool {
     published["diagnostics"]
         .as_array()
         .is_some_and(|items| items.iter().any(|item| item["code"] == "parse-error"))
+}
+
+/// `ya-lsp coverage` is a command, not a server: it indexes the project and its gems itself and
+/// prints one line to stdout, its progress to stderr, with or without a log asked for beside it.
+#[test]
+fn the_coverage_command_prints_one_line_and_its_progress_apart() {
+    let (project, gem_home) = bundled_fixture();
+    std::fs::write(
+        project.path().join("ya-lsp.toml"),
+        "[gems]\ndefault_gems = false\n\n[rbs]\nenabled = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("lib/main.rb"),
+        "def person\n  Person.new\nend\n\ndef megaphone\n  Shouty::Megaphone.new\nend\n",
+    )
+    .unwrap();
+    for log in [None, Some("warn")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ya-lsp"));
+        command
+            .arg("coverage")
+            .arg(project.path())
+            .env("GEM_HOME", gem_home.path())
+            .env_remove("YA_LSP_LOG");
+        if let Some(level) = log {
+            command.env("YA_LSP_LOG", level);
+        }
+        let output = command.output().expect("run ya-lsp coverage");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{err}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "Type coverage: 100.0% (all 2 calls)\n",
+            "the project's own class and the gem's are both typed: {err}"
+        );
+        assert!(
+            err.contains("Indexing 1 gem and signature file.\n"),
+            "{err}"
+        );
+    }
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_ya-lsp"))
+        .args(["coverage", "a", "b"])
+        .output()
+        .expect("run ya-lsp coverage");
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr),
+        "ya-lsp: usage: ya-lsp coverage [DIR]\n"
+    );
 }

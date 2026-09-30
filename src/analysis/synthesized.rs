@@ -76,7 +76,7 @@
 //! which generated definitions become a *useful* place; the scheme guarantees none becomes a wrong
 //! one.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rubydex::{
     indexing::LanguageId,
@@ -84,6 +84,7 @@ use rubydex::{
 };
 
 use super::{indexer, locator::Site, types::Types};
+use crate::generated::Runs;
 use crate::workspace::DocUri;
 
 /// The scheme generated documents are filed under.
@@ -155,6 +156,13 @@ struct Generated {
     /// the bundle, discarded and re-asked every time the graph is linked). Read alongside
     /// `mappings`, never instead.
     placed: Vec<Mapping>,
+    /// The blocks a class this document declares is the `self` of: where each call starts in the
+    /// source, and the class, or `None` for a block whose `self` must not be answered.
+    ///
+    /// Taken with the mappings on every record, text changed or not, and for their reason: it is in
+    /// the source's coordinates, and a line added above a call moves it without changing a byte of
+    /// the RBS.
+    ran: BTreeMap<u32, Runs>,
 }
 
 /// One body's worth of generated text, on its way in.
@@ -173,6 +181,9 @@ pub struct Part {
     pub mappings: Vec<Mapping>,
     /// And the ones whose place is a name in a gem rather than a span in the source.
     pub named: Vec<crate::generated::Named>,
+    /// The blocks a generated class is the `self` of, in the source's coordinates
+    /// ([`Facts::runs`](crate::generated::Facts::runs)).
+    pub ran: Vec<(u32, Runs)>,
 }
 
 /// One span of generated text, and the line that implied it.
@@ -269,6 +280,7 @@ impl Synthesized {
                 // dropping them would leave one settle's worth of requests with no place for a
                 // member that has one.
                 held.named = part.named;
+                held.ran = ran_of(part.ran);
                 written.push(uri);
                 continue;
             }
@@ -309,6 +321,7 @@ impl Synthesized {
                     mappings: part.mappings,
                     named: part.named,
                     placed: Vec::new(),
+                    ran: ran_of(part.ran),
                 },
             );
             // Only the branch that changed the text reaches here, which is exactly what a reader of
@@ -386,6 +399,20 @@ impl Synthesized {
         (!rbs.is_empty()).then_some(rbs)
     }
 
+    /// What the block passed to the call starting at `call` in `source` runs as, where a generator
+    /// said ([`Facts::runs`](crate::generated::Facts::runs)).
+    ///
+    /// `None` where nothing said. `call` is in the coordinates the source was generated from,
+    /// which are the graph's.
+    #[must_use]
+    pub fn ran(&self, source: &str, call: u32) -> Option<&Runs> {
+        self.sources
+            .get(&UriId::from(source))?
+            .iter()
+            .filter_map(|uri| self.documents.get(&UriId::from(uri.as_str())))
+            .find_map(|generated| generated.ran.get(&call))
+    }
+
     /// Where a definition at `offset` of `document` was really written.
     #[must_use]
     pub fn origin(&self, document: &UriId, offset: u32) -> Origin<'_> {
@@ -401,6 +428,30 @@ impl Synthesized {
             .map_or(Origin::Unknown, |mapping| {
                 Origin::Declared(&mapping.declared)
             })
+    }
+
+    /// Every declaration `source` implied whose place selects `selection`: the generated document,
+    /// and the declaration's span in it. The way back from a line in a file to what was written
+    /// about it.
+    #[must_use]
+    pub fn generated_at(&self, source: &str, selection: (u32, u32)) -> Vec<(UriId, (u32, u32))> {
+        self.sources
+            .get(&UriId::from(source))
+            .into_iter()
+            .flatten()
+            .filter_map(|uri| {
+                let id = UriId::from(uri.as_str());
+                Some((id, self.documents.get(&id)?))
+            })
+            .flat_map(|(id, generated)| {
+                generated
+                    .mappings
+                    .iter()
+                    // Every mapping of a source's documents is into that source.
+                    .filter(|mapping| mapping.declared.selection == selection)
+                    .map(move |mapping| (id, mapping.generated))
+            })
+            .collect()
     }
 
     /// Every generated document that wrote a member whose place is a name, and those names.
@@ -529,6 +580,16 @@ impl Synthesized {
     }
 }
 
+/// [`Part::ran`] keyed by the call, the question [`Synthesized::ran`] asks. Two facts about one call
+/// are the same block said twice; the first is kept.
+fn ran_of(ran: Vec<(u32, Runs)>) -> BTreeMap<u32, Runs> {
+    let mut keyed = BTreeMap::new();
+    for (call, runs) in ran {
+        keyed.entry(call).or_insert(runs);
+    }
+    keyed
+}
+
 /// The URI one body of the declarations implied by `source` is indexed under.
 ///
 /// A pure function of the source URI and the body's name, which makes "one generated document per
@@ -614,6 +675,7 @@ mod tests {
                 rbs: rbs.to_owned(),
                 mappings,
                 named,
+                ran: Vec::new(),
             }],
         );
         generated_uri(source, "class:Story")
@@ -638,6 +700,57 @@ mod tests {
             .documents()
             .get(&UriId::from(uri))
             .map_or(0, |document| document.definitions().len())
+    }
+
+    /// Which class a block runs as is kept per source, and taken on every record, text changed or
+    /// not: a line added above the call moves it without changing a byte of the RBS.
+    #[test]
+    fn which_class_a_block_runs_as_is_taken_with_the_mappings() {
+        let mut graph = Graph::new();
+        let mut types = Types::default();
+        let mut table = Synthesized::new();
+        let spec = DocUri::from_path(Path::new("/project/spec/story_spec.rb")).expect("a file uri");
+        let part = |ran: Vec<(u32, Runs)>| Part {
+            body: "whole".to_owned(),
+            rbs: "class Story\nend\n".to_owned(),
+            mappings: Vec::new(),
+            named: Vec::new(),
+            ran,
+        };
+        assert_eq!(
+            table.ran(spec.as_str(), 0),
+            None,
+            "nothing recorded for the source"
+        );
+        table.record(
+            &mut graph,
+            &mut types,
+            &spec,
+            vec![part(vec![
+                (0, Runs::Made("Story".to_owned())),
+                (0, Runs::Refused),
+                (9, Runs::Refused),
+            ])],
+        );
+        assert_eq!(
+            table.ran(spec.as_str(), 0),
+            Some(&Runs::Made("Story".to_owned())),
+            "the first said is kept"
+        );
+        assert_eq!(table.ran(spec.as_str(), 9), Some(&Runs::Refused));
+        assert_eq!(table.ran(spec.as_str(), 5), None);
+        // The same text, the call moved down a line.
+        table.record(
+            &mut graph,
+            &mut types,
+            &spec,
+            vec![part(vec![(4, Runs::Made("Story".to_owned()))])],
+        );
+        assert_eq!(table.ran(spec.as_str(), 0), None);
+        assert_eq!(
+            table.ran(spec.as_str(), 4),
+            Some(&Runs::Made("Story".to_owned()))
+        );
     }
 
     #[test]
@@ -793,6 +906,7 @@ mod tests {
                     mapping((12, 40), column.clone()),
                 ],
                 named: Vec::new(),
+                ran: BTreeMap::new(),
                 placed: Vec::new(),
             },
         );
@@ -869,6 +983,7 @@ mod tests {
                     rbs: format!("class {}\nend\n", body.trim_start_matches("class:")),
                     mappings: Vec::new(),
                     named: Vec::new(),
+                    ran: Vec::new(),
                 })
                 .collect()
         };

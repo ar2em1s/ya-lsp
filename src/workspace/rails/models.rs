@@ -16,15 +16,20 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ruby_prism::{CallNode, Node, StatementsNode};
 
+use super::adapters::{self, Connection};
 use super::associations::{self, Association, Kind};
 use super::attributes::{self, Attribute};
+use super::callbacks::{self as actions, Callbacks};
 use super::concerns::{self, ClassMethod};
+use super::current::{self, CurrentAttribute};
 use super::delegates::{self, Delegate};
 use super::enums::{self, Enum};
-use super::relations::{Chained, callbacks, class_side, relation};
+use super::layouts::{self, Layout};
+use super::relations::{Chained, DURATION, callbacks, class_side, grouped, pick, relation};
 use super::syntax::{self, block_parameter, constant_spelling, reads_local, symbol_or_string};
 use super::tail::{self, Host, Tail};
-use crate::generated::{At, Facts, Namespaces, Owner};
+use crate::generated::grouped_of;
+use crate::generated::{At, Facts, Namespaces, Owner, Runs};
 
 /// One class in a model file, and the macros in its body.
 #[derive(Debug)]
@@ -44,6 +49,9 @@ struct ModelClass {
     /// module's own file. [`Model::extended`] hands out the names and `knowledge::rails` finishes
     /// it against the graph.
     extends: Vec<concerns::Extended>,
+    /// Where each `included do` and `prepended do` block's call starts: blocks whose `self` is an
+    /// including class, not this module ([`concerns::evaluated_elsewhere`]).
+    elsewhere: Vec<u32>,
     associations: Vec<Association>,
     enums: Vec<Enum>,
     /// The `attribute` calls.
@@ -73,6 +81,9 @@ struct ModelClass {
     /// are in mailers; in a controller, they usually name a module a gem ships, which the default
     /// does not reach either.
     helpers: Vec<String>,
+    /// The layout this body said its views are rendered in: the last `layout` it wrote, as Ruby's
+    /// `class_attribute` keeps the last. Nothing is declared; `analysis::views` asks.
+    layout: Option<Layout>,
     /// Every `def` this body writes itself, by `(is a def self., name)`.
     ///
     /// Read only by [`super::LONG_TAIL`]. A long-tail macro installs its members either in a module
@@ -94,7 +105,22 @@ struct ModelClass {
     /// singleton of every includer, where `base.extend` puts them and an ordinary ancestor walk
     /// finds them. See [`super::concerns`].
     class_methods: Vec<ClassMethod>,
+    /// The body's own `connects_to` and `establish_connection` calls: which databases its
+    /// connection is ([`super::adapters`]).
+    connections: Vec<Connection>,
+    /// It writes `self.primary_key =` or `def self.primary_key`: `ids` reads another
+    /// key than the table's, for it and whatever inherits or includes it.
+    rekeyed: bool,
+    /// What this body runs before a controller's actions, and takes back. Nothing is
+    /// declared; `analysis::views` asks.
+    callbacks: Callbacks,
+    /// Every `attribute` call read as a current-attributes class writes it: declared
+    /// only where the class is one ([`Elsewhere::current`]).
+    current: Vec<CurrentAttribute>,
 }
+
+/// The method a model's primary key is read through.
+const PRIMARY_KEY: &str = "primary_key";
 
 /// One Ruby file, read for the macros above. Text in, no graph and no I/O.
 #[derive(Debug)]
@@ -106,6 +132,8 @@ pub struct Model {
     /// not a `ModelClass` at all: `application_record.rb` holds `self.abstract_class = true` and no
     /// macro, and this list exists to name exactly that class.
     abstract_classes: BTreeSet<String>,
+    /// The callback calls no body's statements hold ([`actions::loose`]): each may apply anywhere.
+    loose: Callbacks,
 }
 
 /// Read every association and scope `source` declares.
@@ -135,6 +163,7 @@ pub fn read_model(source: &str) -> Model {
         nesting: Vec::new(),
         classes: Vec::new(),
         abstract_classes: BTreeSet::new(),
+        read: BTreeSet::new(),
     };
     models.walk(
         parsed
@@ -146,6 +175,7 @@ pub fn read_model(source: &str) -> Model {
     Model {
         classes: models.classes,
         abstract_classes: models.abstract_classes,
+        loose: actions::loose(source, &parsed.node(), &models.read),
     }
 }
 
@@ -218,6 +248,34 @@ impl Model {
             .map(|class| (class.name.as_str(), class.helpers.as_slice()))
     }
 
+    /// Every body here that said which layout its views are rendered in, and what it said.
+    ///
+    /// Beside [`Model::exports`], read by the same consumer: a layout template's path names no
+    /// class, and the classes whose views it wraps are found by walking each one's ancestors for
+    /// the nearest `layout` ([`super::layouts_of`]).
+    pub fn layouts(&self) -> impl Iterator<Item = (&str, &Layout)> {
+        self.classes
+            .iter()
+            .filter_map(|class| Some((class.name.as_str(), class.layout.as_ref()?)))
+    }
+
+    /// Every body here that wrote a controller callback, and what they say.
+    ///
+    /// Beside [`Model::layouts`], read by the same consumer: `analysis::views` walks an action's
+    /// ancestors for what surely runs before it ([`super::runs_before`]).
+    pub fn callbacks(&self) -> impl Iterator<Item = (&str, &Callbacks)> {
+        self.classes
+            .iter()
+            .filter(|class| !class.callbacks.is_empty())
+            .map(|class| (class.name.as_str(), &class.callbacks))
+    }
+
+    /// The callback calls here no body's statements hold, which may apply to any class.
+    #[must_use]
+    pub fn loose_callbacks(&self) -> &Callbacks {
+        &self.loose
+    }
+
     /// Every class a *collection* here needs a relation for.
     ///
     /// The element of each `has_many`, plus two that are easy to miss: the class each `scope` is
@@ -246,7 +304,7 @@ impl Model {
                 .filter(|association| match association.kind {
                     Kind::Many => true,
                     Kind::Scope => !class.module,
-                    Kind::One | Kind::Maybe => false,
+                    Kind::One => false,
                 })
                 .filter_map(|association| association.resolved(known))
                 .chain(
@@ -254,6 +312,21 @@ impl Model {
                         .then_some(class.name.as_str()),
                 )
         })
+    }
+
+    /// Every instance method a class body in this file writes with `def`, by class: what a
+    /// column's attribute methods defer to, since the `def` replaces the one Rails would define.
+    pub fn defined_members(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.classes
+            .iter()
+            .filter(|class| !class.module)
+            .flat_map(|class| {
+                class
+                    .defined
+                    .iter()
+                    .filter(|(singleton, _)| !singleton)
+                    .map(|(_, name)| (class.name.as_str(), name.as_str()))
+            })
     }
 
     /// Every `(class, column)` a macro here re-types, so the schema can decline the column.
@@ -298,6 +371,49 @@ impl Model {
                             .map(|name| (class.name.as_str(), name)),
                     )
             })
+    }
+
+    /// Every `(host, column, whether the host is a module)` whose value a macro here hands back as
+    /// something other than the column's type: [`Self::retyped_columns`]' three, a `store`'s
+    /// column, and the same macros in a **module**.
+    ///
+    /// Wider than what the schema withdraws, and for another reader: `pick` hands back what the
+    /// attribute's type decodes, so a column any of these touch gets no arm there. A concern's
+    /// `serialize :preferences` re-types the column on every includer, which this pass cannot list,
+    /// so the caller refuses the name on every class.
+    pub fn recast_columns(&self) -> impl Iterator<Item = (&str, &str, bool)> {
+        self.classes.iter().flat_map(|class| {
+            class
+                .enums
+                .iter()
+                .map(Enum::attribute)
+                .chain(class.attributes.iter().filter_map(Attribute::retypes))
+                .chain(class.tail.iter().flat_map(Tail::recasts))
+                .map(|column| (class.name.as_str(), column, class.module))
+        })
+    }
+
+    /// Every class's own `connects_to` or `establish_connection`, where its own file writes no
+    /// `def self.connection`: that `def` is the answer then, not the macro's.
+    pub fn connections(&self) -> impl Iterator<Item = (&str, &Connection)> {
+        self.classes
+            .iter()
+            .filter(|class| !class.defined.contains(&(true, "connection".to_owned())))
+            .flat_map(|class| {
+                class
+                    .connections
+                    .iter()
+                    .map(|connection| (class.name.as_str(), connection))
+            })
+    }
+
+    /// Every body that moves its primary key, and whether it is a module, whose
+    /// includers are moved.
+    pub fn rekeyed(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.classes
+            .iter()
+            .filter(|class| class.rekeyed)
+            .map(|class| (class.name.as_str(), class.module))
     }
 
     /// The class methods every concern in this file installs on the classes that include it.
@@ -391,13 +507,28 @@ impl Model {
             } else {
                 Owner::Instance(class.name.clone())
             };
+            // A block `ActiveSupport::Concern` evaluates on each includer runs as that includer's
+            // class object, never the module's: each including class this project
+            // writes, or refused where none is known.
+            // `Context::includers` holds a concern only with a class under it, never an empty set.
+            let runs = match elsewhere.includers.get(&class.name) {
+                Some(classes) => Runs::Each {
+                    of: class.name.clone(),
+                    classes: classes.iter().cloned().collect(),
+                },
+                None => Runs::Refused,
+            };
+            for call in &class.elsewhere {
+                facts.runs(owner.clone(), *call, runs.clone());
+            }
             // `attribute` asks the same host test, being the second reader that needs one.
             let admitted = class.module || models.contains(&class.name);
+            let zoned = elsewhere.zoned && !class.module && models.contains(&class.name);
             for declared in &class.attributes {
                 let shadowed = elsewhere
                     .columns
                     .contains(&(class.name.clone(), declared.name().to_owned()));
-                declared.declare(&mut facts, file, &owner, admitted && !shadowed);
+                declared.declare(&mut facts, file, &owner, admitted && !shadowed, zoned);
             }
             // The seventeen long-tail families and the three gates they need: `known` for a class
             // the application defines, `framework` for one a gem defines, and `defined` for a name
@@ -408,9 +539,23 @@ impl Model {
                 class: &class.name,
                 module: class.module,
                 defined: &class.defined,
+                sealed: class.module
+                    && elsewhere
+                        .includers
+                        .get(&class.name)
+                        .is_none_or(BTreeSet::is_empty),
             };
             for declared in &class.tail {
                 declared.declare(&mut facts, file, &host, known, framework);
+            }
+            if elsewhere.current.contains(&class.name) {
+                current::declare(
+                    &mut facts,
+                    file,
+                    &class.name,
+                    &class.current,
+                    &class.defined,
+                );
             }
         }
         // After every class, so one relation class is one body however many models and concerns in
@@ -419,13 +564,31 @@ impl Model {
         chained.flush(&mut facts);
         for element in emit {
             relation(&mut facts, element);
+            let columns = elsewhere.picked.columns.get(element);
+            // A project's own `Story::Grouped` meant something by it: `group` stays the relation.
+            if !known.contains(&grouped_of(element)) {
+                let durations = columns.is_some_and(|columns| {
+                    columns
+                        .iter()
+                        .any(|(_, picked, _)| picked.contains(DURATION))
+                });
+                grouped(&mut facts, element, durations);
+            }
+            if let Some(columns) = columns.and_then(|columns| columns.split_first()) {
+                pick(
+                    &mut facts,
+                    element,
+                    columns,
+                    elsewhere.picked.keys.get(element).map(String::as_str),
+                );
+            }
         }
         // The class side and the callbacks are **inherited**, so they are written once per base
         // class, not per model. [`class_side`] has the argument; `bases` comes from a caller that
         // knows the superclass chain.
         for base in bases {
             callbacks(&mut facts, base);
-            class_side(&mut facts, base);
+            class_side(&mut facts, base, elsewhere.framework);
         }
         facts
     }
@@ -532,6 +695,16 @@ pub struct Elsewhere<'a> {
     /// without a cast type keeps "the previously defined type", which *is* the column. Otherwise
     /// the two would be a silent overload set, typed by whichever `Types::harvest` read last.
     pub columns: &'a BTreeSet<(String, String)>,
+    /// Whether the project keeps Rails' time-zone default: no file on the `rails.zones` list
+    /// writes one of [`super::TIME_ZONE_SETTINGS`]. What an `attribute`'s `datetime` is rests on it.
+    pub zoned: bool,
+    /// What `pick` hands back for each column of each class, from the schemas
+    /// ([`Schema::picked`](super::Schema::picked)). A relation class this document writes gets
+    /// its element's arms ([`super::relations::pick`]).
+    pub picked: &'a super::Picked,
+    /// Every class whose superclass chain reaches `ActiveSupport::CurrentAttributes`:
+    /// its `attribute` calls declare readers and writers ([`super::current`]).
+    pub current: &'a BTreeSet<String>,
 }
 
 /// The empty project, for a test that cares about one field.
@@ -545,6 +718,7 @@ impl<'a> Elsewhere<'a> {
         static NOTHING: LazyLock<BTreeSet<String>> = LazyLock::new(BTreeSet::new);
         static NOBODY: LazyLock<BTreeMap<String, BTreeSet<String>>> = LazyLock::new(BTreeMap::new);
         static NO_COLUMNS: LazyLock<BTreeSet<(String, String)>> = LazyLock::new(BTreeSet::new);
+        static NOTHING_PICKED: LazyLock<super::Picked> = LazyLock::new(super::Picked::default);
         // Empty, and that is a **decline**, not a blank: a project that declares nothing cannot be
         // joined onto, so `concerns` writes no `ClassMethods` module unless the test says the
         // concern's own `module` line exists. A test about that generator states it.
@@ -560,6 +734,9 @@ impl<'a> Elsewhere<'a> {
             includers: &NOBODY,
             namespaces: &NO_NAMESPACES,
             columns: &NO_COLUMNS,
+            zoned: true,
+            picked: &NOTHING_PICKED,
+            current: &NOTHING,
         }
     }
 }
@@ -596,6 +773,7 @@ struct Macros {
     tail: Vec<Tail>,
     exports: Vec<String>,
     helpers: Vec<String>,
+    layout: Option<Layout>,
     /// Not a macro, and deliberately not part of [`Macros::is_empty`]: a body full of `def`s and no
     /// macro is not a model class, and counting it would put every file in the application on the
     /// generated list.
@@ -607,6 +785,9 @@ struct Macros {
     /// A name, never a member: the `def`s are in the extended module's own file, and
     /// `knowledge::rails` asks the graph for them.
     extends: Vec<concerns::Extended>,
+    /// Where each `included do` and `prepended do` block's call starts. **Part of
+    /// [`Macros::is_empty`]**, for `extends`' reason.
+    elsewhere: Vec<u32>,
     /// The `def`s of every `class_methods do` block. **Part of [`Macros::is_empty`]**, unlike
     /// `defined`.
     ///
@@ -615,19 +796,37 @@ struct Macros {
     /// body holding one is a concern by construction, and counting it widens the generated list by
     /// exactly the blocks that exist.
     class_methods: Vec<ClassMethod>,
+    /// `connects_to` and `establish_connection`, each a macro whose body is the class's own.
+    connections: Vec<Connection>,
+    /// A `primary_key=` call among its statements, `self.primary_key =` or another
+    /// receiver's: the key `ids` reads may not be the table's.
+    rekeyed: bool,
+    /// The controller callbacks among its statements.
+    callbacks: Callbacks,
+    /// Where each of those calls starts.
+    read: Vec<u32>,
+    /// Its `attribute` calls, as a current-attributes class reads them.
+    current: Vec<CurrentAttribute>,
 }
 
 impl Macros {
     fn is_empty(&self) -> bool {
-        self.associations.is_empty()
+        !self.rekeyed
+            && self.callbacks.is_empty()
+            && self.current.is_empty()
+            && !self.defined.contains(&(true, PRIMARY_KEY.to_owned()))
+            && self.associations.is_empty()
             && self.enums.is_empty()
             && self.attributes.is_empty()
             && self.delegates.is_empty()
             && self.tail.is_empty()
             && self.exports.is_empty()
             && self.helpers.is_empty()
+            && self.layout.is_none()
             && self.class_methods.is_empty()
             && self.extends.is_empty()
+            && self.elsewhere.is_empty()
+            && self.connections.is_empty()
     }
 }
 
@@ -682,6 +881,8 @@ struct Models<'src> {
     nesting: Vec<String>,
     classes: Vec<ModelClass>,
     abstract_classes: BTreeSet<String>,
+    /// Where each callback call a body read starts: the rest are [`Model::loose`]'s.
+    read: BTreeSet<u32>,
 }
 
 /// Whether this body says its class is **abstract**, in either of Rails' two spellings.
@@ -742,7 +943,13 @@ impl Models<'_> {
             found
                 .extends
                 .extend(concerns::extended(self.source, &statements, module));
+            found
+                .elsewhere
+                .extend(concerns::evaluated_elsewhere(&statements, module));
+            self.read.extend(found.read.iter().copied());
             if !found.is_empty() {
+                let rekeyed =
+                    found.rekeyed || found.defined.contains(&(true, PRIMARY_KEY.to_owned()));
                 self.classes.push(ModelClass {
                     name: self.nesting.join("::"),
                     module,
@@ -753,9 +960,15 @@ impl Models<'_> {
                     tail: found.tail,
                     exports: found.exports,
                     helpers: found.helpers,
+                    layout: found.layout,
                     defined: found.defined,
                     class_methods: found.class_methods,
                     extends: found.extends,
+                    elsewhere: found.elsewhere,
+                    connections: found.connections,
+                    rekeyed,
+                    callbacks: found.callbacks,
+                    current: found.current,
                 });
             }
         }
@@ -806,9 +1019,43 @@ impl Models<'_> {
                 ));
                 continue;
             }
+            // `connects_to … if replica_enabled?`: a connection the class may or may not make, so
+            // the application's stays one of the answers. Nothing else under a conditional is read.
+            let guarded = statement
+                .as_if_node()
+                .and_then(|conditional| conditional.statements())
+                .or_else(|| {
+                    statement
+                        .as_unless_node()
+                        .and_then(|conditional| conditional.statements())
+                });
+            if let Some(guarded) = guarded {
+                if !module {
+                    for inner in guarded.body().iter() {
+                        let Some(call) = inner.as_call_node().filter(|call| bare(call, receiver))
+                        else {
+                            continue;
+                        };
+                        let called = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+                        if let Some(mut connection) =
+                            adapters::read_connection(self.source, &call, &called)
+                        {
+                            connection.conditional = true;
+                            into.connections.push(connection);
+                        }
+                    }
+                }
+                continue;
+            }
             let Some(call) = statement.as_call_node() else {
                 continue;
             };
+            // `self.primary_key = …` moves the key `ids` reads. Whatever the receiver:
+            // `Other.primary_key =` here is rare, and refusing this class's `ids` is never wrong.
+            if call.name().as_slice() == b"primary_key=" {
+                into.rekeyed = true;
+                continue;
+            }
             if !bare(&call, receiver) {
                 continue;
             }
@@ -830,12 +1077,20 @@ impl Models<'_> {
                 // broken Ruby, as [`HOSTS`] argues.
                 into.class_methods
                     .extend(concerns::read(self.source, &inner, concerns::BLOCK));
+            } else if let Some(connection) = (!module)
+                .then(|| adapters::read_connection(self.source, &call, &called))
+                .flatten()
+            {
+                into.connections.push(connection);
             } else if called == "enum" {
                 if !module {
                     into.enums.extend(enums::read(self.source, &call));
                 }
             } else if called == "attribute" {
                 into.attributes.extend(attributes::read(self.source, &call));
+                if !module {
+                    into.current.extend(current::read(self.source, &call));
+                }
             } else if called == "delegate" {
                 into.delegates
                     .extend(delegates::read(self.source, &call, hosts));
@@ -844,6 +1099,12 @@ impl Models<'_> {
                 // to. Anything else (`helper Rails.application.routes.url_helpers`, or a
                 // `helper do … end` block) is a module this reader cannot name, so it names none.
                 into.helpers.extend(helper_modules(self.source, &call));
+            } else if actions::NAMES.contains(&called.as_str()) && hosts.is_empty() {
+                // Declares nothing: what runs before a controller's actions. Under a
+                // `with_options` its keywords may limit the call, so it is left to
+                // [`actions::loose`], which takes a skip anywhere and a callback nowhere.
+                actions::read(self.source, &call, &called, &mut into.callbacks);
+                into.read.push(call.location().start_offset() as u32);
             } else if called == "helper_method" {
                 // Read here, not in [`tail`], because it produces no member:
                 // `helper_method :current_user` declares nothing; it says the class's own
@@ -853,6 +1114,13 @@ impl Models<'_> {
                 // case.
                 into.exports
                     .extend(syntax::positional_names(self.source, &call));
+            } else if called == "layout" {
+                // Declares nothing either: which layout the class's views are rendered in, which
+                // `analysis::views` reads to find the classes a layout template's variables come
+                // from. A later call replaces an earlier one, as the `class_attribute` it sets does.
+                if let Some(layout) = layouts::read(self.source, &call) {
+                    into.layout = Some(layout);
+                }
             } else if let Some(read) = tail::read(self.source, &call, &called) {
                 into.tail.push(read);
             } else if let Some(association) =
@@ -868,6 +1136,31 @@ impl Models<'_> {
 #[cfg(test)]
 mod tests {
     use crate::analysis::testing::*;
+
+    /// A class's own `connects_to` and `establish_connection` are read, one under an `if` as a
+    /// connection the class may not make, and a class's own `def self.connection` answers instead.
+    /// A module's are not: whichever class includes it connects.
+    #[test]
+    fn a_models_own_connection_is_read_and_its_own_def_wins() {
+        let model = super::read_model(
+            "class Animal < ApplicationRecord\n  connects_to database: { writing: :animals }\nend\n\
+             class Reader < ApplicationRecord\n  connects_to database: { reading: :replica } if replica?\n\
+             end\n\
+             class Guarded < ApplicationRecord\n  establish_connection :x unless test?\n  \
+             if test?\n    count = 1\n    enum :x, [:y]\n  end\nend\n\
+             class Custom < ApplicationRecord\n  connects_to database: { writing: :x }\n  \
+             def self.connection\n    super\n  end\nend\n\
+             module Shared\n  establish_connection :x\nend\n",
+        );
+        let read: Vec<(&str, bool)> = model
+            .connections()
+            .map(|(class, connection)| (class, connection.conditional))
+            .collect();
+        assert_eq!(
+            read,
+            [("Animal", false), ("Reader", true), ("Guarded", true)]
+        );
+    }
 
     /// What the two view-context macros take out of a body, and what they refuse.
     ///
@@ -931,6 +1224,50 @@ end
                     ["current_user".to_owned(), "logged_in?".to_owned()].as_slice()
                 ),
                 ("Authentication", ["current_account".to_owned()].as_slice()),
+            ]
+        );
+    }
+
+    /// The layout a body says its views are rendered in: the last `layout` it wrote, since each
+    /// call replaces the `class_attribute` the one before set. A body whose only macro is a
+    /// `layout` is still recorded, which is the common controller.
+    #[test]
+    fn the_layout_a_body_says_its_views_are_rendered_in() {
+        let source = "\
+class Admin::BaseController < ApplicationController
+  layout \"application\"
+  layout \"admin\"
+end
+
+module Themed
+  included do
+    layout :theme, only: :show
+  end
+end
+
+class ApiController < ApplicationController
+  layout
+end
+";
+        let model = super::read_model(source);
+        let said: Vec<(&str, &Layout)> = model.layouts().collect();
+        assert_eq!(
+            said,
+            [
+                (
+                    "Admin::BaseController",
+                    &Layout {
+                        said: layouts::Said::Named("layouts/admin".to_owned()),
+                        conditional: false
+                    }
+                ),
+                (
+                    "Themed",
+                    &Layout {
+                        said: layouts::Said::Dynamic,
+                        conditional: true
+                    }
+                ),
             ]
         );
     }
@@ -1107,32 +1444,32 @@ end
             declarations.rbs,
             "\
 module Storyish
-  # From `app/models/concerns/storyish.rb`, `has_many :comments`, which is a `Comment`.
+  # From `app/models/concerns/storyish.rb`, `has_many :comments`, a collection of `Comment`.
   def comments: () -> Comment::Relation
   # From `app/models/concerns/storyish.rb`, `has_many :comments`, which also installs `comments=`.
-  def comments=: (untyped) -> untyped
+  def comments=: (untyped value) -> untyped
   # From `app/models/concerns/storyish.rb`, `has_many :comments`, which also installs `comment_ids`.
   def comment_ids: () -> Array[untyped]
   # From `app/models/concerns/storyish.rb`, `has_many :comments`, which also installs `comment_ids=`.
-  def comment_ids=: (untyped) -> untyped
+  def comment_ids=: (untyped value) -> untyped
   # From `app/models/concerns/storyish.rb`, `belongs_to :first_note`, which is a `Comment`.
   def first_note: () -> Comment?
   # From `app/models/concerns/storyish.rb`, `belongs_to :first_note`, which also installs `first_note=`.
-  def first_note=: (Comment?) -> Comment?
+  def first_note=: (Comment? value) -> Comment?
   # From `app/models/concerns/storyish.rb`, `belongs_to :first_note`, which also installs `build_first_note`.
   def build_first_note: (*untyped) ?{ (Comment) -> untyped } -> Comment
   # From `app/models/concerns/storyish.rb`, `belongs_to :first_note`, which also installs `create_first_note`.
   def create_first_note: (*untyped) ?{ (Comment) -> untyped } -> Comment
   # From `app/models/concerns/storyish.rb`, `belongs_to :first_note`, which also installs `create_first_note!`.
   def create_first_note!: (*untyped) ?{ (Comment) -> untyped } -> Comment
-  # From `app/models/concerns/storyish.rb`, `has_many :notes`, which is a `Comment`.
+  # From `app/models/concerns/storyish.rb`, `has_many :notes`, a collection of `Comment`.
   def notes: () -> Comment::Relation
   # From `app/models/concerns/storyish.rb`, `has_many :notes`, which also installs `notes=`.
-  def notes=: (untyped) -> untyped
+  def notes=: (untyped value) -> untyped
   # From `app/models/concerns/storyish.rb`, `has_many :notes`, which also installs `note_ids`.
   def note_ids: () -> Array[untyped]
   # From `app/models/concerns/storyish.rb`, `has_many :notes`, which also installs `note_ids=`.
-  def note_ids=: (untyped) -> untyped
+  def note_ids=: (untyped value) -> untyped
 end
 ",
             "{}",
@@ -1243,7 +1580,7 @@ end
                 .render(&declaring(modules))
                 .rbs;
             assert!(rbs.starts_with(opens), "{rbs}");
-            assert!(rbs.contains("def user: () -> User\n"), "{rbs}");
+            assert!(rbs.contains("def user: () -> User?\n"), "{rbs}");
         }
     }
 
@@ -1310,10 +1647,10 @@ end
         let member = card(&mut harness, &uri, source, "notes");
         assert!(member.contains("Storyish#notes"), "{member}");
         assert!(
-            member.contains("`has_many :notes`"),
-            "the provenance names the macro in the concern: {member}"
+            member.contains("Storyish#notes -> Comment::Relation"),
+            "the member is the macro's in the concern: {member}"
         );
-        assert!(!member.contains("guessed from the name"), "{member}");
+        assert!(!member.contains("Guessed from name alone"), "{member}");
 
         // …and the chain runs through it, so a concern's collection is worth exactly what a class's
         // is.
@@ -1439,26 +1776,23 @@ end
         let uri = harness.write("app/models/story.rb", source);
         harness.index();
 
-        // The card names the **class** the member was declared onto and the concern that installed
-        // it, because that is what the declaration says, not the `ClassMethods` module, a namespace
-        // no file declares.
-        for (needle, owner) in [
-            ("validates", "in `ActiveModel::Validations`"),
-            ("scope", "in `ActiveRecord::Scoping::Named`"),
-            ("belongs_to", "in `ActiveRecord::Associations`"),
-            ("counts_by", "in `Countable`"),
-        ] {
+        // The card names the **class** the member was declared onto, because that is what the
+        // declaration says, not the `ClassMethods` module, a namespace no file declares.
+        for needle in ["validates", "scope", "belongs_to", "counts_by"] {
             let found = card(&mut harness, &uri, source, needle);
-            assert!(found.contains(owner), "{found}");
             assert!(
-                !found.contains("Matched on the method name alone"),
+                found.contains(&format!("ApplicationRecord.{needle}")),
+                "{found}"
+            );
+            assert!(
+                !found.contains("Guessed from name alone"),
                 "{needle} is resolved, not guessed: {found}"
             );
         }
 
         let guessed = card(&mut harness, &uri, source, "helper");
         assert!(
-            guessed.contains("Matched on the method name alone"),
+            guessed.contains("Guessed from name alone"),
             "a module with no nested ClassMethods extends nothing: {guessed}"
         );
     }
@@ -1492,14 +1826,11 @@ Story.hidden
 
         let found = card(&mut harness, &uri, source, "model_name");
         assert!(
-            found.contains(
-                "`def model_name` in `Naming`, which `Nameable`'s `included do … \
-                            extend` puts on every including class — here `Story`"
-            ),
-            "the card names the module, the concern and the class: {found}"
+            found.contains("Story.model_name") && !found.contains("Guessed from name alone"),
+            "the member is on every including class: {found}"
         );
         assert!(
-            !found.contains("Matched on the method name alone"),
+            !found.contains("Guessed from name alone"),
             "resolved, not guessed: {found}"
         );
 
@@ -1522,7 +1853,7 @@ Story.hidden
         // nowhere, so nothing resolves and only the name rung is left.
         let guessed = card(&mut harness, &uri, source, "not_installed");
         assert!(
-            guessed.contains("Matched on the method name alone"),
+            guessed.contains("Guessed from name alone"),
             "not_installed is not installed: {guessed}"
         );
 
@@ -1593,21 +1924,14 @@ Story.model_name
         harness.index();
         harness.index_gems();
 
-        for (needle, said) in [
-            (
-                "counts_by",
-                "`def counts_by` in `module ClassMethods` in `Counting`",
-            ),
-            ("model_name", "`def model_name` in `Naming`"),
-        ] {
+        for needle in ["counts_by", "model_name"] {
             let found = card(&mut harness, &uri, source, needle);
-            assert!(found.contains(said), "{needle}: {found}");
             assert!(
-                found.contains("`Shouty::Base`"),
+                found.contains(&format!("Shouty::Base.{needle}")),
                 "{needle} is declared on the gem's class, which `Story` inherits: {found}"
             );
             assert!(
-                !found.contains("Matched on the method name alone"),
+                !found.contains("Guessed from name alone"),
                 "{needle} is resolved, not guessed: {found}"
             );
         }
@@ -1644,7 +1968,7 @@ end
 
         let found = card(&mut harness, &uri, source, "counts_by");
         assert!(
-            found.contains("`def counts_by` in `module ClassMethods` in `Countable`"),
+            found.contains("ApplicationRecord.counts_by(column)"),
             "the concern is above `Object` in the singleton chain: {found}"
         );
         assert!(
@@ -1675,7 +1999,7 @@ end
         let found = card(&mut harness, &uri, source, "configure_everything");
         assert!(found.contains("Object#configure_everything"), "{found}");
         assert!(
-            !found.contains("Matched on the method name alone"),
+            !found.contains("Guessed from name alone"),
             "it resolves rather than falling to the name rung: {found}"
         );
     }
@@ -1735,5 +2059,19 @@ end
 
         assert!(!harness.has("Taggable::Holder#tags()"));
         assert!(!harness.has("Taggable#tags()"));
+    }
+
+    /// What a column's attribute methods defer to: an instance `def`, never a `def self.` of the
+    /// same name, and nothing a module writes.
+    #[test]
+    fn the_instance_methods_a_model_writes_itself() {
+        let model = read_model(
+            "class Story < ApplicationRecord\n  has_many :comments\n  def title?\n  end\n  \
+             def self.hidden?\n  end\nend\nmodule Storyish\n  has_many :tags\n  def name?\n  end\nend\n",
+        );
+        assert_eq!(
+            model.defined_members().collect::<Vec<_>>(),
+            [("Story", "title?")]
+        );
     }
 }

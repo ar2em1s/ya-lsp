@@ -9,7 +9,7 @@
 //! declines; for [`super::models`] a `class_name:` that is not a literal is an association it
 //! declines.
 
-use ruby_prism::{CallNode, DefNode, Node, ParametersNode};
+use ruby_prism::{CallNode, DefNode, Node, ParametersNode, StatementsNode};
 
 /// A call's first argument, when it is a symbol or a plain string.
 ///
@@ -120,6 +120,22 @@ pub(super) fn inherited<'pr>(
     keyword(node, name).or_else(|| hosts.iter().rev().find_map(|host| keyword(host, name)))
 }
 
+/// Whether a constant is written from the top (`::Spree`, `::Spree::Core`), which names that constant
+/// wherever it is written: Ruby's own escape from the lexical walk. [`constant_spelling`] drops the
+/// `::`, so the path is asked: its leftmost segment has no parent.
+pub(super) fn absolute(node: &Node<'_>) -> bool {
+    let Some(mut path) = node.as_constant_path_node() else {
+        return false;
+    };
+    while let Some(parent) = path.parent() {
+        let Some(outer) = parent.as_constant_path_node() else {
+            return false;
+        };
+        path = outer;
+    }
+    true
+}
+
 /// A call's own name plus its arguments (`create_table "stories", force: :cascade`), without the
 /// `do ... end` a whole-node location would drag in.
 pub(super) fn header(node: &CallNode<'_>) -> Option<(u32, u32)> {
@@ -156,6 +172,49 @@ pub(super) fn block_parameter(node: &CallNode<'_>) -> Option<String> {
 pub(super) fn reads_local(node: &Node<'_>, name: &str) -> bool {
     node.as_local_variable_read_node()
         .is_some_and(|read| read.name().as_slice() == name.as_bytes())
+}
+
+/// The body of every `class` or `module` a file writes under the name `wanted`, reached through the
+/// class and module bodies written as statements above it.
+///
+/// `nesting` is the path walked so far, empty at the top of a file. The name is the whole path, not
+/// its last segment, and a class body is descended into as well as a module's, because the wanted
+/// body may be nested in one (`Random::Formatter`). A matching body is not descended into again.
+///
+/// Statements only, not a generic visitor, `models::Models::walk`'s reason: one that descends into
+/// every method body in a large file is thousands of frames on a 2 MiB stack.
+pub(super) fn bodies_named<'pr>(
+    source: &str,
+    statements: Option<StatementsNode<'pr>>,
+    wanted: &str,
+    nesting: &mut Vec<String>,
+    found: &mut Vec<StatementsNode<'pr>>,
+) {
+    let Some(statements) = statements else {
+        return;
+    };
+    if !nesting.is_empty() && nesting.join("::") == wanted {
+        found.push(statements);
+        return;
+    }
+    for statement in statements.body().iter() {
+        let (path, body) = if let Some(module) = statement.as_module_node() {
+            (module.constant_path(), module.body())
+        } else if let Some(class) = statement.as_class_node() {
+            (class.constant_path(), class.body())
+        } else {
+            continue;
+        };
+        nesting.push(constant_spelling(source, &path));
+        bodies_named(
+            source,
+            body.and_then(|body| body.as_statements_node()),
+            wanted,
+            nesting,
+            found,
+        );
+        nesting.pop();
+    }
 }
 
 /// The whole `def … end` a generated member was read from.

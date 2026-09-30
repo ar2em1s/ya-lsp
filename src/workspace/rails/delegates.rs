@@ -36,7 +36,7 @@
 use ruby_prism::{CallNode, Node};
 
 use super::syntax::{constant_spelling, header, inherited, symbol_or_string};
-use crate::generated::{Declared, Facts, Owner, Source};
+use crate::generated::{Declared, FORWARDED, Facts, Owner, Source};
 
 /// What `to:` names, and therefore what the first hop asks.
 #[derive(Debug, PartialEq, Eq)]
@@ -244,7 +244,7 @@ impl Delegate {
                 .as_ref()
                 .and_then(|target| project.returns(target, name))
                 .filter(|returns| *returns != "untyped")
-                .map_or_else(|| "untyped".to_owned(), |returns| self.nullable(returns));
+                .map_or_else(|| self.forwarded(name), |returns| self.nullable(returns));
             facts.declare(Declared {
                 owner: owner.clone(),
                 name: declared,
@@ -265,6 +265,7 @@ impl Delegate {
                 at: Some((self.at, *name_at)),
                 from: Source::Delegated,
                 overloads: Vec::new(),
+                private: false,
             });
         }
     }
@@ -285,6 +286,20 @@ impl Delegate {
             Target::Method(name) => {
                 Some(Owner::Instance(class_named(project.returns(owner, name)?)?))
             }
+        }
+    }
+
+    /// The two calls Rails writes, for the types table to make where the member is called
+    /// ([`FORWARDED`]), where this pass could not answer them: a first hop no generator declared (an
+    /// `attr_reader`, a `def`), or a second hop that is someone's `def`.
+    ///
+    /// `untyped` for an [`Target::Opaque`] target, which names no call to make.
+    fn forwarded(&self, name: &str) -> String {
+        match &self.target {
+            Target::Method(through) | Target::Constant(through) => {
+                self.nullable(&format!("{FORWARDED}[\"{through}\", \"{name}\"]"))
+            }
+            Target::Opaque => "untyped".to_owned(),
         }
     }
 
@@ -319,6 +334,7 @@ mod tests {
                 at: None,
                 from,
                 overloads: Vec::new(),
+                private: false,
             });
         };
         member(
@@ -403,6 +419,20 @@ mod tests {
             "String",
             Source::Annotated,
         );
+        // A sentinel, which means something only on the member it is written for.
+        member(
+            Owner::Instance("User".to_owned()),
+            "drafts",
+            crate::generated::COLLECTION,
+            Source::Interface,
+        );
+        // A sentinel inside a union, as `Rails.logger` writes one: it names `User`'s own writer.
+        member(
+            Owner::Instance("User".to_owned()),
+            "logger",
+            &format!("Logger | {}", crate::generated::WRITTEN),
+            Source::Interface,
+        );
         facts
     }
 
@@ -449,20 +479,21 @@ class Story
   # From `app/models/story.rb`, `delegate :host, to: Settings`.
   def host: (*untyped) -> String
   # From `app/models/story.rb`, `delegate :missing, to: :user`.
-  def missing: (*untyped) -> untyped
+  def missing: (*untyped) -> ForwardedToItsTarget[\"user\", \"missing\"]
   # From `app/models/story.rb`, `delegate :shadow, to: :user`.
-  def shadow: (*untyped) -> untyped
+  def shadow: (*untyped) -> ForwardedToItsTarget[\"user\", \"shadow\"]
   # From `app/models/story.rb`, `delegate :anything, to: :@config`.
   def anything: (*untyped) -> untyped
   # From `app/models/story.rb`, `delegate :name=, to: :user`.
-  def name=: (untyped) -> untyped
+  def name=: (untyped value) -> ForwardedToItsTarget[\"user\", \"name=\"]
 end
 "
         );
     }
 
-    /// Two first hops that end at `untyped`: one whose answer is not one class's name, and one
-    /// whose class this pass has nothing to say about. Only the first tests [`class_named`].
+    /// Two first hops this pass cannot answer: one whose answer is not one class's name, and one
+    /// whose class this pass has nothing to say about. Only the first tests [`class_named`]. Both
+    /// are left to the types table, which makes the two calls where the member is called.
     #[test]
     fn a_first_hop_this_cannot_ask_about_types_nothing() {
         // `tags` is an `Array[Tag]`: a real answer, but not an owner with members here. `title` is
@@ -475,11 +506,13 @@ class Story
 end
 ");
         assert!(
-            rendered.contains("def length: (*untyped) -> untyped"),
+            rendered
+                .contains("def length: (*untyped) -> ForwardedToItsTarget[\"tags\", \"length\"]"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("def upcase: (*untyped) -> untyped"),
+            rendered
+                .contains("def upcase: (*untyped) -> ForwardedToItsTarget[\"title\", \"upcase\"]"),
             "{rendered}"
         );
     }
@@ -506,6 +539,7 @@ end
             at: None,
             from: Source::Association,
             overloads: Vec::new(),
+            private: false,
         });
         facts.declare(Declared {
             owner: Owner::Instance("User".to_owned()),
@@ -516,6 +550,7 @@ end
             at: None,
             from: Source::Column,
             overloads: Vec::new(),
+            private: false,
         });
         let rendered = read_model(
             "module Storyish\n  extend ActiveSupport::Concern\n\n  included do\n    belongs_to \
@@ -655,6 +690,7 @@ end
             at: None,
             from: Source::Annotated,
             overloads: Vec::new(),
+            private: false,
         });
         assert!(
             read_model("class Story\n  delegate :currency, to: Spree::Config\nend\n")
@@ -675,6 +711,22 @@ end
         );
     }
 
+    /// A sentinel the second hop answers is not copied: `ActiveRecordCollection` on `User` is
+    /// `User`'s relation, and on `Story` it would be `Story`'s. The types table makes the calls.
+    #[test]
+    fn a_sentinel_is_no_answer_to_copy() {
+        let rendered =
+            rbs("class Story\n  delegate :drafts, to: :user\n  delegate :logger, to: :user\nend\n");
+        for name in ["drafts", "logger"] {
+            assert!(
+                rendered.contains(&format!(
+                    "def {name}: (*untyped) -> ForwardedToItsTarget[\"user\", \"{name}\"]"
+                )),
+                "{rendered}"
+            );
+        }
+    }
+
     /// The two first-hop answers [`class_named`] must tell apart, one at each end.
     /// - `bool` is an answer but not a class (`true | false` in RBS), so nothing can be asked of
     ///   it.
@@ -689,7 +741,8 @@ class Story
 end
 ");
         assert!(
-            rendered.contains("def to_s: (*untyped) -> untyped"),
+            rendered
+                .contains("def to_s: (*untyped) -> ForwardedToItsTarget[\"flagged\", \"to_s\"]"),
             "{rendered}"
         );
         assert!(
@@ -757,11 +810,11 @@ end
     /// The phase boundary, stated as a test.
     ///
     /// `delegate :x, to: :user`, then `delegate :y, to: :x`: the second asks about a member the
-    /// first declared, which does not exist when phase two starts. Both are declared; the second is
-    /// `untyped`. Anything else means iterating to a fixed point over a graph a user can write a
-    /// cycle into.
+    /// first declared, which does not exist when phase two starts. Both are declared, and neither
+    /// is typed here: both are left to the types table's two calls. Anything else means iterating
+    /// to a fixed point over a graph a user can write a cycle into.
     #[test]
-    fn a_delegate_through_a_delegate_is_untyped() {
+    fn a_delegate_through_a_delegate_is_left_to_the_call() {
         // `owner` is nothing until this call declares it, and this call's own facts are not in
         // `project`. So the second `delegate` asks about a member that does not exist yet.
         assert_eq!(
@@ -774,9 +827,9 @@ end
             "\
 class Story
   # From `app/models/story.rb`, `delegate :owner, to: :user`.
-  def owner: (*untyped) -> untyped
+  def owner: (*untyped) -> ForwardedToItsTarget[\"user\", \"owner\"]
   # From `app/models/story.rb`, `delegate :username, to: :owner`.
-  def username: (*untyped) -> untyped
+  def username: (*untyped) -> ForwardedToItsTarget[\"owner\", \"username\"]
 end
 "
         );
@@ -788,20 +841,7 @@ end
     /// *schema* generator writes into a different file's generated document. Nothing has resolved
     /// when either is asked: the two-phase seam in a fixture.
     fn delegates_project(caller: &str) -> (Harness, DocUri, DocUri) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let signatures = dir.path().join("sig");
-        std::fs::create_dir_all(signatures.join("core")).unwrap();
-        std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
-        std::fs::write(
-            dir.path().join("ya-lsp.toml"),
-            format!(
-                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
-                signatures.display().to_string()
-            ),
-        )
-        .unwrap();
-
-        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
         let story = harness.write(
             "app/models/story.rb",
             "class Story < ApplicationRecord\n  \
@@ -877,7 +917,7 @@ end
     }
 
     #[test]
-    fn a_hover_on_a_delegated_name_says_which_file_and_which_call_it_came_from() {
+    fn a_hover_on_a_delegated_name_is_typed_through_the_call_it_hands_on() {
         // The provenance rule again, and load-bearing here: a delegated type is two derivations
         // deep, so a card that did not say so would present the *target's* schema as if this class
         // declared it.
@@ -886,9 +926,7 @@ end
 
         let card = card(&mut harness, &uri, source, "username");
         assert!(card.contains("Story#username"), "{card}");
-        assert!(card.contains("app/models/story.rb"), "{card}");
-        assert!(card.contains("delegate :username"), "{card}");
-        assert!(card.contains("to: :user"), "{card}");
+        assert!(card.contains("-> String"), "{card}");
     }
 
     #[test]
@@ -920,13 +958,10 @@ end
         // exactly as with no declaration at all, while the typed one resolves.
         let derived = card(&mut harness, &uri, source, "upcase");
         assert!(derived.contains("String#upcase"), "{derived}");
-        assert!(
-            !derived.contains("Matched on the method name alone"),
-            "{derived}"
-        );
+        assert!(!derived.contains("Guessed from name alone"), "{derived}");
         let guessed = card(&mut harness, &uri, source, "length");
         assert!(
-            guessed.contains("Matched on the method name alone"),
+            guessed.contains("Guessed from name alone"),
             "an untyped delegation must add no entry to the return table: {guessed}"
         );
     }
@@ -944,7 +979,7 @@ end
 
         let column = card(&mut harness, &uri, source, "title");
         assert!(
-            column.contains("db/schema.rb"),
+            column.contains("Story#title -> String") && !column.contains("*args"),
             "the delegate won: {column}"
         );
         assert!(!column.contains("delegate :title"), "{column}");

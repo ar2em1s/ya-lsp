@@ -99,10 +99,10 @@ def build(corpus):
             blocked |= patterns.prefixed(text)
             if name.endswith("schema.rb"):
                 for found in patterns.COLUMN.finditer(text):
-                    blocked.update((found.group(1), found.group(1) + "="))
+                    blocked.update(found.group(1) + suffix for suffix in patterns.COLUMN_SUFFIXES)
             elif name.endswith(".sql"):
                 for found in patterns.COLUMN_SQL.finditer(text):
-                    blocked.update((found.group(1), found.group(1) + "="))
+                    blocked.update(found.group(1) + suffix for suffix in patterns.COLUMN_SUFFIXES)
     blocked |= foreign_names()
     # **A definition only in `vendor/` blocks instead of answering**: it is a copy the walk sees of
     # a file whose real copy the walk cannot see.

@@ -82,7 +82,8 @@
 //! help, and the tag has to say what the tree is *for*.
 //!
 //! It needs no [`Layout`]: a template is the same thing in a gem and in the project. That is also
-//! why the root rung can read it (see [`Fence::loadable_on_a_root`]).
+//! why [`Fence::unloadable`] reads it on every rung, the root's included: the receiver walk steps
+//! past a template's member before a root is asked about (see [`Fence::loadable_on_a_root`]).
 //!
 //! **Templates stay indexed.** They are real Ruby somebody edits, and `references`, `rename` and
 //! `documentHighlight` must still find uses in them.
@@ -126,7 +127,8 @@
 //! A cursor inside a scratch document gets that document's classes completed, jumped to and
 //! renamed. Every other cursor gets no trace of it.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use rubydex::model::{
     declaration::Declaration,
@@ -140,7 +142,7 @@ use super::synthesized::source_of;
 ///
 /// A **deny**-list, because repositories do not agree on where source lives but do agree on where
 /// tests live. An allow-list of `app/` and `lib/` would call loaded first-party code wrong: an
-/// `extras/` directory, `module Mastodon` in `config/application.rb`, a reopened class in
+/// `extras/` directory, `module Shop` in `config/application.rb`, a reopened class in
 /// `config/initializers/`.
 pub const TEST_TREES: [&str; 4] = ["spec", "test", "tests", "features"];
 
@@ -437,7 +439,11 @@ pub(super) fn fenced_from<'c>(cursor: Option<&'c str>, layout: Layout<'_>) -> Ga
         // A migration is on the off-list for the same reason a spec is. Inside
         // `class Foo < Migration`, Ruby really resolves the constant to the copy declared in that
         // file, and that lexical question is not a path fence's to decide.
-        trees: cursor.is_some_and(|uri| !layout.names.turns_the_fence_off(uri)),
+        trees: cursor.is_some_and(|uri| {
+            !layout.held(UriId::from(uri), Asked::TurnsTheFenceOff, || {
+                layout.names.turns_the_fence_off(uri)
+            })
+        }),
         outward: match cursor {
             None => Outward::Unfenced,
             Some(uri) if layout.is_outside(uri) => Outward::Alone(uri),
@@ -571,14 +577,16 @@ pub struct Layout<'a> {
     /// Every gem root, the RBS root and Ruby's own library, from `Analysis::foreign_prefixes` —
     /// the one way a document inside the root can still be somebody else's.
     pub(super) foreign: &'a [String],
+    /// What the fences already read off each path under this layout ([`HeldPaths`]). `None`
+    /// reads every path afresh.
+    pub(super) held: Option<&'a HeldPaths>,
 }
 
 impl Layout<'_> {
     /// Whether a document is code the user can act on. **The one place this rule is written.**
     ///
     /// A result the user cannot act on is worse than none. Nobody fixes a warning inside a gem or
-    /// edits a gem to rename their own method, and `types::from_ancestor` must not parse actionpack
-    /// to learn it does not assign the app's instance variable.
+    /// edits a gem to rename their own method.
     ///
     /// **Both halves are needed:**
     ///
@@ -633,6 +641,61 @@ impl Layout<'_> {
     }
 }
 
+/// What the fences read off each document's path, held until the placement goes
+/// ([`Indexed::paths`](super::indexed::Indexed::paths)).
+///
+/// - **Why:** [`Fence::unloadable`] is asked once per definition of every candidate, and a typed
+///   receiver's member lookup asks [`fenced_from`] once per call. Each splits a path by `/` up to
+///   three times, which was a tenth of a hover (2026-09-29). Both answers depend only on the path
+///   and the [`Layout`], so each is read once.
+/// - **Keyed by the document, never the cursor**: both answers are about one path. The gates stay
+///   per request.
+/// - **Dropped by `Indexed::forget_placement` and `Indexed::graph_mut`**, as the placement is:
+///   the first when the layout's inputs move, the second because the workspace walk and gem
+///   discovery move a prefix list and then write the graph, without the first.
+/// - **Only `Analysis::layout` carries one.** A layout built for a test, or the one
+///   [`Placed::of`](super::indexed::Placed::of) reads every document with, asks every path afresh.
+#[derive(Default)]
+pub(super) struct HeldPaths(RefCell<HashMap<UriId, [Option<bool>; 2]>>);
+
+/// Which of [`HeldPaths`]' answers a reader wants.
+#[derive(Clone, Copy)]
+enum Asked {
+    /// [`Fence::unloadable`].
+    Unloadable,
+    /// [`Names::turns_the_fence_off`], for [`fenced_from`].
+    TurnsTheFenceOff,
+}
+
+impl HeldPaths {
+    /// Forget every answer: the layout or the graph moved.
+    pub(super) fn forget(&mut self) {
+        self.0.get_mut().clear();
+    }
+
+    /// How many documents have an answer held. For tests; the memo has no other observable state.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+}
+
+impl Layout<'_> {
+    /// `read`'s answer about one document, held where this layout carries [`HeldPaths`].
+    fn held(self, id: UriId, asked: Asked, read: impl FnOnce() -> bool) -> bool {
+        let Some(held) = self.held else {
+            return read();
+        };
+        let slot = asked as usize;
+        if let Some(answer) = held.0.borrow().get(&id).and_then(|answers| answers[slot]) {
+            return answer;
+        }
+        let answer = read();
+        held.0.borrow_mut().entry(id).or_default()[slot] = Some(answer);
+        answer
+    }
+}
+
 /// The fence every surface applies: whether the cursor turns it on, and the [`Layout`] that tells a
 /// library from a suite.
 ///
@@ -643,6 +706,15 @@ impl Layout<'_> {
 pub struct Fence<'a> {
     on: Gates<'a>,
     layout: Layout<'a>,
+}
+
+/// A [`Fence`] less its [`Layout`] ([`Fence::key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct FenceKey {
+    trees: bool,
+    /// [`Outward`], its cursor by id: `None` unfenced, `Some(None)` the project, and
+    /// `Some(Some(_))` the one document outside it that is an answer.
+    outward: Option<Option<UriId>>,
 }
 
 impl<'a> Fence<'a> {
@@ -676,6 +748,23 @@ impl<'a> Fence<'a> {
     /// Whether the three tree rules apply here. See [`fenced_from`].
     pub(super) fn on_trees(self) -> bool {
         self.on.trees
+    }
+
+    /// This fence as a key, for an answer held across requests (`types::hierarchy`).
+    ///
+    /// Everything it decides by except the [`Layout`], which such an answer drops with the
+    /// placement (`Indexed::forget_placement`). Two fences with one key drop the same documents, so
+    /// every ordinary cursor in the project shares one answer, and a cursor outside it keeps its
+    /// own: that one document is an answer there and nowhere else.
+    pub(super) fn key(self) -> FenceKey {
+        FenceKey {
+            trees: self.on.trees,
+            outward: match self.on.outward {
+                Outward::Unfenced => None,
+                Outward::Project => Some(None),
+                Outward::Alone(cursor) => Some(Some(UriId::from(cursor))),
+            },
+        }
     }
 
     /// Whether a document is fenced out for being outside the project.
@@ -731,9 +820,17 @@ impl<'a> Fence<'a> {
     /// `rename` and `documentHighlight` must still find uses in them. The tag answers only the
     /// surfaces the module docs list as drop or rank.
     pub(super) fn unloadable(self, uri: &str) -> bool {
-        self.only_the_suite(uri)
-            || in_a_generator_template(source_of(uri))
-            || self.only_a_migration(uri)
+        self.unloadable_at(UriId::from(uri), uri)
+    }
+
+    /// [`Self::unloadable`] for a document whose id the caller holds, read once per placement
+    /// ([`HeldPaths`]).
+    fn unloadable_at(self, id: UriId, uri: &str) -> bool {
+        self.layout.held(id, Asked::Unloadable, || {
+            self.only_the_suite(uri)
+                || in_a_generator_template(source_of(uri))
+                || self.only_a_migration(uri)
+        })
     }
 
     /// Whether a document is one only the migration task loads.
@@ -769,7 +866,9 @@ impl<'a> Fence<'a> {
     /// [`Tally::loadable`]'s no-definitions rule: there the question is about definitions, here the
     /// lookup failed and there is nowhere to send anyone.
     pub(super) fn loadable(self, graph: &Graph, id: DeclarationId) -> bool {
-        self.walk(graph, id, self.on.trees, |uri| self.unloadable(uri))
+        self.walk(graph, id, self.on.trees, |document, uri| {
+            self.unloadable_at(document, uri)
+        })
     }
 
     /// Whether **any** definition of one declaration is inside the project.
@@ -779,7 +878,7 @@ impl<'a> Fence<'a> {
     /// file beside the project is still the project's class. Only a declaration whose *every*
     /// definition is outside goes.
     pub(super) fn inside(self, graph: &Graph, id: DeclarationId) -> bool {
-        self.walk(graph, id, self.on.outward.on(), |uri| self.outside(uri))
+        self.walk(graph, id, self.on.outward.on(), |_, uri| self.outside(uri))
     }
 
     /// [`loadable`](Self::loadable) for a member found on a **root**. Reads only the directory
@@ -796,14 +895,16 @@ impl<'a> Fence<'a> {
     /// harness. A fence loosened where being wrong is worst is loosened backwards. The cost: a
     /// gem's top-level `def` under a `test` directory, which nobody should be sent to anyway.
     ///
-    /// [`in_a_generator_template`] and [`Names::in_a_migration`] apply here too, since both already
-    /// say what a tree is *for*. Templates are the worst case: a gem's cucumber-steps template has
-    /// a top-level `def with_ivars` that would otherwise be a member of every receiver.
+    /// [`Names::in_a_migration`] applies here too, since it already says what a tree is *for*.
+    ///
+    /// **A template never reaches this question.** [`unloadable`](Self::unloadable) reads the
+    /// template tag without a layout, and both roads to a root answer ask it first: the receiver
+    /// walk steps past a member only the application never loads (`locator::find_loaded_member`),
+    /// and so does the extend repair. A gem's cucumber-steps template's top-level
+    /// `def with_ivars`, a member of every receiver, is gone before a root is asked about.
     pub(super) fn loadable_on_a_root(self, graph: &Graph, id: DeclarationId) -> bool {
-        self.walk(graph, id, self.on.trees, |uri| {
-            self.layout.names.in_a_test_tree(uri)
-                || in_a_generator_template(uri)
-                || self.layout.names.in_a_migration(uri)
+        self.walk(graph, id, self.on.trees, |_, uri| {
+            self.layout.names.in_a_test_tree(uri) || self.layout.names.in_a_migration(uri)
         }) && self.inside(graph, id)
     }
 
@@ -817,7 +918,7 @@ impl<'a> Fence<'a> {
         graph: &Graph,
         id: DeclarationId,
         on: bool,
-        unloadable: impl Fn(&str) -> bool,
+        unloadable: impl Fn(UriId, &str) -> bool,
     ) -> bool {
         if !on {
             return true;
@@ -829,8 +930,11 @@ impl<'a> Fence<'a> {
                     graph
                         .definitions()
                         .get(definition_id)
-                        .and_then(|definition| graph.documents().get(definition.uri_id()))
-                        .is_some_and(|document| unloadable(document.uri())),
+                        .and_then(|definition| {
+                            let document = definition.uri_id();
+                            Some((*document, graph.documents().get(document)?))
+                        })
+                        .is_some_and(|(id, document)| unloadable(id, document.uri())),
                 );
             }
             tally.loadable()
@@ -1148,6 +1252,7 @@ mod tests {
             names: Names::default(),
             own: &[],
             foreign: &[],
+            held: None,
         };
         let fence = Fence::at(Some("file:///p/app/models/store.rb"), layout);
         assert!(fence.on_trees());
@@ -1258,6 +1363,7 @@ mod tests {
             names: Names::default(),
             own: &[],
             foreign: &[],
+            held: None,
         };
         let fence = Fence::at(Some("file:///p/app/models/story.rb"), layout);
         assert!(fence.unloadable("file:///gems/spree-4.4.0/db/migrate/20210101_add.rb"));
@@ -1274,6 +1380,7 @@ mod tests {
                 names: Names::default(),
                 own: &[],
                 foreign: &[],
+                held: None,
             },
         );
         assert!(!asked.unloadable("file:///p/db/data_migrations/backfill_stories.rb"));
@@ -1414,6 +1521,7 @@ mod tests {
             names: Names::default(),
             own: &[],
             foreign: &[],
+            held: None,
         };
         let template =
             "file:///g/pundit-2.3.1/lib/generators/pundit/install/templates/application_policy.rb";
@@ -1525,6 +1633,7 @@ mod tests {
             names: Names::default(),
             own: &own,
             foreign: &foreign,
+            held: None,
         };
 
         assert!(
@@ -1594,6 +1703,24 @@ mod tests {
             "and it is still not a spec, so the tree rules go on applying"
         );
 
+        // The key an answer held across requests is filed under says the same: every cursor in the
+        // project's own code shares one, a spec its own, and a loose file keeps its own too.
+        let key = |cursor| Fence::at(cursor, layout).key();
+        assert_eq!(
+            key(Some("file:///p/app/models/store.rb")),
+            key(Some("file:///p/app/controllers/stores_controller.rb"))
+        );
+        assert_ne!(
+            key(Some("file:///p/app/models/store.rb")),
+            key(Some("file:///p/spec/models/store_spec.rb"))
+        );
+        assert_ne!(
+            key(Some("file:///elsewhere/scratch_pad.rb")),
+            key(Some("file:///elsewhere/other_pad.rb")),
+            "each loose file is an answer only to itself"
+        );
+        assert_ne!(key(None), key(Some("file:///p/spec/models/store_spec.rb")));
+
         // `resolve`'s pair, the one place the two gates are set apart by hand: `references` and
         // `rename` must find a use under `spec/` and must not reach outside the project.
         let uses = Fence::uses(Some("file:///p/app/models/store.rb"), layout);
@@ -1628,6 +1755,66 @@ mod tests {
             unsaved.outside("untitled:Untitled-2"),
             "two unsaved buffers are two documents, and neither is the other's project"
         );
+    }
+
+    #[test]
+    fn a_held_path_reading_answers_what_reading_the_path_again_would() {
+        // `HeldPaths` changes what a fence costs, never what it says: under one layout, the first
+        // ask and every later one agree with a layout that holds nothing. Every shape the two held
+        // questions tell apart, under the layouts that move them.
+        let load = vec!["file:///g/rack-test-2.1.0/lib/".to_owned()];
+        let qa = crate::workspace::config::TreesConfig {
+            test: Some(vec!["qa".to_owned()]),
+            migration: Some(vec!["db/data_migrations".to_owned()]),
+            ..crate::workspace::config::TreesConfig::default()
+        };
+        let layouts = [
+            Layout::default(),
+            Layout {
+                root: "file:///p/",
+                load: &load,
+                ..Layout::default()
+            },
+            Layout {
+                root: "file:///p/",
+                names: Names::of(&qa),
+                ..Layout::default()
+            },
+        ];
+        let paths = [
+            "file:///p/app/models/store.rb",
+            "file:///p/spec/models/store_spec.rb",
+            "file:///p/qa/store_check.rb",
+            "file:///p/spec/support/testing_support/helpers.rb",
+            "file:///p/db/migrate/20200101_add.rb",
+            "file:///p/db/data_migrations/20200101_fill.rb",
+            "file:///g/rack-test-2.1.0/lib/rack/test/utils.rb",
+            "file:///g/pundit-2.3.1/lib/generators/pundit/install/templates/policy.rb",
+            "ya-lsp-generated:file:///p/spec/models/store_spec.rb#Store",
+            "file:///elsewhere/scratch_pad.rb",
+        ];
+        for fresh in layouts {
+            let held = HeldPaths::default();
+            let holding = Layout {
+                held: Some(&held),
+                ..fresh
+            };
+            for _ in 0..2 {
+                for path in paths {
+                    assert_eq!(
+                        Fence::at(Some(paths[0]), holding).unloadable(path),
+                        Fence::at(Some(paths[0]), fresh).unloadable(path),
+                        "{path}"
+                    );
+                    assert_eq!(
+                        fenced_from(Some(path), holding).trees,
+                        fenced_from(Some(path), fresh).trees,
+                        "{path} as the cursor"
+                    );
+                }
+            }
+            assert_eq!(held.len(), paths.len(), "one entry per document");
+        }
     }
 
     #[test]

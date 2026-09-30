@@ -75,11 +75,58 @@ pub fn mailer_of(path: &Path) -> Option<String> {
     namespaced(path)
 }
 
+/// The template a view path is, as a render call names it: `directory/name`, every extension left
+/// off, and whether it is a partial (its file name starts with `_`, which the name drops).
+///
+/// `app/views/stories/show.html.erb` is `("stories/show", false)` and
+/// `app/views/stories/_story.html.erb` is `("stories/story", true)`. `None` outside a `views`
+/// directory.
+#[must_use]
+pub fn template_of(path: &Path) -> Option<(String, bool)> {
+    let segments = segments(path);
+    let views = segments.iter().rposition(|segment| *segment == VIEWS)?;
+    let (file, directories) = segments.get(views + 1..)?.split_last()?;
+    let name = file.split('.').next().unwrap_or_default();
+    let partial = name.starts_with('_');
+    let name = name.trim_start_matches('_');
+    if name.is_empty() {
+        return None;
+    }
+    let mut logical = directories.join("/");
+    if !logical.is_empty() {
+        logical.push('/');
+    }
+    logical.push_str(name);
+    Some((logical, partial))
+}
+
+/// Whether `path` is a jbuilder view: `app/views/stories/show.json.jbuilder`, which the
+/// view conventions read as they read an ERB template, though it is indexed whole, as Ruby.
+#[must_use]
+pub fn is_jbuilder(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "jbuilder")
+        && template_of(path).is_some()
+}
+
+/// Whether a receiverless `render` in `path` hands a template the variables of the object it runs
+/// on: a controller, a mailer, a helper or a view, each under an `app` directory.
+///
+/// A component (`app/components`), a service or a library object that calls `render` renders
+/// something of its own, with its own variables, and names no template of the application's.
+#[must_use]
+pub fn renders_its_own_variables(path: &Path) -> bool {
+    let segments = segments(path);
+    segments
+        .windows(2)
+        .any(|pair| pair[0] == APP && ["controllers", "mailers", HELPERS, VIEWS].contains(&pair[1]))
+}
+
 /// Whether `path` is a file Rails puts in every template's view context.
 ///
 /// `ActionController::Base.all_helpers_from_path` globs `**/*_helper.rb` under each `app/helpers`
 /// directory, so **both halves of this are Rails' own**, not a convention this crate chose: a file
-/// under `app/helpers` not named `*_helper.rb` is not a default helper. Solidus has several
+/// under `app/helpers` not named `*_helper.rb` is not a default helper. An engine may have several
 /// (`core/app/helpers/spree/core/controller_helpers/auth.rb`) and reaches them by `include`ing them
 /// into controllers, a different mechanism that `analysis::views` answers through the ancestor
 /// walk, not this list.
@@ -119,10 +166,28 @@ fn namespaced(path: &Path) -> Option<String> {
     // Everything between `views/` and the file name. The file name is the action, which this rule
     // does not read.
     let directories = segments.get(views + 1..segments.len().saturating_sub(1))?;
+    constant_of(directories)
+}
+
+/// The mailer a view directory names where a `default template_path:` moved the mailer's views:
+/// `mailers/notify_mailer` is `NotifyMailer` between `mailers/` and nothing.
+///
+/// The inverse of the setting's own rule, `"#{before}#{mailer.class.name.underscore}#{after}"`,
+/// with [`mailer_of`]'s camelizing: `None` where the directory is not spelled that way, or the name
+/// between is empty or cannot spell a constant. Which class that is, and whether it is a mailer
+/// that setting applies to, is `analysis::views`' question.
+#[must_use]
+pub fn mailer_in(directory: &str, before: &str, after: &str) -> Option<String> {
+    let between = directory.strip_prefix(before)?.strip_suffix(after)?;
+    constant_of(&between.split('/').collect::<Vec<_>>())
+}
+
+/// Directory names as the constant Rails camelizes them into: `admin/users` is `Admin::Users`.
+/// `None` for no directory, or one that cannot spell a constant (`""` included).
+fn constant_of(directories: &[&str]) -> Option<String> {
     if directories.is_empty() {
         return None;
     }
-
     let mut name = String::new();
     for directory in directories {
         let camelized = camelize(directory)?;
@@ -144,7 +209,7 @@ fn segments(path: &Path) -> Vec<&str> {
 /// Where a path's namespace directories begin, or `None` if it is under no autoload root.
 ///
 /// **The three bounds both autoload rules share, in one place.** The anchor is a segment literally
-/// named `app`, which engines and discourse plugins keep too; [`NOT_AUTOLOADED`] is the list Rails
+/// named `app`, which engines and plugins keep too; [`NOT_AUTOLOADED`] is the list Rails
 /// leaves out; and a `concerns` directly under a root is itself a root ([`CONCERNS`]). A second
 /// copy would one day disagree about `app/models/concerns/`.
 ///
@@ -180,7 +245,7 @@ fn autoloaded_from(segments: &[&str]) -> Option<usize> {
 /// caller, which holds every name the workspace and bundle declare, can tell.
 ///
 /// **Three bounds, each Rails' own, not this crate's:** the anchor is a segment literally named
-/// `app` (engines and discourse plugins keep it too); [`NOT_AUTOLOADED`] is the list Rails leaves
+/// `app` (engines and plugins keep it too); [`NOT_AUTOLOADED`] is the list Rails leaves
 /// out; and a `concerns` directly under a root is itself a root ([`CONCERNS`]), so nothing named
 /// `Concerns` is ever conjured.
 ///
@@ -422,6 +487,65 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn only_a_controller_a_mailer_a_helper_or_a_view_renders_with_its_own_variables() {
+        for path in [
+            "app/controllers/stories_controller.rb",
+            "app/controllers/concerns/reshows.rb",
+            "engines/blog/app/mailers/digest_mailer.rb",
+            "app/helpers/stories_helper.rb",
+            "app/views/stories/show.html.erb",
+        ] {
+            assert!(renders_its_own_variables(&PathBuf::from(path)), "{path}");
+        }
+        for path in [
+            "app/components/card/component.rb",
+            "app/services/exporter.rb",
+            "lib/renderer.rb",
+            "controllers/stray.rb",
+        ] {
+            assert!(!renders_its_own_variables(&PathBuf::from(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_jbuilder_view_is_one_under_a_views_directory() {
+        for path in [
+            "app/views/stories/show.json.jbuilder",
+            "app/views/stories/_story.json.jbuilder",
+        ] {
+            assert!(is_jbuilder(&PathBuf::from(path)), "{path}");
+        }
+        for path in [
+            "app/views/stories/show.html.erb",
+            "lib/builders/story.jbuilder",
+            "app/views/stories/show.rb",
+        ] {
+            assert!(!is_jbuilder(&PathBuf::from(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_template_is_named_as_a_render_call_names_it() {
+        let named = |path: &str| template_of(&PathBuf::from(path));
+        assert_eq!(
+            named("app/views/stories/show.html.erb"),
+            Some(("stories/show".to_owned(), false))
+        );
+        assert_eq!(
+            named("engines/blog/app/views/admin/users/_row.html.erb"),
+            Some(("admin/users/row".to_owned(), true))
+        );
+        // Directly under `views/`, which no controller renders but a `render template:` can name.
+        assert_eq!(
+            named("app/views/home.html.erb"),
+            Some(("home".to_owned(), false))
+        );
+        // Not a view, and a file name with nothing before its extensions.
+        assert_eq!(named("app/models/story.rb"), None);
+        assert_eq!(named("app/views/stories/_.html.erb"), None);
+    }
 
     /// Every shape of path a routes file can and cannot take.
     ///
@@ -766,6 +890,45 @@ mod tests {
         assert_eq!(answers, expected);
     }
 
+    /// A `default template_path:` spelled around the mailer's own name, read backwards.
+    #[test]
+    fn the_mailer_a_moved_view_directory_names() {
+        let rows = [
+            (
+                "mailers/notify_mailer",
+                "mailers/",
+                "",
+                Some("NotifyMailer"),
+            ),
+            (
+                "mailers/admin/report_mailer",
+                "mailers/",
+                "",
+                Some("Admin::ReportMailer"),
+            ),
+            (
+                "emails/user_mailer/html",
+                "emails/",
+                "/html",
+                Some("UserMailer"),
+            ),
+            // The setting says nothing moved.
+            ("user_mailer", "", "", Some("UserMailer")),
+            // Spelled some other way, or nothing between.
+            ("notify_mailer", "mailers/", "", None),
+            ("mailers/", "mailers/", "", None),
+            ("mailers/notify_mailer", "mailers/", "/html", None),
+            ("mailers/123", "mailers/", "", None),
+        ];
+        for (directory, before, after, expected) in rows {
+            assert_eq!(
+                mailer_in(directory, before, after).as_deref(),
+                expected,
+                "{directory}"
+            );
+        }
+    }
+
     /// Rails' own glob, both halves.
     ///
     /// The `_helper.rb` half keeps `core/app/helpers/spree/core/controller_helpers/auth.rb` off the
@@ -905,6 +1068,7 @@ mod tests {
         // instance-variable machinery has nothing in the file to walk: the assignment is in another
         // file the template never names, and only a path connects them.
         let mut harness = Harness::new();
+        harness.write("sig/nil.rbs", "class NilClass\nend\n");
         let view = rails_app(&harness);
         harness.index();
 
@@ -913,17 +1077,11 @@ mod tests {
         assert!(markdown.contains("Story#title"), "{markdown}");
         // The provenance, which is what makes a convention shippable: the class and the line, both
         // in a file the card is not drawn over.
-        assert!(
-            markdown.contains(
-                "Type taken from `StoriesController`, line 3 — the controller Rails renders \
-                 this template from."
-            ),
-            "{markdown}"
-        );
+        assert!(!markdown.contains("Guessed from name alone"), "{markdown}");
         // And it is a derived answer, not a guess, which the card shows by *not* saying the other
         // thing.
         assert!(
-            !markdown.contains("guessed from the name"),
+            !markdown.contains("Guessed from name alone"),
             "a convention that names a file is not a guess: {markdown}"
         );
 
@@ -931,11 +1089,7 @@ mod tests {
         // assignment of its own to walk to, so the convention that types `@story.title` must also
         // type this.
         let bare = card(&mut harness, &view, source, "@story");
-        assert!(bare.contains("class Story"), "{bare}");
-        assert!(
-            bare.contains("Type taken from `StoriesController`, line 3"),
-            "{bare}"
-        );
+        assert_eq!(bare, "```ruby\nStoriesController#@story: Story?\n```");
 
         // A variable the controller never assigns is not this controller's to answer for, and the
         // convention says so by finding no assignment, not a wrong one.
@@ -960,6 +1114,7 @@ mod tests {
         // not missing it but reaching the *top-level* `StoriesController` instead: a different
         // controller assigning a different variable.
         let mut harness = Harness::new();
+        harness.write("sig/nil.rbs", "class NilClass\nend\n");
         harness.write("app/models/story.rb", STORY);
         harness.write(
             "app/models/draft.rb",
@@ -979,10 +1134,7 @@ mod tests {
 
         let markdown = card(&mut harness, &view, source, "slug");
         assert!(markdown.contains("Draft#slug"), "{markdown}");
-        assert!(
-            markdown.contains("`Admin::StoriesController`"),
-            "{markdown}"
-        );
+        assert!(!markdown.contains("Guessed from name alone"), "{markdown}");
     }
 
     #[test]
@@ -1005,10 +1157,7 @@ mod tests {
         );
         // The rung below answers instead, wearing its own label. This shows the two are separable:
         // same file, same variable, a different tier.
-        assert!(
-            markdown.contains("Type guessed from the name `@story` alone"),
-            "{markdown}"
-        );
+        assert!(markdown.contains("Guessed from name alone"), "{markdown}");
     }
 
     #[test]
@@ -1062,10 +1211,7 @@ mod tests {
         let markdown = card(&mut harness, &view, source, "title");
         assert!(!markdown.contains("StoriesController"), "{markdown}");
         // The rung below still answers, which makes this a missing file, not a broken request.
-        assert!(
-            markdown.contains("Type guessed from the name `@story` alone"),
-            "{markdown}"
-        );
+        assert!(markdown.contains("Guessed from name alone"), "{markdown}");
     }
 
     #[test]

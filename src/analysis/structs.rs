@@ -65,11 +65,8 @@
 //! hand-written annotation, because a `sig` above a `def` overriding a reader is the one collision
 //! either can reach.
 //!
-//! `Struct#each` is declared `untyped` although Ruby returns `self`. [`Facts`] holds one
-//! declaration per `(owner, name)`, and `each` returns the struct with a block and an `Enumerator`
-//! without one. `untyped` is the only honest single answer;
-//! [`Types::harvest`](super::types::Types::harvest) drops it, leaving the name rung. `Data#with`
-//! has no such split and chains.
+//! `Struct#each` returns the struct with a block and an `Enumerator` without one, so it is written
+//! as two arms, and the call's block picks. `Data#with` has no such split and chains.
 
 use ruby_prism::{CallNode, ConstantWriteNode, Node};
 
@@ -77,6 +74,9 @@ use crate::generated::{Declared, Facts, Namespaces, Owner, Source};
 
 /// One member name and the two spans a jump to it needs: the whole `:x`, and the `x` inside it.
 type Named = (String, (u32, u32), (u32, u32));
+
+/// A fixed member's arms after its first, as `(parameters, returns)`.
+type Arms = &'static [(&'static str, &'static str)];
 
 /// Which of the two macros was written, and therefore what it installs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,27 +127,37 @@ impl Shape {
     /// member Ruby defines on both sides. Declaring only the instance half would leave
     /// `Point.members` on the name rung with a *longer* candidate list than before this reader ran,
     /// **which is how a generator makes an answer worse without making one wrong**.
-    fn framework(self) -> &'static [(&'static str, &'static str, &'static str, bool)] {
+    ///
+    /// The last field is every arm after the first, where the call decides the answer.
+    #[allow(clippy::type_complexity)]
+    fn framework(self) -> &'static [(&'static str, &'static str, &'static str, bool, Arms)] {
         match self {
             // `[]` takes a member's name or index and can return any member; `each` is the
             // two-armed case from the module header; `members` is the one that chains.
             Self::Struct => &[
-                ("[]", "(untyped)", "untyped", false),
-                ("each", "() ?{ (untyped) -> void }", "untyped", false),
-                ("members", "()", "Array[Symbol]", false),
-                ("members", "()", "Array[Symbol]", true),
+                ("[]", "(untyped)", "untyped", false, &[]),
+                (
+                    "each",
+                    "() { (untyped) -> void }",
+                    "%s",
+                    false,
+                    &[("()", "Enumerator[untyped, %s]")],
+                ),
+                ("members", "()", "Array[Symbol]", false, &[]),
+                ("members", "()", "Array[Symbol]", true, &[]),
             ],
             // `with` hands back the same class, which is what lets a `Data` chain through a copy.
             // Both hashes are keyed by the member names, so `Symbol` is exact, and the value side
             // is the readers' `untyped`.
             Self::Data => &[
-                ("with", "(**untyped)", "%s", false),
-                ("to_h", "()", "Hash[Symbol, untyped]", false),
+                ("with", "(**untyped)", "%s", false, &[]),
+                ("to_h", "()", "Hash[Symbol, untyped]", false, &[]),
                 (
                     "deconstruct_keys",
                     "(Array[Symbol]?)",
                     "Hash[Symbol, untyped]",
                     false,
+                    &[],
                 ),
             ],
         }
@@ -163,6 +173,17 @@ impl Shape {
 /// Text in, no I/O: the contract every generator has.
 #[must_use]
 pub fn read(source: &str, file: &str, namespaces: &Namespaces) -> Facts {
+    read_asking(source, file, namespaces).0
+}
+
+/// [`read`], and every class it asked `namespaces` about with the answer, in order: the only way
+/// the answer depends on anything but the text, so a memo of it holds while those answers do.
+#[must_use]
+pub fn read_asking(
+    source: &str,
+    file: &str,
+    namespaces: &Namespaces,
+) -> (Facts, Vec<(String, bool)>) {
     let parsed = ruby_prism::parse(source.as_bytes());
     let mut reader = Reader {
         source,
@@ -170,6 +191,7 @@ pub fn read(source: &str, file: &str, namespaces: &Namespaces) -> Facts {
         namespaces,
         nesting: Vec::new(),
         out: Facts::default(),
+        asked: Vec::new(),
     };
     reader.walk(
         parsed
@@ -177,7 +199,7 @@ pub fn read(source: &str, file: &str, namespaces: &Namespaces) -> Facts {
             .as_program_node()
             .map(|program| program.statements().as_node()),
     );
-    reader.out
+    (reader.out, reader.asked)
 }
 
 struct Reader<'src> {
@@ -186,6 +208,8 @@ struct Reader<'src> {
     namespaces: &'src Namespaces,
     nesting: Vec<String>,
     out: Facts,
+    /// Every name [`Reader::spellable`] was asked, with its answer.
+    asked: Vec<(String, bool)>,
 }
 
 impl Reader<'_> {
@@ -252,8 +276,10 @@ impl Reader<'_> {
     /// [`Namespaces::spellable`] is the rule. It lives there, not here, because the schema
     /// generator declares on a nested model too: two generators ask the question, and they must not
     /// answer it differently.
-    fn spellable(&self, owner: &Owner) -> bool {
-        self.namespaces.spellable(owner.name())
+    fn spellable(&mut self, owner: &Owner) -> bool {
+        let spellable = self.namespaces.spellable(owner.name());
+        self.asked.push((owner.name().to_owned(), spellable));
+        spellable
     }
 
     /// Everything one `Struct.new` or `Data.define` installs on `owner`, or nothing.
@@ -277,7 +303,12 @@ impl Reader<'_> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let mut say = |owner: Owner, name: String, parameters: &str, returns: &str, at, from| {
+        let mut say = |owner: Owner,
+                       name: String,
+                       (parameters, returns): (&str, &str),
+                       overloads: Vec<(String, String)>,
+                       at,
+                       from| {
             // Instance side only: `block_methods` collects receiverless `def`s, which are instance
             // methods. A `def members` in the block says nothing about `Point.members`.
             if matches!(owner, Owner::Instance(_)) && shadowed.contains(&name) {
@@ -301,7 +332,8 @@ impl Reader<'_> {
                 },
                 at,
                 from,
-                overloads: Vec::new(),
+                overloads,
+                private: false,
             });
         };
         for (name, declared, selection) in &names {
@@ -309,8 +341,8 @@ impl Reader<'_> {
             say(
                 owner.clone(),
                 name.clone(),
-                "()",
-                "untyped",
+                ("()", "untyped"),
+                Vec::new(),
                 at,
                 Source::Struct,
             );
@@ -318,15 +350,15 @@ impl Reader<'_> {
                 say(
                     owner.clone(),
                     format!("{name}="),
-                    "(untyped)",
-                    "untyped",
+                    ("(untyped)", "untyped"),
+                    Vec::new(),
                     at,
                     Source::Struct,
                 );
             }
         }
-        for (name, parameters, returns, singleton) in shape.framework() {
-            let returns = returns.replace("%s", owner.name());
+        for (name, parameters, returns, singleton, arms) in shape.framework() {
+            let named = |returns: &str| returns.replace("%s", owner.name());
             let side = if *singleton {
                 Owner::Singleton(owner.name().to_owned())
             } else {
@@ -335,8 +367,10 @@ impl Reader<'_> {
             say(
                 side,
                 (*name).to_owned(),
-                parameters,
-                &returns,
+                (parameters, &named(returns)),
+                arms.iter()
+                    .map(|(parameters, returns)| ((*parameters).to_owned(), named(returns)))
+                    .collect(),
                 None,
                 Source::Interface,
             );
@@ -457,15 +491,15 @@ class Point
   # From `app/models/point.rb`, `Struct.new(:x, :y)`.
   def x: () -> untyped
   # From `app/models/point.rb`, `Struct.new(:x, :y)`.
-  def x=: (untyped) -> untyped
+  def x=: (untyped value) -> untyped
   # From `app/models/point.rb`, `Struct.new(:x, :y)`.
   def y: () -> untyped
   # From `app/models/point.rb`, `Struct.new(:x, :y)`.
-  def y=: (untyped) -> untyped
+  def y=: (untyped value) -> untyped
   # Every `Struct` has this; ya-lsp writes it, and no file declares it.
   def []: (untyped) -> untyped
   # Every `Struct` has this; ya-lsp writes it, and no file declares it.
-  def each: () ?{ (untyped) -> void } -> untyped
+  def each: () { (untyped) -> void } -> Point | () -> Enumerator[untyped, Point]
   # Every `Struct` has this; ya-lsp writes it, and no file declares it.
   def members: () -> Array[Symbol]
   # Every `Struct` has this; ya-lsp writes it, and no file declares it.
@@ -770,7 +804,6 @@ end
 
         let card = card(&mut harness, &uri, source, "x");
         assert!(card.contains("Point#x"), "{card}");
-        assert!(card.contains("`Struct.new(:x, :y)`"), "{card}");
 
         let definition = harness.definition_at(&uri, source, "x");
         assert_eq!(
@@ -811,7 +844,7 @@ end
         let card = card(&mut harness, &uri, source, "north");
         assert!(card.contains("Coord#north"), "{card}");
         assert!(
-            card.contains("Type derived through `Coord#with()`"),
+            !card.contains("Guessed from name alone"),
             "the copy is what the chain was followed through: {card}"
         );
     }
@@ -828,19 +861,7 @@ end
     #[test]
     fn a_struct_under_a_namespace_nobody_defines_declares_and_costs_nothing() {
         let source = "Reports::Registry.supported?(1)\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let signatures = dir.path().join("sig");
-        std::fs::create_dir_all(signatures.join("core")).unwrap();
-        std::fs::write(signatures.join("core/core.rbs"), TYPED_RBS).unwrap();
-        std::fs::write(
-            dir.path().join("ya-lsp.toml"),
-            format!(
-                "[gems]\nenabled = false\n\n[rbs]\npath = {:?}\n",
-                signatures.display().to_string()
-            ),
-        )
-        .unwrap();
-        let mut harness = Harness::at(dir, PositionEncoding::Utf16);
+        let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
         let registry_uri = harness.write(
             "app/services/reports/registry.rb",
             "module Reports::Registry\n  Metric = Data.define(:name)\n\n  def self.supported?(name)\n    name\n  end\nend\n",
@@ -872,7 +893,7 @@ end
         // footnote that says so. Over a real application the same failure shows as a candidate
         // list, and asserting on the list is what made this look unreproducible here.
         assert!(
-            !card.contains("Matched on the method name alone"),
+            !card.contains("Guessed from name alone"),
             "the module keeps its own singleton: {card}"
         );
     }
@@ -899,10 +920,10 @@ end
             "and the schema's, in another document"
         );
 
-        // Two documents, two sentences: neither generator's provenance leaks into the other's.
+        // Two documents, and each card is its own member's.
         let column = card(&mut harness, &uri, source, "title");
-        assert!(column.contains("db/schema.rb"), "{column}");
+        assert!(column.contains("Story#title"), "{column}");
         let member = card(&mut harness, &uri, source, "x");
-        assert!(member.contains("`Struct.new(:x)`"), "{member}");
+        assert!(member.contains("Point#x"), "{member}");
     }
 }

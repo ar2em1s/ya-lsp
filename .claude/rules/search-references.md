@@ -11,7 +11,7 @@ paths:
 - **Ask `is_own_code` and never re-derive it.** The rule is written once, on
   `environment::Layout::is_own`: the workspace prefix, plus `own_prefixes`, minus `foreign_prefixes`
   (a vendored bundle sits inside the root, and a monorepo load path sits outside it).
-- Callers: diagnostics, `references`, `workspace/symbol` ranking and `types::from_ancestor`.
+- Callers: diagnostics, `references` and `workspace/symbol` ranking.
 
 ## `workspace/symbol`
 
@@ -51,6 +51,15 @@ paths:
    still lists its call sites. Resolution only narrows `includeDeclaration` (`declaration_sites`).
 5. **Filter out the synthetic `<Foo>` references** (`references::is_synthetic`). Otherwise
    `class << self` answers with `Person.new` in another file.
+6. **A method's name handed as a symbol is a use of it** (`references::Named`,
+   `Analysis::named_uses`): `send(:shout)`, `try(:shout)`, `method(:shout)`, `respond_to?(:shout)`,
+   by name like every other use, the call matched by how it is spelled (`types::naming_calls`).
+   rubydex records the call, not its argument, so the text is read: only a document whose calls
+   include one of those names, once per version (`HeldExits::handed`, every call's first-argument
+   symbols in graph coordinates). `documentHighlight` passes the same hook, so the two agree;
+   `rename` passes none (methods never rename), and `callHierarchy/incomingCalls` stays calls only.
+   Asked at the symbol itself, `references` answers through `locator::symbol_at`.
+   Held by `a_name_handed_to_send_or_its_kin_is_a_use_of_it`.
 
 ## Caps
 

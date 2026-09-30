@@ -72,7 +72,7 @@ test('a second server asking for the same roots is dropped, not forwarded empty'
 
 test('a root only one bundle resolved to stays with that bundle', () => {
   const claims = new Claims();
-  const mine = 'file:///gems/solidus_core-4.6.0';
+  const mine = 'file:///gems/shouty-1.2.3';
   claims.narrow(APP, [documents('textDocument/hover', [ACTIVERECORD, RUBY])]);
 
   const second = claims.narrow(API, [

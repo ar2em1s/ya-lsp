@@ -9,9 +9,9 @@ rescue it.
 shape, but it is the *weaker* reading: the corpus is the authority here, not the card. The card is
 still read, to bucket an absence by the tier the server claimed, as the member key does.
 
-**It covers a blind spot.** Without this key, no lane poses `completion` at a receiverless call
-(`lane2.receiver` reads `listed`, not `offered`, from the other side). So `hover` answering a bare
-word from one scope while `completion` answers from another would move no counter.
+**It covers a blind spot.** Without this key, no lane poses `completion` at a receiverless call. So
+`hover` answering a bare word from one scope while `completion` answers from another would move no
+counter.
 
 # The prefix is the word: the one design decision here
 
@@ -24,13 +24,6 @@ So the cursor goes at the **end** of the word, where a developer's cursor is whe
 and read the list. The candidate set does not depend on the prefix (`completion.rs` collects for the
 receiver and filters by `tier`), so a name absent here is absent from the candidate set outright:
 the strong claim, and the one worth reporting.
-
-# Its replies stay out of the run's `answers`
-
-The member key writes into the run's dict so `lane2.receiver` can hold a card against its list. This
-one must not: `Row.listed` means *(index, completion) is in answers*, so a call cursor there would
-move `receiver-asked`, an existing counter, for a card with no receiver sentence in it. A key that
-quietly redefines another lane's denominator is not additive, whatever it measures.
 """
 
 from audit import site
@@ -50,8 +43,8 @@ SHAPE = "call"
 def counters():
     return {"asked": 0, "declined": 0, "answered": 0, "empty": 0, "present": 0, "absent": 0,
             "truncated": 0, "rank-1": 0, "rank-2-10": 0, "rank-11-50": 0, "rank-51+": 0,
-            "absent-resolved": 0, "absent-derived": 0, "absent-guessed": 0, "absent-no-card": 0,
-            "empty-resolved": 0, "empty-derived": 0, "empty-guessed": 0, "empty-no-card": 0}
+            "absent-resolved": 0, "absent-guessed": 0, "absent-no-card": 0,
+            "empty-resolved": 0, "empty-guessed": 0, "empty-no-card": 0}
 
 
 def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
@@ -135,7 +128,7 @@ def under(counts):
                                ("rank-1", "rank-2-10", "rank-11-50", "rank-51+"))]
     for shape in ("absent", "empty"):
         lost = [(rung, counts[f"{shape}-{rung}"])
-                for rung in ("resolved", "derived", "guessed", "no-card")
+                for rung in ("resolved", "guessed", "no-card")
                 if counts.get(f"{shape}-{rung}")]
         if lost:
             out.append(f"{shape} " + "  ".join(f"{rung} {count}" for rung, count in lost))

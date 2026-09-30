@@ -38,6 +38,8 @@ pub struct Config {
     pub index: IndexConfig,
     pub log: LogConfig,
     pub rails: RailsConfig,
+    pub rspec: RspecConfig,
+    pub i18n: I18nConfig,
     pub trees: TreesConfig,
     pub gems: GemsConfig,
     pub rbs: RbsConfig,
@@ -185,6 +187,48 @@ pub struct RailsConfig {
     pub views: bool,
 }
 
+/// What ya-lsp knows about RSpec: the example groups a spec file writes, what `let` and `subject`
+/// return, and what `self` is inside a `describe`, an `it` and a hook.
+///
+/// Its own table, not a Rails key: RSpec runs outside Rails, and a Rails project on Minitest has
+/// nothing for it to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RspecConfig {
+    /// `auto` by default: yes when `Gemfile.lock` locks `rspec-core`.
+    pub enabled: Switch,
+}
+
+/// What ya-lsp reads of the project's translations: the keys a `t("…")` call can
+/// name, what each holds, and where it is written.
+///
+/// Its own table, for `[rspec]`'s reason: i18n is its own gem, and runs outside Rails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct I18nConfig {
+    /// `auto` by default: yes when `Gemfile.lock` locks `i18n`.
+    pub enabled: Switch,
+    /// The one locale every surface reads, `en` by default. What another locale holds is the
+    /// project's business, not the server's (ruled 2026-09-28).
+    pub locale: String,
+    /// Globs, relative to the root, of the project's own locale files. `None` is the built-in list
+    /// (every `config/locales` in the project); a list **replaces** it, and `[]` reads none. The
+    /// gems' files are read either way.
+    ///
+    /// **A wrong list can give a wrong type**: a key read as a `String` from the listed files,
+    /// whose real value is a subtree in a file the list leaves out, is answered `String`. The list
+    /// is the project's word, as `gems.paths` is.
+    pub paths: Option<Vec<String>>,
+}
+
+impl Default for I18nConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Switch::Word(Word::Auto),
+            locale: "en".to_owned(),
+            paths: None,
+        }
+    }
+}
+
 /// Where this project keeps the trees the fence is about.
 ///
 /// `analysis::environment` decides that from four hard-coded words and one hard-coded pair, tuned
@@ -224,6 +268,9 @@ pub struct TypesConfig {
     pub structs: bool,
     /// A Sorbet `sig` and a YARD `@return`. In `[types]` for `structs`' reason.
     pub annotations: bool,
+    /// Which class a FactoryBot factory builds, so `create(:user)` is a `User`. In `[types]` for
+    /// `structs`' reason: a test library, not Rails.
+    pub factories: bool,
     /// Answer from a receiver's own name when nothing else can: `@user` is a `User`, `person` is a
     /// `Person`.
     ///
@@ -375,10 +422,19 @@ impl Default for RailsConfig {
     }
 }
 
+impl Default for RspecConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Switch::Word(Word::Auto),
+        }
+    }
+}
+
 impl Default for TypesConfig {
     fn default() -> Self {
         Self {
             structs: true,
+            factories: true,
             annotations: true,
             guess_from_names: true,
         }
@@ -437,6 +493,8 @@ pub struct PartialConfig {
     pub index: Option<PartialIndex>,
     pub log: Option<PartialLog>,
     pub rails: Option<PartialRails>,
+    pub rspec: Option<PartialRspec>,
+    pub i18n: Option<PartialI18n>,
     pub trees: Option<PartialTrees>,
     pub gems: Option<PartialGems>,
     pub rbs: Option<PartialRbs>,
@@ -485,6 +543,20 @@ pub struct PartialRails {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PartialRspec {
+    pub enabled: Option<Switch>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialI18n {
+    pub enabled: Option<Switch>,
+    pub locale: Option<String>,
+    pub paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialTrees {
     pub test: Option<Vec<String>>,
     pub test_support: Option<Vec<String>>,
@@ -495,6 +567,7 @@ pub struct PartialTrees {
 #[serde(deny_unknown_fields)]
 pub struct PartialTypes {
     pub structs: Option<bool>,
+    pub factories: Option<bool>,
     pub annotations: Option<bool>,
     pub guess_from_names: Option<bool>,
 }
@@ -562,6 +635,17 @@ impl Config {
             replace(&mut self.rails.entrypoints, rails.entrypoints);
             replace(&mut self.rails.views, rails.views);
         }
+        if let Some(rspec) = layer.rspec {
+            replace(&mut self.rspec.enabled, rspec.enabled);
+        }
+        if let Some(i18n) = layer.i18n {
+            replace(&mut self.i18n.enabled, i18n.enabled);
+            replace(&mut self.i18n.locale, i18n.locale);
+            // Replaces, as `trees.test` does: the layer's list whole, an empty one included.
+            if i18n.paths.is_some() {
+                self.i18n.paths = i18n.paths;
+            }
+        }
         if let Some(trees) = layer.trees {
             // `test` and `migration` replace, so they take the layer's list whole, including an
             // empty one (how a fence is turned off). `test_support` extends, so it is assigned like
@@ -576,6 +660,7 @@ impl Config {
         }
         if let Some(types) = layer.types {
             replace(&mut self.types.structs, types.structs);
+            replace(&mut self.types.factories, types.factories);
             replace(&mut self.types.annotations, types.annotations);
             replace(&mut self.types.guess_from_names, types.guess_from_names);
         }
@@ -612,6 +697,8 @@ impl Config {
             ("index", self.index != defaults.index),
             ("log", self.log != defaults.log),
             ("rails", self.rails != defaults.rails),
+            ("rspec", self.rspec != defaults.rspec),
+            ("i18n", self.i18n != defaults.i18n),
             ("trees", self.trees != defaults.trees),
             ("gems", self.gems != defaults.gems),
             ("rbs", self.rbs != defaults.rbs),
@@ -719,6 +806,12 @@ fn validate(config: &Config) -> Vec<String> {
         problems.push(messages::max_files_is_zero(
             IndexConfig::default().max_files,
         ));
+    }
+
+    for pattern in config.i18n.paths.iter().flatten() {
+        if let Err(error) = glob::Pattern::new(pattern) {
+            problems.push(messages::invalid_glob("i18n.paths", pattern, &error));
+        }
     }
 
     // A `trees.migration` entry with no parent is the one spelling of this key that deletes
@@ -997,6 +1090,8 @@ mod tests {
             enabled = false
             [rbs]
             stdlib = false
+            [rspec]
+            enabled = "off"
             [types]
             guess_from_names = false
             [hints]
@@ -1010,12 +1105,51 @@ mod tests {
             vec![
                 "index",
                 "log",
+                "rspec",
                 "gems",
                 "rbs",
                 "types",
                 "hints",
                 "diagnostics"
             ]
+        );
+        assert_eq!(
+            parse("[rspec]\nenabled = true\n").rspec.enabled,
+            Switch::Fixed(true)
+        );
+    }
+
+    /// `[i18n]`: the main locale, and a list of the project's own files that replaces the default,
+    /// `[]` included; a layer that does not name the list keeps the one below it.
+    #[test]
+    fn the_i18n_table_names_the_main_locale_and_where_its_files_are() {
+        let config =
+            parse("[i18n]\nenabled = true\nlocale = \"de\"\npaths = [\"locales/*.yml\"]\n");
+        assert_eq!(config.i18n.enabled, Switch::Fixed(true));
+        assert_eq!(config.i18n.locale, "de");
+        assert_eq!(config.i18n.paths, Some(vec!["locales/*.yml".to_owned()]));
+        assert_eq!(config.changed_from_defaults(), vec!["i18n"]);
+        assert_eq!(parse("[i18n]\npaths = []\n").i18n.paths, Some(Vec::new()));
+        let mut layered = parse("[i18n]\npaths = [\"a/*.yml\"]\n");
+        layered.apply(toml::from_str("[i18n]\nlocale = \"fr\"\n").expect("valid config"));
+        assert_eq!(layered.i18n.paths, Some(vec!["a/*.yml".to_owned()]));
+        assert_eq!(layered.i18n.locale, "fr");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            "[i18n]\npaths = [\"a/[.yml\", \"ok/*.yml\"]\n",
+        )
+        .unwrap();
+        let loaded = load(dir.path(), None);
+        assert_eq!(
+            loaded
+                .problems
+                .iter()
+                .filter(|problem| problem.contains("i18n.paths"))
+                .count(),
+            1,
+            "{:?}",
+            loaded.problems
         );
     }
 

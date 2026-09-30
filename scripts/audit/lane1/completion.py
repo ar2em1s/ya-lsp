@@ -13,6 +13,14 @@ of lane 2's methods and it carries a `context` nothing else sends.
 cursor is already in `answers`, so an absent member is reported with the tier the server claimed for
 its receiver. That separates a list that lost a candidate from a receiver that was never typed.
 
+**The card is the member's, and over an empty list a root's member claims nothing about the
+receiver** (`claim`). `Object`, `Kernel` and `BasicObject` are every object's ancestors, so a card
+naming `Object#present?` resolves on a receiver nobody typed. That empty list gets its own bucket,
+`empty-root`, and raises no finding. The receiver's own card is no better witness: a constant's
+names the constant, not what it holds. **A list that answered is not excused**: it typed the
+receiver, so a root's member missing from it (`self.class` in a module's `def`) is still
+`completion-absent`.
+
 **What is thrown away** (each filter would otherwise score spelling, not knowledge):
 - **A setter.** At `order.total = 1` the method is `total=`, and servers disagree about offering
   `total` or `total=`. That is a naming convention.
@@ -39,6 +47,8 @@ baseline flattens them one level; a median allows neither and moves with the sam
 buckets are the questions a person has: is it first, is it on screen, is it reachable at all.
 """
 
+import re
+
 from audit import site
 from audit.answers import card_of, tier
 from audit.client import uri
@@ -56,6 +66,11 @@ METHOD = "textDocument/completion"
 # a day.
 CONTEXT = {"triggerKind": 2, "triggerCharacter": "."}
 IN_FLIGHT = 32
+# Every object's ancestors. A member only these declare is found whatever the receiver is.
+ROOTS = ("Object", "Kernel", "BasicObject")
+# The card's first line names the member: `Owner#name` or `Owner.name`, owner first.
+MEMBER = re.compile(r"^```ruby\n([A-Z][\w:]*)[#.]")
+RUNGS = ("resolved", "guessed", "no-card")
 
 
 def bucket(rank):
@@ -115,14 +130,26 @@ def setter(text, line, column, word):
     return after.startswith("=") and not after.startswith("==")
 
 
+def claim(card):
+    """What the member's card claims about the receiver of an **empty** list: its tier, `root`, or
+    `no-card`.
+
+    `root` is a sure card for a member only `ROOTS` declare, which any receiver reaches, typed or
+    not. A guess stays a guess. Not asked of a list that answered (see the module docs).
+    """
+    rung = tier(card) or "no-card"
+    found = MEMBER.match(card or "")
+    if rung == "resolved" and found and found.group(1) in ROOTS:
+        return "root"
+    return rung
+
+
 def counters():
     return {"asked": 0, "declined": 0, "answered": 0, "empty": 0, "present": 0, "absent": 0,
             "truncated": 0, "cut-short": 0,
             "rank-1": 0, "rank-2-10": 0, "rank-11-50": 0, "rank-51+": 0,
-            "absent-resolved": 0, "absent-derived": 0, "absent-guessed": 0,
-            "absent-no-card": 0,
-            "empty-resolved": 0, "empty-derived": 0, "empty-guessed": 0,
-            "empty-no-card": 0}
+            **{f"absent-{rung}": 0 for rung in RUNGS},
+            **{f"empty-{rung}": 0 for rung in ("root", *RUNGS)}}
 
 
 def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
@@ -136,16 +163,9 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
     rows = [(index, row) for index, row in enumerate(drawn or []) if row[1] == "member"]
     if not rows:
         return counts, findings
-    # **The replies land in the run's own `answers`, so lane 2 can read them.** *The card says the
-    # receiver has no type, and the list beside it is a class's members* contradicts two of the
-    # server's answers, so it is a check (check 6). But its second request exists only because this
-    # key sends it. A dict local to this function would make that check cost a third request per
-    # position, on the largest cost in the budget.
-    #
     # Nothing is in flight when this runs: `ask_all` drains to empty before returning, and the Rails
     # key asks through `ask_all` too, so every reply arriving here was posted below.
-    texts, posed = {}, []
-    replies = answers if isinstance(answers, dict) else {}
+    texts, posed, replies = {}, [], {}
     for index, (_, _, path, line, column, offset, word) in rows:
         if path not in texts:
             texts[path] = (corpus.dir / path).read_text(encoding="utf-8", errors="replace")
@@ -170,18 +190,19 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
         if incomplete:
             counts["truncated"] += 1
         items = items or []
-        rung = tier(card_of((answers or {}).get((index, "textDocument/hover")))) or "no-card"
+        card = card_of((answers or {}).get((index, "textDocument/hover")))
+        rung = tier(card) or "no-card"
         if not items:
             counts["empty"] += 1
-            counts[f"empty-{rung}"] += 1
+            counts[f"empty-{claim(card)}"] += 1
             # **An empty list is bucketed by tier, like an absent member.** ya-lsp *decides* to
             # answer with nothing where it cannot type the receiver, and a decision hides what an
             # absence would reveal: a **Resolved** card over an empty list is the server naming the
             # receiver's class in one request and failing to type it in the next.
             if rung == "resolved":
                 findings.append(("completion-declined", site(path, offset),
-                                 f"[{rung}] `{word}` — hover names the receiver's type and "
-                                 f"completion answered no list at {path}:{line + 1}"))
+                                 f"[{rung}] `{word}` — hover finds the member on the receiver's "
+                                 f"class and completion answered no list at {path}:{line + 1}"))
             continue
         counts["answered"] += 1
         rank = rank_of(items, word)
@@ -234,9 +255,9 @@ def under(counts):
         return []
     out = ["rank " + "  ".join(f"{name.split('-', 1)[1]} {counts[name]}" for name in
                                ("rank-1", "rank-2-10", "rank-11-50", "rank-51+"))]
-    for shape in ("absent", "empty"):
+    for shape, rungs in (("absent", RUNGS), ("empty", ("resolved", "root", *RUNGS[1:]))):
         lost = [(rung, counts[f"{shape}-{rung}"])
-                for rung in ("resolved", "derived", "guessed", "no-card")
+                for rung in rungs
                 if counts.get(f"{shape}-{rung}")]
         if lost:
             out.append(f"{shape} " + "  ".join(f"{rung} {count}" for rung, count in lost))

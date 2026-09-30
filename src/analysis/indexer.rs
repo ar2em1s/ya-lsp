@@ -62,13 +62,15 @@ pub struct Batch {
     /// The documents whose indexing panicked: not in the graph, and *named* rather than silently
     /// absent, which is the whole difference between this and a wrapper.
     pub skipped: Vec<DocUri>,
+    /// Each document indexed, with which of the texts asked for it spells ([`spells`]).
+    pub spelled: Vec<(DocUri, u64)>,
 }
 
 /// What one file's worth of work produced.
 enum Built {
     /// Boxed: a `LocalGraph` is an order of magnitude larger than the other two arms, and this
     /// travels down a channel once per file.
-    Indexed(Box<LocalGraph>),
+    Indexed(Box<LocalGraph>, DocUri, u64),
     Failed(Errors),
     Panicked(DocUri),
 }
@@ -79,10 +81,14 @@ enum Built {
 /// `Url::from_file_path` fails on a relative one, and a document with no URI is indexed nowhere
 /// (see `core-invariants.md`). A relative path is reported here, not dropped, as rubydex's own loop
 /// does.
-pub fn index_files(graph: &mut Graph, paths: Vec<PathBuf>) -> Batch {
+///
+/// `texts` are looked for in each file while its text is at hand ([`spells`]), for a question
+/// rubydex's index cannot answer: see `knowledge::Wants::spells`.
+pub fn index_files(graph: &mut Graph, paths: Vec<PathBuf>, texts: &[&str]) -> Batch {
     let mut batch = Batch {
         errors: Vec::new(),
         skipped: Vec::new(),
+        spelled: Vec::new(),
     };
     if paths.is_empty() {
         return batch;
@@ -113,7 +119,7 @@ pub fn index_files(graph: &mut Graph, paths: Vec<PathBuf>) -> Batch {
             scope.spawn(move || {
                 for path in jobs {
                     // Same: the merge loop below runs until every worker is done.
-                    let _ = built.send(build(&path));
+                    let _ = built.send(build(&path, texts));
                 }
             });
         }
@@ -123,7 +129,10 @@ pub fn index_files(graph: &mut Graph, paths: Vec<PathBuf>) -> Batch {
         // Merged as they arrive, overlapping with the workers, exactly as rubydex does.
         for outcome in built_rx {
             match outcome {
-                Built::Indexed(local) => graph.consume_document_changes(*local),
+                Built::Indexed(local, uri, spelled) => {
+                    graph.consume_document_changes(*local);
+                    batch.spelled.push((uri, spelled));
+                }
                 Built::Failed(error) => batch.errors.push(error),
                 Built::Panicked(uri) => batch.skipped.push(uri),
             }
@@ -134,7 +143,7 @@ pub fn index_files(graph: &mut Graph, paths: Vec<PathBuf>) -> Batch {
 }
 
 /// Read one file and index it, off the calling thread.
-fn build(path: &Path) -> Built {
+fn build(path: &Path, texts: &[&str]) -> Built {
     let Ok(source) = std::fs::read_to_string(path) else {
         return Built::Failed(Errors::FileError(format!(
             "Failed to read file `{}`",
@@ -160,7 +169,10 @@ fn build(path: &Path) -> Built {
             IndexerBackend::RubyIndexer,
         )
     })) {
-        Ok(local) => Built::Indexed(Box::new(local)),
+        Ok(local) => {
+            let spelled = spells(&source, texts);
+            Built::Indexed(Box::new(local), uri, spelled)
+        }
         // The default panic hook has already put rubydex's own file and line on stderr, which is
         // what a bug report is made of. Silencing it would make a contained panic unreportable: the
         // reasoning `Analysis::resolve` gives.
@@ -196,6 +208,18 @@ fn crash_if_asked(source: &str) {
         SOURCE_INDEXES_TO_CRASH.set(remaining - 1);
         panic!("a stand-in for rubydex ruby_indexer.rs:985, on the route no fixture reaches");
     }
+}
+
+/// Which of `texts` `source` spells, as bits: bit `n` is `texts[n]`.
+///
+/// Vectorised (`memchr::memmem`), because it runs over every file indexed.
+#[must_use]
+pub fn spells(source: &str, texts: &[&str]) -> u64 {
+    texts
+        .iter()
+        .enumerate()
+        .filter(|(_, text)| memchr::memmem::find(source.as_bytes(), text.as_bytes()).is_some())
+        .fold(0, |mask, (bit, _)| mask | 1 << bit)
 }
 
 /// Index one in-memory document, and say whether it survived.
@@ -266,7 +290,11 @@ mod tests {
         let also = write(root.path(), "also.rb", "class Also; end\n");
 
         let mut graph = Graph::new();
-        let batch = index_files(&mut graph, vec![good.clone(), bad.clone(), also.clone()]);
+        let batch = index_files(
+            &mut graph,
+            vec![good.clone(), bad.clone(), also.clone()],
+            &[],
+        );
 
         assert!(holds(&graph, &good));
         assert!(holds(&graph, &also));
@@ -309,7 +337,7 @@ mod tests {
         }
 
         let mut graph = Graph::new();
-        let batch = index_files(&mut graph, paths.clone());
+        let batch = index_files(&mut graph, paths.clone(), &[]);
 
         assert_eq!(bad.len(), bad_count);
         let lost: Vec<&PathBuf> = paths
@@ -332,7 +360,7 @@ mod tests {
         std::fs::create_dir(&directory).expect("mkdir");
 
         let mut graph = Graph::new();
-        let batch = index_files(&mut graph, vec![directory.clone()]);
+        let batch = index_files(&mut graph, vec![directory.clone()], &[]);
 
         assert!(batch.skipped.is_empty());
         assert_eq!(
@@ -353,7 +381,7 @@ mod tests {
         // one relative path certain to exist without the test writing one. Writing one would mean
         // changing the process's directory, which the rest of the suite is running in.
         let mut graph = Graph::new();
-        let batch = index_files(&mut graph, vec![PathBuf::from("Cargo.toml")]);
+        let batch = index_files(&mut graph, vec![PathBuf::from("Cargo.toml")], &[]);
 
         assert!(batch.skipped.is_empty());
         assert_eq!(
@@ -368,7 +396,7 @@ mod tests {
         // Not `is_empty`: a fresh graph already holds rubydex's own synthetic `built-in` document,
         // which is why `DocUri::from_graph_uri` rejects that URI.
         let before = graph.documents().len();
-        let batch = index_files(&mut graph, Vec::new());
+        let batch = index_files(&mut graph, Vec::new(), &[]);
         assert!(batch.errors.is_empty());
         assert!(batch.skipped.is_empty());
         assert_eq!(graph.documents().len(), before);

@@ -1,8 +1,9 @@
-"""Check 2: a **Resolved** card never points outside the code the application loads.
+"""Check 2: a sure card never points outside the code the application loads.
 
-Only the top tier is judged; that is the design. A Derived or Guessed card landing in a spec is the
-tier doing its job: it said it followed something, and a reader who checks finds the spec. A
-**Resolved** card said the code names this.
+Every card that does not say it guessed is judged; that is the design. A Guessed card landing in a
+spec is the tier doing its job: it said it is a guess, and a reader who checks finds the spec. Any
+other card claims the answer outright (since 2026-09-29 a derived answer reads exactly like one the
+code names), so it is held to the standard of one.
 
 `answers.where` holds the vocabulary of places, and why it is a deny-list, not an allow-list.
 
@@ -70,7 +71,7 @@ def breakdown(counts):
     `gem` is the tier working.
     """
     out = []
-    for rung in ("resolved", "derived", "guessed"):
+    for rung in ("resolved", "guessed"):
         row = counts["landed"].get(rung)
         if row:
             mix = "  ".join(f"{k} {v}" for k, v in sorted(row.items(), key=lambda kv: -kv[1]))

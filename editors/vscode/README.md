@@ -8,8 +8,8 @@ is the whole setup.
 1. **No Ruby needed.** It never runs `ruby`, `bundle` or `gem`. It reads your code, `Gemfile.lock`
    and the gems on disk. The binary ships inside the extension, so nothing is added to your
    `Gemfile`.
-2. **Every answer says how far to trust it.** Hover cards and completion rows are labelled
-   *Resolved*, *Derived* or *Guessed*. Guessing can be switched off.
+2. **It says when it is guessing.** An answer read off a name alone is marked *Guessed from name
+   alone.* on its card, is never drawn as an inlay hint, and can be switched off.
 3. **Rails without booting Rails.** Columns, associations, `enum`s, routes, mailers and jobs all
    resolve, because the schema and the macros are read as text.
 4. **Fast, no cache.** A real 612-file Rails app indexes in well under a second. Nothing sits on
@@ -18,9 +18,9 @@ is the whole setup.
    and their RBS signatures.
 
 ```ruby
-"x".upcase          # String  — Resolved: the code names the type
-@title.upcase       # String  — Derived: from the assignment, and the card says so
-@user               # User    — Guessed: from the name alone
+"x".upcase          # String  — the code names the type
+@title.upcase       # String  — from the assignment
+@user               # User    — Guessed from name alone, and the card says so
 ```
 
 ---
@@ -31,8 +31,8 @@ is the whole setup.
    [the Marketplace page](https://marketplace.visualstudio.com/items?itemName=ar2em1s.yalsp).
 2. **Open a Ruby project.** The server starts on the first `.rb` or `.erb` file. It indexes the
    workspace, then the bundle, with progress in the status bar.
-3. **Check it works.** Hover any constant: the card names the declaration and its tier. If nothing
-   appears, run **ya-lsp: Show Output**.
+3. **Check it works.** Hover any constant: the card names the declaration. If nothing appears, run
+   **ya-lsp: Show Output**.
 4. *(Optional)* **Commit a `ya-lsp.toml`** in the workspace root so the whole team gets the same
    setup in every editor. It overrides every setting below, and changes apply without a restart.
 
@@ -61,7 +61,7 @@ Anywhere else (Intel macOS included), build the server from
 | **Go to implementation** | The method, then every override below the receiver's class. |
 | **Go to type definition** | The class of the value under the cursor. |
 | **Go to declaration** | The RBS signature of a method. |
-| **Hover** | Signature, docs, and where the type came from. |
+| **Hover** | Signature, docs and the type. A guess says it is one. |
 | **Completion** | Knows ancestors and visibility. Completes keyword arguments and model columns. |
 | **Signature help** | The parameters of the current call, with the current one marked. |
 | **Inlay hints** | Block parameters, locals and returns. A guess is never drawn. |
@@ -72,7 +72,8 @@ Anywhere else (Intel macOS included), build the server from
 | **Refactorings** | Extract a variable or method, toggle `{ }` ↔ `do … end`, declare an `attr_`. |
 | **Generated RBS** | The lightbulb opens what a schema, macro or route declared, read-only. |
 | **Folding** | Follows the syntax: `if`/`elsif`/`else`, heredocs, comment blocks and `#region`. `end` stays visible. |
-| **Templates** | `.erb` gets full answers. `.jbuilder`, `.builder` and `.ruby` are read as plain Ruby. |
+| **Templates** | `.erb` and `.jbuilder` views get full answers. `.builder` and `.ruby` are read as plain Ruby. |
+| **RSpec, FactoryBot, translations** | `let` and `subject` are typed, `create(:user)` is a `User`, and `t("…")` completes its keys and jumps to the YAML. |
 | **Unsaved buffers** | An `Untitled-1` set to Ruby gets answers too. |
 
 - **Every refactoring is tested on a copy of the file first.** Nothing in the menu can leave your
@@ -118,6 +119,7 @@ A committed `ya-lsp.toml` **overrides every one of these**. Its key is listed be
 | `ya-lsp.types.guessFromNames` | `[types] guess_from_names` | Answer from a receiver's name when nothing else can. Always labelled a guess. |
 | `ya-lsp.types.structs` | `[types] structs` | Read `Struct.new` and `Data.define`. |
 | `ya-lsp.types.annotations` | `[types] annotations` | Read Sorbet `sig`s and YARD `@return` tags. |
+| `ya-lsp.types.factories` | `[types] factories` | Read FactoryBot factories, so `create(:user)` is a `User`. |
 | `ya-lsp.hints.blockParameters` | `[hints] block_parameters` | Label what a block parameter holds. |
 | `ya-lsp.hints.locals` | `[hints] locals` | Label what a local holds when it is assigned from a call. |
 | `ya-lsp.hints.returns` | `[hints] returns` | Label what a method returns. |
@@ -130,6 +132,10 @@ A committed `ya-lsp.toml` **overrides every one of these**. Its key is listed be
 | `ya-lsp.rails.routes` | `[rails] routes` | Read `config/routes.rb`, so `stories_path` completes and jumps. |
 | `ya-lsp.rails.entrypoints` | `[rails] entrypoints` | Read mailers, jobs and Sidekiq workers. |
 | `ya-lsp.rails.views` | `[rails] views` | Answer inside templates: helpers, and the controller's `@story`. |
+| `ya-lsp.rspec.enabled` | `[rspec] enabled` | Read RSpec's example groups, `let` and `subject`. `auto` looks for `rspec-core` in `Gemfile.lock`. |
+| `ya-lsp.i18n.enabled` | `[i18n] enabled` | Read the project's locale files: keys complete, hover with their text, jump and are typed. `auto` looks for `i18n` in `Gemfile.lock`. |
+| `ya-lsp.i18n.locale` | `[i18n] locale` | The one locale read, `en` by default. |
+| `ya-lsp.i18n.paths` | `[i18n] paths` | Globs of the project's own locale files. **Replaces** the built-in list; the gems' files are read either way. |
 | `ya-lsp.trees.test` | `[trees] test` | Directory names holding your tests. Their `def`s are offered only from inside them. **Replaces** the list; `[]` turns it off. |
 | `ya-lsp.trees.testSupport` | `[trees] test_support` | Extra test-scaffolding names, for the cursor only. Added to the built-in list. |
 | `ya-lsp.trees.migration` | `[trees] migration` | Where migrations live, as `parent/mark` pairs. |

@@ -10,25 +10,16 @@ import urllib.parse
 from collections import Counter
 from pathlib import Path
 
-# **The card never prints the word "Resolved".** A resolved answer has nothing to caveat, so the
-# tier is what the card does *not* say (`hover.rs`'s design).
-# - Reading the tier back means recognising the sentences the other two tiers carry, so these are
-#   quoted exactly from `hover.rs`.
-# - A reworded footnote would silently score every card as Resolved and turn the second check off.
-#   `report` refuses a corpus with no derived and no guessed card, so that failure cannot pass
-#   quietly.
+# **Two tiers, because a card says one thing about its confidence** (decided 2026-09-29): an answer
+# resting on a name alone says *Guessed from name alone.*, and every other answer says nothing. So
+# the tier is `guessed` where the card carries that line and `resolved` (sure) everywhere else: a
+# derived answer reads exactly as sure as one the code names, and is held to the same standard.
+# - The line is quoted exactly from `hover.rs` (`GUESSED`).
+# - A reworded line would silently score every card as sure and turn the second check off.
+#   `report` refuses a corpus with no guessed card, so that failure cannot pass quietly.
 #
-# `hover.rs` writes four sentences opening with the first `GUESSED` entry. One says the receiver had
-# no type; three say it had one and the member is not on it. All four are the same tier (a list
-# matched on a name is a guess), so one shared clause matches them.
-# `the_three_tiers_of_answer_drawn_side_by_side` pins the full wording.
-GUESSED = ("Matched on the method name alone", "Type guessed from the name")
-DERIVED = ("Type derived through", "Type taken from the assignment on line",
-           "Type taken from the signature for",
-           "Type taken from where",
-           "the controller Rails renders this template from",
-           "Reached through the view context", "Reached through `helper_method`",
-           "Found on an instance of")
+# `the_two_tiers_a_reader_sees_drawn_side_by_side` pins the wording.
+GUESSED = ("Guessed from name alone.",)
 # A footnote is a whole line in italics, and `hover.rs` writes nothing else that way.
 FOOTNOTE = re.compile(r"^\*(.+)\*$", re.M)
 
@@ -99,14 +90,12 @@ GENERATED_SOURCES = ("schema.rb", "structure.sql")
 
 
 def tier(card):
-    """Which of the three tiers a hover card is, or `None` when there was no card."""
+    """Which of the two tiers a hover card is, or `None` when there was no card."""
     if not card:
         return None
     notes = FOOTNOTE.findall(card)
     if any(any(mark in note for mark in GUESSED) for note in notes):
         return "guessed"
-    if any(any(mark in note for mark in DERIVED) for note in notes):
-        return "derived"
     return "resolved"
 
 

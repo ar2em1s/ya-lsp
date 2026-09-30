@@ -26,9 +26,13 @@
 //! worse.
 
 pub mod annotations;
+pub mod defines;
+pub mod factories;
+pub mod i18n;
+pub mod mixins;
 pub mod rails;
-#[cfg(test)]
 pub mod rspec;
+pub mod singletons;
 pub mod structs;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -81,6 +85,14 @@ pub struct Wants {
     pub defines: &'static [&'static str],
     /// A file-name suffix that puts a document on the list.
     pub path: Option<&'static str>,
+    /// Text that puts a document on the list, wherever it is written.
+    ///
+    /// For a call rubydex records nothing of: `Post.include(M)` leaves two constant references and
+    /// no method reference, so `calls` cannot see it. Looked for **by the indexer**, which holds each
+    /// file's text anyway (`indexer::spells`), never by the walk, which has none: reading every
+    /// application file again to look cost the largest corpus's cold open a third of a second. At most 64
+    /// across the registry ([`Registry::spelled`]).
+    pub spells: &'static [&'static str],
     /// Whether a `@return`/`@param` tag in a comment above a `def` puts it on the list.
     pub tags: bool,
     /// Whether a class this document defines, matching the module's own superclass test, puts it on
@@ -106,6 +118,17 @@ pub struct Wants {
     /// [`Context::read_by_a_generator`] deliberately does not, because such a file is still read
     /// and the gate that watches generator reads must watch it.
     pub reads_only: bool,
+    /// Whether only the documents **the editor holds** are read from this list.
+    ///
+    /// For a module whose output a closed document has no reader for. Opening or closing one then
+    /// changes what the pass reads though no text moved, which no other gate can see: the graph
+    /// already holds the text, so nothing is re-indexed. `Analysis` marks such a document touched
+    /// on `didOpen` and `didClose`.
+    ///
+    /// **A module with such a list declares apart**: after every other module, into a map of its
+    /// own, reading nobody's facts and read by nobody's phases. That makes its output a function of
+    /// its own inputs, so a settle whose only news is a reopened file re-runs it alone.
+    pub buffers: bool,
 }
 
 /// What one document contributes to one module's own projection.
@@ -288,6 +311,10 @@ pub struct Sources<'a> {
     pub features: Features,
     /// How the text of a file is identified right now, for a memo to compare against.
     pub fresh: &'a dyn Fn(&DocUri) -> Fresh,
+    /// Whether the editor holds a document. A module that reads only open buffers asks this
+    /// before [`Self::fresh`], which reads a closed file's modification time: one `stat` for each
+    /// of thousands of spec files, to learn each is closed.
+    pub held: &'a dyn Fn(&DocUri) -> bool,
     /// The text itself, as the buffer or the file has it. `None` for a file that has gone.
     pub text: &'a dyn Fn(&DocUri) -> Option<String>,
     /// How a file inside the workspace should be spelled to a person: `db/animals_schema.rb`.
@@ -328,11 +355,20 @@ pub fn add(into: &mut Declared, uri: &DocUri, facts: Facts) {
 /// arbitrary, but deterministic.
 pub type Declares<'a> = &'a dyn Fn(&BTreeSet<String>) -> BTreeMap<String, DocUri>;
 
+/// Which of a set of constant names some file declares, each with whether it is a `module`.
+///
+/// [`Declares`]' question with the other half of the answer: the keyword a generated body must
+/// open with. For a module writing onto a class it knows only by the name a call spelled
+/// (`Paperclip::Attachment.prepend(…)`), which nothing in the [`Context`] has looked up. A name
+/// is a `module` only where every file declaring it says so, the rule `Namespaces` keeps.
+pub type Kinds<'a> = &'a dyn Fn(&BTreeSet<String>) -> BTreeMap<String, bool>;
+
 /// What a generator may read while it declares.
 ///
-/// Four things, which is what the Rails generators turned out to need: a document's **text**, how a
-/// file is **spelled to a person**, whether a document is the **user's own code**, and the
-/// **features**. Anything else a generator wants is in the [`Context`] or in its own memo.
+/// What the Rails generators turned out to need: a document's **text**, how a file is **spelled to a
+/// person**, whether a document is the **user's own code**, and the **features**; plus two name
+/// questions ([`Declares`], [`Kinds`]) and whether the application **loads** a document at all.
+/// Anything else a generator wants is in the [`Context`] or in its own memo.
 ///
 /// **No graph and no filesystem.** A generator writes the text rubydex is about to link, so while
 /// it runs every question about a gem's classes would answer nothing; and an open buffer outranks
@@ -351,6 +387,12 @@ pub struct Declaring<'a> {
     pub own: &'a dyn Fn(&str) -> bool,
     /// Which document declares each of these module names — see [`Declares`].
     pub declares: Declares<'a>,
+    /// Which of these names are declared, and as a `module` or not — see [`Kinds`].
+    pub kinds: Kinds<'a>,
+    /// Whether the application loads a document: not a test tree, a migration or a generator's
+    /// template (`environment::Fence::unloadable`'s reading, never a copy of it). For a fact that
+    /// changes what the application's own classes are, which a file only the suite loads must not.
+    pub loaded: &'a dyn Fn(&DocUri) -> bool,
 }
 
 /// What a module may read while it looks for files nothing has indexed.
@@ -364,6 +406,10 @@ pub struct Reading<'a> {
     pub admits: &'a dyn Fn(&std::path::Path) -> bool,
     /// Which bodies of knowledge this project asked for.
     pub features: Features,
+    /// The bundle's gems, as discovery found them: where a gem's own files are.
+    pub gems: &'a [crate::workspace::Gem],
+    /// What `[i18n]` says: the main locale and where the project's locale files are.
+    pub i18n: &'a crate::workspace::config::I18nConfig,
 }
 
 /// What one module declared, for the one line that says the pass ran.
@@ -404,6 +450,17 @@ pub trait Knowledge {
         Vec::new()
     }
 
+    /// The namespaces this module invents, each with what a reader sees in its place:
+    /// `(invented, shown)`.
+    ///
+    /// A generator names a namespace no file declares when Ruby's own has no name or cannot hold
+    /// what is written onto it. The name is the graph's, and a reader who types it finds nothing,
+    /// so a card spells the class Ruby really builds, or, where `shown` is empty, the member alone
+    /// (`render::qualified_name`). Empty by default: most modules write onto real classes.
+    fn shown(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     /// What one document contributes to this module's own projection, or nothing.
     ///
     /// **A fold, never a walk.** Everything in [`Seen`] was already read by the one pass over the
@@ -423,6 +480,13 @@ pub trait Knowledge {
 
     /// Take what [`Knowledge::discover`] found, so the module can put it on its projection.
     fn discovered(&mut self, _found: Vec<DocUri>) {}
+
+    /// A file nothing indexes changed on disk (a watched event): whether this module reads it, so
+    /// the next settle runs the pass again. A module that keeps a walk of such files forgets it
+    /// here, so a file added or removed is found.
+    fn touched(&mut self, _path: &std::path::Path) -> bool {
+        false
+    }
 
     /// Re-read whatever this module parses, before anything declares.
     ///
@@ -458,7 +522,7 @@ pub trait Knowledge {
     /// The same, once the bundle has been asked what it declares.
     ///
     /// Two things need it, both about names, not documents: a directory conjures a name only where
-    /// **nothing else declares it**, and which framework classes may be written onto is exactly
+    /// **no `class` declares it**, and which framework classes may be written onto is exactly
     /// which of them the bundle holds. Whatever is returned is declared as a module namespace,
     /// because a module cannot reach `Namespaces` while holding its own projection mutably.
     fn after_the_bundle(&self, _context: &mut Context) -> Vec<String> {
@@ -505,6 +569,47 @@ pub trait Knowledge {
         None
     }
 
+    /// Where the literal a call passes a member this module declared names something written down:
+    /// `create(:user)`'s `:user` is the `factory :user` call. `owner` and `method` spell the
+    /// declaration (`FactoryBot::Syntax::Methods`, `create`); the answer is the file's graph URI
+    /// and the span of what is written there. Asked by a jump that found the member and no place
+    /// for it.
+    ///
+    /// `None` by default, for every module whose members' places are the lines they read.
+    fn literal_place(&self, _owner: &str, _method: &str, _literal: &str) -> Option<(String, At)> {
+        None
+    }
+
+    /// The RBS type of what a call's literal key names, where this module keeps a table of keys
+    ///: `t("users.show.title")` is a `String` where the main locale holds one. Asked
+    /// for a member whose signature returns [`crate::generated::KEYED`]; `None` answers nothing.
+    fn keyed_type(&self, _keyed: &Keyed<'_>) -> Option<&'static str> {
+        None
+    }
+
+    /// Where a call's literal key is written and what it holds, for a jump and a card.
+    fn keyed_entry(&self, _keyed: &Keyed<'_>) -> Option<KeyedEntry> {
+        None
+    }
+
+    /// The keys one step under `prefix` (dotted, `""` for the top), for completion inside a call's
+    /// literal key, where `member` is one this module keeps keys for.
+    fn keyed_under(&self, _member: &str, _prefix: &str) -> Option<Vec<KeyedChild>> {
+        None
+    }
+
+    /// The declaration whose Ruby `def` is the code a member this module declared without a place
+    /// really runs: RSpec's `expect` is the `def expect` rspec-expectations writes inside a
+    /// `module_exec`, which rubydex files under `RSpec::Expectations::Syntax`. `owner` and
+    /// `method` spell the member's declaration, as for [`Self::literal_place`]; the answer is a
+    /// declaration name, `RSpec::Expectations::Syntax#expect()`. Asked by a jump that found the
+    /// member and no place for it.
+    ///
+    /// `None` by default, for every module whose members are placed at the lines they read.
+    fn written_in(&self, _owner: &str, _method: &str) -> Option<String> {
+        None
+    }
+
     /// Whether a class with this superclass and these mixins is one of the module's own.
     ///
     /// Answers [`Wants::inherits`]. Defaults to no, so a module with no such convention writes
@@ -512,6 +617,51 @@ pub trait Knowledge {
     fn claims_by_ancestry(&self, _superclass: Option<&str>, _mixins: &[String]) -> bool {
         false
     }
+}
+
+/// A call whose first argument is a literal key: what [`Knowledge::keyed_type`] and its siblings
+/// read. Everything here is the call as written; what the key means is the module's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Keyed<'a> {
+    /// The member the call reached, as its declaration is named: `I18n::Base#t()`.
+    pub member: &'a str,
+    /// The literal key: a string's or a symbol's text.
+    pub key: &'a str,
+    /// Each keyword the call writes, and what its value is where the text says.
+    pub keywords: &'a [(String, Written)],
+    /// Whether the call writes a block, which a lookup may hand the translation to.
+    pub block: bool,
+}
+
+/// A keyword's value as the call writes it, where that is a literal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Written {
+    /// A string literal, and its text.
+    Text(String),
+    /// A symbol literal, and its name.
+    Symbol(String),
+    /// Anything else: a variable, a call, an interpolation.
+    Other,
+}
+
+/// Where a key is written and what it holds, for a jump and a card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedEntry {
+    /// The file that writes it, as a graph URI, and the span of the key's name there.
+    pub uri: String,
+    pub at: (u32, u32),
+    /// What it holds, as the YAML a card shows, the key first (`i18n::yaml`).
+    pub shown: String,
+}
+
+/// One key under a prefix, for completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedChild {
+    pub name: String,
+    /// Whether more keys lie under it, which completes as a segment rather than a key's end.
+    pub branch: bool,
+    /// What it holds, for the item's detail.
+    pub shown: String,
 }
 
 /// Every body of knowledge this build has.
@@ -530,6 +680,17 @@ pub struct Registry {
     wants: Vec<&'static Wants>,
     /// Which module supplied each row of [`Self::wants`], by its index in `modules`.
     owner: Vec<usize>,
+}
+
+/// [`Registry::spelled`], for a registry still being built.
+fn spelled_in(wants: &[&'static Wants]) -> Vec<&'static str> {
+    let mut spelled: Vec<&'static str> = Vec::new();
+    for text in wants.iter().flat_map(|row| row.spells) {
+        if !spelled.contains(text) {
+            spelled.push(text);
+        }
+    }
+    spelled
 }
 
 impl Registry {
@@ -555,11 +716,33 @@ impl Registry {
                 owner.push(at);
             }
         }
+        assert!(
+            spelled_in(&wants).len() <= 64,
+            "more than 64 `Wants::spells` texts; the indexer keeps them as bits of a u64"
+        );
         Self {
             modules,
             wants,
             owner,
         }
+    }
+
+    /// Every [`Wants::spells`] text in the registry, once each, in registration order: what the
+    /// indexer looks for in each file it reads (`indexer::spells`), each one bit of a `u64`.
+    #[must_use]
+    pub fn spelled(&self) -> Vec<&'static str> {
+        spelled_in(&self.wants)
+    }
+
+    /// Row `at`'s [`Wants::spells`] as bits of the mask [`Self::spelled`] numbers.
+    #[must_use]
+    pub fn spelled_by(&self, at: usize) -> u64 {
+        let spelled = self.spelled();
+        self.wants[at]
+            .spells
+            .iter()
+            .filter_map(|text| spelled.iter().position(|known| known == text))
+            .fold(0, |mask, bit| mask | 1 << bit)
     }
 
     /// A build with nothing registered. What the test for the seam drives.
@@ -599,6 +782,15 @@ impl Registry {
             .iter()
             .position(|row| row.list == list)
             .is_some_and(|at| self.behind(at).wanted(list, features))
+    }
+
+    /// Every module's [`Knowledge::shown`], in registration order.
+    #[must_use]
+    pub fn shown(&self) -> Vec<(&'static str, &'static str)> {
+        self.modules
+            .iter()
+            .flat_map(|module| module.shown().iter().copied())
+            .collect()
     }
 
     /// Every module, in registration order.
@@ -836,6 +1028,32 @@ impl Context {
         )
     }
 
+    /// Every file some generator reads **from disk**, for the stamps the pass gate compares.
+    ///
+    /// [`Context::read_by_a_generator`] less the lists whose row reads only what the editor holds
+    /// ([`Wants::buffers`]): an open document on one is read from its buffer, whose edits touch
+    /// it, and a closed one is not read at all. A document on another list too is still here.
+    pub fn read_from_disk<'a>(&'a self, knowledge: &Registry) -> impl Iterator<Item = &'a str> {
+        let held_only: BTreeSet<ListId> = knowledge
+            .wants()
+            .iter()
+            .filter(|row| row.buffers)
+            .map(|row| row.list)
+            .collect();
+        self.documents
+            .iter()
+            .filter(move |(list, _)| !held_only.contains(*list))
+            .flat_map(|(_, on)| on)
+            .map(String::as_str)
+            .chain(
+                self.projections
+                    .iter()
+                    .filter_map(|projection| projection.0.as_ref())
+                    .flat_map(|held| held.also_reads())
+                    .map(DocUri::as_str),
+            )
+    }
+
     /// Merge what one document contributes: the **only** place a [`Contribution`] becomes part of a
     /// `Context`.
     ///
@@ -851,14 +1069,25 @@ impl Context {
     /// - **`claims` is sorted** by `settle`, because it is pushed per definition.
     ///
     /// Everything else is a `BTreeSet`, a `BTreeMap` keyed by name, or a list `settle` sorts.
+    ///
+    /// **Borrowed, and a name copied only where it is new**: the walk absorbs every document's
+    /// held contribution on every pass, and a gem's module is declared in hundreds of its files.
     pub fn absorb(
         &mut self,
         uri: &str,
-        contribution: Contribution,
+        contribution: &Contribution,
         included: &mut Vec<(String, String)>,
     ) {
-        for list in contribution.lists {
-            self.documents.entry(list).or_default().push(uri.to_owned());
+        fn insert(set: &mut BTreeSet<String>, name: &str) {
+            if !set.contains(name) {
+                set.insert(name.to_owned());
+            }
+        }
+        for list in &contribution.lists {
+            self.documents
+                .entry(*list)
+                .or_default()
+                .push(uri.to_owned());
         }
         // Each module's own half, handed back to the module that made it. Zipped by position
         // (registration order on both sides), so core never needs to know which projection is
@@ -868,33 +1097,33 @@ impl Context {
                 projection.absorb(uri, held.as_ref());
             }
         }
-        for (name, superclass) in contribution.superclasses {
+        for (name, superclass) in &contribution.superclasses {
             // `<=`, not `<`: a document that already holds the entry is writing its *second*
             // `class Story < ...`, one file disagreeing with itself, where the last line is the one
             // Ruby runs.
             if self
                 .defined_in
-                .get(&name)
+                .get(name)
                 .is_none_or(|held| uri <= held.as_str())
             {
-                self.superclasses.insert(name.clone(), superclass);
-                self.defined_in.insert(name, uri.to_owned());
+                self.superclasses.insert(name.clone(), superclass.clone());
+                self.defined_in.insert(name.clone(), uri.to_owned());
             }
         }
-        for (name, module) in contribution.declared {
-            self.namespaces.declare(name.clone(), module);
-            if module {
-                self.modules.insert(name.clone());
+        for (name, module) in &contribution.declared {
+            self.namespaces.declare(name.clone(), *module);
+            if *module {
+                insert(&mut self.modules, name);
             }
-            self.classes.insert(name);
+            insert(&mut self.classes, name);
         }
-        for (name, module) in contribution.foreign {
-            if module {
-                self.foreign_modules.insert(name.clone());
+        for (name, module) in &contribution.foreign {
+            if *module {
+                insert(&mut self.foreign_modules, name);
             }
-            self.foreign_classes.insert(name);
+            insert(&mut self.foreign_classes, name);
         }
-        included.extend(contribution.included);
+        included.extend(contribution.included.iter().cloned());
     }
 
     /// An empty projection, with a slot for every registered module's own.
@@ -974,11 +1203,13 @@ mod tests {
             modules: &[],
             defines: &[],
             path: None,
+            spells: &[],
             tags: false,
             inherits: false,
             engines: false,
             gems: false,
             reads_only: false,
+            buffers: false,
         }
     }
 
@@ -1043,11 +1274,27 @@ mod tests {
         let registry = Registry::new(vec![
             Box::new(rails::Rails::default()),
             Box::new(annotations::Annotations::default()),
-            Box::new(structs::Structs),
+            Box::new(structs::Structs::default()),
+            Box::new(rspec::RSpec::default()),
+            Box::new(factories::Factories::default()),
+            Box::new(singletons::Singletons),
+            Box::new(defines::Defines::default()),
+            Box::new(mixins::Mixins::default()),
+            Box::new(i18n::Translate::default()),
         ]);
         assert_eq!(
             registry.modules().map(Knowledge::name).collect::<Vec<_>>(),
-            vec!["rails", "annotations", "structs"]
+            vec![
+                "rails",
+                "annotations",
+                "structs",
+                "rspec",
+                "factories",
+                "singletons",
+                "defines",
+                "mixins",
+                "i18n"
+            ]
         );
         for (at, row) in registry.wants().iter().enumerate() {
             let module = registry.behind(at);
@@ -1068,13 +1315,19 @@ mod tests {
         for (list, features) in [
             (rails::SCHEMAS, only(|f| f.schema = true)),
             (rails::RENAMED, only(|f| f.schema = true)),
+            (rails::ZONES, only(|f| f.schema = true)),
             (rails::MODELS, only(|f| f.models = true)),
             (rails::CONCERNS, only(|f| f.models = true)),
             (rails::ROUTES, only(|f| f.routes = true)),
+            (rails::ENGINES, only(|f| f.routes = true)),
             (rails::ENTRYPOINTS, only(|f| f.entrypoints = true)),
             (rails::FRAMEWORK, only(|f| f.rails = true)),
+            (rails::CONFIGURED, only(|f| f.rails = true)),
             (annotations::ANNOTATED, only(|f| f.annotations = true)),
             (structs::STRUCTS, only(|f| f.structs = true)),
+            (rspec::GROUPS, only(|f| f.rspec = true)),
+            (rspec::CONFIGS, only(|f| f.rspec = true)),
+            (factories::DEFINITIONS, only(|f| f.factories = true)),
         ] {
             assert!(registry.wanted(list, features), "{list} was not wanted");
             assert!(
@@ -1082,16 +1335,26 @@ mod tests {
                 "{list} was wanted anyway"
             );
         }
+        // Ruby's own library is no switch's, nor is Ruby itself.
+        assert!(registry.wanted(singletons::SINGLETONS, nothing()));
+        assert!(registry.wanted(defines::DEFINES, nothing()));
+        assert!(registry.wanted(mixins::MIXINS, nothing()));
 
         // A list nobody registered is nobody's, and so is one asked of the wrong module: the arm
         // each `wanted` ends with. The registry never reaches it, because it finds the row first;
         // it is there so that adding a row and forgetting its switch declines instead of answering
         // something arbitrary.
-        let elsewhere = ListId("rspec.groups");
+        let elsewhere = ListId("nobody.list");
         assert!(!registry.wanted(elsewhere, all()));
         assert!(!rails::Rails::default().wanted(elsewhere, all()));
         assert!(!annotations::Annotations::default().wanted(elsewhere, all()));
-        assert!(!structs::Structs.wanted(elsewhere, all()));
+        assert!(!structs::Structs::default().wanted(elsewhere, all()));
+        assert!(!rspec::RSpec::default().wanted(elsewhere, all()));
+        assert!(!factories::Factories::default().wanted(elsewhere, all()));
+        assert!(!singletons::Singletons.wanted(elsewhere, all()));
+        assert!(!defines::Defines::default().wanted(elsewhere, all()));
+        assert!(!mixins::Mixins::default().wanted(elsewhere, all()));
+        assert!(!i18n::Translate::default().wanted(elsewhere, all()));
         // And the one predicate whose question core cannot ask is the module's.
         assert!(rails::Rails::default().claims_by_ancestry(Some("ApplicationJob"), &[]));
         assert!(
@@ -1103,35 +1366,12 @@ mod tests {
         assert!(registry.of::<rails::Rails>().is_some());
         assert!(registry.of::<annotations::Annotations>().is_some());
         assert!(registry.of::<structs::Structs>().is_some());
-        assert!(registry.of::<rspec::RSpec>().is_none());
-    }
-
-    /// A second body of knowledge, and what it costs to add one.
-    ///
-    /// **Zero files outside its own.** `rspec.rs` registers a list, a row and a generator, and
-    /// touches no core file: not this one, not the pass, not `Features`, not `Source`.
-    #[test]
-    fn a_second_body_of_knowledge_costs_nothing_outside_its_own_file() {
-        let registry = Registry::new(vec![Box::new(rspec::RSpec)]);
-        assert_eq!(registry.len(), 1);
-        assert_eq!(registry.wants().len(), 1);
-        assert_eq!(registry.wants()[0].list, rspec::GROUPS);
-        assert_eq!(registry.behind(0).name(), "rspec");
-        // It wants its own list and nothing else's, which is what an empty build answers to every
-        // question.
-        assert!(registry.wanted(rspec::GROUPS, nothing()));
-        assert!(!registry.wanted(rails::MODELS, all()));
-        // And it registers beside the three that ship, without any of them noticing.
-        let both = Registry::new(vec![
-            Box::new(rails::Rails::default()),
-            Box::new(annotations::Annotations::default()),
-            Box::new(structs::Structs),
-            Box::new(rspec::RSpec),
-        ]);
-        assert_eq!(both.len(), 4);
-        assert_eq!(both.wants().len(), 10);
-        assert!(both.wanted(rspec::GROUPS, nothing()));
-        assert!(both.wanted(rails::MODELS, all()));
+        assert!(registry.of::<rspec::RSpec>().is_some());
+        assert!(registry.of::<factories::Factories>().is_some());
+        assert!(registry.of::<singletons::Singletons>().is_some());
+        assert!(registry.of::<defines::Defines>().is_some());
+        assert!(registry.of::<mixins::Mixins>().is_some());
+        assert!(registry.of::<i18n::Translate>().is_some());
     }
 
     fn all() -> Features {
@@ -1144,6 +1384,9 @@ mod tests {
             views: true,
             structs: true,
             annotations: true,
+            rspec: true,
+            factories: true,
+            i18n: true,
         }
     }
 
@@ -1164,6 +1407,9 @@ mod tests {
             views: false,
             structs: false,
             annotations: false,
+            rspec: false,
+            factories: false,
+            i18n: false,
         }
     }
 }

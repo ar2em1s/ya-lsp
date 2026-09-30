@@ -9,8 +9,8 @@ then open a `.rb` file. Other editors: [Install](#install).
 
 1. **No Ruby needed.** It never runs `ruby`, `bundle` or `gem`. It reads your code, `Gemfile.lock`
    and the gems on disk. It ships as one Rust binary.
-2. **Every answer says how far to trust it.** Hover cards and completion rows are labelled
-   *Resolved*, *Derived* or *Guessed*. Guessing can be switched off.
+2. **It says when it is guessing.** An answer read off a name alone is marked *Guessed from name
+   alone.* on its card, is never drawn as an inlay hint, and can be switched off.
 3. **Rails without booting Rails.** Columns, associations, `enum`s, routes, mailers and jobs all
    resolve, because the schema and the macros are read as text.
 4. **Fast, no cache.** A real 612-file Rails app indexes in well under a second, and CI fails the
@@ -21,8 +21,7 @@ then open a `.rb` file. Other editors: [Install](#install).
 ```ruby
 story = Story.where(published: true).first
 story.title
-#     ↑ hover: Story#title
-#       From `db/schema.rb`, table `stories`, column `title` (`string`, `null: false`).
+#     ↑ hover: Story#title -> String      (the column, read from db/schema.rb)
 ```
 
 **Not included:** formatting and RuboCop, because both are Ruby. Run
@@ -123,7 +122,7 @@ not guess.
 | **Go to implementation** | The method, then every override below the receiver's class. |
 | **Go to type definition** | The class of the value under the cursor. |
 | **Go to declaration** | The RBS signature of a method. |
-| **Hover** | Signature, docs, and where the type came from. |
+| **Hover** | Signature, docs and the type. A guess says it is one. |
 | **Completion** | Knows ancestors and visibility. Completes keyword arguments and model columns. |
 | **Signature help** | The parameters of the current call, with the current one marked. |
 | **Inlay hints** | Types the line does not show. Guesses are never drawn. |
@@ -136,7 +135,7 @@ not guess.
 | **Refactorings** | Extract variable or method, toggle block style, declare `attr_`. |
 | **Generated RBS** | Opens what a schema, macro or route declared, as a read-only document. |
 | **Folding, selection, highlighting** | Folding ranges, expand selection, local-vs-call colouring. |
-| **Templates** | `.erb` gets full answers. `.jbuilder`, `.builder` and `.ruby` are read as plain Ruby. |
+| **Templates** | `.erb` and `.jbuilder` views get full answers. `.builder` and `.ruby` are read as plain Ruby. |
 | **Unsaved buffers** | An `Untitled-1` set to Ruby gets answers too, including parse errors. |
 
 ## Trust tiers
@@ -144,13 +143,33 @@ not guess.
 | Tier | Meaning | Example |
 | --- | --- | --- |
 | **Resolved** | The code names the type | `Foo.bar`, `"x".upcase`, `Foo.new.bar` |
-| **Derived** | A signature, an assignment or a Rails convention says so, and the card names which | `"x".upcase.strip`, `ENV.fetch`, a view's `@story` |
+| **Derived** | A signature, an assignment or a Rails convention says so | `"x".upcase.strip`, `ENV.fetch`, a view's `@story` |
 | **Guessed** | Only the receiver's name matched | `@user` → `User` |
 
+- **A card shows Resolved and Derived the same way.** It says nothing about how an answer was found,
+  and marks a guess *Guessed from name alone.*
 - **Guessed** is the only tier that can be wrong. It never replaces a better answer.
 - A guess is never drawn as an inlay hint. Go to implementation, type definition and declaration
   also refuse to answer from a guess.
 - To turn guessing off, set `[types] guess_from_names = false`.
+
+## Type coverage
+
+`ya-lsp coverage [DIR]` prints what share of your production code's calls ya-lsp can type:
+
+```console
+$ ya-lsp coverage
+Type coverage: 47.3% ± 2.1% (2,000 of 37,909 calls sampled)
+```
+
+- It indexes the project and its gems itself, reading `ya-lsp.toml`: a few seconds on a large
+  application. No editor or running server is needed.
+- It samples 2,000 of the calls whose value is used, in your own Ruby files outside test and
+  migration folders (`[trees]`). A project with no more calls than that is counted in full, and
+  the `±` goes away.
+- A call counts as typed where ya-lsp is sure of its type, as an inlay hint would be. A guess does
+  not count. The `±` is the sample's 95% error.
+- Progress goes to stderr, the result to stdout.
 
 ## Rails
 
@@ -165,7 +184,15 @@ Nothing boots. Each item below is read as text:
 4. **Routes, mailers, jobs and Sidekiq workers.** Route helpers jump to their line in
    `config/routes.rb`. `perform_later` resolves to the `def` it ends up calling.
 5. **Views and engines.** `@story` in `stories/show.html.erb` gets its type from
-   `StoriesController`. A gem's `app/` is indexed, so `ActiveStorage::Blob` resolves.
+   `StoriesController`, and keeps its `nil` out where a `before_action` always sets it. A
+   partial's locals come from the calls that render it, a jbuilder view reads like an ERB one, and
+   a gem's `app/` is indexed, so `ActiveStorage::Blob` resolves.
+6. **`ActiveSupport::CurrentAttributes`.** `Current.user` is what the application assigns to it, or
+   `nil`.
+
+Outside Rails, ya-lsp also reads **RSpec** (`describe` groups, `let`, `subject`), **FactoryBot**
+(`create(:user)` is a `User`) and **translation files** (`t("users.show.title")` completes its keys
+and is typed by what the key holds).
 
 ## Limits
 
@@ -175,7 +202,8 @@ Nothing boots. Each item below is read as text:
 3. **Rename refuses methods and instance variables**, because neither can be found exactly. It also
    refuses the whole rename if any one site cannot be confirmed.
 4. **A chain stops at an untyped method.** It does not infer types for arbitrary expressions.
-5. **Runtime metaprogramming is invisible**, such as `define_method` or a `Class.new` nothing names.
+5. **Runtime metaprogramming is invisible**, such as a `define_method` whose name is computed or a
+   `Class.new` nothing names.
 
 **Not included:** formatting, RuboCop, quick fixes, code lenses, test running, a debugger, a plugin API.
 
@@ -267,10 +295,19 @@ views       = true                        # what a template can call, and its @i
 test_support   = []                       # adds to the built-in `testing_support`
 # migration    = ["db/migrat"]            # parent/mark pairs; replaces; [] turns it off
 
+[rspec]
+enabled = "auto"                          # "auto" (rspec-core in Gemfile.lock) | true | false
+
+[i18n]
+enabled = "auto"                          # "auto" (i18n in Gemfile.lock) | true | false
+locale  = "en"                            # the one locale read
+# paths = ["**/config/locales/**/*.yml", "**/config/locales/**/*.rb"]   # replaces; gems' files are read either way
+
 [types]
 guess_from_names = true                   # `@user` is a `User`, always labelled as a guess
 structs          = true                   # Struct.new and Data.define
 annotations      = true                   # Sorbet `sig`, YARD `@return`
+factories        = true                   # FactoryBot: `create(:user)` is a `User`
 
 [hints]
 block_parameters = true                   # what a method yields
@@ -286,6 +323,8 @@ What some of these settings do:
 
 - **`[rails]`** controls which answers you get, not speed. `auto` checks for `config/application.rb`,
   then for `railties` in `Gemfile.lock`.
+- **`[rspec]` and `[i18n]`** are their own tables because neither needs Rails. `auto` looks for the
+  gem in `Gemfile.lock`. RSpec is read in the spec files the editor has open.
 - **`[trees]`** marks your test tree. A method defined in the test suite is offered, and jumped to,
   only from inside that suite.
 - **`[diagnostics]`**: only `parse-error` and `parse-warning` are on by default. ERB templates

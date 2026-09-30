@@ -20,6 +20,7 @@ use ya_lsp::{
     workspace::Config,
     workspace::Severity,
     workspace::config::{PartialConfig, Switch, Word},
+    workspace::i18n::DEFAULT_LOCALE_PATHS,
 };
 
 fn manifest() -> Value {
@@ -82,6 +83,9 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
     // `"auto"` is written out below because `Switch` cannot be serialized; this holds the word to
     // the server's own default, so the two cannot drift apart silently.
     assert_eq!(config.rails.enabled, Switch::Word(Word::Auto));
+    assert_eq!(config.rspec.enabled, Switch::Word(Word::Auto));
+    assert_eq!(config.i18n.enabled, Switch::Word(Word::Auto));
+    assert_eq!(config.i18n.paths, None);
 
     // An empty map is what `{}` in the manifest documents, and the only default here that cannot be
     // written as a `json!` of the field itself: `Severity` is deserialized, never serialized,
@@ -117,6 +121,7 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
         ),
         ("ya-lsp.types.structs", json!(config.types.structs)),
         ("ya-lsp.types.annotations", json!(config.types.annotations)),
+        ("ya-lsp.types.factories", json!(config.types.factories)),
         // `Switch` is deserialized and never serialized (the server never sends one back), so the
         // word is written out here, as `diagnostics.rules`' empty map is. The line below, not this
         // one, holds it to the server.
@@ -126,6 +131,11 @@ fn every_documented_default_is_the_one_the_server_actually_uses() {
         ("ya-lsp.rails.routes", json!(config.rails.routes)),
         ("ya-lsp.rails.entrypoints", json!(config.rails.entrypoints)),
         ("ya-lsp.rails.views", json!(config.rails.views)),
+        ("ya-lsp.rspec.enabled", json!("auto")),
+        ("ya-lsp.i18n.enabled", json!("auto")),
+        ("ya-lsp.i18n.locale", json!(config.i18n.locale)),
+        // The built-in list, read from the code, for `trees.test`'s reason: a project replaces it.
+        ("ya-lsp.i18n.paths", json!(DEFAULT_LOCALE_PATHS)),
         // The two lists the manifest shows are the built-in ones, read from the code, not written
         // out: a project *replaces* them, so what the settings UI shows someone about to do that
         // must be what they are actually replacing. `Config::default()` holds `None` for both: the

@@ -63,6 +63,10 @@ pub struct Reference {
 ///
 /// `scope` is the set of documents that count as the user's own code. The caller owns that
 /// definition, because a vendored bundle sits inside the workspace root and must not count.
+///
+/// `named` finds a method's name handed as a symbol to a call that takes one (`send(:shout)`,
+/// `try(:shout)`), matched by name like every other use of a method: a use no call reference
+/// records, which needs the text this module does not read.
 #[must_use]
 pub fn find(
     graph: &Graph,
@@ -71,6 +75,7 @@ pub fn find(
     resolution: &Resolution,
     scope: &HashSet<UriId>,
     include_declaration: bool,
+    named: &Named<'_>,
 ) -> Vec<Reference> {
     let mut found = match located.target {
         // A call, whatever it did or did not resolve to. Deliberately not routed through the
@@ -79,7 +84,9 @@ pub fn find(
         // second spelling comes from the cursor's own word, not from a declaration as in
         // `method_names`: there may be no declaration, and a redirected one is spelled something
         // else entirely.
-        Target::Call(reference) => by_name(graph, &call_spellings(graph, reference.str()), scope),
+        Target::Call(reference) => {
+            by_names(graph, &call_spellings(graph, reference.str()), scope, named)
+        }
         Target::Constant(_) => by_declaration(graph, &resolution.declarations, scope),
         // The definition itself. Which mechanism applies depends on what was defined, and only the
         // resolution knows: `def` and `attr_reader` are both methods, `class` and `=` are both
@@ -89,7 +96,7 @@ pub fn find(
             if names.is_empty() {
                 by_declaration(graph, &resolution.declarations, scope)
             } else {
-                by_name(graph, &names, scope)
+                by_names(graph, &names, scope, named)
             }
         }
     };
@@ -125,8 +132,9 @@ pub fn to_member(
     name: &str,
     declarations: &[DeclarationId],
     scope: &HashSet<UriId>,
+    named: &Named<'_>,
 ) -> Vec<Reference> {
-    let mut found = by_name(graph, &spellings(name), scope);
+    let mut found = by_names(graph, &spellings(name), scope, named);
     found.extend(declaration_sites(graph, synthesized, declarations, scope));
     ordered(found)
 }
@@ -214,6 +222,29 @@ fn by_declaration(
             found.extend(at(graph, reference.uri_id(), reference.offset()));
         }
     }
+    found
+}
+
+/// What finds a method's name handed as a symbol ([`find`]): given the name's spellings and the
+/// documents, every such symbol in them.
+pub type Named<'n> = dyn Fn(&[StringId], &HashSet<UriId>) -> Vec<Reference> + 'n;
+
+/// A [`Named`] that finds nothing, for a caller no method reaches: `rename` refuses every method
+/// before it asks.
+#[must_use]
+pub fn unasked(_names: &[StringId], _scope: &HashSet<UriId>) -> Vec<Reference> {
+    Vec::new()
+}
+
+/// [`by_name`], and the same names handed as symbols ([`Named`]).
+fn by_names(
+    graph: &Graph,
+    names: &[StringId],
+    scope: &HashSet<UriId>,
+    named: &Named<'_>,
+) -> Vec<Reference> {
+    let mut found = by_name(graph, names, scope);
+    found.extend(named(names, scope));
     found
 }
 
@@ -500,6 +531,86 @@ end
         assert_eq!(
             harness.reference_list(&uri, ALIASED, "shout\n  end", false),
             vec!["hr.rb:6:4", "hr.rb:9:13", "hr.rb:10:25"]
+        );
+    }
+
+    /// A method's name handed to the calls that take one, beside a symbol handed to a call that
+    /// does not and a name only a string spells.
+    const HANDED: &str = "\
+class Person
+  def shout
+    \"!\"
+  end
+
+  def announce
+    send(:shout)
+    public_send(:shout, 1)
+    respond_to?(:shout)
+    method(:shout)
+    other(:shout)
+    send(:whisper)
+    send(\"shout\")
+  end
+end
+";
+
+    #[test]
+    fn a_caller_no_method_reaches_asks_for_no_handed_name() {
+        assert!(unasked(&[StringId::from("shout")], &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn a_name_handed_to_send_or_its_kin_is_a_use_of_it() {
+        // `send(:shout)` calls `shout`, and `method(:shout)` and `respond_to?(:shout)` name it, but
+        // rubydex records the call to `send`, never its argument. So the uses are found in the
+        // text, by name like every other use of a method: the calls are matched by how they are
+        // spelled. A symbol handed to any other call, and a string, are not a method's name.
+        // Ruby's own `send` and its kin, which the symbol's own cursor needs to resolve its call.
+        let mut harness = signed(
+            &[(
+                "core/core.rbs",
+                "class BasicObject\n  def __send__: (Symbol, *untyped) -> untyped\nend\n\n\
+                 class Object < BasicObject\n  include Kernel\nend\n\n\
+                 module Kernel\n  def public_send: (Symbol, *untyped) -> untyped\n  \
+                 def respond_to?: (Symbol) -> bool\n  def method: (Symbol) -> Method\n  \
+                 alias send __send__\nend\n",
+            )],
+            "",
+        );
+        let uri = harness.write("lib/person.rb", HANDED);
+        harness.write("lib/other.rb", "other(:shout)\n");
+        harness.index();
+
+        let handed = vec![
+            "person.rb:6:10",
+            "person.rb:7:17",
+            "person.rb:8:17",
+            "person.rb:9:12",
+        ];
+        assert_eq!(
+            harness.reference_list(&uri, HANDED, "shout\n    \"!\"", false),
+            handed
+        );
+        // Asked at one of the symbols, the list is the same one, with the `def` it names.
+        let mut declared = vec!["person.rb:1:6"];
+        declared.extend(&handed);
+        assert_eq!(
+            harness.reference_list(&uri, HANDED, "shout, 1)", true),
+            declared
+        );
+        // And the file's highlight lights the same places: the two requests read one list.
+        assert_eq!(
+            harness.agreement_map(&uri, &cursor_after(HANDED, "def sh")),
+            "  def shout\n\
+             \u{20}     WWWWW\n\
+             \u{20}   send(:shout)\n\
+             \u{20}         rrrrr\n\
+             \u{20}   public_send(:shout, 1)\n\
+             \u{20}                rrrrr\n\
+             \u{20}   respond_to?(:shout)\n\
+             \u{20}                rrrrr\n\
+             \u{20}   method(:shout)\n\
+             \u{20}           rrrrr"
         );
     }
 

@@ -30,7 +30,7 @@ This table is exhaustive: a new surface goes into it.
 
 | Verdict | Surfaces | Why |
 |---|---|---|
-| **drop** | `completion`; the name and root rungs of `definition`/`hover`; `locator::places`; `signatureHelp`; `outgoingCalls` | "What can I call from here?" A name the app can't load is not an answer |
+| **drop** | `completion`; the name and root rungs of `definition`/`hover`; which calls `ya-lsp coverage` samples (`coverage.rs`); `locator::places`; `signatureHelp`; `outgoingCalls`; a receiver's member lookup, typed or named (`locator::find_loaded_member`, which `types::member_of` and `resolve_call` share: the walk goes on up past the member) | "What can I call from here?" A name the app can't load is not an answer |
 | **rank** | `workspace/symbol`; `subtypes` | "Find me this." A drop would make it unfindable |
 | **never** | `references`, `rename`, `documentHighlight`, `incomingCalls`, `supertypes` | "Where is this used?" A use under `spec/` is a use |
 
@@ -49,7 +49,7 @@ This table is exhaustive: a new surface goes into it.
 
 | Tag | Rule | Needs `Layout`? |
 |---|---|---|
-| `in_a_test_tree` | `TEST_TREES` = `spec`, `test`, `tests`, `features`, matched as path **segments**, never a prefix (solidus has `core/spec/` and `spec/dummy/`) | Yes. A gem's `lib/rack/test/` is a library. Asks "inside the project and not `require`-able?" |
+| `in_a_test_tree` | `TEST_TREES` = `spec`, `test`, `tests`, `features`, matched as path **segments**, never a prefix (an engine monorepo has `core/spec/` and `spec/dummy/`) | Yes. A gem's `lib/rack/test/` is a library. Asks "inside the project and not `require`-able?" |
 | `in_a_migration` | A `migrat` **substring** in a directory whose parent is `db` (`db/migrate`, `db/post_migrate`, `db/old_migrations`) | No root clause. Keeps the load-path escape hatch |
 | `in_a_generator_template` | A `templates` segment somewhere after a `generators` segment | No. It is configurable by nothing |
 
@@ -73,6 +73,15 @@ This table is exhaustive: a new surface goes into it.
 - **Tags are computed once per settle in `indexed::Placed`, never per request.**
   `Indexed::forget_placement` runs on config reload and after gem discovery. Inside the predicate,
   check the three short prefix lists before the long load-path list.
+- **An answer held across requests that a fence shaped is keyed by `Fence::key`**, never by the
+  cursor's document, and dropped by `forget_placement` as well as `graph_mut`: the key leaves the
+  `Layout` out (`Indexed::hierarchy`).
+- **A path's own readings are held per document** (`environment::HeldPaths`, `Indexed::paths`):
+  `Fence::unloadable` and the cursor's `turns_the_fence_off`, asked per definition and per call
+  on every request. Only `Analysis::layout` carries the memo; it is dropped with the placement
+  and on `graph_mut` (the workspace walk and gem discovery move a prefix list, then write).
+  Held by `a_held_path_reading_answers_what_reading_the_path_again_would` and
+  `the_paths_a_fence_read_are_held_until_the_layout_or_the_graph_moves`.
 
 ## The outside meaning
 

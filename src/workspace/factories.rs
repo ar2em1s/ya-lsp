@@ -1,0 +1,1074 @@
+//! Which class each FactoryBot factory builds, and the RBS that says so: `create(:user)` is a
+//! `User`.
+//!
+//! Text in, facts out, as `workspace/rails/` is. The orchestration (which files, which names the
+//! bundle declares, which file hosts the rows) is `knowledge::factories`'.
+//!
+//! # What a factory builds
+//!
+//! - **`class:` where a factory names one**, else its parent's (a factory nested in another, or
+//!   `parent:`), else the topmost factory's name camelized. An alias is the factory.
+//! - **A constant is looked up from where it is written; a String or a Symbol from the top level**,
+//!   as `constantize` reads it (`"spree/address"` is `Spree::Address`).
+//! - **An `initialize_with` builds what its block returns.** Only `new(…)` is the class; any other,
+//!   in the factory, a trait, an ancestor, or the global one, leaves the factory untyped.
+//! - **`FactoryBot.register_strategy` replacing a strategy** leaves that strategy undeclared.
+//! - **The call's first argument picks the arm** (`types::pick_by_literal`): each factory is one
+//!   `(:name, *untyped, **untyped)` arm, tried in order, and a name nothing here reads falls to an
+//!   `untyped` catch-all.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use ruby_prism::{BlockNode, CallNode, ClassNode, DefNode, ModuleNode, Node, Visit, parse};
+
+use crate::generated::{At, Declared, Facts, Namespaces, Owner, Source, candidates};
+use crate::workspace::rails::camelize;
+
+/// The module FactoryBot's strategy methods are defined on, which a project includes.
+pub const SYNTAX: &str = "FactoryBot::Syntax::Methods";
+
+/// Every constant this module names, for the pass to ask the bundle about.
+pub const CONSTANTS: [&str; 3] = ["FactoryBot", "FactoryBot::Syntax", SYNTAX];
+
+/// FactoryBot's strategies, `(name, the strategy it runs, what one built object is wrapped in)`:
+/// `create_list` runs `create` and hands back an `Array` of what it built.
+const STRATEGIES: [(&str, &str, Wrap); 9] = [
+    ("create", "create", Wrap::One),
+    ("build", "build", Wrap::One),
+    ("build_stubbed", "build_stubbed", Wrap::One),
+    ("create_list", "create", Wrap::Array),
+    ("build_list", "build", Wrap::Array),
+    ("build_stubbed_list", "build_stubbed", Wrap::Array),
+    ("create_pair", "create", Wrap::Array),
+    ("build_pair", "build", Wrap::Array),
+    ("build_stubbed_pair", "build_stubbed", Wrap::Array),
+];
+
+/// What `attributes_for` and its list and pair build, whatever the factory: the attributes, by
+/// name.
+const ATTRIBUTES: [(&str, &str); 3] = [
+    ("attributes_for", "::Hash[::Symbol, untyped]"),
+    ("attributes_for_list", "::Array[::Hash[::Symbol, untyped]]"),
+    ("attributes_for_pair", "::Array[::Hash[::Symbol, untyped]]"),
+];
+
+/// The strategy [`ATTRIBUTES`] run.
+const ATTRIBUTES_FOR: &str = "attributes_for";
+
+/// How a strategy hands back what it built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrap {
+    One,
+    Array,
+}
+
+/// One file's factory definitions.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Read {
+    /// Every `factory` inside a `FactoryBot.define`, parents before their children.
+    pub factories: Vec<Factory>,
+    /// Whether an `initialize_with` outside every factory builds anything but `new(…)`: FactoryBot's
+    /// global constructor, a global trait's, or one in a `FactoryBot.modify`, which may be any
+    /// factory's.
+    pub otherwise: bool,
+    /// The strategies `FactoryBot.register_strategy` replaces, which build what the project says.
+    pub registered: BTreeSet<String>,
+    /// The file it was read from, which the caller fills in: where a factory is written
+    /// ([`Classes::places`]).
+    pub uri: String,
+    /// Whether that file is a gem's, which the caller fills in: its factories answer only for a
+    /// name the project does not define ([`classes`]).
+    pub gem: bool,
+}
+
+/// One FactoryBot `factory`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Factory {
+    pub name: String,
+    /// `aliases:`, each another name for this factory.
+    pub aliases: Vec<String>,
+    /// What `class:` says, where it is written.
+    pub class: Option<Named>,
+    /// `parent:`, by name.
+    pub parent: Option<String>,
+    /// The factory it is written in, by index into [`Read::factories`]: its parent too.
+    pub within: Option<usize>,
+    /// Whether an `initialize_with` in its block, a trait's included, builds anything but
+    /// `new(…)`.
+    pub otherwise: bool,
+    /// The `module`s and `class`es around the definition, joined.
+    pub nesting: String,
+    /// The whole `factory` call, and its name.
+    pub at: At,
+}
+
+/// A class an option names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Named {
+    /// A constant, as written: Ruby looks it up from where it is written.
+    Constant(String),
+    /// A String or a Symbol, as `constantize` reads it: from the top level.
+    Name(String),
+    /// Something only running Ruby knows.
+    Unknown,
+}
+
+/// Read one file's factory definitions.
+#[must_use]
+pub fn read_factories(source: &str) -> Read {
+    let result = parse(source.as_bytes());
+    let mut reader = Reader {
+        source,
+        read: Read::default(),
+        nesting: Vec::new(),
+        defining: None,
+        within: None,
+    };
+    reader.visit(&result.node());
+    reader.read
+}
+
+/// Which FactoryBot block the walk is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Defining {
+    /// `FactoryBot.define`: each `factory` is a new one.
+    Define,
+    /// `FactoryBot.modify`: each `factory` names one defined elsewhere, and its options are
+    /// ignored.
+    Modify,
+}
+
+/// [`read_factories`]' walk.
+struct Reader<'s> {
+    source: &'s str,
+    read: Read,
+    nesting: Vec<String>,
+    defining: Option<Defining>,
+    /// The factory whose block the walk is in.
+    within: Option<usize>,
+}
+
+impl<'pr> Visit<'pr> for Reader<'_> {
+    fn visit_module_node(&mut self, node: &ModuleNode<'pr>) {
+        self.nested(&node.constant_path(), node.body().as_ref());
+    }
+
+    fn visit_class_node(&mut self, node: &ClassNode<'pr>) {
+        self.nested(&node.constant_path(), node.body().as_ref());
+    }
+
+    fn visit_def_node(&mut self, _node: &DefNode<'pr>) {}
+
+    fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+        let name = node.name().as_slice();
+        let bare = node.receiver().is_none();
+        let on_factory_bot = node.receiver().is_some_and(|receiver| {
+            is_constant(&receiver) && self.spelling(&receiver) == "FactoryBot"
+        });
+        if on_factory_bot && matches!(name, b"define" | b"modify") {
+            let mode = if name == b"define" {
+                Defining::Define
+            } else {
+                Defining::Modify
+            };
+            self.walk(node, Some(mode), None);
+            return;
+        }
+        if on_factory_bot && name == b"register_strategy" {
+            self.registered(node);
+            return;
+        }
+        if bare && name == b"initialize_with" {
+            self.constructor(node);
+            return;
+        }
+        if bare && name == b"factory" && self.defining.is_some() {
+            self.factory(node);
+            return;
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+}
+
+impl Reader<'_> {
+    fn nested(&mut self, path: &Node<'_>, body: Option<&Node<'_>>) {
+        self.nesting.push(self.spelling(path));
+        if let Some(body) = body {
+            self.visit(body);
+        }
+        self.nesting.pop();
+    }
+
+    /// Walk a call's block as the given definition's.
+    fn walk(&mut self, node: &CallNode<'_>, defining: Option<Defining>, within: Option<usize>) {
+        let Some(body) = node
+            .block()
+            .and_then(|block| block.as_block_node())
+            .and_then(|block| block.body())
+        else {
+            return;
+        };
+        let outer = (self.defining, self.within);
+        (self.defining, self.within) = (defining, within);
+        self.visit(&body);
+        (self.defining, self.within) = outer;
+    }
+
+    /// One `factory :name, …` and the factories written in its block. In a `modify` it defines
+    /// nothing, and a constructor written there counts for every factory.
+    fn factory(&mut self, node: &CallNode<'_>) {
+        if self.defining == Some(Defining::Modify) {
+            self.walk(node, self.defining, None);
+            return;
+        }
+        let arguments = arguments_of(node);
+        let Some(name) = arguments.first().and_then(|first| self.literal(first)) else {
+            return;
+        };
+        let options = self.options(&arguments);
+        let whole = node.location();
+        let named = arguments[0].location();
+        // A Symbol's name without its colon, a String's without its quotes.
+        let named = arguments[0]
+            .as_symbol_node()
+            .and_then(|symbol| symbol.value_loc())
+            .or_else(|| {
+                arguments[0]
+                    .as_string_node()
+                    .map(|string| string.content_loc())
+            })
+            .unwrap_or(named);
+        self.read.factories.push(Factory {
+            at: (
+                (whole.start_offset() as u32, whole.end_offset() as u32),
+                (named.start_offset() as u32, named.end_offset() as u32),
+            ),
+            name,
+            aliases: self.aliases(&options),
+            class: options.get("class").map(|value| self.named(value)),
+            parent: options.get("parent").and_then(|value| self.literal(value)),
+            within: self.within,
+            otherwise: false,
+            nesting: self.nesting.join("::"),
+        });
+        let index = self.read.factories.len() - 1;
+        self.walk(node, self.defining, Some(index));
+    }
+
+    /// An `initialize_with`: whether its block builds the factory's class (FactoryBot runs it with
+    /// `new` meaning the class), and whose it is.
+    fn constructor(&mut self, node: &CallNode<'_>) {
+        let Some(block) = node.block().and_then(|block| block.as_block_node()) else {
+            return;
+        };
+        if self.defining.is_none() || returns_new(&block) {
+            return;
+        }
+        match (self.defining, self.within) {
+            (Some(Defining::Define), Some(index)) => self.read.factories[index].otherwise = true,
+            _ => self.read.otherwise = true,
+        }
+    }
+
+    /// `FactoryBot.register_strategy(:name, …)`: a name not written as a literal may be any.
+    fn registered(&mut self, node: &CallNode<'_>) {
+        let arguments = arguments_of(node);
+        match arguments.first().and_then(|first| self.literal(first)) {
+            Some(name) => {
+                self.read.registered.insert(name);
+            }
+            None => self.read.registered.extend(
+                STRATEGIES
+                    .iter()
+                    .map(|(_, strategy, _)| (*strategy).to_owned())
+                    .chain([ATTRIBUTES_FOR.to_owned()]),
+            ),
+        }
+    }
+
+    /// The `key: value` options after the first argument.
+    fn options<'n>(&self, arguments: &[Node<'n>]) -> BTreeMap<String, Node<'n>> {
+        let mut options = BTreeMap::new();
+        for argument in arguments.iter().skip(1) {
+            let Some(hash) = argument.as_keyword_hash_node() else {
+                continue;
+            };
+            for element in hash.elements().iter() {
+                let Some(pair) = element.as_assoc_node() else {
+                    continue;
+                };
+                if let Some(key) = pair.key().as_symbol_node() {
+                    options.insert(
+                        String::from_utf8_lossy(key.unescaped()).into_owned(),
+                        pair.value(),
+                    );
+                }
+            }
+        }
+        options
+    }
+
+    /// `aliases:`, each written as a literal.
+    fn aliases(&self, options: &BTreeMap<String, Node<'_>>) -> Vec<String> {
+        options
+            .get("aliases")
+            .and_then(Node::as_array_node)
+            .map(|array| {
+                array
+                    .elements()
+                    .iter()
+                    .filter_map(|element| self.literal(&element))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The class an option names: a constant as written, a String or a Symbol as `constantize`
+    /// reads it (`"spree/address"` is `Spree::Address`).
+    fn named(&self, value: &Node<'_>) -> Named {
+        if is_constant(value) {
+            return Named::Constant(self.spelling(value));
+        }
+        match self.literal(value).and_then(|text| constantized(&text)) {
+            Some(name) => Named::Name(name),
+            None => Named::Unknown,
+        }
+    }
+
+    fn literal(&self, node: &Node<'_>) -> Option<String> {
+        let bytes = if let Some(string) = node.as_string_node() {
+            string.unescaped().to_vec()
+        } else {
+            node.as_symbol_node()?.unescaped().to_vec()
+        };
+        String::from_utf8(bytes).ok()
+    }
+
+    fn spelling(&self, node: &Node<'_>) -> String {
+        let location = node.location();
+        self.source
+            .get(location.start_offset()..location.end_offset())
+            .unwrap_or_default()
+            .trim_start_matches("::")
+            .to_owned()
+    }
+}
+
+/// A call's arguments.
+fn arguments_of<'pr>(node: &CallNode<'pr>) -> Vec<Node<'pr>> {
+    node.arguments()
+        .map(|arguments| arguments.arguments().iter().collect())
+        .unwrap_or_default()
+}
+
+/// Whether a node is a constant, bare or a path.
+fn is_constant(node: &Node<'_>) -> bool {
+    node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some()
+}
+
+/// Whether a constructor block ends in `new(…)`, sent to nothing: the factory's class.
+fn returns_new(block: &BlockNode<'_>) -> bool {
+    let last = block
+        .body()
+        .and_then(|body| body.as_statements_node())
+        .and_then(|statements| statements.body().iter().last());
+    last.as_ref()
+        .and_then(Node::as_call_node)
+        .is_some_and(|call| call.receiver().is_none() && call.name().as_slice() == b"new")
+}
+
+/// A name as ActiveSupport's `camelize` then `constantize` read it: each `/` a `::`, each segment
+/// camelized. `None` where a segment spells no constant.
+fn constantized(text: &str) -> Option<String> {
+    let segments: Option<Vec<String>> = text
+        .trim_start_matches("::")
+        .split('/')
+        .map(|segment| {
+            if segment.contains("::") {
+                Some(segment.to_owned())
+            } else {
+                camelize(segment)
+            }
+        })
+        .collect();
+    Some(segments?.join("::"))
+}
+
+/// Which class each factory builds, where it can be said.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Classes {
+    /// FactoryBot factories (aliases included), by name: the class, or `None` where it cannot be
+    /// said.
+    pub factories: BTreeMap<String, Option<String>>,
+    /// The strategies a project replaces ([`Read::registered`]).
+    pub registered: BTreeSet<String>,
+    /// Where each factory (aliases included) is written: the file and the `factory` call. Not a
+    /// name two definitions write.
+    pub places: BTreeMap<String, (String, At)>,
+}
+
+/// What every file's definitions build. `resolve` looks a constant written inside a nesting up,
+/// answering the name the project or the bundle declares.
+///
+/// - **A name two definitions write builds nothing here**: FactoryBot refuses the second, and which
+///   file loads first is not known.
+/// - **A gem's factory answers only where the project defines no factory of that name.** A gem's
+///   factories load only when the project requires them, and a project that loaded one beside its
+///   own of the same name would not start, so a working project that writes the name is not
+///   loading the gem's.
+/// - **A parent chain is followed to its end**, a loop or a missing parent answering nothing.
+/// - **A constructor that builds anything but the class, anywhere in the chain, answers
+///   nothing**: a trait's may be the one a call asks for, and a child inherits its parent's.
+#[must_use]
+pub fn classes(reads: &[Read], resolve: &dyn Fn(&str, &str) -> Option<String>) -> Classes {
+    let otherwise = reads.iter().any(|read| read.otherwise);
+    let mut factories: BTreeMap<String, &Factory> = BTreeMap::new();
+    let mut twice: BTreeSet<String> = BTreeSet::new();
+    let mut places: BTreeMap<String, (String, At)> = BTreeMap::new();
+    // Each factory's parent, by every name it has.
+    let mut parents: BTreeMap<String, String> = BTreeMap::new();
+    let own: BTreeSet<&String> = reads
+        .iter()
+        .filter(|read| !read.gem)
+        .flat_map(|read| {
+            read.factories
+                .iter()
+                .flat_map(|factory| std::iter::once(&factory.name).chain(&factory.aliases))
+        })
+        .collect();
+    for read in reads {
+        for factory in &read.factories {
+            let parent = factory.parent.clone().or_else(|| {
+                factory
+                    .within
+                    .map(|index| read.factories[index].name.clone())
+            });
+            for name in std::iter::once(&factory.name).chain(&factory.aliases) {
+                if read.gem && own.contains(name) {
+                    continue;
+                }
+                if factories.insert(name.clone(), factory).is_some() {
+                    twice.insert(name.clone());
+                }
+                places.insert(name.clone(), (read.uri.clone(), factory.at));
+                if let Some(parent) = &parent {
+                    parents.insert(name.clone(), parent.clone());
+                }
+            }
+        }
+    }
+    let mut classes = Classes {
+        registered: reads
+            .iter()
+            .flat_map(|read| read.registered.iter().cloned())
+            .collect(),
+        ..Classes::default()
+    };
+    classes.places = places;
+    classes.places.retain(|name, _| !twice.contains(name));
+    for name in factories.keys() {
+        let answer = if otherwise {
+            None
+        } else {
+            factory_class(name, &factories, &parents, &twice, resolve)
+        };
+        classes.factories.insert(name.clone(), answer);
+    }
+    classes
+}
+
+/// How far a parent chain is followed: a guard against a loop, far above any real chain.
+const PARENTS: usize = 16;
+
+/// FactoryBot's `class_name`: the nearest `class:` up the chain, else the topmost factory's name.
+fn factory_class(
+    name: &str,
+    factories: &BTreeMap<String, &Factory>,
+    parents: &BTreeMap<String, String>,
+    twice: &BTreeSet<String>,
+    resolve: &dyn Fn(&str, &str) -> Option<String>,
+) -> Option<String> {
+    let mut chain: Vec<&Factory> = Vec::new();
+    let mut at = Some(name);
+    while let Some(current) = at {
+        if chain.len() > PARENTS || twice.contains(current) {
+            return None;
+        }
+        let factory = *factories.get(current)?;
+        if factory.otherwise {
+            return None;
+        }
+        chain.push(factory);
+        at = parents.get(current).map(String::as_str);
+    }
+    for factory in &chain {
+        if let Some(named) = &factory.class {
+            return class_of(&factory.nesting, named, resolve);
+        }
+    }
+    resolve("", &constantized(&chain.last()?.name)?)
+}
+
+/// The class an option names, looked up as Ruby would: a constant from where it is written, a
+/// name from the top level.
+fn class_of(
+    nesting: &str,
+    named: &Named,
+    resolve: &dyn Fn(&str, &str) -> Option<String>,
+) -> Option<String> {
+    match named {
+        Named::Constant(written) => resolve(nesting, written),
+        Named::Name(name) => resolve("", name),
+        Named::Unknown => None,
+    }
+}
+
+/// Every name a definition may mean, for the one question the caller asks the graph: each
+/// constant an option writes, looked up from its nesting, and each name camelized.
+#[must_use]
+pub fn wanted_names(reads: &[Read]) -> BTreeSet<String> {
+    let mut wanted = BTreeSet::new();
+    let mut add = |nesting: &str, named: Option<&Named>| match named {
+        Some(Named::Constant(written)) => wanted.extend(candidates_of(nesting, written)),
+        Some(Named::Name(name)) => {
+            wanted.insert(name.clone());
+        }
+        Some(Named::Unknown) | None => {}
+    };
+    let spelled = |name: &str| constantized(name).map(Named::Name);
+    for read in reads {
+        for factory in &read.factories {
+            add(&factory.nesting, factory.class.as_ref());
+            add("", spelled(&factory.name).as_ref());
+        }
+    }
+    wanted
+}
+
+/// The names a constant written inside `nesting` could mean, innermost first.
+#[must_use]
+pub fn candidates_of(nesting: &str, written: &str) -> Vec<String> {
+    if nesting.is_empty() {
+        vec![written.to_owned()]
+    } else {
+        candidates(nesting, written)
+    }
+}
+
+/// The strategies' rows, on [`SYNTAX`] where the bundle declares it.
+#[must_use]
+pub fn rows(built: &Classes, namespaces: &Namespaces) -> Vec<(&'static str, Facts)> {
+    let mut hosted = Vec::new();
+    if namespaces.declares(SYNTAX) && !built.factories.is_empty() {
+        let owner = if namespaces.opens(SYNTAX) {
+            Owner::Module(SYNTAX.to_owned())
+        } else {
+            Owner::Instance(SYNTAX.to_owned())
+        };
+        let mut facts = Facts::default();
+        for (name, strategy, wrap) in STRATEGIES {
+            if built.registered.contains(strategy) {
+                continue;
+            }
+            facts.declare(picked(&owner, name, &built.factories, wrap));
+        }
+        for (name, returns) in ATTRIBUTES {
+            if built.registered.contains(ATTRIBUTES_FOR) {
+                continue;
+            }
+            facts.declare(Declared {
+                owner: owner.clone(),
+                name: name.to_owned(),
+                returns: returns.to_owned(),
+                parameters: format!(
+                    "({}) ?{{ (untyped) -> untyped }}",
+                    parameters(name, "untyped")
+                ),
+                because: "FactoryBot's `attributes_for`: the factory's attributes, by name."
+                    .to_owned(),
+                at: None,
+                from: Source::Interface,
+                overloads: Vec::new(),
+                private: false,
+            });
+        }
+        hosted.push((SYNTAX, facts));
+    }
+    hosted
+}
+
+/// One strategy with an arm per factory that says its class, in name order, then a catch-all.
+fn picked(
+    owner: &Owner,
+    method: &str,
+    classes: &BTreeMap<String, Option<String>>,
+    wrap: Wrap,
+) -> Declared {
+    let mut arms: Vec<(String, String)> = classes
+        .iter()
+        .filter(|(name, _)| symbol_spelled(name))
+        .filter_map(|(name, class)| {
+            let class = class.as_ref()?;
+            let returns = match wrap {
+                Wrap::One => format!("::{class}"),
+                Wrap::Array => format!("::Array[::{class}]"),
+            };
+            Some((
+                format!(
+                    "({}) ?{{ (untyped) -> untyped }}",
+                    parameters(method, &format!(":{name}"))
+                ),
+                returns,
+            ))
+        })
+        .collect();
+    // `untyped` for a list too, though it is an `Array`: arms that all say `Array` agree on the head
+    // before the call's symbol is read, and `create_list(:user, 3)` would lose its `User`.
+    arms.push((
+        format!(
+            "({}) ?{{ (untyped) -> untyped }}",
+            parameters(method, "untyped")
+        ),
+        "untyped".to_owned(),
+    ));
+    let (parameters, returns) = arms.remove(0);
+    Declared {
+        owner: owner.clone(),
+        name: method.to_owned(),
+        returns,
+        parameters,
+        because: format!(
+            "FactoryBot's `{method}`: the class the factory its first argument names builds."
+        ),
+        at: None,
+        from: Source::Interface,
+        overloads: arms,
+        private: false,
+    }
+}
+
+/// A strategy's parameters, named for a card, the factory's written `factory`: `create(factory,
+/// *args, **kwargs)`, and a list's count after it, `create_list(factory, amount, *args,
+/// **kwargs)`. FactoryBot's own `define_method` blocks take `|name, amount, *traits_and_overrides|`.
+///
+/// `amount` is `untyped`, so an arm still names its symbol where every later positional takes
+/// anything (`types::pick_by_literal`), and `create_list(:user, 3)` keeps its `User`.
+fn parameters(method: &str, factory: &str) -> String {
+    let amount = if method.ends_with("_list") {
+        "untyped amount, "
+    } else {
+        ""
+    };
+    format!("{factory} factory, {amount}*untyped args, **untyped kwargs")
+}
+
+/// Whether a name can be written as a bare RBS symbol literal.
+fn symbol_spelled(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|rest| rest.is_ascii_alphanumeric() || rest == '_')
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generated::{declaring, declaring_kinds};
+
+    /// A resolver over the names a fixture's project declares.
+    fn declared(names: &'static [&'static str]) -> impl Fn(&str, &str) -> Option<String> {
+        move |nesting, written| {
+            candidates_of(nesting, written)
+                .into_iter()
+                .find(|name| names.contains(&name.as_str()))
+        }
+    }
+
+    /// Every factory's class, as `name=Class` or `name=-`.
+    fn built(reads: &[Read], names: &'static [&'static str]) -> Vec<String> {
+        classes(reads, &declared(names))
+            .factories
+            .iter()
+            .map(|(name, class)| format!("{name}={}", class.as_deref().unwrap_or("-")))
+            .collect()
+    }
+
+    #[test]
+    fn a_definition_file_is_read_as_factory_bot_evaluates_it() {
+        let read = read_factories(
+            r#"
+module Shop
+  FactoryBot.define do
+    factory :user, class: Account, aliases: [:author, "writer", other] do
+      initialize_with { new(**attributes) }
+      factory :admin do
+        trait :odd do
+          initialize_with { Account.find_or_create_by(name: name) }
+        end
+      end
+    end
+    factory "order", class: "shop/order", parent: :user
+    factory :line, class: :line_item
+    factory :dynamic, class: klass
+    factory name_of(:x)
+    factory :empty do
+      initialize_with {}
+    end
+    factory :bare do
+      initialize_with
+    end
+    factory :splat, **options
+    factory :hashed, "class" => Account
+    factory :positional, "extra"
+    factory :received do
+      initialize_with { Account.new }
+    end
+  end
+  FactoryBot.lint
+  def helper = factory(:ignored)
+  class Empty; end
+end
+factory :outside
+initialize_with { outside }
+"#,
+        );
+        let shapes: Vec<String> = read
+            .factories
+            .iter()
+            .map(|factory| {
+                format!(
+                    "{} {:?} {:?} {:?} {:?} {} [{}]",
+                    factory.name,
+                    factory.aliases,
+                    factory.class,
+                    factory.parent,
+                    factory.within,
+                    factory.otherwise,
+                    factory.nesting
+                )
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                r#"user ["author", "writer"] Some(Constant("Account")) None None false [Shop]"#,
+                "admin [] None None Some(0) true [Shop]",
+                r#"order [] Some(Name("Shop::Order")) Some("user") None false [Shop]"#,
+                r#"line [] Some(Name("LineItem")) None None false [Shop]"#,
+                "dynamic [] Some(Unknown) None None false [Shop]",
+                "empty [] None None None true [Shop]",
+                "bare [] None None None false [Shop]",
+                "splat [] None None None false [Shop]",
+                "hashed [] None None None false [Shop]",
+                "positional [] None None None false [Shop]",
+                "received [] None None None true [Shop]",
+            ]
+        );
+        assert!(
+            !read.otherwise,
+            "an `initialize_with` outside FactoryBot is none of its"
+        );
+        assert!(read.registered.is_empty());
+    }
+
+    #[test]
+    fn a_constructor_outside_every_factory_or_in_a_modify_counts_for_all() {
+        let global = read_factories(
+            "FactoryBot.define do\n  initialize_with { new }\n  trait :x do\n    \
+             initialize_with { find_or_create_by(id: 1) }\n  end\nend\n",
+        );
+        assert!(
+            global.otherwise,
+            "a global trait's constructor may be any factory's"
+        );
+        let fine =
+            read_factories("FactoryBot.define do\n  initialize_with { new(attributes) }\nend\n");
+        assert!(!fine.otherwise);
+        let modified = read_factories(
+            "FactoryBot.modify do\n  factory :user, class: Other do\n    \
+             initialize_with { attributes }\n    factory :child\n  end\nend\n",
+        );
+        assert!(modified.factories.is_empty(), "`modify` defines nothing");
+        assert!(modified.otherwise);
+        let empty =
+            read_factories("FactoryBot.modify do\n  factory :user\nend\nFactoryBot.define\n");
+        assert_eq!(empty, Read::default());
+        // A `FactoryBot` that is not the library's, and `define` sent to something else.
+        let other = read_factories(
+            "Other::FactoryBot.define do\n  factory :x\nend\nbot.define do\n  factory :y\nend\n",
+        );
+        assert!(other.factories.is_empty());
+    }
+
+    #[test]
+    fn a_replaced_strategy_is_read_by_name_or_as_any() {
+        let read = read_factories(
+            "FactoryBot.register_strategy(:create, Custom)\nFactoryBot.register_strategy(\"json\", J)\n",
+        );
+        assert_eq!(
+            read.registered,
+            BTreeSet::from(["create".to_owned(), "json".to_owned()])
+        );
+        let any = read_factories("FactoryBot.register_strategy(name, Custom)\n");
+        assert_eq!(
+            any.registered,
+            BTreeSet::from(
+                ["attributes_for", "build", "build_stubbed", "create"].map(str::to_owned)
+            )
+        );
+    }
+
+    #[test]
+    fn a_factory_builds_its_class_its_parents_or_its_topmost_name() {
+        let reads = [
+            read_factories(
+                r#"
+module Shop
+  FactoryBot.define do
+    factory :user, aliases: [:author] do
+      factory :admin
+      factory :staff, class: "Shop::Staff"
+    end
+    factory :order, class: Order do
+      factory :special, class: "Line"
+    end
+    factory :line, class: "Line"
+    factory :dynamic, class: klass
+    factory :lost, parent: :nobody
+    factory :loop_a, parent: :loop_b
+    factory :loop_b, parent: :loop_a
+    factory :unknown
+    factory :__
+  end
+end
+"#,
+            ),
+            read_factories(
+                r#"
+FactoryBot.define do
+  factory :odd, class: User do
+    initialize_with { attributes }
+  end
+  factory :odd_child, parent: :odd, class: User
+  factory :twin
+  factory :twin_child, parent: :twin
+end
+"#,
+            ),
+            read_factories("FactoryBot.define do\n  factory :twin\nend\n"),
+        ];
+        assert_eq!(
+            built(
+                &reads,
+                &[
+                    "User",
+                    "Shop::Order",
+                    "Order",
+                    "Line",
+                    "Shop::Line",
+                    "Shop::Staff",
+                    "Twin",
+                    // Declared, so a parent nothing defines is what leaves `lost` untyped.
+                    "Lost"
+                ]
+            ),
+            [
+                "__=-",
+                "admin=User",
+                "author=User",
+                "dynamic=-",
+                "line=Line",
+                "loop_a=-",
+                "loop_b=-",
+                "lost=-",
+                "odd=-",
+                "odd_child=-",
+                "order=Shop::Order",
+                "special=Line",
+                "staff=Shop::Staff",
+                "twin=-",
+                "twin_child=-",
+                "unknown=-",
+                "user=User",
+            ]
+        );
+        // One global constructor that builds something else leaves every factory untyped.
+        let mut global = reads[0].clone();
+        global.otherwise = true;
+        assert!(
+            built(&[global], &["User"])
+                .iter()
+                .all(|answer| answer.ends_with("=-"))
+        );
+    }
+
+    #[test]
+    fn a_factory_is_placed_where_its_call_is_written_and_a_doubled_name_nowhere() {
+        let source = "FactoryBot.define do\n  factory :user, aliases: [:author]\n  factory \"order\"\n  factory :twin\nend\n";
+        let mut read = read_factories(source);
+        read.uri = "file:///p/spec/factories.rb".to_owned();
+        let mut other = read_factories("FactoryBot.define do\n  factory :twin\nend\n");
+        other.uri = "file:///p/spec/other.rb".to_owned();
+        let placed = classes(&[read, other], &declared(&[])).places;
+        let spelled = |name: &str| {
+            placed
+                .get(name)
+                .map(|(uri, ((start, end), (name, name_end)))| {
+                    (
+                        uri.as_str(),
+                        &source[*start as usize..*end as usize],
+                        &source[*name as usize..*name_end as usize],
+                    )
+                })
+        };
+        assert_eq!(
+            spelled("user"),
+            Some((
+                "file:///p/spec/factories.rb",
+                "factory :user, aliases: [:author]",
+                "user"
+            ))
+        );
+        assert_eq!(spelled("author"), spelled("user"));
+        assert_eq!(
+            spelled("order"),
+            Some(("file:///p/spec/factories.rb", "factory \"order\"", "order"))
+        );
+        assert_eq!(spelled("twin"), None);
+    }
+
+    #[test]
+    fn a_gem_s_factory_answers_only_for_a_name_the_project_does_not_write() {
+        let own = read_factories(
+            "FactoryBot.define do\n  factory :user, class: Account\n  factory :admin, parent: :order\nend\n",
+        );
+        let mut gem = read_factories(
+            "FactoryBot.define do\n  factory :user, class: Order\n  factory :order, class: Order\n  \
+             factory :line, class: Order\nend\n",
+        );
+        gem.gem = true;
+        let mut other =
+            read_factories("FactoryBot.define do\n  factory :line, class: Order\nend\n");
+        other.gem = true;
+        assert_eq!(
+            built(&[own, gem, other], &["Account", "Order"]),
+            ["admin=Order", "line=-", "order=Order", "user=Account"]
+        );
+    }
+
+    #[test]
+    fn the_names_asked_about_are_every_one_a_definition_may_mean() {
+        let reads = [read_factories(
+            r#"
+module Shop
+  FactoryBot.define do
+    factory :user, class: Account
+    factory :order, class: "shop/order"
+    factory :odd, class: klass
+    factory :"9"
+  end
+end
+"#,
+        )];
+        assert_eq!(
+            wanted_names(&reads),
+            BTreeSet::from(
+                [
+                    "Account",
+                    "Odd",
+                    "Order",
+                    "Shop::Account",
+                    "Shop::Order",
+                    "User",
+                ]
+                .map(str::to_owned)
+            )
+        );
+    }
+
+    #[test]
+    fn a_name_is_constantized_as_active_support_reads_it() {
+        assert_eq!(
+            constantized("spree/address").as_deref(),
+            Some("Spree::Address")
+        );
+        assert_eq!(
+            constantized("::Admin::User").as_deref(),
+            Some("Admin::User")
+        );
+        assert_eq!(constantized("admin_user").as_deref(), Some("AdminUser"));
+        assert_eq!(constantized("admin/9"), None);
+        assert_eq!(candidates_of("", "User"), ["User"]);
+        assert_eq!(
+            candidates_of("A::B", "User"),
+            ["A::B::User", "A::User", "User"]
+        );
+    }
+
+    #[test]
+    fn the_rows_are_written_on_what_the_bundle_declares() {
+        let reads = [read_factories(
+            r#"
+FactoryBot.define do
+  factory :user
+  factory :admin, class: Admin
+  factory :"odd name", class: User
+  factory :"9lives", class: User
+  factory :_hidden, class: User
+  factory :dynamic, class: klass
+end
+"#,
+        )];
+        let classes = classes(&reads, &declared(&["User", "Admin"]));
+        assert!(rows(&classes, &declaring(&[])).is_empty());
+        let bundle = declaring(&["FactoryBot", SYNTAX]);
+        let hosted = rows(&classes, &bundle);
+        let owners: Vec<&str> = hosted.iter().map(|(owner, _)| *owner).collect();
+        assert_eq!(owners, [SYNTAX]);
+        let rbs: String = hosted
+            .iter()
+            .map(|(_, facts)| facts.render(&bundle).rbs)
+            .collect();
+        for expected in [
+            "module FactoryBot",
+            "def create: (:_hidden factory, *untyped args, **untyped kwargs) ?{ (untyped) -> untyped } -> ::User \
+             | (:admin factory, *untyped args, **untyped kwargs) ?{ (untyped) -> untyped } -> ::Admin \
+             | (:user factory, *untyped args, **untyped kwargs) ?{ (untyped) -> untyped } -> ::User \
+             | (untyped factory, *untyped args, **untyped kwargs) ?{ (untyped) -> untyped } -> untyped\n",
+            "def build_stubbed_pair: (:_hidden factory, *untyped args, **untyped kwargs) \
+             ?{ (untyped) -> untyped } -> ::Array[::User]",
+            // A list takes its count after the factory.
+            "def create_list: (:_hidden factory, untyped amount, *untyped args, **untyped kwargs) \
+             ?{ (untyped) -> untyped } -> ::Array[::User]",
+            "| (untyped factory, untyped amount, *untyped args, **untyped kwargs) \
+             ?{ (untyped) -> untyped } -> untyped\n",
+            "def attributes_for: (untyped factory, *untyped args, **untyped kwargs) \
+             ?{ (untyped) -> untyped } -> ::Hash[::Symbol, untyped]",
+            "def attributes_for_list: (untyped factory, untyped amount, *untyped args, **untyped kwargs) \
+             ?{ (untyped) -> untyped } -> ::Array[::Hash[::Symbol, untyped]]",
+        ] {
+            assert!(rbs.contains(expected), "{expected}\n---\n{rbs}");
+        }
+        assert!(
+            !rbs.contains("odd name") && !rbs.contains(":9lives") && !rbs.contains(":dynamic"),
+            "{rbs}"
+        );
+        // `Syntax::Methods` as a class, and the strategies the project replaces left out.
+        let mut replaced = classes.clone();
+        replaced.registered = BTreeSet::from(["create".to_owned(), ATTRIBUTES_FOR.to_owned()]);
+        let classy = declaring_kinds(&[SYNTAX], &[]);
+        let rbs: String = rows(&replaced, &classy)
+            .iter()
+            .map(|(_, facts)| facts.render(&classy).rbs)
+            .collect();
+        assert!(rbs.contains("def build:"), "{rbs}");
+        assert!(
+            !rbs.contains("def create") && !rbs.contains("attributes_for"),
+            "{rbs}"
+        );
+        // No definitions: no rows, even where the bundle declares the owner.
+        assert!(rows(&Classes::default(), &bundle).is_empty());
+    }
+}

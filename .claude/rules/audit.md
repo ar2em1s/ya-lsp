@@ -73,21 +73,26 @@ A new stage that can run silently needs a progress stream, not a longer quiet pe
 - **The report has no direction table.** The check that owns a counter says which way is good.
 - **Over-blocking is safe in a key and unsafe in a draw filter.** `routes.non_helpers` is
   deliberately the weaker filter.
+- **A parameter is a local only in its own file** (`routes.parameters`, read by `shapes.find`), never
+  corpus-wide: solidus' admin component takes `account_path:` while its storefront calls the helper.
+  Six `route` rows were a method's or a block's parameter (2026-09-29).
 
 ## The checks and keys
 
 | # | Check (`lane2.CHECKS`, in order) |
 |---|---|
 | 1 | `highlight`: `documentHighlight` and `definition` agree about the cursor |
-| 2 | `resolved`: a *Resolved* card never points outside loaded code |
+| 2 | `resolved`: a sure card (any card not saying it guessed) never points outside loaded code |
 | 3 | `spans`: `hover` and `definition` agree on the span |
 | 4 | `footnotes`: "Defined in N places" is true (ivars counted apart as `places-of-a-variable`) |
 | 5 | `rebase`: same answer after an untouching `didChange` (edits sent in-stream) |
-| 6 | `receiver`: a card saying "no type" next to a list of a class's members |
-| 7 | `references`: vs `documentHighlight` in-file (both ways), vs `definition`'s places, cursor in own list |
-| 8 | `margins`: the margin types a binding that the card at a call on it will not |
-| 9 | `incoming`: every incoming call site is in `references` |
-| 10 | `renaming`: the rename box is the lit word (constants only; `rename-qualified` counted apart) |
+| 6 | `references`: vs `documentHighlight` in-file (both ways), vs `definition`'s places, cursor in own list |
+| 7 | `margins`: the margin types a binding that the card at a call on it guesses at, with no type `typeDefinition` reaches |
+| 8 | `incoming`: every incoming call site is in `references` |
+| 9 | `renaming`: the rename box is the lit word (constants only; `rename-qualified` counted apart) |
+
+Check 6 was `receiver` until 2026-09-29: it read which of the card's four guess sentences a card
+carried, and the card now has one. The checks after it moved up one.
 
 Keys (`lane1.KEYS`): `neutral`, `rails`, `completion`, `calls`, `closures`, `outline`.
 
@@ -130,12 +135,12 @@ lane3.run      last: residue is what the other lanes left
 
 ## The tiers are what the audit is for
 
-- **A card's tier is what it does *not* say.** `answers.DERIVED` and `answers.GUESSED` are
-  `hover.rs`'s sentences. The weakest rung wins.
-- **A new footnote goes into `answers.DERIVED` or `GUESSED` in the same change.** Check it against
-  `the_three_tiers_of_answer_drawn_side_by_side`. `report.report` prints `BROKEN` only when *every*
-  footnote disappears. A new unknown one is silently scored *Resolved*.
-- **Read both guess spellings:** "Matched on the method name alone" and "Type guessed from the name".
+- **Two tiers, as the card has** (decided 2026-09-29): `guessed` where the card carries
+  *Guessed from name alone.* (`answers.GUESSED`, quoted from `hover.rs`), and `resolved` (sure)
+  everywhere else. A derived answer reads as sure on the card, so it is held to the same standard.
+- **A reworded guess line changes `answers.GUESSED` in the same change**, checked against
+  `the_two_tiers_a_reader_sees_drawn_side_by_side`. `report.report` prints `BROKEN` when no card in a
+  corpus reads as a guess.
 
 ## The strata
 
@@ -153,17 +158,21 @@ lane3.run      last: residue is what the other lanes left
 ## The completion key
 
 - **The corpus wrote `story.title`, so `title` must be on the list** at that cursor. Findings are
-  raised only under a *Resolved* card. `present` is an upper bound.
-- **`empty` is bucketed by tier.** `completion-declined` is a *Resolved* card over no list: key on
-  the claim, not the answer.
+  raised only under a sure card. `present` is an upper bound.
+- **`empty` is bucketed by tier.** `completion-declined` is a sure card over no list: key on the
+  claim, not the answer.
+- **The card is the member's, so an empty list under a root's member is its own bucket,
+  `empty-root`** (`completion.claim`). `Object#present?` resolves on a receiver nobody typed, and
+  raises no finding. The receiver's own card is no better: a constant's names the constant, not what
+  it holds. A list that answered typed its receiver, so a root's member missing from it is still
+  `completion-absent`.
 - **An absence from an `isIncomplete` list is `cut-short`**, counted and not ruled on.
 - **`calls` and `closures` pose at the *end* of a bare word.** At an empty prefix every such list is
-  the 512 cap. `calls` keeps its replies out of `answers`, so check 6's denominator doesn't move.
-  `closures` draws its own cursors, filtered by the server's *Found on an instance of* footnote.
-- **Check 6 reads the completion reply lane 1 sent** (`Row.listed` ≠ `Row.offered`). `completion`
-  stays out of `lane2.METHODS`, because it is the largest cost.
-  - The discriminator ("a non-empty list at a bare dot means a typed receiver") holds only because
-    every corpus is over 512 names. Re-check that before adding a small corpus.
+  the 512 cap. `closures` draws its own cursors, filtered to a sure card naming an **instance**
+  member (`Owner#word`) at a bare word in a class body's block: where rubydex answers the class
+  object's, only a rung that found the name on an instance does that.
+- **`completion` stays out of `lane2.METHODS`**, because it is the largest cost: each key keeps
+  its own replies.
 - **Dropped:** setters (they score spelling). ERB member cursors are kept.
 
 ## Blind spots: read a quiet sweep as "pointed elsewhere"
@@ -218,6 +227,10 @@ The last two are rubydex bugs in `ruby_indexer.rs`:
 
 - `||=` records the reference at `operator_loc()`.
 - `::` never descends into a constant path's parent.
+
+**The shapes still read `wrong` wherever they recur; the cited rows do not.** Two fixes corrected
+every `wrong` row above and re-graded it `correct` (2026-09-28), both rubydex bugs included, which
+are worked around. The ledger holds no `wrong` row.
 
 ## The baseline
 

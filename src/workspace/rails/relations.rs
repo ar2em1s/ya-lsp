@@ -6,29 +6,18 @@
 //!
 //! One module, because it is one argument:
 //!
-//! - **A relation class is empty.** Every name on it comes from [`RELATION_BASE`], written once per
-//!   project, so the member count does not grow with the model count.
+//! - **A relation class is almost empty.** Every name on it comes from [`RELATION_BASE`], written
+//!   once per project, but one: [`pick`], whose answer is a column's, not the element's. So the
+//!   member count grows by one per model with a table.
 //! - **The class side is the same list on the model's own base.** [`query_interface`] makes the
 //!   sharing possible: it knows what each name returns without knowing which model asked.
 //! - **The only relation member with its own place is a `scope`**, which is why [`Chained`] lives
 //!   here and not beside the macro it is read from.
 
-use crate::analysis::types::{COLLECTION, ELEMENT};
-use crate::generated::{Declared, Facts, Owner, Source};
+use std::collections::BTreeSet;
 
-/// The class ya-lsp writes for a collection of `class`.
-///
-/// Nested under the model (`Comment::Relation`, not `CommentRelation`), for three reasons, most
-/// important first:
-///
-/// 1. The name is *scoped*, so it cannot collide with an unrelated top-level constant.
-/// 2. It reads right where a user meets it: a hover card saying `Comment::Relation#first`.
-/// 3. A project that already has a `Comment::Relation` meant something by it, so a collision makes
-///    the pass emit nothing instead of shadowing it.
-#[must_use]
-pub fn relation_of(class: &str) -> String {
-    format!("{class}::{RELATION}")
-}
+use crate::generated::{COLLECTION, ELEMENT, FORWARDED, collection_of, grouped_of};
+use crate::generated::{Declared, Facts, Owner, Source};
 
 /// The relation-side half of every `scope` one document writes, held back until the document ends.
 ///
@@ -64,7 +53,7 @@ impl Chained {
     /// itself), so none can drift from the others.
     pub(super) fn declare(&mut self, facts: &mut Facts, class: &str, declared: Declared) {
         self.0.push(Declared {
-            owner: Owner::Instance(relation_of(class)),
+            owner: Owner::Instance(collection_of(class)),
             ..declared.clone()
         });
         facts.declare(declared);
@@ -79,22 +68,6 @@ impl Chained {
         }
     }
 }
-
-/// The class a relation is a collection of: [`relation_of`] read backwards.
-///
-/// Needed at *lookup* time, not generation time: `Story::Relation#first` is declared once for the
-/// whole project, so only the receiver's name says which model the answer is about. See
-/// [`Return::Element`](crate::analysis::types::Return::Element).
-///
-/// A name that is not a relation answers `None`, not itself: the caller's next question is "what is
-/// that model's relation", and a wrong answer here would invent a class.
-#[must_use]
-pub fn element_of(relation: &str) -> Option<&str> {
-    relation.strip_suffix(RELATION)?.strip_suffix("::")
-}
-
-/// The last segment of the name [`relation_of`] builds, and the one [`element_of`] takes off.
-const RELATION: &str = "Relation";
 
 /// The class every relation ya-lsp writes inherits from, and where the query interface lives.
 ///
@@ -119,9 +92,9 @@ const RELATION: &str = "Relation";
 /// collision rule: a project that already declares this name means something by it, and the pass
 /// writes nothing.
 ///
-/// **The cost is the hover card.** `story.comments.where(...)` shows `ActiveRecordRelation#where`,
-/// not `Comment::Relation#where`. The element is gone from the card but still in the *answer*,
-/// which is what a reader chains off.
+/// **The cost is the hover card.** `story.comments.where(...)` shows `ActiveRecord::Relation#where`
+/// ([`SHOWN`](super::SHOWN)), not `Comment::Relation#where`. The element is gone from the card but
+/// still in the *answer*, which is what a reader chains off.
 pub const RELATION_BASE: &str = "ActiveRecordRelation";
 
 /// Where Rails itself writes the relation half of the query interface.
@@ -133,7 +106,7 @@ pub const RELATION_BASE: &str = "ActiveRecordRelation";
 /// declares that resolves lands on the line Ruby names. The exceptions are `instantiate` (class
 /// side only) and `default_order` (not in a released Rails).
 ///
-/// Ordered and searched in order for [`RAILS_CLASS_SIDE`]'s sake, which needs three names before
+/// Ordered and searched in order for [`RAILS_CLASS_SIDE`]'s sake, which needs five names before
 /// this one.
 pub const RAILS_RELATION: [&str; 1] = ["ActiveRecord::Relation"];
 
@@ -141,19 +114,25 @@ pub const RAILS_RELATION: [&str; 1] = ["ActiveRecord::Relation"];
 ///
 /// `Story.where` is `delegate(*QUERYING_METHODS, to: :all)` in `querying.rb`, and **no reader can
 /// expand a splatted constant into ninety method names**, so `ActiveRecord::Querying` holds no
-/// `def` for the graph to find. What remains: the ten names Rails does write a class-side `def`
-/// for, owned by the three modules here, and the rest, which take the relation's because that is
-/// exactly what the `delegate` line says (`Story.where` is `Story.all.where`). All ten class-side
-/// `def`s land where `Method#source_location` says.
+/// `def` for the graph to find. What remains: the twelve names Rails does write a class-side `def`
+/// for, owned by the five modules here, and the rest, which take the relation's because that is
+/// exactly what the `delegate` line says (`Story.where` is `Story.all.where`). All twelve
+/// class-side `def`s land where `Method#source_location` says.
+///
+/// **The two `Scoping` modules come before the relation** because `all` is on both: Ruby answers
+/// `Story.all` from `Scoping::Named::ClassMethods`, and Rails 8's `QueryMethods#all` is only the
+/// relation's.
 ///
 /// `ActiveRecord::Base`'s own singleton is deliberately **not** on this list, although Ruby
 /// searches it first. ya-lsp writes the class side onto that singleton, so looking there would find
-/// this crate's own place-less declaration and stop, and the ten names that have a place would lose
-/// it.
-pub const RAILS_CLASS_SIDE: [&str; 4] = [
+/// this crate's own place-less declaration and stop, and the twelve names that have a place would
+/// lose it.
+pub const RAILS_CLASS_SIDE: [&str; 6] = [
     "ActiveRecord::Persistence::ClassMethods",
     "ActiveRecord::Core::ClassMethods",
     "ActiveRecord::Inheritance::ClassMethods",
+    "ActiveRecord::Scoping::Named::ClassMethods",
+    "ActiveRecord::Scoping::Default::ClassMethods",
     "ActiveRecord::Relation",
 ];
 
@@ -164,7 +143,7 @@ struct Query {
     /// hands one the element.
     parameters: String,
     returns: String,
-    /// Every arm after the first, for the four names one signature cannot state.
+    /// Every arm after the first, for the names one signature cannot state.
     overloads: Vec<(String, String)>,
     /// Which of the two types the name is really on.
     side: Side,
@@ -179,7 +158,9 @@ struct Query {
 /// a class method no relation answers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
-    /// In `QUERYING_METHODS`: the relation defines it and the model delegates to `all`.
+    /// In `QUERYING_METHODS`: the relation defines it and the model delegates to `all`. Also the
+    /// two names the other way round, `all` and `unscoped`: the model defines them (`Scoping`)
+    /// and a relation reaches them too.
     Both,
     /// `Relation`'s own: on the model it is a `NoMethodError` or somebody else's method. `size`,
     /// `length`, `empty?`, `to_a` and `each` are relation-only, which keeps the last two off the
@@ -192,6 +173,10 @@ enum Side {
     /// `create!`, `update`, `update!` and `build` (an alias of `new`), so `story.comments.create!`
     /// really is a call. `instantiate` is the one `Relation` does not define.
     Class,
+    /// In `QUERYING_METHODS`, but the model's answer is not the relation's, so each side has a row
+    /// of its own: this is the model's. `count`, `average` and `sum` are a `Hash` on a grouped
+    /// relation and never on a model.
+    Model,
 }
 
 /// Every name in `ActiveRecord::Querying::QUERYING_METHODS` that hands back a relation.
@@ -199,14 +184,13 @@ enum Side {
 /// One list, not one entry each, because the name is the whole row: these take anything and return
 /// the relation, which is what makes a query chainable. `with` is on both sides like the delegated
 /// names: `QueryMethods#with` is on the relation and `Querying#with` is a `def` beside the list.
-const RELATIONAL: [&str; 40] = [
+const RELATIONAL: [&str; 39] = [
     "reselect",
     "order",
     "regroup",
     "in_order_of",
     "reorder",
     "default_order",
-    "group",
     "limit",
     "offset",
     "joins",
@@ -289,7 +273,8 @@ const ASYNC: [&str; 8] = [
     "async_pick",
 ];
 
-/// The bulk writers, which all hand back an `ActiveRecord::Result` or the ids it carries.
+/// The bulk writers. Each runs `InsertAll.execute`, which hands back the connection's
+/// `ActiveRecord::Result` (an empty one where there was nothing to insert), whatever the adapter.
 const WRITES: [&str; 6] = [
     "insert",
     "insert_all",
@@ -297,6 +282,35 @@ const WRITES: [&str; 6] = [
     "insert_all!",
     "upsert",
     "upsert_all",
+];
+
+/// What `ActiveRecord::Delegation` delegates to a relation's records, the same in activerecord 7.2,
+/// 8.0 and 8.1, less `length` and `each`, which a relation answers itself ([`query_interface`]).
+const RECORDS: [&str; 24] = [
+    "to_xml",
+    "encode_with",
+    "join",
+    "intersect?",
+    "[]",
+    "&",
+    "|",
+    "+",
+    "-",
+    "sample",
+    "reverse",
+    "rotate",
+    "compact",
+    "in_groups",
+    "in_groups_of",
+    "to_sentence",
+    "to_fs",
+    "to_formatted_s",
+    "as_json",
+    "shuffle",
+    "split",
+    "slice",
+    "index",
+    "rindex",
 ];
 
 /// The query interface ActiveRecord installs, written once and declared on the sides it is on.
@@ -309,15 +323,16 @@ const WRITES: [&str; 6] = [
 /// # The bound is Rails' own list
 ///
 /// A table chosen for being *typeable* is a bound nobody can check. **The list is
-/// `QUERYING_METHODS`**, plus the two places Rails puts a class method outside it:
-/// `Persistence::ClassMethods` (where `create!` lives) and `Querying#with`. A name is here because
+/// `QUERYING_METHODS`**, plus the three places Rails puts a class method outside it:
+/// `Persistence::ClassMethods` (where `create!` lives), `Querying#with`, and `Scoping`'s `all`
+/// and `unscoped`, the two every other name starts from. A name is here because
 /// Rails put it on a model, not because ya-lsp could type it; that is why the async family and the
 /// bulk writers are here.
 ///
 /// **The type can still be refused**, which keeps the width safe. `pick`, `calculate`, `minimum`,
-/// `maximum`, every `async_*` and every bulk writer return `untyped`: the name resolves, the chain
-/// stops, and [`Types::harvest`](crate::analysis::types::Types::harvest) drops the claim instead of
-/// carrying a wrong one.
+/// `maximum` and every `async_*` return `untyped`: the name resolves, the chain stops, and [`Types::harvest`](crate::analysis::types::Types::harvest) drops the claim instead of
+/// carrying a wrong one. A relation class with a table overrides `pick` with its columns
+/// ([`pick`]).
 ///
 /// # `Enumerable`'s names, instantiated
 ///
@@ -344,27 +359,28 @@ const WRITES: [&str; 6] = [
 /// Every row is [`Side::Relation`]: a model's class object reaches `Class` and `Object` but no
 /// `Enumerable`, so `Story.map` raises where `Story.all.map` does not.
 ///
-/// # The approximations
+/// # The calls one signature cannot state
 ///
-/// - **A scalar or an array in one argument.** `find`, `create`, `create!`, `build`, `instantiate`
-///   and `destroy` return a record for a scalar and an `Array` for an array, both with **one**
-///   positional argument, so [`Arity`](crate::analysis::cursor::Arity) cannot tell them apart. Each
-///   types the singular. `update` and `update!` return `untyped`: their first parameter *defaults
-///   to `:all`*, so the array is not even unlikely.
-/// - **`count` after a `group` is a `Hash`**, but this always says `Integer`: the same inexactness
-///   as `where` always returning a relation.
+/// - **A scalar or an array in one argument.** `find`, `destroy`, `create`, `create!` and `build`
+///   return a record for one thing and an `Array` for an array of them, with **one** positional
+///   argument either way. Each has an arm per argument class, and the argument's class picks
+///   (`types::pick_by_argument`); an argument nothing types picks none, so
+///   `Story.find(params[:id])` answers nothing: a request can send an array. A keyword hash is one
+///   `Hash` to `create` ([`Arity::Keyed`](crate::analysis::cursor::Arity)). `update` and
+///   `update!` return `untyped`: their first parameter *defaults to `:all`*. `instantiate` always
+///   builds one record.
+/// - **A relation's `count`, `average` and `sum` are a `Hash` after `group`**, and nothing here
+///   knows whether a relation was grouped, so a relation's say `(T | Hash[untyped, untyped])`. A
+///   model's own ([`Side::Model`]) are over every row.
 /// - **`pluck` and `ids` are `Array[untyped]`**, not `Array[Element]`: `Story.pluck(:title)` is an
 ///   array of *columns*.
-///
-/// # What `where` cannot say
-///
-/// `where` with **no argument** returns a `QueryMethods::WhereChain` (home of `not`, `missing` and
-/// `associated`). An arity split like `first`'s **cannot express** this: `arity_of` does not count
-/// a keyword hash as a positional argument (so `3.7.round(half: :up)` reaches the zero-argument
-/// arm), which makes `where()` and `where(title: "x")` the same call here. A `WhereChain` arm at
-/// arity 0 would answer the commonest call in Rails. So `where` returns a relation on every arm,
-/// `WhereChain` is not generated, and `where.not` stays on the name rung.
-fn query_interface() -> Vec<Query> {
+/// - **`where` with nothing written** returns a [`WHERE_CHAIN`] (home of `not`, `missing` and
+///   `associated`), which answers nothing a relation does, while keywords (`Arity::Keyed`) or a
+///   positional reach the relation. Where the bundle declares the class, the bare arm names it,
+///   holding the relation it was made from ([`where_chain`]); elsewhere it is `untyped`, and a bare
+///   `where` answers nothing.
+fn query_interface(framework: &BTreeSet<String>) -> Vec<Query> {
+    let chain = framework.contains(WHERE_CHAIN);
     let element = ELEMENT;
     let relation = COLLECTION.to_owned();
     let nilable = format!("{element}?");
@@ -404,8 +420,47 @@ fn query_interface() -> Vec<Query> {
     });
 
     for name in RELATIONAL {
+        if name == "where" {
+            continue;
+        }
         queries.push(both(name, "(*untyped)".to_owned(), relation.clone()));
     }
+    // `where` with nothing written is a `WhereChain`, which answers `not`, `missing` and
+    // `associated` and nothing a relation does; keywords or a positional reach the relation.
+    queries.push(Query {
+        name: "where",
+        parameters: "()".to_owned(),
+        returns: if chain {
+            format!("{WHERE_CHAIN}[{relation}]")
+        } else {
+            "untyped".to_owned()
+        },
+        // Rails writes `def where(*args)`, so a keyword hash is its first positional, and the
+        // positional arm reaches it (`Arity::Keyed`). An arm of its own taking `**untyped` would
+        // also take a call with nothing written, and join the relation to the chain.
+        overloads: vec![("(untyped, *untyped)".to_owned(), relation.clone())],
+        side: Side::Both,
+    });
+    // The two the model defines itself, `Scoping::Named#all` and `Scoping::Default#unscoped`.
+    // A relation answers both as well: Rails 8 writes `QueryMethods#all` and, in `Delegation`,
+    // `delegate :unscoped, to: :model`; 7.2 reaches both through `Delegation`'s `method_missing`.
+    // Either way the answer is the model's relation. `all_queries:` is the model's keyword, which
+    // Rails 8's relation `all` does not take: that call raises, so the answer holds wherever the
+    // call returns. `unscoped` with a block runs it inside the unscoped relation and hands back
+    // what the block made, the arm nobody can read. The arm only states that a block is taken: a
+    // call with one reaches no blockless arm, so it answers nothing either way.
+    queries.push(both(
+        "all",
+        "(?all_queries: untyped)".to_owned(),
+        relation.clone(),
+    ));
+    queries.push(Query {
+        name: "unscoped",
+        parameters: "()".to_owned(),
+        returns: relation.clone(),
+        overloads: vec![("[T] () { () -> T }".to_owned(), "T".to_owned())],
+        side: Side::Both,
+    });
     for name in ORDINALS {
         queries.push(both(name, "()".to_owned(), nilable.clone()));
     }
@@ -426,7 +481,19 @@ fn query_interface() -> Vec<Query> {
     ] {
         queries.push(both(name, "()".to_owned(), element.to_owned()));
     }
-    queries.push(both("find", "(untyped)".to_owned(), element.to_owned()));
+    // A scalar finds a record and an array finds an array of them, with one argument either way.
+    // The argument's class picks the arm; one nothing types picks none.
+    let by_id = |name| Query {
+        name,
+        parameters: "(Integer)".to_owned(),
+        returns: element.to_owned(),
+        overloads: vec![
+            ("(String)".to_owned(), element.to_owned()),
+            ("(Array[untyped])".to_owned(), records.clone()),
+        ],
+        side: Side::Both,
+    };
+    queries.push(by_id("find"));
     queries.push(both("find_by", "(*untyped)".to_owned(), nilable.clone()));
     queries.push(both(
         "find_by!",
@@ -456,7 +523,6 @@ fn query_interface() -> Vec<Query> {
 
     // How many rows a write touched.
     for (name, parameters) in [
-        ("delete", "(untyped)"),
         ("delete_all", "()"),
         ("delete_by", "(*untyped)"),
         ("update_all", "(untyped)"),
@@ -464,54 +530,173 @@ fn query_interface() -> Vec<Query> {
     ] {
         queries.push(both(name, parameters.to_owned(), "Integer".to_owned()));
     }
-    // The two that instantiate what they remove and hand the records back.
-    queries.push(both("destroy_all", "()".to_owned(), records.clone()));
+    // A model's `delete(id)` is `delete_by`'s count. **A relation class is also an association's
+    // `CollectionProxy`**, whose `delete(*records)` and `destroy(*records)` hand back the records
+    // they removed, or `nil` where there were none or a `before_remove` callback aborted
+    // (`CollectionAssociation#delete_or_destroy`), so a relation's say both.
+    queries.push(plain(
+        "delete",
+        "(untyped)".to_owned(),
+        "Integer".to_owned(),
+        Side::Model,
+    ));
+    queries.push(plain(
+        "delete",
+        "(*untyped)".to_owned(),
+        format!("Integer | {records} | nil"),
+        Side::Relation,
+    ));
+    // `destroy(id)` is `find(id).destroy`: the record, or `false` where a callback halted, or
+    // `nil` where one raised `ActiveRecord::Rollback`. An array of ids is `find(ids).each(&:destroy)`.
+    let destroyed = format!("{element} | false | nil");
+    queries.push(Query {
+        name: "destroy",
+        parameters: "(Integer)".to_owned(),
+        returns: destroyed.clone(),
+        overloads: vec![
+            ("(String)".to_owned(), destroyed.clone()),
+            ("(Array[untyped])".to_owned(), records.clone()),
+        ],
+        side: Side::Model,
+    });
+    queries.push(plain(
+        "destroy",
+        "(*untyped)".to_owned(),
+        format!("{element} | {records} | false | nil"),
+        Side::Relation,
+    ));
+    // The two that instantiate what they remove and hand the records back. An association's
+    // `destroy_all` is `destroy(load_target)`, `nil` for an empty one.
+    queries.push(plain(
+        "destroy_all",
+        "()".to_owned(),
+        records.clone(),
+        Side::Model,
+    ));
+    queries.push(plain(
+        "destroy_all",
+        "()".to_owned(),
+        format!("{records}?"),
+        Side::Relation,
+    ));
     queries.push(both("destroy_by", "(*untyped)".to_owned(), records.clone()));
-    queries.push(both("destroy", "(untyped)".to_owned(), element.to_owned()));
 
-    // `Batches`. The block is **required** on all three: without one each returns an enumerator,
-    // and an optional-block arm would claim `void` for a call that chains off it.
-    queries.push(both(
-        "find_each",
-        format!("(*untyped) {{ ({element}) -> void }}"),
-        "void".to_owned(),
-    ));
-    queries.push(both(
-        "find_in_batches",
-        format!("(*untyped) {{ (Array[{element}]) -> void }}"),
-        "void".to_owned(),
-    ));
-    queries.push(both(
-        "in_batches",
-        format!("(*untyped) {{ ({relation}) -> void }}"),
-        "void".to_owned(),
-    ));
+    // `Batches`. With a block each runs it batch by batch and ends in `nil` (both
+    // `batch_on_loaded_relation` and `batch_on_unloaded_relation` do); without one each returns an
+    // enumerator of what the block would have been handed.
+    for (name, handed, enumerates) in [
+        (
+            "find_each",
+            element.to_owned(),
+            format!("Enumerator[{element}, untyped]"),
+        ),
+        (
+            "find_in_batches",
+            records.clone(),
+            format!("Enumerator[{records}, untyped]"),
+        ),
+        (
+            "in_batches",
+            relation.clone(),
+            "ActiveRecord::Batches::BatchEnumerator".to_owned(),
+        ),
+    ] {
+        queries.push(Query {
+            name,
+            parameters: format!("(*untyped) {{ ({handed}) -> void }}"),
+            returns: "NilClass".to_owned(),
+            overloads: vec![("(*untyped)".to_owned(), enumerates)],
+            side: Side::Both,
+        });
+    }
 
     // `Calculations`.
-    queries.push(both("count", taking_element(), "Integer".to_owned()));
-    queries.push(both(
-        "average",
-        "(untyped)".to_owned(),
-        "Numeric?".to_owned(),
-    ));
-    // No block arm: `Enumerable#sum` with a block returns whatever the block summed, while a
-    // relation's own `sum` is a number. Stating only the blockless arm makes `Story.sum { ... }`
-    // answer nothing instead of something wrong.
-    queries.push(both("sum", "(*untyped)".to_owned(), "Numeric".to_owned()));
-    for (name, parameters) in [
-        ("minimum", "(untyped)"),
-        ("maximum", "(untyped)"),
-        ("calculate", "(untyped, untyped)"),
-        ("pick", "(*untyped)"),
+    // After `group` a relation's calculations are a `Hash` by group, and nothing here knows
+    // whether a relation was grouped, so a relation's say both. The model's own are ungrouped.
+    //
+    // No block arm for `sum`: `Enumerable#sum` with a block returns whatever the block summed,
+    // while a relation's own `sum` is a number. Stating only the blockless arm makes
+    // `Story.sum { ... }` answer nothing instead of something wrong.
+    for (name, parameters, returns) in [
+        ("count", taking_element(), "Integer"),
+        ("average", "(untyped)".to_owned(), "Numeric?"),
+        ("sum", "(*untyped)".to_owned(), "Numeric"),
     ] {
-        queries.push(both(name, parameters.to_owned(), "untyped".to_owned()));
+        queries.push(plain(
+            name,
+            parameters.clone(),
+            returns.to_owned(),
+            Side::Model,
+        ));
+        queries.push(plain(
+            name,
+            parameters,
+            format!("({returns} | Hash[untyped, untyped])"),
+            Side::Relation,
+        ));
     }
     queries.push(both(
-        "pluck",
-        "(*untyped)".to_owned(),
-        "Array[untyped]".to_owned(),
+        "calculate",
+        "(untyped, untyped)".to_owned(),
+        "untyped".to_owned(),
     ));
-    queries.push(both("ids", "()".to_owned(), "Array[untyped]".to_owned()));
+    // A column's own type, which a relation class's arms say per column ([`pick`]); the model's is
+    // `all`'s, so a model reaches the same arms and its own `def self.pluck` still answers first
+    //. `group` hands back a grouped relation ([`relation`]), whose calculations are a
+    // `Hash` by group.
+    for (name, parameters, returns) in [
+        ("pick", "(*untyped)", "untyped"),
+        ("pluck", "(*untyped)", "Array[untyped]"),
+        ("ids", "()", "Array[untyped]"),
+        ("group", "(*untyped)", COLLECTION),
+    ] {
+        queries.push(plain(
+            name,
+            parameters.to_owned(),
+            returns.to_owned(),
+            Side::Relation,
+        ));
+        queries.push(plain(
+            name,
+            parameters.to_owned(),
+            format!("{FORWARDED}[\"all\", \"{name}\"]"),
+            Side::Model,
+        ));
+    }
+    // A column's own type, which a relation class's arms say per column ([`pick`]). The model's is
+    // `all`'s (`delegate(*QUERYING_METHODS, to: :all)`), so a model reaches the same arms and
+    // a model's own `def self.maximum` still answers first.
+    for name in ["minimum", "maximum"] {
+        queries.push(plain(
+            name,
+            "(untyped)".to_owned(),
+            "untyped".to_owned(),
+            Side::Relation,
+        ));
+        queries.push(plain(
+            name,
+            "(untyped)".to_owned(),
+            format!("{FORWARDED}[\"all\", \"{name}\"]"),
+            Side::Model,
+        ));
+    }
+
+    // A relation's own, which a model does not delegate: its SQL, its Arel, and loading it, which
+    // hands the same relation back.
+    for (name, parameters, returns) in [
+        ("to_sql", "()", "String"),
+        ("arel", "(?untyped)", "Arel::SelectManager"),
+        ("load", "() ?{ (untyped) -> void }", "self"),
+        ("load_async", "()", "self"),
+        ("joins!", "(*untyped)", "self"),
+    ] {
+        queries.push(plain(
+            name,
+            parameters.to_owned(),
+            returns.to_owned(),
+            Side::Relation,
+        ));
+    }
     // `preload(association).collect(&association)`, so an array of whatever the association is.
     queries.push(both(
         "extract_associated",
@@ -519,8 +704,21 @@ fn query_interface() -> Vec<Query> {
         "Array[untyped]".to_owned(),
     ));
 
-    for name in ASYNC.into_iter().chain(WRITES) {
-        queries.push(both(name, "(*untyped)".to_owned(), "untyped".to_owned()));
+    // Each is a `Promise` of the value, where the bundle declares the class (7.1 and later).
+    let promise = if framework.contains(PROMISE) {
+        PROMISE
+    } else {
+        "untyped"
+    };
+    for name in ASYNC {
+        queries.push(both(name, "(*untyped)".to_owned(), promise.to_owned()));
+    }
+    for name in WRITES {
+        queries.push(both(
+            name,
+            "(*untyped)".to_owned(),
+            "ActiveRecord::Result".to_owned(),
+        ));
     }
 
     // `Relation`'s own, which raise on the model. This is why [`Side`] exists instead of a flag
@@ -531,12 +729,26 @@ fn query_interface() -> Vec<Query> {
         records.clone(),
         Side::Relation,
     ));
-    queries.push(plain(
-        "each",
-        format!("() {{ ({element}) -> void }}"),
-        relation.clone(),
-        Side::Relation,
-    ));
+    // `delegate …, :each, to: :records`: the loaded `Array`'s `each`, which hands the array back,
+    // or an enumerator over it without a block.
+    queries.push(Query {
+        name: "each",
+        parameters: format!("() {{ ({element}) -> void }}"),
+        returns: records.clone(),
+        overloads: vec![("()".to_owned(), format!("Enumerator[{element}, {records}]"))],
+        side: Side::Relation,
+    });
+    // What `ActiveRecord::Delegation` hands the loaded records (`delegate …, to: :records`): each
+    // is the two calls `delegate` makes ([`FORWARDED`]), through `to_a`, which is the records, so
+    // `Story.where(…).reverse` is `Array[Story]`#reverse's answer.
+    for name in RECORDS {
+        queries.push(plain(
+            name,
+            "(*untyped) ?{ (*untyped) -> untyped }".to_owned(),
+            format!("{FORWARDED}[\"to_a\", \"{name}\"]"),
+            Side::Relation,
+        ));
+    }
     for name in ["size", "length"] {
         queries.push(plain(
             name,
@@ -565,20 +777,47 @@ fn query_interface() -> Vec<Query> {
 
     // `Persistence::ClassMethods`: names not in `QUERYING_METHODS` at all. **Five of these six are
     // on the relation too**, per `relation.rb`; see [`Side::Class`].
-    for name in ["create", "create!", "build"] {
-        queries.push(both(name, taking_element(), element.to_owned()));
+    // One record from attributes, an array of them from an array: `create(attributes = nil)` maps
+    // an `Array` over itself.
+    // `relation.rb` has `alias build new`, the *same method*, so the two say the same. `new` is the
+    // relation's alone because a model gets `new` from `Class`, which a class-side declaration
+    // would shadow.
+    for (name, side) in [
+        ("create", Side::Both),
+        ("create!", Side::Both),
+        ("build", Side::Both),
+        ("new", Side::Relation),
+    ] {
+        let block = format!("?{{ ({element}) -> untyped }}");
+        queries.push(Query {
+            name,
+            parameters: format!("() {block}"),
+            returns: element.to_owned(),
+            overloads: vec![
+                (
+                    format!("(Hash[untyped, untyped]) {block}"),
+                    element.to_owned(),
+                ),
+                (format!("(Array[untyped]) {block}"), records.clone()),
+            ],
+            side,
+        });
     }
-    // `relation.rb` has `alias build new`, the *same method*, so declaring one without the other
-    // would be incoherent. It is the relation's alone because a model gets `new` from `Class`,
-    // which a class-side declaration would shadow.
-    queries.push(plain(
-        "new",
-        taking_element(),
-        element.to_owned(),
-        Side::Relation,
-    ));
+    // `update(id = :all, attributes)`: attributes alone update every record and hand the loaded
+    // `Array` back (`each`), an array of ids the records found and updated, and one id that record.
+    // A relation's hands the ids to its model's.
     for name in ["update", "update!"] {
-        queries.push(both(name, "(*untyped)".to_owned(), "untyped".to_owned()));
+        queries.push(Query {
+            name,
+            parameters: "(untyped)".to_owned(),
+            returns: records.clone(),
+            overloads: vec![
+                ("(Array[untyped], untyped)".to_owned(), records.clone()),
+                ("(Integer, untyped)".to_owned(), element.to_owned()),
+                ("(String, untyped)".to_owned(), element.to_owned()),
+            ],
+            side: Side::Both,
+        });
     }
     queries.push(plain(
         "instantiate",
@@ -673,10 +912,11 @@ fn query_interface() -> Vec<Query> {
             "untyped".to_owned(),
         ));
     }
+    // The memo it was handed, whatever the block did to it.
     queries.push(on_relation(
         "each_with_object",
-        format!("(untyped) {{ ({element}, untyped) -> untyped }}"),
-        "untyped".to_owned(),
+        format!("[U] (U) {{ ({element}, U) -> untyped }}"),
+        "U".to_owned(),
     ));
 
     // And the walks, which hand back what they walked over.
@@ -781,7 +1021,9 @@ fn callback_names() -> Vec<(String, &'static str)> {
 /// `(*untyped)` because a callback takes symbols, a condition hash, or neither; `-> void` because
 /// nobody chains off one. The optional block is handed the **record** (`ActiveSupport::Callbacks`'
 /// behaviour for a proc with an argument), so `before_save { |story| ... }` types `story`, and a
-/// call without a block reaches the same arm.
+/// call without a block reaches the same arm. The block **runs against** the record too, and so do
+/// the `if:` and `unless:` lambdas ([`super::blocks::model_callback`]), so a bare `title` inside
+/// either is the record's.
 ///
 /// **Declared on the base and inherited**, like [`class_side`]: one copy on `ApplicationRecord`
 /// answers for every model under it. The block parameter is
@@ -793,7 +1035,7 @@ pub(super) fn callbacks(facts: &mut Facts, base: &str) {
             owner: Owner::Singleton(base.to_owned()),
             name,
             returns: "void".to_owned(),
-            parameters: format!("(*untyped) ?{{ ({ELEMENT}) -> void }}"),
+            parameters: super::blocks::model_callback(ELEMENT),
             because: format!(
                 "ActiveRecord's callback, installed on every model by {installed_by}. \
                  ya-lsp writes this; no file declares it."
@@ -801,6 +1043,7 @@ pub(super) fn callbacks(facts: &mut Facts, base: &str) {
             at: None,
             from: Source::Interface,
             overloads: Vec::new(),
+            private: false,
         });
     }
 }
@@ -823,14 +1066,14 @@ pub(super) fn callbacks(facts: &mut Facts, base: &str) {
 /// One comment for the whole class, because the *class* is what ya-lsp invented: its name already
 /// tells a reader nobody wrote it. [`class_side`] cannot say that and does not try.
 pub(super) fn relation(facts: &mut Facts, element: &str) {
-    let owner = Owner::Instance(relation_of(element));
+    let owner = Owner::Instance(collection_of(element));
     facts.note(
         owner.clone(),
         format!("A collection of `{element}`. ya-lsp writes this class; no file declares it."),
     );
     // That is all. Every query-interface member is on [`RELATION_BASE`], written once, because the
     // receiver-relative return types keep the element out of signatures. A relation class gets only
-    // the scopes [`Chained`] writes. One of those may open the body first: a document writing a
+    // the scopes [`Chained`] writes, and its columns' [`pick`]. A scope may open the body first: a document writing a
     // scope onto a relation it was not asked to *emit* opens the class with no superclass, and the
     // two merge like a reopened Ruby class.
     //
@@ -839,6 +1082,176 @@ pub(super) fn relation(facts: &mut Facts, element: &str) {
     // inherit whatever the user meant.
     facts.inherits(owner, RELATION_BASE.to_owned());
 }
+
+/// The relation `group` hands back for one element: `X::Grouped`, a subclass of
+/// `X::Relation` whose calculations are a `Hash` by group. The chain methods it inherits keep it
+/// grouped (`types` answers [`COLLECTION`] with a grouped receiver itself), and `X::Relation#group`
+/// makes one. Where the project declares the name itself, `group` stays the plain relation.
+///
+/// `durations`: the model has an `interval` column, whose `sum` and `average` are a `Duration`
+/// ([`pick`]'s decline), so the grouped ones are a `Hash` of anything.
+pub(super) fn grouped(facts: &mut Facts, element: &str, durations: bool) {
+    let relation = collection_of(element);
+    let grouped = grouped_of(element);
+    let owner = Owner::Instance(grouped.clone());
+    facts.note(
+        owner.clone(),
+        format!("A `{relation}` after `group`. ya-lsp writes this class; no file declares it."),
+    );
+    facts.inherits(owner.clone(), relation.clone());
+    let row = |owner: &Owner, name: &str, parameters: &str, returns: String| Declared {
+        owner: owner.clone(),
+        name: name.to_owned(),
+        returns,
+        parameters: parameters.to_owned(),
+        because: String::new(),
+        at: None,
+        from: Source::Query,
+        overloads: Vec::new(),
+        private: false,
+    };
+    facts.declare(row(
+        &Owner::Instance(relation),
+        "group",
+        "(*untyped)",
+        grouped.clone(),
+    ));
+    let (summed, averaged) = if durations {
+        ("Hash[untyped, untyped]", "Hash[untyped, untyped]")
+    } else {
+        ("Hash[untyped, Numeric]", "Hash[untyped, Numeric?]")
+    };
+    for (name, parameters, returns) in [
+        ("count", "(*untyped)", "Hash[untyped, Integer]"),
+        ("sum", "(*untyped)", summed),
+        ("average", "(untyped)", averaged),
+        ("minimum", "(untyped)", "Hash[untyped, untyped]"),
+        ("maximum", "(untyped)", "Hash[untyped, untyped]"),
+    ] {
+        facts.declare(row(&owner, name, parameters, returns.to_owned()));
+    }
+}
+
+/// `pick` on one relation class, with an arm per column it can answer for.
+///
+/// **The one query-interface name a relation class holds itself**, because its answer is a
+/// column's, not the element's: `Comment.where(...).pick(:depth)` is `Integer?`. One signature on
+/// [`RELATION_BASE`] cannot say which column a symbol names; an arm per column can, and
+/// `types::pick_by_literal` reads the symbol the call wrote. `columns` is the schema's half
+/// ([`Picked`](super::Picked)): every type is already the `?` a relation with no row adds.
+///
+/// - **The last arm takes anything and says nothing**: a string, an `Arel.sql(...)`, a joined
+///   table's column, or several columns (an `Array`). RBS tries arms in order, so it answers only
+///   what no column arm did.
+/// - **One line**, however many columns, and **no place**: Rails' `pick` is the jump, found by the
+///   same lookup as the base's copy ([`Source::Query`]).
+/// - **Only the relation side.** A model's own `def self.pick` would make the class side's arms
+///   wrong, and a relation's `pick` is Rails' `Calculations#pick` whatever the model defines.
+///
+/// **`minimum` and `maximum` get the same arms**: Rails casts either through the
+/// column's type (`type_cast_calculated_value`), `nil` over no row. After `group` they are a `Hash`
+/// by group, and nothing here knows whether a relation was grouped, so each arm says both.
+pub(super) fn pick(
+    facts: &mut Facts,
+    element: &str,
+    (first, rest): (&Column, &[Column]),
+    key: Option<&str>,
+) {
+    for (name, shape, rest_arm, otherwise) in [
+        ("pick", Shape::Picked, "(*untyped)", "untyped"),
+        ("minimum", Shape::Grouped, "(untyped)", "untyped"),
+        ("maximum", Shape::Grouped, "(untyped)", "untyped"),
+        ("pluck", Shape::Plucked, "(*untyped)", "Array[untyped]"),
+    ] {
+        let arm = |(column, picked, plucked): &Column| {
+            (
+                format!("(:{column})"),
+                match shape {
+                    Shape::Picked => picked.clone(),
+                    Shape::Grouped => format!("{picked} | Hash[untyped, untyped]"),
+                    Shape::Plucked => format!("Array[{plucked}]"),
+                },
+            )
+        };
+        let (parameters, returns) = arm(first);
+        let mut overloads: Vec<(String, String)> = rest.iter().map(arm).collect();
+        overloads.push((rest_arm.to_owned(), otherwise.to_owned()));
+        facts.declare(Declared {
+            owner: Owner::Instance(collection_of(element)),
+            name: name.to_owned(),
+            returns,
+            parameters,
+            because: String::new(),
+            at: None,
+            from: Source::Query,
+            overloads,
+            private: false,
+        });
+    }
+    // `ids` is `pluck(primary_key)`, where the key is one column nothing re-keys.
+    if let Some(key) = key {
+        facts.declare(Declared {
+            owner: Owner::Instance(collection_of(element)),
+            name: "ids".to_owned(),
+            returns: format!("Array[{key}]"),
+            parameters: "()".to_owned(),
+            because: String::new(),
+            at: None,
+            from: Source::Query,
+            overloads: Vec::new(),
+            private: false,
+        });
+    }
+    // `sum` and `average` cast through the column's type too, so an `interval` column's are a
+    // `Duration`, which the interface's `Numeric` is not: both decline on this model, on either
+    // side. An `untyped` declaration has no vote, so a model's own `def self.sum` still answers.
+    // Ranked as the column it rests on, so it outranks the class side's row where the model is its
+    // own base.
+    if [first]
+        .into_iter()
+        .chain(rest)
+        .any(|(_, returns, _)| returns.contains(DURATION))
+    {
+        for (owner, (name, parameters)) in [
+            Owner::Instance(collection_of(element)),
+            Owner::Singleton(element.to_owned()),
+        ]
+        .into_iter()
+        .flat_map(|owner| {
+            [("sum", "(*untyped)"), ("average", "(untyped)")].map(|named| (owner.clone(), named))
+        }) {
+            facts.declare(Declared {
+                owner,
+                name: name.to_owned(),
+                returns: "untyped".to_owned(),
+                parameters: parameters.to_owned(),
+                because: String::new(),
+                at: None,
+                from: Source::Column,
+                overloads: Vec::new(),
+                private: false,
+            });
+        }
+    }
+}
+
+/// One column [`pick`] answers for: its name, `pick`'s type and `pluck`'s element type
+/// ([`Picked`](super::Picked)).
+type Column = (String, String, String);
+
+/// What one of [`pick`]'s names hands back for a column.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// The column's value, or `nil` for no row.
+    Picked,
+    /// The same, or a `Hash` by group.
+    Grouped,
+    /// Every row's value: an `Array` of the column's own type.
+    Plucked,
+}
+
+/// What an `interval` column reads as ([`super::COLUMN_TYPES`]).
+pub(super) const DURATION: &str = "ActiveSupport::Duration";
 
 /// The query interface, written once for the whole project.
 ///
@@ -852,7 +1265,10 @@ pub(super) fn relation(facts: &mut Facts, element: &str) {
 ///
 /// Names go on in [`query_interface`]'s order, skipping the ones only `Persistence` has. [`Side`]
 /// says which; `instantiate` is the only one skipped.
-pub fn relation_base(facts: &mut Facts) {
+///
+/// `framework` is the gem classes the bundle declares: [`WHERE_CHAIN`], which the same document
+/// then opens ([`where_chain`]), and [`PROMISE`].
+pub fn relation_base(facts: &mut Facts, framework: &BTreeSet<String>) {
     let owner = Owner::Instance(RELATION_BASE.to_owned());
     facts.note(
         owner.clone(),
@@ -861,8 +1277,8 @@ pub fn relation_base(facts: &mut Facts) {
             .to_owned(),
     );
     facts.mixin(owner.clone(), "Enumerable".to_owned());
-    for query in query_interface() {
-        if query.side == Side::Class {
+    for query in query_interface(framework) {
+        if matches!(query.side, Side::Class | Side::Model) {
             continue;
         }
         facts.declare(Declared {
@@ -874,6 +1290,53 @@ pub fn relation_base(facts: &mut Facts) {
             at: None,
             from: Source::Query,
             overloads: query.overloads,
+            private: false,
+        });
+    }
+    if framework.contains(WHERE_CHAIN) {
+        where_chain(facts);
+    }
+}
+
+/// `where` with nothing written: ActiveRecord's `QueryMethods::WhereChain`.
+pub const WHERE_CHAIN: &str = "ActiveRecord::QueryMethods::WhereChain";
+
+/// What an `async_*` query hands back (ActiveRecord 7.1 and later).
+pub const PROMISE: &str = "ActiveRecord::Promise";
+
+/// [`WHERE_CHAIN`], opened with the relation it was made from as its type parameter.
+///
+/// **Rails keeps that relation in `@scope`**, and each of the three members hands it back with its
+/// condition added, which no reader follows. So the relation travels as a type argument: a bare
+/// `where` returns `WhereChain[Story::Relation]` ([`query_interface`]), and each member is `-> R`.
+/// `Story.where.not(…)` is then `Story::Relation`, and the chain goes on from there.
+///
+/// - **Only the return is said.** The members are Rails' own `def`s, which rubydex already holds
+///   with their places, so each row is place-less [`Source::Interface`], like the framework's
+///   singletons.
+/// - **The type parameter is ya-lsp's**, and the class note says so: Rails' class has none.
+/// - **`missing` is Rails 6.1's and `associated` 7.0's.** An older bundle's class lacks them, and
+///   this still names them.
+fn where_chain(facts: &mut Facts) {
+    let owner = Owner::Instance(WHERE_CHAIN.to_owned());
+    facts.generic(owner.clone(), "[R]".to_owned());
+    facts.note(
+        owner.clone(),
+        "What ActiveRecord's `where` returns with nothing written. `R` is the relation it was \
+         made from, which ya-lsp writes; Rails' class has no type parameter."
+            .to_owned(),
+    );
+    for name in ["not", "missing", "associated"] {
+        facts.declare(Declared {
+            owner: owner.clone(),
+            name: name.to_owned(),
+            returns: "R".to_owned(),
+            parameters: "(*untyped)".to_owned(),
+            because: String::new(),
+            at: None,
+            from: Source::Interface,
+            overloads: Vec::new(),
+            private: false,
         });
     }
 }
@@ -911,8 +1374,8 @@ pub fn relation_base(facts: &mut Facts) {
 /// nobody writes. The alternative is a wrong *type* on receivers everybody writes.
 ///
 /// **Nothing here is mapped** (the no-place rule): no line of code declares `Story.where`.
-pub(super) fn class_side(facts: &mut Facts, base: &str) {
-    for query in query_interface() {
+pub(super) fn class_side(facts: &mut Facts, base: &str, framework: &BTreeSet<String>) {
+    for query in query_interface(framework) {
         let because = match query.side {
             Side::Relation => continue,
             // Deliberately short. This sentence sits above **every** class-side declaration, so its
@@ -920,7 +1383,7 @@ pub(super) fn class_side(facts: &mut Facts, base: &str) {
             // is the user's own class, and a generated `def self.pluck` with nothing above it reads
             // as something their file declared. A relation class needs none, because the *class* is
             // what ya-lsp invented, an argument this side cannot make.
-            Side::Both => {
+            Side::Both | Side::Model => {
                 "ActiveRecord's query interface, on every model that inherits this.".to_owned()
             }
             Side::Class => "ActiveRecord's `Persistence::ClassMethods`.".to_owned(),
@@ -934,6 +1397,7 @@ pub(super) fn class_side(facts: &mut Facts, base: &str) {
             at: None,
             from: Source::Query,
             overloads: query.overloads,
+            private: false,
         });
     }
 }
@@ -949,23 +1413,6 @@ mod tests {
     use crate::generated::declaring;
     use crate::workspace::rails;
 
-    /// [`relation_of`] and [`element_of`] are one mapping, and it must be invertible.
-    ///
-    /// The interface is declared once per project, so only the receiver's **name** says which model
-    /// an answer is about. A non-relation name answers `None`, not itself, because the caller's
-    /// next question would build a class out of it.
-    #[test]
-    fn a_relation_names_its_element_and_nothing_else_does() {
-        for element in ["Story", "Spree::Order", "A::B::C"] {
-            assert_eq!(element_of(&relation_of(element)), Some(element));
-        }
-        // Everything that is not one: a bare model, the last segment on its own, a name that
-        // merely ends in the letters, and nothing at all.
-        for other in ["Story", "Relation", "StoryRelation", ""] {
-            assert_eq!(element_of(other), None, "{other}");
-        }
-    }
-
     /// One copy per project, checked on the table, not on a document.
     ///
     /// **No interface signature names a concrete application class**, which is the whole mechanism:
@@ -974,7 +1421,7 @@ mod tests {
     /// (and would need a copy per model again) fails here.
     #[test]
     fn no_signature_in_the_interface_names_what_the_collection_holds() {
-        let queries = query_interface();
+        let queries = query_interface(&BTreeSet::new());
         // And how many rows do it: what [`RELATION_BASE`] would cost per model if the
         // receiver-relative returns were removed. A tripwire, since nothing else would notice that
         // number going stale.
@@ -988,7 +1435,7 @@ mod tests {
                 text.contains(ELEMENT)
             })
             .count();
-        assert_eq!(naming_the_element, 90, "of {} rows", queries.len());
+        assert_eq!(naming_the_element, 96, "of {} rows", queries.len());
         let named = |want: &str| {
             queries
                 .iter()
@@ -1010,7 +1457,7 @@ mod tests {
         );
         // And the relation, which is not `self`: on a class object `where` returns the
         // relation, which is a different type from the receiver.
-        assert_eq!(named("where").returns, COLLECTION);
+        assert_eq!(named("where").overloads[0].1, COLLECTION);
 
         for query in &queries {
             for text in [&query.parameters, &query.returns]
@@ -1055,20 +1502,21 @@ mod tests {
         // are on the base, which this document was not asked to write. Eight readers, four more for
         // each of the three singular associations that name a class, three more for each of the
         // three collections, the polymorphic one's writer, and the `scope`'s second home on
-        // `Story::Relation` (see [`Chained`]).
-        assert_eq!(declarations.methods, 8 + 3 * 4 + 3 * 3 + 1 + 1);
+        // `Story::Relation` (see [`Chained`]); then the asked-for relation's `group` and its
+        // grouped class's five calculations, which have no place.
+        assert_eq!(declarations.methods, 8 + 3 * 4 + 3 * 3 + 1 + 1 + 1 + 5);
         assert_eq!(declarations.spans.len(), 8 + 3 * 4 + 3 * 3 + 1 + 1);
-        // `Story`, the `Story::Relation` the scope is chained onto, and the `Comment::Relation`
-        // this caller asked for. The third shows that a relation class gets members here whether or
-        // not this document writes its superclass.
-        assert_eq!(declarations.classes, 3);
+        // `Story`, the `Story::Relation` the scope is chained onto, the `Comment::Relation` this
+        // caller asked for and its `Comment::Grouped`. The third shows that a relation class gets
+        // members here whether or not this document writes its superclass.
+        assert_eq!(declarations.classes, 4);
     }
 
     /// The base class the whole project's relations inherit.
     #[test]
     fn the_query_interface_is_written_once_and_names_no_model() {
         let mut facts = Facts::default();
-        relation_base(&mut facts);
+        relation_base(&mut facts, &BTreeSet::new());
         let rbs = facts.render(&declaring(&[])).rbs;
         assert!(
             rbs.starts_with(&format!(
@@ -1089,8 +1537,14 @@ mod tests {
         );
         assert!(
             rbs.contains(&format!(
-                "def each: () {{ ({ELEMENT}) -> void }} -> {COLLECTION}\n"
+                "def each: () {{ ({ELEMENT}) -> void }} -> Array[{ELEMENT}] | () -> \
+                 Enumerator[{ELEMENT}, Array[{ELEMENT}]]\n"
             )),
+            "{rbs}"
+        );
+        // A bulk writer hands back the connection's result, whatever the adapter.
+        assert!(
+            rbs.contains("def upsert_all: (*untyped) -> ActiveRecord::Result\n"),
             "{rbs}"
         );
         // `Persistence`'s own is the one name a relation does not answer.
@@ -1175,15 +1629,27 @@ mod tests {
             .render(&declaring(&[]))
             .rbs;
         let mut interface = Facts::default();
-        relation_base(&mut interface);
+        relation_base(&mut interface, &BTreeSet::new());
         let relation = interface.render(&declaring(&[])).rbs;
 
-        let (mut on_both, mut relation_only, mut class_only) = (0, 0, 0);
-        for query in query_interface() {
-            let mut signature =
-                format!("{}: {} -> {}", query.name, query.parameters, query.returns);
+        let (mut on_both, mut relation_only, mut class_only, mut model_only) = (0, 0, 0, 0);
+        // A union return is written in brackets, as RBS reads a method type.
+        let enclosed = |returns: &str| {
+            if returns.contains(" | ") && !returns.starts_with('(') {
+                format!("({returns})")
+            } else {
+                returns.to_owned()
+            }
+        };
+        for query in query_interface(&BTreeSet::new()) {
+            let mut signature = format!(
+                "{}: {} -> {}",
+                query.name,
+                query.parameters,
+                enclosed(&query.returns)
+            );
             for (parameters, returns) in &query.overloads {
-                signature.push_str(&format!(" | {parameters} -> {returns}"));
+                signature.push_str(&format!(" | {parameters} -> {}", enclosed(returns)));
             }
             let on_relation = relation.contains(&format!("  def {signature}\n"));
             let on_class = class_side.contains(&format!("  def self.{signature}\n"));
@@ -1192,7 +1658,7 @@ mod tests {
                 match query.side {
                     Side::Both => (true, true),
                     Side::Relation => (true, false),
-                    Side::Class => (false, true),
+                    Side::Class | Side::Model => (false, true),
                 },
                 "{signature} is on the wrong side: relation={on_relation} class={on_class}"
             );
@@ -1200,24 +1666,36 @@ mod tests {
                 Side::Both => on_both += 1,
                 Side::Relation => relation_only += 1,
                 Side::Class => class_only += 1,
+                Side::Model => model_only += 1,
             }
         }
         // A tripwire on the bound: `ActiveRecord::Querying::QUERYING_METHODS` counted, plus
         // `Querying#with`, plus the five `Persistence::ClassMethods` names that `relation.rb` also
-        // defines. A name added without a line of Rails behind it moves this number and must say
-        // which file it read.
+        // defines, plus `Scoping`'s `all` and `unscoped`. A name added without a line of Rails
+        // behind it moves this number and must say which file it read.
+        // `count`, `average` and `sum` are one name each on both sides, written once per side:
+        // a relation's may be grouped and answer a `Hash`, the model's may not.
         assert_eq!(
-            on_both, 119,
-            "QUERYING_METHODS, `with`, and `relation.rb`'s five"
+            on_both, 109,
+            "QUERYING_METHODS, `with`, `relation.rb`'s five and `Scoping`'s two, less the five \
+             calculations and the three removals a relation answers differently, and `pick`, \
+             `pluck`, `ids` and `group`, which the model forwards to `all`"
         );
         assert_eq!(
-            relation_only, 46,
+            relation_only, 87,
             "`Relation`'s own — the five that raise on the model, `new`, which `relation.rb` aliases `build` to, \
-             `reload`, and `Enumerable`'s 39"
+             `reload`, `Enumerable`'s 39, and `to_sql`, `arel`, `load`, `load_async` and `joins!` — the \
+             five calculations and three removals as a relation answers them, `Delegation`'s 24 \
+             to the records, and `pick`, `pluck`, `ids` and `group`"
         );
         assert_eq!(
             class_only, 1,
             "`instantiate`, which `Relation` does not define"
+        );
+        assert_eq!(
+            model_only, 12,
+            "the five calculations and `delete`, `destroy`, `destroy_all` as the model answers them, \
+             and `pick`, `pluck`, `ids` and `group` forwarded to `all`"
         );
         // Every class-side declaration carries its own provenance, because
         // `class ApplicationRecord` is the user's own class and a note on *it* would read as a
@@ -1227,7 +1705,7 @@ mod tests {
             class_side
                 .matches("ActiveRecord's query interface, on every model that inherits this.")
                 .count(),
-            119,
+            121,
             "{class_side}"
         );
         assert_eq!(
@@ -1268,20 +1746,14 @@ mod tests {
         let (mut harness, _dump, uri) = models_project(source);
         let mapped = card(&mut harness, &uri, source, "story");
         assert!(mapped.contains("Comment#story"), "{mapped}");
-        assert!(
-            !mapped.contains("Matched on the method name alone"),
-            "{mapped}"
-        );
+        assert!(!mapped.contains("Guessed from name alone"), "{mapped}");
 
         // And a return that is the element itself.
         let source = "Story.new.comments.detect { |one| one }.story\n";
         let (mut harness, _dump, uri) = models_project(source);
         let found = card(&mut harness, &uri, source, "story");
         assert!(found.contains("Comment#story"), "{found}");
-        assert!(
-            !found.contains("Matched on the method name alone"),
-            "{found}"
-        );
+        assert!(!found.contains("Guessed from name alone"), "{found}");
     }
 
     /// A name the interface copies from `Enumerable` is offered **once**.
@@ -1312,12 +1784,6 @@ mod tests {
     }
 
     #[test]
-    fn what_the_relation_class_is_called() {
-        assert_eq!(relation_of("Comment"), "Comment::Relation");
-        assert_eq!(relation_of("Admin::Setting"), "Admin::Setting::Relation");
-    }
-
-    #[test]
     fn a_collection_chains_through_a_relation_class_that_no_file_declares() {
         // The relation class's whole point: `story.comments` is a relation and `.first` is a
         // `Comment`. `Comment` has no columns here, so the chain goes one link further:
@@ -1345,7 +1811,7 @@ mod tests {
         );
         let started = card(&mut harness, &uri, source, "user");
         assert!(started.contains("Story#user"), "{started}");
-        assert!(!started.contains("guessed from the name"), "{started}");
+        assert!(!started.contains("Guessed from name alone"), "{started}");
 
         // `where` hands back the relation, which is the half that makes the two sides one fact:
         // `Story.where(...)` and `Story.all.where(...)` are the same method reached two ways.
@@ -1379,10 +1845,7 @@ mod tests {
         // receiver that is the relation rather than the class object.
         let visible = card(&mut harness, &uri, source, "visible.");
         assert!(visible.contains("Story::Relation#visible"), "{visible}");
-        assert!(
-            visible.contains("`app/models/story.rb`, `scope :visible`"),
-            "{visible}"
-        );
+        assert!(visible.contains("Story::Relation#visible"), "{visible}");
         let definition = harness.definition_at(&uri, source, "visible.");
         assert_eq!(
             definition[0]["targetUri"],
@@ -1398,7 +1861,7 @@ mod tests {
         // And the query interface still answers after it: the relation class the scope was
         // written onto is the same one that inherits [`rails::RELATION_BASE`].
         let first = card(&mut harness, &uri, source, "first");
-        assert!(first.contains("ActiveRecordRelation#first"), "{first}");
+        assert!(first.contains("ActiveRecord::Relation#first"), "{first}");
         assert!(harness.has("Story::Relation#visible()"));
         assert!(harness.has("Story::<Story>#visible()"));
     }
@@ -1449,7 +1912,7 @@ mod tests {
         // The reopening cost the class nothing: what `poll.rb`'s document said about its
         // superclass still stands, so the query interface answers after the second scope.
         let first = card(&mut harness, &uri, source, "first");
-        assert!(first.contains("ActiveRecordRelation#first"), "{first}");
+        assert!(first.contains("ActiveRecord::Relation#first"), "{first}");
     }
 
     #[test]
@@ -1481,10 +1944,7 @@ mod tests {
         let (mut harness, _story, uri) = models_project(source);
         let found = card(&mut harness, &uri, source, "user");
         assert!(found.contains("Story#user"), "{found}");
-        assert!(
-            !found.contains("Matched on the method name alone"),
-            "{found}"
-        );
+        assert!(!found.contains("Guessed from name alone"), "{found}");
 
         // `find_by` is declared `Story?`, and an optional takes its inner type, so the chain off it
         // is the same. `types.md` lists this as the one inexact entry.
@@ -1499,7 +1959,7 @@ mod tests {
         harness.watch(&[&other]);
         let missed = card(&mut harness, &other, bare, "user");
         assert!(
-            missed.contains("Matched on the method name alone"),
+            missed.contains("Guessed from name alone"),
             "a call no arm accepts is answered for by none of them: {missed}"
         );
     }
@@ -1575,8 +2035,8 @@ mod tests {
             );
             let found = card(&mut harness, &widget, source, name);
             assert!(
-                found.contains("no file declares it"),
-                "{name} does not carry the generated provenance: {found}"
+                found.contains(&format!("Widget.{name}")),
+                "{name} is the model's own class method: {found}"
             );
             assert!(
                 !found.contains("possible definitions"),
@@ -1614,7 +2074,7 @@ mod tests {
         let with_self = card(&mut harness, &explicit, explicit_source, "first");
         let without = card(&mut harness, &bare, bare_source, "first");
         assert!(
-            with_self.contains("ActiveRecordRelation#first"),
+            with_self.contains("ActiveRecord::Relation#first"),
             "the twin the equality is against has to be the answer it always was: {with_self}"
         );
         assert_eq!(
@@ -1632,13 +2092,10 @@ mod tests {
         harness.watch(&[&gizmo]);
         let chained = card(&mut harness, &gizmo, with_argument, "first");
         assert!(
-            chained.contains("ActiveRecordRelation#first"),
+            chained.contains("ActiveRecord::Relation#first"),
             "a receiverless call that wrote an argument still resolves: {chained}"
         );
-        assert!(
-            !chained.contains("Matched on the method name alone"),
-            "{chained}"
-        );
+        assert!(!chained.contains("Guessed from name alone"), "{chained}");
     }
 
     #[test]
@@ -1659,9 +2116,9 @@ mod tests {
         // One copy per project puts the interface on one class every relation inherits, so the card
         // names that class, not `Comment::Relation`. That is the stated cost; the assertion below
         // checks the chain still resolves.
-        assert!(counted.contains("ActiveRecordRelation#size"), "{counted}");
+        assert!(counted.contains("ActiveRecord::Relation#size"), "{counted}");
         assert!(
-            !counted.contains("Matched on the method name alone"),
+            !counted.contains("Guessed from name alone"),
             "the third hop of the chain resolves rather than guessing: {counted}"
         );
 
@@ -1707,7 +2164,7 @@ mod tests {
         let sorted = card(&mut harness, &uri, source, "entries");
         assert!(sorted.contains("Enumerable#entries"), "{sorted}");
         assert!(
-            !sorted.contains("Matched on the method name alone"),
+            !sorted.contains("Guessed from name alone"),
             "the hop after a `select` resolves rather than guessing: {sorted}"
         );
         // One `include` for the whole project, on the class every relation inherits.
@@ -1790,11 +2247,11 @@ mod tests {
         assert!(harness.has("Story::<Story>#upsert_all()"));
 
         let plucked = card(&mut harness, &uri, source, "pluck");
-        assert!(plucked.contains("ActiveRecordRelation#pluck"), "{plucked}");
         assert!(
-            !plucked.contains("Matched on the method name alone"),
+            plucked.contains("ActiveRecord::Relation#pluck"),
             "{plucked}"
         );
+        assert!(!plucked.contains("Guessed from name alone"), "{plucked}");
 
         // The arity split: one declaration, two arms, and the call's argument count decides.
         // `class_at` reads `Array` off the members offered, so this is what a user would see.
@@ -1809,31 +2266,151 @@ mod tests {
             "Array"
         );
         assert_eq!(
-            class_at(&mut harness, &uri, "Story.select(:id).count.~"),
-            "Integer",
+            class_at(&mut harness, &uri, "Story.select(:id).to_a.~"),
+            "Array",
             "with column names it is still a relation, so the chain runs on through it"
         );
     }
 
     #[test]
-    fn where_never_answers_the_chain_a_keyword_hash_cannot_be_told_from() {
-        // A bound stated as a test, because it is a decision. `where` with no argument returns a
-        // `QueryMethods::WhereChain` (home of `not`, `missing` and `associated`). An arity split
-        // like `first`'s **cannot express** it: `arity_of` does not count a keyword hash as a
-        // positional argument, so `Story.where(title: "x")`, the commonest call in Rails, also
-        // reaches the zero-argument arm. A `WhereChain` arm would answer it for that call too.
-        //
-        // So `where` answers a relation on every arm. The second assertion matters most: the
-        // keyword form keeps its answer.
-        let source = "Story.where.not(id: 1)\nStory.where(title: \"x\").first.user\n";
+    fn a_call_that_answers_a_record_or_an_array_is_decided_by_its_argument() {
+        // `find` and `create` answer a record for one thing and an `Array` for an array of them,
+        // with one argument either way. The argument's class picks the arm, and an argument
+        // nothing types picks none: `Story.find(params[:id])` is an `Array` when the request
+        // sends one.
+        let (mut harness, _story, uri) = models_project("Story.first\n");
+        // A record offers the model's own members; the name-based list offers everything,
+        // `upcase` included.
+        let record = |offered: &[String]| {
+            offered.iter().any(|name| name == "user")
+                && !offered.iter().any(|name| name == "upcase")
+        };
+        assert!(record(&harness.declarations_at(&uri, "Story.find(1).~")));
+        assert!(record(
+            &harness.declarations_at(&uri, "Story.find(\"1\").~")
+        ));
+        assert_eq!(
+            class_at(&mut harness, &uri, "Story.find([1, 2]).~"),
+            "Array"
+        );
+        // An argument nothing types reaches both arms: the record's members beside `Array`'s.
+        let untyped = harness.declarations_at(&uri, "def show(id)\n  Story.find(id).~\nend\n");
+        assert!(
+            record(&untyped) && untyped.iter().any(|name| name == "join"),
+            "{untyped:?}"
+        );
+        // A keyword hash is one `Hash` to `create`, never the `Array` arm.
+        assert!(record(
+            &harness.declarations_at(&uri, "Story.create(title: \"x\").~")
+        ));
+        assert!(record(&harness.declarations_at(&uri, "Story.create.~")));
+        assert_eq!(
+            class_at(&mut harness, &uri, "Story.create([{}]).~"),
+            "Array"
+        );
+        // `destroy(1)` is `find(1).destroy`: the record, or `false` where a callback halted it, a
+        // union completion lists both for; an array of ids is the records.
+        assert!(record(&harness.declarations_at(&uri, "Story.destroy(1).~")));
+        assert_eq!(
+            class_at(&mut harness, &uri, "Story.destroy([1]).~"),
+            "Array"
+        );
+    }
+
+    #[test]
+    fn a_relation_s_count_may_be_a_hash_and_the_model_s_may_not() {
+        // After `group`, a relation's calculations are a `Hash` by group, and nothing here knows
+        // whether a relation was grouped. A model's own are counted over every row.
+        let (mut harness, _story, uri) = models_project("Story.first\n");
+        assert_eq!(class_at(&mut harness, &uri, "Story.count.~"), "Integer");
+        // Grouped, a `Hash`; not known to be grouped, a union, whose list is `Integer`'s members
+        // beside `Hash`'s.
+        let grouped = harness.declarations_at(&uri, "Story.group(:x).count.~");
+        assert!(
+            grouped.iter().any(|row| row == "keys") && !grouped.iter().any(|row| row == "succ"),
+            "{grouped:?}"
+        );
+        let either = harness.declarations_at(&uri, "Story.all.count.~");
+        assert!(
+            ["succ", "keys"]
+                .iter()
+                .all(|name| either.iter().any(|row| row == name)),
+            "{either:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_where_answers_nothing_and_a_written_one_is_a_relation() {
+        // `where` with nothing written returns a `QueryMethods::WhereChain` (home of `not`,
+        // `missing` and `associated`), which answers nothing a relation does. A call writing
+        // keywords or a positional reaches the positional arm, as Rails' `where(*args)` takes
+        // either; the bare call reaches only its own arm, which a bundle without the class leaves
+        // unreadable, as this one does.
+        let source = "\
+Story.where.not(id: 1)
+Story.where(title: \"x\").first.user
+Story.where(\"id = 1\").first.user
+";
         let (mut harness, _story, uri) = models_project(source);
         assert!(
             !harness.has("Story::Relation#not()") && !harness.has("ActiveRecordRelation#not()"),
             "`not` is `WhereChain`'s and putting it on a relation would make `Story.all.not` \
              resolve, which raises"
         );
-        let kept = card(&mut harness, &uri, source, "user");
-        assert!(kept.contains("Story#user"), "{kept}");
+        let keyed = card(&mut harness, &uri, source, "user");
+        assert!(keyed.contains("Story#user"), "{keyed}");
+        // A relation offers its own members and nothing the name-based list would add; a bare
+        // `where` offers only that list. Asked last: completion rewrites the document.
+        let precise = |offered: &[String]| {
+            offered.iter().any(|name| name == "pluck")
+                && !offered.iter().any(|name| name == "upcase")
+        };
+        let positional = harness.declarations_at(&uri, "Story.where(\"id = 1\").~");
+        assert!(precise(&positional), "{positional:?}");
+        let keywords = harness.declarations_at(&uri, "Story.where(title: \"x\").~");
+        assert!(precise(&keywords), "{keywords:?}");
+        let bare = harness.declarations_at(&uri, "Story.where.~");
+        assert!(!precise(&bare), "{bare:?}");
+    }
+
+    /// `all` and `unscoped` are where chains start, and `Scoping` writes them on the model, outside
+    /// `QUERYING_METHODS`. Without their rows `Story.all` found Rails' own `def`, which states no
+    /// type, so every call after it fell to the name rung.
+    #[test]
+    fn all_and_unscoped_are_the_relation_on_either_side() {
+        let source = "Story.all.first.user\n";
+        let (mut harness, _story, uri) = models_project(source);
+        let started = card(&mut harness, &uri, source, "user");
+        assert!(started.contains("Story#user"), "{started}");
+        assert!(!started.contains("Guessed from name alone"), "{started}");
+
+        let relation = |offered: &[String]| {
+            offered.iter().any(|name| name == "pluck")
+                && !offered.iter().any(|name| name == "upcase")
+        };
+        for marked in [
+            "Story.unscoped.~",
+            // The model's keyword.
+            "Story.all(all_queries: true).~",
+            // And on a relation, where Rails 8 writes `QueryMethods#all` and delegates `unscoped`
+            // to the model.
+            "Story.where(id: 1).all.~",
+            "Story.first.comments.unscoped.~",
+        ] {
+            let offered = harness.declarations_at(&uri, marked);
+            assert!(relation(&offered), "{marked}: {offered:?}");
+        }
+        // Still the receiver's own model, through a relation that is not `Story`'s.
+        assert!(
+            harness
+                .declarations_at(&uri, "Story.first.comments.all.first.~")
+                .iter()
+                .any(|name| name == "story"),
+            "a comment has a story"
+        );
+        // With a block, `unscoped` hands back what the block made.
+        let blocked = harness.declarations_at(&uri, "Story.unscoped { 1 }.~");
+        assert!(!relation(&blocked), "{blocked:?}");
     }
 
     #[test]
@@ -1924,8 +2501,8 @@ mod tests {
 
         let card = card(&mut harness, &uri, source, "username");
         assert!(card.contains("User#username"), "{card}");
-        assert!(!card.contains("guessed from the name"), "{card}");
-        assert!(!card.contains("Matched on the method name alone"), "{card}");
+        assert!(!card.contains("Guessed from name alone"), "{card}");
+        assert!(!card.contains("Guessed from name alone"), "{card}");
 
         let definition = harness.definition_at(&uri, source, "username");
         assert_eq!(definition.as_array().map(Vec::len), Some(1), "{definition}");
@@ -1933,6 +2510,278 @@ mod tests {
             definition[0]["targetUri"],
             serde_json::json!(schema.as_str()),
             "{definition}"
+        );
+    }
+
+    /// The two classes the interface names only where the bundle declares them.
+    #[test]
+    fn a_gem_class_the_interface_names_is_written_only_where_the_bundle_declares_it() {
+        let render = |framework: &BTreeSet<String>| {
+            let mut facts = Facts::default();
+            relation_base(&mut facts, framework);
+            facts.render(&declaring(&[])).rbs
+        };
+        let bare = render(&BTreeSet::new());
+        assert!(
+            bare.contains("def async_count: (*untyped) -> untyped\n"),
+            "{bare}"
+        );
+        let declared = render(&[PROMISE.to_owned(), WHERE_CHAIN.to_owned()].into());
+        assert!(
+            declared.contains("def async_count: (*untyped) -> ActiveRecord::Promise\n"),
+            "{declared}"
+        );
+        assert!(
+            declared.contains("class ActiveRecord::QueryMethods::WhereChain"),
+            "{declared}"
+        );
+    }
+
+    /// `minimum` and `maximum` cast through the column's type, as `pick` does, and after `group`
+    /// are a `Hash`, so a relation's arm says both; a model's is its `all`'s. An `interval` column's
+    /// `sum` and `average` are a `Duration`, which the interface's `Numeric` is not, so that model
+    /// declines both, on either side, and its grouped ones are a `Hash` of anything
+    ///.
+    #[test]
+    fn a_calculation_is_the_type_of_the_column_it_names() {
+        let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
+        harness.write(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\nend\n",
+        );
+        let visit = harness.write(
+            "app/models/visit.rb",
+            "class Visit < ApplicationRecord\nend\n",
+        );
+        harness.write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[7.1].define(version: 1) do\n  \
+             create_table \"comments\", force: :cascade do |t|\n    \
+             t.integer \"depth\", null: false\n  end\n  \
+             create_table \"visits\", force: :cascade do |t|\n    \
+             t.interval \"spent\"\n  end\nend\n",
+        );
+        let source = "\
+low = Comment.where(id: 1).minimum(:depth)
+high = Comment.maximum(:depth)
+total = Comment.sum(:depth)
+spent = Visit.sum(:spent)
+kept = Visit.where(id: 1).average(:spent)
+grouped = Visit.group(:id).sum(:spent)
+";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "low: Integer? | Hash = Comment.where(id: 1).minimum(:depth)\n\
+             high: Integer? | Hash = Comment.maximum(:depth)\n\
+             grouped: Hash = Visit.group(:id).sum(:spent)"
+        );
+        let generated = harness.generated_for(&visit).unwrap_or_default();
+        for line in [
+            "def self.sum: (*untyped) -> untyped",
+            "def self.average: (untyped) -> untyped",
+            "def sum: (*untyped) -> untyped",
+            "def average: (untyped) -> untyped",
+            "def maximum: (:id) -> (Integer? | Hash[untyped, untyped]) | (:spent) -> \
+             (ActiveSupport::Duration? | Hash[untyped, untyped]) | (untyped) -> untyped",
+            "def sum: (*untyped) -> Hash[untyped, untyped]",
+            "def average: (untyped) -> Hash[untyped, untyped]",
+        ] {
+            assert!(generated.contains(line), "{line}: {generated}");
+        }
+    }
+
+    /// What a relation answers where Rails hands the call to its loaded records or to an
+    /// association's proxy: `each` is the `Array`, an `Array` of attributes builds an
+    /// `Array`, `update` with attributes alone updates every record, a block `unscoped` runs is
+    /// its value, and `each_with_object` is its memo.
+    #[test]
+    fn a_relation_answers_what_rails_hands_its_call_to() {
+        let source = "\
+walked = Story.where(id: 1).each { |story| story }
+built = Story.all.new([{}, {}])
+one = Story.all.new(title: \"x\")
+updated = Story.where(id: 1).update(title: \"x\")
+found = Story.update(1, title: \"x\")
+scoped = Story.unscoped { 1 }
+memo = Story.all.each_with_object([]) { |story, all| all }
+";
+        let (mut harness, _story, uri) = models_project(source);
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "walked: Array[Story] = Story.where(id: 1).each { |story| story }\n\
+             walked = Story.where(id: 1).each { |story: Story| story }\n\
+             built: Array[Story] = Story.all.new([{}, {}])\n\
+             one: Story = Story.all.new(title: \"x\")\n\
+             updated: Array[Story] = Story.where(id: 1).update(title: \"x\")\n\
+             found: Array | Story = Story.update(1, title: \"x\")\n\
+             scoped: Integer = Story.unscoped { 1 }\n\
+             memo: Array = Story.all.each_with_object([]) { |story, all| all }\n\
+             memo = Story.all.each_with_object([]) { |story: Story, all| all }"
+        );
+    }
+
+    /// `pluck` by column, `ids` by the primary key where nothing moves it, and a
+    /// grouped relation whose calculations are a `Hash` by group, through any chain.
+    ///
+    /// - `pluck` keeps a column's `?` only where it is nullable: stored rows hold `null: false`
+    ///   values. `body` is nullable, so its element is no bare class, and several columns reach
+    ///   the catch-all.
+    /// - `ids` is untyped for `Keystore`, which writes `self.primary_key =`, for `Archived`, which
+    ///   inherits that key, for `Pinned`, which includes a concern writing it, for `Legacy`,
+    ///   which defines `self.primary_key`, and for `Tally`, whose body sets some receiver's key.
+    /// - `Tally::Grouped` is the application's own class, so `Tally.group` stays the relation.
+    #[test]
+    fn a_relation_plucks_its_columns_and_groups_its_calculations() {
+        let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
+        harness.write(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n  has_many :comments\nend\n",
+        );
+        harness.write(
+            "app/models/keystore.rb",
+            "class Keystore < ApplicationRecord\n  self.primary_key = \"key\"\nend\n",
+        );
+        harness.write("app/models/archived.rb", "class Archived < Keystore\nend\n");
+        harness.write(
+            "app/models/concerns/keyed.rb",
+            "module Keyed\n  extend ActiveSupport::Concern\n\n  included do\n    \
+             self.primary_key = \"uid\"\n  end\nend\n",
+        );
+        harness.write(
+            "app/models/pinned.rb",
+            "class Pinned < ApplicationRecord\n  include Keyed\nend\n",
+        );
+        harness.write(
+            "app/models/legacy.rb",
+            "class Legacy < ApplicationRecord\n  def self.primary_key\n    \"code\"\n  end\nend\n",
+        );
+        harness.write(
+            "app/models/tally.rb",
+            "class Tally < ApplicationRecord\n  Legacy.primary_key = \"code\"\nend\n",
+        );
+        harness.write("app/models/tally/grouped.rb", "class Tally::Grouped\nend\n");
+        harness.write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[7.1].define(version: 1) do\n  \
+             create_table \"comments\", force: :cascade do |t|\n    \
+             t.integer \"depth\", null: false\n    t.string \"body\"\n  end\n  \
+             create_table \"keystores\", force: :cascade do |t|\n    t.string \"key\"\n  end\n  \
+             create_table \"archiveds\", force: :cascade do |t|\n    t.string \"key\"\n  end\n  \
+             create_table \"pinneds\", force: :cascade do |t|\n    t.string \"uid\"\n  end\n  \
+             create_table \"legacies\", force: :cascade do |t|\n    t.string \"code\"\n  end\n  \
+             create_table \"tallies\", force: :cascade do |t|\n    t.integer \"n\"\n  end\nend\n",
+        );
+        let source = "\
+depth = Comment.where(id: 1).pluck(:depth)
+body = Comment.all.pluck(:body)
+class_side = Comment.pluck(:depth)
+both = Comment.all.pluck(:depth, :body)
+ids = Comment.ids
+relation_ids = Comment.where(id: 1).ids
+kept = Keystore.ids
+inherited = Archived.ids
+included = Pinned.ids
+defined = Legacy.ids
+elsewhere = Tally.ids
+counted = Comment.group(:depth).count
+chained = Comment.group(:depth).where(id: 1).order(:id).count
+summed = Comment.all.group(:depth).sum(:depth)
+ungrouped = Comment.where(id: 1).count
+owned = Tally.group(:n).count
+";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "\
+depth: Array[Integer] = Comment.where(id: 1).pluck(:depth)
+body: Array = Comment.all.pluck(:body)
+class_side: Array[Integer] = Comment.pluck(:depth)
+both: Array = Comment.all.pluck(:depth, :body)
+ids: Array[Integer] = Comment.ids
+relation_ids: Array[Integer] = Comment.where(id: 1).ids
+kept: Array = Keystore.ids
+inherited: Array = Archived.ids
+included: Array = Pinned.ids
+defined: Array = Legacy.ids
+elsewhere: Array = Tally.ids
+counted: Hash[untyped, Integer] = Comment.group(:depth).count
+chained: Hash[untyped, Integer] = Comment.group(:depth).where(id: 1).order(:id).count
+summed: Hash = Comment.all.group(:depth).sum(:depth)
+ungrouped: Integer | Hash = Comment.where(id: 1).count
+owned: Integer | Hash = Tally.group(:n).count"
+        );
+    }
+
+    /// `pick(:column)` on a relation is that column's type or `nil`, and only for a column read
+    /// through its own type.
+    ///
+    /// - `depth` is `null: false` and still `Integer?`: a relation with no row picks `nil`.
+    /// - `state` is an `enum`'s label, `meta` a `serialize`'s value, `price` an `attribute`'s type
+    ///   object, `tags` a concern's `serialize` and `prefs` a `store`'s hash: none is the column's
+    ///   type, so none gets an arm.
+    /// - A string, a variable, two columns and a name no column has reach the catch-all, which
+    ///   answers nothing. The class side is `all`'s, so a model's own `def self.pick`
+    ///   still answers first.
+    #[test]
+    fn a_relation_picks_the_type_of_the_column_its_symbol_names() {
+        let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
+        let comment = harness.write(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n  enum :state, { open: 0 }\n  \
+             serialize :meta, coder: YAML\n  attribute :price, Money::Type.new\n  \
+             store :prefs, accessors: [:color]\nend\n",
+        );
+        harness.write(
+            "app/models/concerns/tagged.rb",
+            "module Tagged\n  extend ActiveSupport::Concern\n\n  included do\n    \
+             serialize :tags\n  end\nend\n",
+        );
+        harness.write(
+            "db/schema.rb",
+            "ActiveRecord::Schema[7.1].define(version: 1) do\n  \
+             create_table \"comments\", force: :cascade do |t|\n    \
+             t.integer \"depth\", null: false\n    t.string \"body\"\n    \
+             t.string \"codes\", array: true\n    t.integer \"state\"\n    t.text \"meta\"\n    \
+             t.decimal \"price\"\n    t.text \"tags\"\n    t.text \"prefs\"\n    \
+             t.jsonb \"data\"\n  end\nend\n",
+        );
+        let source = "\
+depth = Comment.where(id: 1).pick(:depth)
+body = Comment.all.order(:id).pick(:body)
+codes = Comment.all.pick(:codes)
+state = Comment.all.pick(:state)
+meta = Comment.all.pick(:meta)
+price = Comment.all.pick(:price)
+tags = Comment.all.pick(:tags)
+prefs = Comment.all.pick(:prefs)
+data = Comment.all.pick(:data)
+named = Comment.all.pick(\"depth\")
+column = :depth
+held = Comment.all.pick(column)
+both = Comment.all.pick(:depth, :body)
+none = Comment.all.pick(:nothing)
+class_side = Comment.pick(:depth)
+";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "\
+depth: Integer? = Comment.where(id: 1).pick(:depth)
+body: String? = Comment.all.order(:id).pick(:body)
+codes: Array[String]? = Comment.all.pick(:codes)
+class_side: Integer? = Comment.pick(:depth)"
+        );
+        let generated = harness.generated_for(&comment).unwrap_or_default();
+        assert!(
+            generated.contains(
+                "def pick: (:id) -> Integer? | (:depth) -> Integer? | (:body) -> String? | \
+                 (:codes) -> Array[String]? | (*untyped) -> untyped"
+            ),
+            "{generated}"
         );
     }
 }

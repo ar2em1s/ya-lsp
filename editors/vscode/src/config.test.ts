@@ -107,6 +107,21 @@ test('the rails switch is sent as the word it is, and a family at a time', () =>
   assert.equal(serverOptions(set({ 'rails.enabled': '  ' })), undefined);
 });
 
+test('the rspec switch is its own table, sent as the word it is', () => {
+  assert.deepEqual(serverOptions(set({ 'rspec.enabled': 'on' })), {
+    rspec: { enabled: 'on' },
+  });
+  assert.equal(serverOptions(set({ 'rspec.enabled': ' ' })), undefined);
+});
+
+test('the translations are their own table: a word, a locale and a list', () => {
+  assert.deepEqual(
+    serverOptions(set({ 'i18n.enabled': 'off', 'i18n.locale': ' de ', 'i18n.paths': [] })),
+    { i18n: { enabled: 'off', locale: 'de', paths: [] } }
+  );
+  assert.equal(serverOptions(set({ 'i18n.enabled': ' ', 'i18n.locale': '' })), undefined);
+});
+
 test('the two type families that are not rails are in the types table', () => {
   // `structs` and `annotations` have nothing to do with Rails, so they must not sit under a `rails`
   // table.

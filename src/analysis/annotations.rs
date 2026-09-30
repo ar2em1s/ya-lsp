@@ -225,15 +225,29 @@ impl Reader<'_> {
             at: None,
             from: Source::Annotated,
             overloads: Vec::new(),
+            private: false,
         });
     }
 
-    /// The `@return` tag in the comment block above `def`, as an RBS type.
+    /// The `@return` tags in the comment block above `def`, as one RBS type.
+    ///
+    /// **Several tags are the method's possible returns**, so their types are read as one list:
+    /// `@return [String] if found` beside `@return [nil] otherwise` is `String?`. Reading one tag
+    /// answered `nil` for a method that mostly returns a `String`. A tag with no type refuses the
+    /// whole: the method returns something no tag names.
     fn yard_return(&self, def: &DefNode<'_>) -> Option<String> {
-        self.comments(def)
+        let listed: Vec<String> = self
+            .comments(def)
             .iter()
-            .rev()
-            .find_map(|line| yard_type(line.strip_prefix("@return ")?.trim()))
+            .filter_map(|line| line.strip_prefix("@return "))
+            .map(|tag| {
+                let inner = tag.trim().strip_prefix('[')?;
+                inner.get(..inner.find(']')?).map(str::to_owned)
+            })
+            .collect::<Option<_>>()?;
+        (!listed.is_empty())
+            .then(|| yard_type(&format!("[{}]", listed.join(", "))))
+            .flatten()
     }
 
     /// Every `@param` tag above `def`, by the parameter it names.
@@ -405,15 +419,26 @@ fn yard_type(written: &str) -> Option<String> {
     let inner = written.trim().strip_prefix('[')?;
     let inner = inner.get(..inner.find(']')?)?;
     let mut parts: Vec<&str> = split(inner, ',');
-    let nilable = parts.contains(&"nil");
-    parts.retain(|part| *part != "nil");
-    // `[true, false]` is YARD's other spelling of a boolean, and neither half is a class.
-    if parts.len() == 2
-        && parts
-            .iter()
-            .all(|part| YARD_ALIASES.iter().any(|(yard, _)| yard == part))
-    {
-        return Some("bool".to_owned());
+    // `NilClass` is the class of `nil`, spelled out: the same value, not a second class.
+    let nilable = parts.iter().any(|part| matches!(*part, "nil" | "NilClass"));
+    parts.retain(|part| !matches!(*part, "nil" | "NilClass"));
+    // Two tags naming one class (`@return [String] a` and `@return [String] b`) name one class.
+    parts.sort_unstable();
+    parts.dedup();
+    // `[true, false]` is YARD's other spelling of a boolean, and neither half is a class. So is
+    // `[TrueClass]` in one tag beside `[FalseClass]` in another, one application's spelling.
+    let boolean = |part: &&str| {
+        matches!(*part, "TrueClass" | "FalseClass")
+            || YARD_ALIASES.iter().any(|(yard, _)| yard == part)
+    };
+    if parts.len() >= 2 && parts.iter().all(boolean) {
+        // A `nil` beside them is still one of the values: `bool?`, where the old reading said
+        // `bool`.
+        return Some(if nilable {
+            optional("bool")
+        } else {
+            "bool".to_owned()
+        });
     }
     let [only] = parts.as_slice() else {
         return None;
@@ -774,12 +799,39 @@ end
             returns("# @return [Hash<Symbol, Array<String>>]").as_deref(),
             Some("Hash[Symbol, Array[String]]")
         );
-        // The whole block above the `def` is read, and the *last* tag wins. That is YARD's rule,
-        // and it matters when a doc comment restates a tag.
+        // The whole block above the `def` is read.
         assert_eq!(
             returns("# Does a thing.\n  #\n  # @param x [Integer] how many\n  # @return [String]")
                 .as_deref(),
             Some("String")
+        );
+        // Several tags are YARD's way of listing distinct return cases, so they are read as one
+        // list: an `optimized_image_url` writes these two, and reading the last alone said
+        // `nil`. `NilClass` is `nil` spelled as its class.
+        assert_eq!(
+            returns("# @return [String] if found\n  # @return [NilClass] otherwise").as_deref(),
+            Some("String?")
+        );
+        assert_eq!(
+            returns("# @return [nil] if missing\n  # @return [String] otherwise").as_deref(),
+            Some("String?")
+        );
+        assert_eq!(
+            returns("# @return [String] a\n  # @return [String] b").as_deref(),
+            Some("String")
+        );
+        assert_eq!(
+            returns("# @return [NilClass, Integer]").as_deref(),
+            Some("Integer?")
+        );
+        // A boolean written one class per tag, which the last tag alone read as `false`.
+        assert_eq!(
+            returns("# @return [TrueClass] yes\n  # @return [FalseClass] no").as_deref(),
+            Some("bool")
+        );
+        assert_eq!(
+            returns("# @return [true, false, nil]").as_deref(),
+            Some("bool?")
         );
     }
 
@@ -805,6 +857,11 @@ end
             // a real class in the graph and would displace them.
             "# @return [Object]",
             "# @return [Object, nil]",
+            // Two tags naming two classes are a union no class spells, and a tag with no type
+            // leaves a return nothing names.
+            "# @return [String] a\n  # @return [Integer] b",
+            "# @return [String] a\n  # @return something else",
+            "# @return [NilClass]",
         ] {
             assert_eq!(returns(annotation), None, "{annotation:?}");
         }
@@ -1018,9 +1075,9 @@ end
     }
 
     #[test]
-    fn a_sig_block_and_a_yard_tag_each_type_a_receiver_and_say_which_they_read() {
-        // Both halves of an annotation. A card says which one it read, because a comment is not a
-        // signature and the tiers already have a place to say so.
+    fn a_sig_block_and_a_yard_tag_each_type_a_receiver() {
+        // Both halves of an annotation: each types the method its card names, and the chain after
+        // it.
         let source = "Widget.new.name.upcase\nWidget.new.label.upcase\n";
         let (mut harness, _story, uri) = models_project(source);
         let widget = harness.write(
@@ -1036,11 +1093,10 @@ end
         harness.watch(&[&widget]);
 
         let sorbet = card(&mut harness, &uri, source, "name");
-        assert!(sorbet.contains("a Sorbet `sig` block"), "{sorbet}");
-        assert!(sorbet.contains("app/models/widget.rb"), "{sorbet}");
+        assert!(sorbet.contains("Widget#name -> String"), "{sorbet}");
 
         let yard = card(&mut harness, &uri, source, "label");
-        assert!(yard.contains("a YARD `@return` tag"), "{yard}");
+        assert!(yard.contains("Widget#label -> String"), "{yard}");
 
         // Both type the chain, which is the only reason to read either.
         let chained = card(&mut harness, &uri, "Widget.new.name.upcase\n", "upcase");

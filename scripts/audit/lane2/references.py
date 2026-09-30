@@ -1,4 +1,4 @@
-"""Check 7: `references` against the two answers it can be held to.
+"""Check 6: `references` against the two answers it can be held to.
 
 `textDocument/references` is the widest answer the server gives. No key is possible: nothing writes
 down every place a name is used in a real Rails app, and a key would be `references::by_name`

@@ -146,6 +146,10 @@ pub enum Source {
     /// collision it can meet is the one it is ranked against: a `sig` above a `def` that overrides
     /// a struct's reader, where a human states what this reader can only call `untyped`.
     Struct,
+    /// A method `define_method(:x)` makes, named by a symbol literal in the call: the call is the
+    /// whole evidence, as a struct's is, and ranks beside it. Ruby keeps it over the method a column
+    /// or a macro installs, which live in modules the class includes.
+    Defined,
     /// `enum`. It names a column's values, and *refining* the column means winning over it.
     ///
     /// **Above** the column: `story.status` is the label (a `String`), while the column stores an
@@ -203,7 +207,7 @@ impl Source {
     fn rank(self) -> u8 {
         match self {
             Self::Annotated => 1,
-            Self::Struct => 2,
+            Self::Struct | Self::Defined => 2,
             Self::Enum => 3,
             Self::Column => 4,
             Self::Association => 5,
@@ -250,17 +254,76 @@ pub struct Declared {
     pub at: Option<At>,
     /// Which generator said so. The precedence table's key.
     pub from: Source,
+    /// Written `private def`: a member the source keeps private.
+    ///
+    /// **Set only where the source is private.** rubydex takes a method's visibility from the last
+    /// of its definitions (`Graph::visibility`), and which one that is depends on the order they
+    /// were resolved in. A public signature over a private `def` would then be a public method in
+    /// some orders. rubydex reads `private` in RBS (`rbs_indexer.rs`), so with it the two agree in
+    /// every order.
+    pub private: bool,
+}
+
+/// A return type as a method type may hold it: a union in brackets.
+///
+/// RBS reads `() -> A | B` as two overloads, the second of which is no method type, so the whole
+/// document fails to parse and every declaration in it is lost. A generator writes the union it
+/// means, and this writes it the way RBS can read it.
+fn enclosed(returns: &str) -> std::borrow::Cow<'_, str> {
+    let mut depth = 0_usize;
+    let mut union = false;
+    for character in returns.chars() {
+        match character {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => union = true,
+            _ => {}
+        }
+    }
+    if union {
+        format!("({returns})").into()
+    } else {
+        returns.into()
+    }
+}
+
+/// A writer's one positional, named: `def title=: (untyped value) -> untyped`.
+///
+/// RBS lets a parameter go unnamed, and rubydex then calls it `arg0`, which a hover card prints
+/// (decided 2026-09-29). Only a list that is exactly one bare type: one a generator named, or wrote
+/// with anything else in it, is left as written.
+fn named_value<'p>(name: &str, parameters: &'p str) -> std::borrow::Cow<'p, str> {
+    let setter = name
+        .strip_suffix('=')
+        .is_some_and(|stem| !stem.is_empty() && !stem.ends_with(['=', '<', '>', '!']));
+    let Some(one) = parameters
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return parameters.into();
+    };
+    let named = [
+        one.is_empty(),
+        one.starts_with(['?', '*', '&']),
+        one.contains([' ', ',', '(', '{']),
+    ];
+    if setter && !named.contains(&true) {
+        format!("({one} value)").into()
+    } else {
+        parameters.into()
+    }
 }
 
 impl Declared {
     /// The `def` line, without its indentation.
     fn signature(&self) -> String {
         let mut line = format!(
-            "def {}{}: {} -> {}",
+            "{}def {}{}: {} -> {}",
+            if self.private { "private " } else { "" },
             self.owner.prefix(),
             self.name,
-            self.parameters,
-            self.returns
+            named_value(&self.name, &self.parameters),
+            enclosed(&self.returns)
         );
         // RBS writes an overload set as `|`-separated method types and accepts them on one line.
         // Kept on one line on purpose: a `Span` is a byte range into this text, and a declaration
@@ -270,7 +333,7 @@ impl Declared {
             line.push_str(" | ");
             line.push_str(parameters);
             line.push_str(" -> ");
-            line.push_str(returns);
+            line.push_str(&enclosed(returns));
         }
         line
     }
@@ -314,6 +377,17 @@ pub struct Facts {
     /// so this writes one. Not a [`Declared`]: an `include` names no member, has no return type and
     /// cannot collide, so a list is enough.
     mixins: Vec<(Owner, String)>,
+    /// The modules a body `extend`s, in the order they were said.
+    ///
+    /// Only for a body this document declares, or one declared nowhere else: rubydex links an
+    /// `extend` only where it is indexed with the namespace (`navigation.md`), so one written onto
+    /// somebody else's class is never read.
+    extensions: Vec<(Owner, String)>,
+    /// The modules a body `prepend`s, in the order they were said, for [`Facts::mixins`]' reason.
+    ///
+    /// Written onto somebody else's class, like an `include`: rubydex links a late `prepend` as it
+    /// links a late `include` (`Paperclip::Attachment.prepend(…)`, `workspace::mixins`).
+    prepends: Vec<(Owner, String)>,
     /// The superclass a generated `class` opens with, for the bodies that have one.
     ///
     /// This is what lets ActiveRecord's query interface be written once per project, not once per
@@ -322,6 +396,12 @@ pub struct Facts {
     /// on a class the user's own file already gives one is silently ignored**, so this may only be
     /// written on a name nothing else declares.
     supers: Vec<(Owner, String)>,
+    /// The type parameters a generated `class` opens with (`[R]`), for the bodies that have them.
+    ///
+    /// What lets a value carry a class across a call that Ruby's own classes cannot name: a
+    /// signature returning `WhereChain[Story::Relation]` hands `Story::Relation` to a member
+    /// declared `-> R`. Not a [`Declared`], for [`Facts::mixins`]' reason.
+    generics: Vec<(Owner, String)>,
     /// The bodies that exist and hold nothing: a namespace, and nothing it contains.
     ///
     /// A map, not a list: one document states a namespace once per *name*, while the chain above a
@@ -334,6 +414,11 @@ pub struct Facts {
     /// rule as every span here, *the source this generator read*. `None` keeps the no-place
     /// behaviour for a body nothing confirmed.
     bodies: BTreeMap<Owner, Option<At>>,
+    /// The blocks whose `self` a generator knows: `(the body it is filed with, where the call the
+    /// block is passed to starts in the source, what it runs as)` ([`Facts::runs`]).
+    ran: Vec<(Owner, u32, Runs)>,
+    /// Whether every body goes into one document ([`Facts::whole`]).
+    whole: bool,
 }
 
 impl Facts {
@@ -385,6 +470,21 @@ impl Facts {
         self.supers.push((owner, superclass));
     }
 
+    /// Say that a generated `class` opens with type parameters, written with their brackets.
+    ///
+    /// Said twice for one body, the first is kept, as with [`Facts::inherits`].
+    pub fn generic(&mut self, owner: Owner, parameters: String) {
+        let key = (owner.is_module(), owner.name().to_owned());
+        if self
+            .generics
+            .iter()
+            .any(|(held, _)| (held.is_module(), held.name().to_owned()) == key)
+        {
+            return;
+        }
+        self.generics.push((owner, parameters));
+    }
+
     /// Say that a type exists, and nothing about what is in it.
     ///
     /// The one fact with no member and no type, and both are the point. Zeitwerk defines
@@ -413,23 +513,74 @@ impl Facts {
         self.mixins.push((owner, module));
     }
 
+    /// Say that a body `extend`s a module, which only a body this document declares may: see
+    /// [`Facts::extensions`]. The owner is a body, as in [`Facts::mixin`].
+    pub fn extension(&mut self, owner: Owner, module: String) {
+        self.extensions.push((owner, module));
+    }
+
+    /// Say that a body `prepend`s a module. The owner is a body, as in [`Facts::mixin`].
+    pub fn prepend(&mut self, owner: Owner, module: String) {
+        self.prepends.push((owner, module));
+    }
+
+    /// Say what the block passed to the call starting at `call` in the source runs as ([`Runs`]).
+    ///
+    /// A class some call makes and then evaluates a block in (`Class.new(parent) { … }` is Ruby's
+    /// own) has no name the text writes, so the generator that names it is the only one who knows
+    /// which class a block's `self` is. Not RBS: a signature says what `self` is for **every** call
+    /// of a method, and two calls of one method here make two classes. It travels beside the text
+    /// with the mappings, in the source's own coordinates.
+    ///
+    /// [`Runs::Refused`] is a refusal, not silence: a block whose `self` is a class some *other*
+    /// call decides must not read as the class around it.
+    ///
+    /// `owner` only says which body the fact is filed with, as [`Facts::mixin`]'s does.
+    pub fn runs(&mut self, owner: Owner, call: u32, runs: Runs) {
+        self.ran.push((owner, call, runs));
+    }
+
+    /// Say that everything here renders as **one** document, not one per body ([`Facts::split`]).
+    ///
+    /// For a source that implies many small bodies nobody else writes onto: a spec file's example
+    /// groups. One document per body is the right unit where a keystroke changes one body of many
+    /// (a column, a table), and the wrong one where the bodies are one file's own and a file of
+    /// forty groups would be forty documents to index.
+    pub fn whole(&mut self) {
+        self.whole = true;
+    }
+
     /// Take everything `other` said, subject to the same precedence.
     ///
     /// This is where precedence is really enforced: a file that feeds two generators (a model with
     /// a `has_many` and a `@return` tag) merges here, and a member both name is decided, not
     /// written twice.
     pub fn extend(&mut self, other: Self) {
+        // Into nothing, `other` is already what the loop below would build: one member per key in
+        // the order it was said, and every list deduped by its own writer. Taken whole, because
+        // declaring a schema's thousands of members again cost a large app milliseconds a settle.
+        if *self == Self::default() {
+            *self = other;
+            return;
+        }
         for member in other.members {
             self.declare(member);
         }
         self.notes.extend(other.notes);
         self.mixins.extend(other.mixins);
+        self.extensions.extend(other.extensions);
+        self.prepends.extend(other.prepends);
         for (owner, at) in other.bodies {
             self.bodies.entry(owner).or_insert(at);
         }
         for (owner, superclass) in other.supers {
             self.inherits(owner, superclass);
         }
+        for (owner, parameters) in other.generics {
+            self.generic(owner, parameters);
+        }
+        self.ran.extend(other.ran);
+        self.whole |= other.whole;
     }
 
     /// Take what `other` said about its **members**, and nothing it said about a type.
@@ -456,9 +607,21 @@ impl Facts {
     /// only the type declines, and [`Types::harvest`](crate::analysis::types::Types::harvest) drops
     /// it.
     #[must_use]
+    ///
+    /// **A sentinel is no answer here either** ([`ELEMENT`], [`COLLECTION`], [`WRITTEN`],
+    /// [`SHARED`], [`HELD`], [`DEFINED`], [`FORWARDED`], [`BLOCK`], [`OWN_DEF`], [`SENT`]). Each is read against the member it was
+    /// written on: copied onto a delegator, it would name the delegator's element, writer, `def` or
+    /// block.
     pub fn returns(&self, owner: &Owner, name: &str) -> Option<&str> {
         let held = self.held(owner, name)?;
-        held.overloads.is_empty().then_some(held.returns.as_str())
+        // Anywhere in it, not only as the head: `Rails.logger`'s `(… | WrittenByItsWriter)` names
+        // `Rails`' writer, which a delegator copying it would read as its own.
+        let sentinel = [
+            ELEMENT, COLLECTION, WRITTEN, SHARED, HELD, DEFINED, FORWARDED, BLOCK, OWN_DEF, SENT,
+        ]
+        .iter()
+        .any(|sentinel| held.returns.contains(sentinel));
+        (held.overloads.is_empty() && !sentinel).then_some(held.returns.as_str())
     }
 
     /// Every `(owner, name)` that survived precedence.
@@ -496,8 +659,12 @@ impl Facts {
     pub fn is_empty(&self) -> bool {
         self.members.is_empty()
             && self.mixins.is_empty()
+            && self.extensions.is_empty()
+            && self.prepends.is_empty()
             && self.supers.is_empty()
+            && self.generics.is_empty()
             && self.bodies.is_empty()
+            && self.ran.is_empty()
     }
 
     /// How many members survived precedence. What a generator reports it declared.
@@ -524,8 +691,13 @@ impl Facts {
     /// pays per declaration it re-indexes, so a document is the unit of invalidation. One document
     /// per file means a column that changed type re-indexes every column in the schema, which
     /// dominated keystroke latency on a large schema. One document per body re-indexes one table.
+    ///
+    /// **A whole [`Facts`] is one part** ([`Facts::whole`]), filed under [`WHOLE`].
     #[must_use]
     pub fn split(self) -> Vec<(String, Self)> {
+        if self.whole {
+            return vec![(WHOLE.to_owned(), self)];
+        }
         let mut parts: BTreeMap<String, Self> = BTreeMap::new();
         for member in self.members {
             parts
@@ -547,11 +719,31 @@ impl Facts {
                 .mixins
                 .push((owner, module));
         }
+        for (owner, module) in self.extensions {
+            parts
+                .entry(owner.body())
+                .or_default()
+                .extensions
+                .push((owner, module));
+        }
+        for (owner, module) in self.prepends {
+            parts
+                .entry(owner.body())
+                .or_default()
+                .prepends
+                .push((owner, module));
+        }
         for (owner, superclass) in self.supers {
             parts
                 .entry(owner.body())
                 .or_default()
                 .inherits(owner, superclass);
+        }
+        for (owner, parameters) in self.generics {
+            parts
+                .entry(owner.body())
+                .or_default()
+                .generic(owner, parameters);
         }
         for (owner, at) in self.bodies {
             parts
@@ -560,6 +752,13 @@ impl Facts {
                 .bodies
                 .entry(owner)
                 .or_insert(at);
+        }
+        for (owner, call, runs) in self.ran {
+            parts
+                .entry(owner.body())
+                .or_default()
+                .ran
+                .push((owner, call, runs));
         }
         parts.into_iter().collect()
     }
@@ -586,7 +785,7 @@ impl Facts {
                 if open.is_some() {
                     out.close(wrappers);
                 }
-                wrappers = out.open(key.1, key.0, self.superclass(key), namespaces).0;
+                wrappers = out.open(key, self.opening(key), namespaces).0;
                 open = Some(key);
                 // Only above the first body of a type: a note is about the type, and a type whose
                 // members were stated in two runs is still one type.
@@ -624,7 +823,10 @@ impl Facts {
         for (owner, at) in self
             .mixins
             .iter()
+            .chain(&self.extensions)
+            .chain(&self.prepends)
             .chain(&self.supers)
+            .chain(&self.generics)
             .map(|(owner, _)| (owner, None))
             .chain(self.bodies.iter().map(|(owner, at)| (owner, *at)))
         {
@@ -632,7 +834,7 @@ impl Facts {
             if !noted.insert(key) {
                 continue;
             }
-            let (wrappers, line) = out.open(key.1, key.0, self.superclass(key), namespaces);
+            let (wrappers, line) = out.open(key, self.opening(key), namespaces);
             // The one span in this function that is not a member's. It covers the body's own line,
             // not anything inside it: a conjured namespace holds nothing, so the line *is* the
             // declaration. A body reached through `mixins` or `supers` has no span and keeps the
@@ -648,10 +850,16 @@ impl Facts {
             self.head(&mut out, key);
             out.close(wrappers);
         }
+        out.ran = self
+            .ran
+            .iter()
+            .map(|(_, call, runs)| (*call, runs.clone()))
+            .collect();
         out
     }
 
-    /// What goes at the top of a body: its note, then every `include` written on it.
+    /// What goes at the top of a body: its note, then every `include`, `extend` and `prepend`
+    /// written on it.
     fn head(&self, out: &mut Declarations, key: (bool, &str)) {
         if let Some((_, text)) = self
             .notes
@@ -667,15 +875,44 @@ impl Facts {
         {
             out.include(module);
         }
+        for (_, module) in self
+            .extensions
+            .iter()
+            .filter(|(owner, _)| (owner.is_module(), owner.name()) == key)
+        {
+            out.extension(module);
+        }
+        for (_, module) in self
+            .prepends
+            .iter()
+            .filter(|(owner, _)| (owner.is_module(), owner.name()) == key)
+        {
+            out.prepend(module);
+        }
     }
 
-    /// The superclass one body opens with, when [`Facts::inherits`] was told of one.
-    fn superclass(&self, key: (bool, &str)) -> Option<&str> {
-        self.supers
-            .iter()
-            .find(|(owner, _)| (owner.is_module(), owner.name()) == key)
-            .map(|(_, superclass)| superclass.as_str())
+    /// What one body's line says after its name: the type parameters [`Facts::generic`] was told
+    /// of, then the superclass [`Facts::inherits`] was.
+    fn opening(&self, key: (bool, &str)) -> Opening<'_> {
+        Opening {
+            parameters: said_of(&self.generics, key),
+            superclass: said_of(&self.supers, key),
+        }
     }
+}
+
+/// What one of [`Facts`]' per-body lists says about the body `key` names.
+fn said_of<'f>(said: &'f [(Owner, String)], key: (bool, &str)) -> Option<&'f str> {
+    said.iter()
+        .find(|(owner, _)| (owner.is_module(), owner.name()) == key)
+        .map(|(_, text)| text.as_str())
+}
+
+/// What a body's opening line holds after its name ([`Facts::opening`]).
+#[derive(Default)]
+struct Opening<'f> {
+    parameters: Option<&'f str>,
+    superclass: Option<&'f str>,
 }
 
 /// RBS text, and where in the file that implied it each declaration was really written.
@@ -703,6 +940,22 @@ pub struct Declarations {
     /// source this generator read*, which the generator knows; this is *the name Rails gave the
     /// same method*, which only the graph can turn into a file.
     pub named: Vec<Named>,
+    /// `(where a call starts in the source, what its block runs as)`, as [`Facts::runs`] was told.
+    /// Not text, so nothing about it is rendered.
+    pub ran: Vec<(u32, Runs)>,
+}
+
+/// What a block runs as, where a generator knows and no signature can say ([`Facts::runs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Runs {
+    /// The class object of a class some call makes at run time and the generator names: two calls
+    /// of one method make two classes, which no signature can say.
+    Made(String),
+    /// The class object of **each** class that includes `of`, whichever runs the block: a block
+    /// handed to every includer. Every includer is one this project writes.
+    Each { of: String, classes: Vec<String> },
+    /// A `self` nothing here can name: a class some other file decides, none of which is known.
+    Refused,
 }
 
 /// A generated declaration whose real definition is a name, not a span.
@@ -763,6 +1016,8 @@ pub struct Namespaces {
     declared: BTreeSet<String>,
     /// The subset written `module`, so a body may be opened for it.
     modules: BTreeSet<String>,
+    /// The subset written `class`, so a directory's `module` may not join it.
+    classes: BTreeSet<String>,
 }
 
 impl Namespaces {
@@ -776,6 +1031,8 @@ impl Namespaces {
     pub fn declare(&mut self, name: String, module: bool) {
         if module {
             self.modules.insert(name.clone());
+        } else {
+            self.classes.insert(name.clone());
         }
         self.declared.insert(name);
     }
@@ -790,6 +1047,14 @@ impl Namespaces {
     #[must_use]
     pub fn opens(&self, name: &str) -> bool {
         self.modules.contains(name)
+    }
+
+    /// Whether nothing declares it, or only `module` lines do: a name a directory's generated
+    /// `module` may declare too. A `class` beside it would make the two kinds a coin toss, since
+    /// rubydex holds one declaration per constant.
+    #[must_use]
+    pub fn admits_a_module(&self, name: &str) -> bool {
+        !self.classes.contains(name)
     }
 
     /// Whether a generated declaration on `name` can be written without introducing a namespace.
@@ -874,6 +1139,166 @@ pub fn is_constant_path(name: &str) -> bool {
     })
 }
 
+/// How a generated signature says "the element this receiver is a collection of".
+///
+/// **Part of the text contract between a generator and the types table**, so it lives here, beside
+/// the other names both sides share, and neither side imports the other for it.
+///
+/// - **A made-up class name, because RBS has no keyword for it.** `self` is the receiver and
+///   `instance` is the declaring class; a query interface written once for every collection needs
+///   neither.
+/// - **It never reaches the graph.** Nothing declares this class, so a lookup that escaped
+///   `types::class_of` answers `None` and stops the chain.
+/// - **It never reaches a reader.** A margin draws a `def`'s return only for a class the graph
+///   holds, and this is none.
+pub const ELEMENT: &str = "ActiveRecordElement";
+
+/// How a generated signature says "the collection of this receiver's element". See [`ELEMENT`].
+pub const COLLECTION: &str = "ActiveRecordCollection";
+
+/// How a generated signature says "whatever this accessor's writer is given, or `nil`".
+///
+/// For a reader whose storage only its writer beside it fills, so every value it can hand back is
+/// one some call of that writer passed: `thread_mattr_accessor :account` on a module nothing
+/// includes. The types table answers it by reading every such call ([`ELEMENT`]'s contract: a name
+/// no file declares, which a lookup that escaped `types::class_of` finds nothing for).
+pub const WRITTEN: &str = "WrittenByItsWriter";
+
+/// How a generated signature says "whatever the writer of this name is given on any instance of
+/// the class that declares it, or a descendant".
+///
+/// For a reader whose storage every instance shares, which only the writer beside it fills:
+/// `Rails::Railtie::Configuration` keeps an application's own `config.dispatcher = …` in one class
+/// variable, so the application's, an engine's and a railtie's `config` all hold it. The types
+/// table reads every call of the writer, and one whose receiver it cannot type refuses
+/// ([`ELEMENT`]'s contract otherwise).
+pub const SHARED: &str = "WrittenOnAnyInstance";
+
+/// How a generated signature says "whatever the writer of this name is given on the receiver's
+/// class object or its one instance, or `nil`".
+///
+/// For an `ActiveSupport::CurrentAttributes` attribute: the class object hands its reader and
+/// writer to its per-thread `instance`, so both write one store, which each class keeps apart from
+/// its subclasses'. The types table reads every call of the writer, and `set(x: v)`, on either.
+pub const HELD: &str = "WrittenOnItsObjectOrClass";
+
+/// How a generated signature says "what the Ruby `def` of this name in that module returns, read
+/// as the receiver's own method", with the module as its one type argument:
+/// `AnsweredByItsDef[::Account::Finder]`.
+///
+/// For a member Ruby installs by extending a module onto the receiver, which no file writes down:
+/// a concern's `class_methods do` and `module ClassMethods`. The `def` is real and indexed, as the
+/// module's; the types table reads its body with the receiver as `self`, and a lookup of this name
+/// finds nothing ([`ELEMENT`]'s contract).
+pub const DEFINED: &str = "AnsweredByItsDef";
+
+/// How a generated signature says "what the second name answers on what the first answers, both
+/// asked of the receiver", as two string literals: `ForwardedToItsTarget["order", "line_items"]`.
+///
+/// For a member that hands its call on: `delegate :line_items, to: :order` is Rails'
+/// `_ = order; _.line_items(...)`. The first is a method name or a constant; the types table makes
+/// both calls where the member is called ([`ELEMENT`]'s contract otherwise).
+pub const FORWARDED: &str = "ForwardedToItsTarget";
+
+/// How a generated signature says "what the block passed to the call that declared this member
+/// hands back", with no arguments: `def user: () -> ReturnedByItsBlock`.
+///
+/// For a member a call defines from its block, as Ruby's `define_method(:user) { … }` does: RSpec's
+/// `let(:user) { create(:user) }` is a method whose body is that block. The call is the member's
+/// own place (its mapping), so the sentinel names nothing: the types table finds the block there
+/// and reads it the way it reads a `def`'s body ([`ELEMENT`]'s contract otherwise).
+pub const BLOCK: &str = "ReturnedByItsBlock";
+
+/// How a generated signature says "what the Ruby `def` written at this member's own place returns",
+/// with no arguments: `def helper: () -> ReturnedByItsOwnDef`.
+///
+/// For a `def` Ruby files on a class nothing names: one written in an RSpec group's block is a
+/// method of that group's class, and rubydex, reading a block, files every such `def` of one name
+/// as one `Object` method. The member's mapping names the `def`, whose body the types table reads
+/// alone, as it reads any `def`'s ([`ELEMENT`]'s contract otherwise).
+pub const OWN_DEF: &str = "ReturnedByItsOwnDef";
+
+/// How a generated signature says "what the method the call's first argument names answers, called
+/// publicly on the receiver with the arguments after it", with no arguments:
+/// `def try: (*untyped) -> SentByItsSymbol`.
+///
+/// For a member that calls another by name, as ActiveSupport's `try(:title)` does: which method is
+/// written at the call, not in the signature, so the types table makes that call where the member is
+/// called ([`ELEMENT`]'s contract otherwise).
+pub const SENT: &str = "SentByItsSymbol";
+
+/// How a generated signature says "what the lambda passed to the call that declared this member
+/// hands back, where that is truthy", beside what the member hands back otherwise:
+/// `def self.recent: (*untyped) -> Story::Relation | ScopedByItsLambda`.
+///
+/// For a member a call defines from a lambda it is passed, whose value stands unless it is `nil` or
+/// `false`: ActiveRecord's `scope :recent, -> { … }` is `instance_exec(&body) || self` on the
+/// relation. The call is the member's own place, so the sentinel names nothing: the types table
+/// finds the lambda there, reads it, and keeps the rest of the union for its falsy half, or for a
+/// lambda it cannot read ([`ELEMENT`]'s contract otherwise).
+pub const SCOPED: &str = "ScopedByItsLambda";
+
+/// How a generated signature says "what the literal key the call passes first names, in a table a
+/// body of knowledge keeps", with no arguments: `def t: (*untyped) -> NamedByItsKey`.
+///
+/// For a member whose value is looked up by a key written as a literal, as i18n's `t("a.b")` looks
+/// up a translation: which key is written at the call, and what it holds is in the
+/// module's table, not in RBS. The types table asks the registry at the call
+/// ([`crate::knowledge::Knowledge::keyed_type`]; [`ELEMENT`]'s contract otherwise).
+pub const KEYED: &str = "NamedByItsKey";
+
+/// The name a [`Facts::whole`] document is filed under, in place of a body's.
+pub const WHOLE: &str = "whole";
+
+/// The class ya-lsp writes for a collection of `element`: [`element_of`] read forwards.
+///
+/// Nested under the element (`Comment::Relation`, not `CommentRelation`), for three reasons, most
+/// important first:
+///
+/// 1. The name is *scoped*, so it cannot collide with an unrelated top-level constant.
+/// 2. It reads right where a user meets it: a hover card saying `Comment::Relation#first`.
+/// 3. A project that already has a `Comment::Relation` meant something by it, so a collision makes
+///    the pass emit nothing instead of shadowing it.
+#[must_use]
+pub fn collection_of(element: &str) -> String {
+    format!("{element}::{COLLECTION_CLASS}")
+}
+
+/// The relation `group` hands back for `element`: `Story::Grouped`, a subclass of
+/// [`collection_of`]'s whose calculations are a `Hash` by group.
+#[must_use]
+pub fn grouped_of(element: &str) -> String {
+    format!("{element}::{GROUPED_CLASS}")
+}
+
+/// Whether `name` is a relation [`grouped_of`] builds: a chain on it stays grouped.
+#[must_use]
+pub fn is_grouped(name: &str) -> bool {
+    name.strip_suffix(GROUPED_CLASS)
+        .is_some_and(|element| element.ends_with("::"))
+}
+
+/// The class a collection holds: [`collection_of`] read backwards.
+///
+/// Needed at *lookup* time, not generation time: `Story::Relation#first` is declared once for the
+/// whole project, so only the receiver's name says which element the answer is about.
+///
+/// A name that is not a collection answers `None`, not itself: the caller's next question is "what
+/// is that element's collection", and a wrong answer here would invent a class.
+#[must_use]
+pub fn element_of(collection: &str) -> Option<&str> {
+    collection
+        .strip_suffix(COLLECTION_CLASS)
+        .or_else(|| collection.strip_suffix(GROUPED_CLASS))?
+        .strip_suffix("::")
+}
+
+/// The last segment of the name [`collection_of`] builds, and the one [`element_of`] takes off.
+const COLLECTION_CLASS: &str = "Relation";
+
+/// The last segment of the name [`grouped_of`] builds, which [`element_of`] takes off too.
+const GROUPED_CLASS: &str = "Grouped";
+
 /// The one namespace of a name that becomes its own body, and what is left to spell joined inside
 /// it: [`Declarations::open`]'s half of the rule.
 ///
@@ -910,9 +1335,8 @@ impl Declarations {
     /// no-mapping-no-place rule, doing its usual job.
     fn open(
         &mut self,
-        name: &str,
-        module: bool,
-        superclass: Option<&str>,
+        (module, name): (bool, &str),
+        opening: Opening<'_>,
         namespaces: &Namespaces,
     ) -> (usize, (u32, u32)) {
         let (wrapper, inner) = nesting(name, namespaces);
@@ -928,8 +1352,11 @@ impl Declarations {
         let start = self.rbs.len() as u32;
         self.rbs.push_str(if module { "module " } else { "class " });
         self.rbs.push_str(inner);
+        if let Some(parameters) = opening.parameters {
+            self.rbs.push_str(parameters);
+        }
         // A `module` cannot have one, and [`Facts::inherits`] is only ever told about a class.
-        if let Some(superclass) = superclass.filter(|_| !module) {
+        if let Some(superclass) = opening.superclass.filter(|_| !module) {
             self.rbs.push_str(" < ");
             self.rbs.push_str(superclass);
         }
@@ -944,6 +1371,20 @@ impl Declarations {
     /// Write an `include`, which names no member and so records no span.
     fn include(&mut self, module: &str) {
         self.rbs.push_str("  include ");
+        self.rbs.push_str(module);
+        self.rbs.push('\n');
+    }
+
+    /// Write an `extend`, for [`Self::include`]'s reason.
+    fn extension(&mut self, module: &str) {
+        self.rbs.push_str("  extend ");
+        self.rbs.push_str(module);
+        self.rbs.push('\n');
+    }
+
+    /// Write a `prepend`, for [`Self::include`]'s reason.
+    fn prepend(&mut self, module: &str) {
+        self.rbs.push_str("  prepend ");
         self.rbs.push_str(module);
         self.rbs.push('\n');
     }
@@ -1005,6 +1446,55 @@ pub(crate) fn declaring_kinds(classes: &[&str], modules: &[&str]) -> Namespaces 
 mod tests {
     use super::*;
 
+    /// A relation and its grouped twin name one element.
+    #[test]
+    fn a_grouped_relation_names_its_element() {
+        assert_eq!(grouped_of("Story"), "Story::Grouped");
+        assert!(is_grouped("Story::Grouped"));
+        assert!(!is_grouped("Grouped"));
+        assert!(!is_grouped("Story::Relation"));
+        assert_eq!(element_of("Story::Grouped"), Some("Story"));
+        assert_eq!(element_of(&collection_of("Story")), Some("Story"));
+        assert_eq!(element_of("Story"), None);
+    }
+
+    /// A writer's lone parameter is named, and nothing else is touched.
+    #[test]
+    fn a_writer_s_one_bare_parameter_is_named_value() {
+        assert_eq!(named_value("title=", "(untyped)"), "(untyped value)");
+        assert_eq!(named_value("user=", "(::User?)"), "(::User? value)");
+        // Not a writer: a reader, an operator ending in `=`, and a bare `=`.
+        assert_eq!(named_value("title", "(untyped)"), "(untyped)");
+        assert_eq!(named_value("==", "(untyped)"), "(untyped)");
+        assert_eq!(named_value("<=", "(untyped)"), "(untyped)");
+        assert_eq!(named_value("=", "(untyped)"), "(untyped)");
+        // A list that is not exactly one bare type, or not a list at all.
+        assert_eq!(named_value("x=", "()"), "()");
+        assert_eq!(named_value("x=", "(*untyped)"), "(*untyped)");
+        assert_eq!(named_value("x=", "(untyped given)"), "(untyped given)");
+        assert_eq!(named_value("x=", "(A, B)"), "(A, B)");
+        assert_eq!(named_value("x=", ""), "");
+    }
+
+    /// [`collection_of`] and [`element_of`] are one mapping, and it must be invertible.
+    ///
+    /// The query interface is declared once per project, so only the receiver's **name** says which
+    /// element an answer is about. A non-collection name answers `None`, not itself, because the
+    /// caller's next question would build a class out of it.
+    #[test]
+    fn a_collection_names_its_element_and_nothing_else_does() {
+        assert_eq!(collection_of("Comment"), "Comment::Relation");
+        assert_eq!(collection_of("Admin::Setting"), "Admin::Setting::Relation");
+        for element in ["Story", "Spree::Order", "A::B::C"] {
+            assert_eq!(element_of(&collection_of(element)), Some(element));
+        }
+        // Everything that is not one: a bare model, the last segment on its own, a name that
+        // merely ends in the letters, and nothing at all.
+        for other in ["Story", "Relation", "StoryRelation", ""] {
+            assert_eq!(element_of(other), None, "{other}");
+        }
+    }
+
     /// Every rank, in order. The table itself, so a row added below has to be added here.
     const RANKS: [Source; 10] = [
         Source::Annotated,
@@ -1055,7 +1545,99 @@ mod tests {
             at: None,
             from,
             overloads: Vec::new(),
+            private: false,
         }
+    }
+
+    /// Extending an empty table takes the other one whole, which is what merging it member by
+    /// member rebuilt: it already holds one member per key, and lists its own writers deduped. A
+    /// table holding anything at all, even only a comment [`Facts::is_empty`] does not count, still
+    /// merges.
+    #[test]
+    fn extending_nothing_takes_the_other_table_whole() {
+        let mut other = Facts::default();
+        other.declare(said(story(), "title", "untyped", Source::Interface));
+        other.declare(said(story(), "title", "String", Source::Column));
+        other.declare(said(story(), "body", "String", Source::Column));
+        other.inherits(story(), "Base".to_owned());
+        other.mixin(story(), "Tagged".to_owned());
+        other.whole();
+        let mut into = Facts::default();
+        into.extend(other.clone());
+        assert_eq!(into, other);
+
+        let mut noted = Facts::default();
+        noted.note(story(), "Written by ya-lsp.".to_owned());
+        assert!(noted.is_empty());
+        noted.extend(other.clone());
+        assert_ne!(noted, other, "the comment is kept");
+        let rbs = noted.render(&declaring(&[])).rbs;
+        assert!(rbs.contains("Written by ya-lsp."), "{rbs}");
+        assert!(rbs.contains("def title: () -> String"), "{rbs}");
+        assert_eq!(noted.len(), 2);
+    }
+
+    /// A whole `Facts` is one document, and the two facts that are not RBS go with their body: an
+    /// `extend` is written at its head, and which class a block runs as is carried beside the text.
+    #[test]
+    fn a_whole_facts_is_one_part_and_carries_its_blocks_and_extends() {
+        let namespaces = declaring(&["Story"]);
+        let mut facts = Facts::default();
+        assert!(facts.is_empty());
+        facts.runs(story(), 10, Runs::Made("Story".to_owned()));
+        assert!(!facts.is_empty(), "a block's class is something said");
+        let mut extended = Facts::default();
+        extended.extension(story(), "::Tagged".to_owned());
+        assert!(!extended.is_empty());
+        facts.extend(extended);
+        facts.declare(said(story(), "title", "String", Source::Column));
+        facts.declare(said(
+            Owner::Instance("Widget".to_owned()),
+            "name",
+            BLOCK,
+            Source::Convention,
+        ));
+        facts.runs(Owner::Instance("Widget".to_owned()), 20, Runs::Refused);
+        assert_eq!(
+            facts.returns(&Owner::Instance("Widget".to_owned()), "name"),
+            None
+        );
+
+        let apart = facts.clone().split();
+        assert_eq!(
+            apart.len(),
+            2,
+            "by body, where nobody asked for one document"
+        );
+        assert_eq!(
+            apart[0].1.render(&namespaces).ran,
+            [(10, Runs::Made("Story".to_owned()))]
+        );
+        assert_eq!(apart[1].1.render(&namespaces).ran, [(20, Runs::Refused)]);
+        let mut whole = Facts::default();
+        whole.whole();
+        whole.extend(facts);
+        let parts = whole.split();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0, WHOLE);
+        let rendered = parts[0].1.render(&namespaces);
+        assert!(
+            rendered.rbs.contains("class Story\n  extend ::Tagged\n"),
+            "{}",
+            rendered.rbs
+        );
+        assert_eq!(
+            rendered.ran,
+            [(10, Runs::Made("Story".to_owned())), (20, Runs::Refused)]
+        );
+        // An `extend` alone still opens its body.
+        let mut only = Facts::default();
+        only.extension(Owner::Module("Storyish".to_owned()), "::Tagged".to_owned());
+        assert!(
+            only.render(&namespaces)
+                .rbs
+                .contains("module Storyish\n  extend ::Tagged\n")
+        );
     }
 
     /// One `Facts` per body, and every field goes with its owner.
@@ -1281,6 +1863,7 @@ mod tests {
             at: None,
             from: Source::Convention,
             overloads: Vec::new(),
+            private: false,
         });
         facts.mixin(
             Owner::Module("RouteHelpers".to_owned()),
@@ -1354,6 +1937,7 @@ mod tests {
             at: None,
             from: Source::Column,
             overloads: Vec::new(),
+            private: false,
         });
         // A `module` cannot have one, whatever it is told.
         facts.inherits(Owner::Module("Helpers".to_owned()), "Base".to_owned());
@@ -1375,6 +1959,80 @@ mod tests {
         into.inherits(Owner::Instance("A".to_owned()), "C".to_owned());
         into.extend(only);
         assert_eq!(into.render(&declaring(&[])).rbs, "class A < C\nend\n");
+    }
+
+    /// A union return is written in brackets, in every arm, since RBS reads a bare `|` after a
+    /// return as the next overload. A `|` inside a type argument or a block is already enclosed.
+    #[test]
+    fn a_union_return_is_bracketed_so_rbs_reads_one_overload() {
+        let mut facts = Facts::default();
+        for (name, returns, overloads) in [
+            ("either", "Integer | Float", vec![]),
+            ("held", "Array[Integer | Float]", vec![]),
+            (
+                "arms",
+                "String",
+                vec![("(Integer)".to_owned(), "Symbol | nil".to_owned())],
+            ),
+        ] {
+            facts.declare(Declared {
+                owner: Owner::Instance("Widget".to_owned()),
+                name: name.to_owned(),
+                returns: returns.to_owned(),
+                parameters: "()".to_owned(),
+                because: String::new(),
+                at: None,
+                from: Source::Interface,
+                overloads,
+                private: false,
+            });
+        }
+        assert_eq!(
+            facts.render(&declaring(&[])).rbs,
+            "class Widget\n  def either: () -> (Integer | Float)\n  \
+             def held: () -> Array[Integer | Float]\n  \
+             def arms: () -> String | (Integer) -> (Symbol | nil)\nend\n"
+        );
+    }
+
+    /// A generated class may open with type parameters, before its superclass, and the first said
+    /// is kept, as for a superclass. `extend` and `split` carry them like one.
+    #[test]
+    fn a_generated_class_may_open_with_type_parameters() {
+        let chain = || Owner::Instance("Chain".to_owned());
+        let mut facts = Facts::default();
+        facts.generic(chain(), "[R]".to_owned());
+        facts.generic(Owner::Singleton("Chain".to_owned()), "[S, T]".to_owned());
+        facts.inherits(chain(), "Base".to_owned());
+        facts.declare(Declared {
+            owner: chain(),
+            name: "not".to_owned(),
+            returns: "R".to_owned(),
+            parameters: "(*untyped)".to_owned(),
+            because: String::new(),
+            at: None,
+            from: Source::Interface,
+            overloads: Vec::new(),
+            private: false,
+        });
+        assert_eq!(
+            facts.render(&declaring(&[])).rbs,
+            "class Chain[R] < Base\n  def not: (*untyped) -> R\nend\n"
+        );
+
+        // A body holding only its parameters is still written, and still a document.
+        let mut only = Facts::default();
+        only.generic(chain(), "[R]".to_owned());
+        assert!(!only.is_empty());
+        let mut into = Facts::default();
+        into.extend(only);
+        assert_eq!(into.render(&declaring(&[])).rbs, "class Chain[R]\nend\n");
+        let parts = into.split();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].1.render(&declaring(&[])).rbs,
+            "class Chain[R]\nend\n"
+        );
     }
 
     /// The two-hop question, answered without any generator ordering: both ways round.

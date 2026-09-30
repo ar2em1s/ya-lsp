@@ -14,6 +14,28 @@ KEY_HELPER_COL = re.compile(r"^\s*t\.\w+\s+[\"']([a-z_][A-Za-z0-9_]*_(?:path|url
 KEY_HELPER_SQL = re.compile(r"^\s{4}([a-z_][A-Za-z0-9_]*_(?:path|url))\s+[a-z]", re.M)
 # `stored_url = session.delete(...)` is a local variable, not something Rails generated.
 KEY_HELPER_VAR = re.compile(r"^[ \t]*([a-z_][A-Za-z0-9_]*_(?:path|url))\s*(?:\|\|)?=[^=~]", re.M)
+# A parameter is a local too: `def non_matching_uri_hosts?(base_url, comparison_url)` and
+# `.each do |template_path|`. The list is split and only each parameter's own name is read, so a
+# default that calls a real helper (`def back(to = root_path)`) is not taken for one.
+KEY_HELPER_PARAMS = re.compile(r"\bdef\s+[\w.]+[?!=]?\s*\(([^)]*)\)|\|([^|\n]*)\|")
+KEY_HELPER_PARAM = re.compile(r"^\s*[*&]{0,2}([a-z_][A-Za-z0-9_]*_(?:path|url))\s*(?:[:=]|$)")
+
+
+def parameters(text):
+    """Every `_path`/`_url` name a method or a block in one file takes as a parameter.
+
+    **Per file, not per corpus** like [`non_helpers`]: a parameter is a local of its own method, and
+    solidus' admin component takes `account_path:` and `logout_path:` while its storefront calls
+    the helpers of those names. Read corpus-wide, one keyword argument would strike a real helper
+    from every file's draw.
+    """
+    found = set()
+    for listed in KEY_HELPER_PARAMS.finditer(text):
+        for piece in (listed.group(1) or listed.group(2) or "").split(","):
+            named = KEY_HELPER_PARAM.match(piece)
+            if named:
+                found.add(named.group(1))
+    return found
 
 
 def non_helpers(corpus):

@@ -178,6 +178,9 @@ pub(super) enum Returns {
     Fixed(&'static str),
     /// The one class the call names, subject to [`Typing`].
     Named,
+    /// Whatever the writer beside it is given ([`crate::generated::WRITTEN`]), where the call and
+    /// its host allow it ([`Tail::stored`], [`Host::sealed`]); `untyped` everywhere else.
+    Written,
 }
 
 /// One member a macro installs.
@@ -302,6 +305,7 @@ const MODULE_WRITER: &[Shape] = &[
 const MODULE_ACCESSOR: &[Shape] = &[
     Shape {
         singleton: true,
+        returns: Returns::Written,
         ..READ
     },
     Shape {
@@ -403,8 +407,8 @@ const SERIALIZE: &[Shape] = &[Shape {
 /// `attr_reader attribute` and `attr_accessor :"#{attribute}_confirmation"`,
 /// `:"#{attribute}_challenge"`; then `define_method` for the writer, `authenticate_#{attribute}`
 /// and `#{attribute}_salt`. Each is `nil` until assigned, hence the `?`s. `authenticate_` answers
-/// the record or `false`, so the honest common type is `untyped`, not a `bool` that would be wrong
-/// for the branch everybody uses.
+/// `digest.present? && BCrypt::Password.new(digest).is_password?(password) && self`: the record or
+/// `false`, the same in 7.2, 8.0 and 8.1.
 const SECURE_PASSWORD: &[Shape] = &[
     Shape {
         returns: Returns::Fixed("String?"),
@@ -450,14 +454,14 @@ const SECURE_PASSWORD: &[Shape] = &[
         name: Affix::Around("authenticate_", ""),
         singleton: false,
         parameters: "(String)",
-        returns: Returns::Fixed("untyped"),
+        returns: Returns::Fixed("self | false"),
         off: ALWAYS,
     },
     Shape {
         name: Affix::Default("authenticate"),
         singleton: false,
         parameters: "(String)",
-        returns: Returns::Fixed("untyped"),
+        returns: Returns::Fixed("self | false"),
         off: ALWAYS,
     },
 ];
@@ -578,6 +582,9 @@ pub(super) struct Host<'body> {
     /// Every `def` the body writes itself, by `(is a def self., name)`. See `ModelClass::defined`
     /// for why only this reader asks.
     pub(super) defined: &'body BTreeSet<(bool, String)>,
+    /// A `module` no class `include`s, so no object holds its instance writer: the module object's
+    /// own writer is the only way in ([`Returns::Written`]). `extend` is not seen.
+    pub(super) sealed: bool,
 }
 
 /// One long-tail macro call, read.
@@ -604,6 +611,13 @@ pub(super) struct Tail {
     off: Vec<String>,
     /// Whether the name came from the macro's default rather than from the call.
     defaulted: bool,
+    /// Whether the value a reader hands back is only ever what its writer was given
+    /// ([`Returns::Written`]): an accessor with no `default:` and no block. A plain one keeps a
+    /// class variable, which the reader checks nothing else fills.
+    stored: bool,
+    /// The column a `store` keeps its hash in: its first positional. Rails `serialize`s it, so the
+    /// value is the coder's, not the column's ([`Tail::recasts`]).
+    store: Option<String>,
     at: (u32, u32),
 }
 
@@ -655,6 +669,18 @@ pub(super) fn read(source: &str, node: &CallNode<'_>, called: &str) -> Option<Ta
         aliased,
         off: turned_off(node, &table),
         defaulted,
+        // The `thread_` spellings keep the value in `IsolatedExecutionState`, which only the
+        // writer fills. The others keep a class variable, which an `@@name =` or a
+        // `class_variable_set` fills too: the reader refuses where the application writes one
+        // (`types::written_to`). A `default:` or a block sets a value the writer never passed.
+        stored: matches!(installs, Installs::ModuleAccessor)
+            && keyword(node, "default").is_none()
+            && node.block().is_none(),
+        store: matches!(installs, Installs::Store)
+            .then(|| node.arguments()?.arguments().iter().next())
+            .flatten()
+            .and_then(|first| symbol_or_string(source, &first))
+            .map(|(column, _)| column),
         at,
     })
 }
@@ -811,7 +837,7 @@ impl Tail {
     ///
     /// **`store` withdraws nothing, deliberately.** Rails implements it by calling `serialize` on
     /// the store column, so in principle it re-types one too, but store columns are typically
-    /// `json`/`jsonb`, which is not one of [`super::COLUMN_TYPES`]' ten, so the schema already
+    /// `json`/`jsonb`, which is not one of [`super::COLUMN_TYPES`], so the schema already
     /// declares them `untyped`. Withdrawing would remove a member and replace it with nothing,
     /// whereas withdrawing a `text` column removes a `String` known to be wrong.
     pub(super) fn retypes(&self) -> impl Iterator<Item = &str> {
@@ -819,6 +845,15 @@ impl Tail {
             .then(|| self.names.iter().map(|named| named.member.as_str()))
             .into_iter()
             .flatten()
+    }
+
+    /// Every column whose value this call hands back through something other than the column's
+    /// own type: [`Self::retypes`], and a `store`'s column, which Rails `serialize`s too.
+    ///
+    /// Wider than what the schema withdraws, for a reader that must never copy the column's type
+    /// where the coder's is the answer (`pick`).
+    pub(super) fn recasts(&self) -> impl Iterator<Item = &str> {
+        self.retypes().chain(self.store.as_deref())
     }
 
     /// Say every member this call installs, or decline those it cannot type.
@@ -884,6 +919,7 @@ impl Tail {
             class: owner.name(),
             module: matches!(owner, Owner::Module(_) | Owner::ModuleSingleton(_)),
             defined,
+            sealed: false,
         };
         self.emit(facts, file, &host, &table, &returns);
     }
@@ -923,6 +959,10 @@ impl Tail {
                 let returns = match shape.returns {
                     Returns::Fixed(written) => written.to_owned(),
                     Returns::Named => named.to_owned(),
+                    Returns::Written if self.stored && host.module && host.sealed => {
+                        crate::generated::WRITTEN.to_owned()
+                    }
+                    Returns::Written => "untyped".to_owned(),
                 };
                 let owner = match (shape.singleton, host.module) {
                     (false, false) => Owner::Instance(host.class.to_owned()),
@@ -939,6 +979,7 @@ impl Tail {
                     at: Some((self.at, *at)),
                     from: Source::Derived,
                     overloads: Vec::new(),
+                    private: false,
                 });
             }
         }
@@ -1012,10 +1053,10 @@ mod tests {
             (
                 "  class_attribute :setting\n",
                 "  def self.setting: () -> untyped
-  def self.setting=: (untyped) -> untyped
+  def self.setting=: (untyped value) -> untyped
   def self.setting?: () -> bool
   def setting: () -> untyped
-  def setting=: (untyped) -> untyped
+  def setting=: (untyped value) -> untyped
   def setting?: () -> bool
 ",
             ),
@@ -1025,32 +1066,32 @@ mod tests {
             ),
             (
                 "  cattr_writer :pam\n",
-                "  def self.pam=: (untyped) -> untyped\n  def pam=: (untyped) -> untyped\n",
+                "  def self.pam=: (untyped value) -> untyped\n  def pam=: (untyped value) -> untyped\n",
             ),
             (
                 "  thread_mattr_accessor :pam\n",
                 "  def self.pam: () -> untyped
   def pam: () -> untyped
-  def self.pam=: (untyped) -> untyped
-  def pam=: (untyped) -> untyped
+  def self.pam=: (untyped value) -> untyped
+  def pam=: (untyped value) -> untyped
 ",
             ),
             (
                 "  accepts_nested_attributes_for :author, :pages\n",
-                "  def author_attributes=: (untyped) -> untyped\n  \
-                 def pages_attributes=: (untyped) -> untyped\n",
+                "  def author_attributes=: (untyped value) -> untyped\n  \
+                 def pages_attributes=: (untyped value) -> untyped\n",
             ),
             (
                 "  store_accessor :settings, :color\n",
                 "  def color: () -> untyped
-  def color=: (untyped) -> untyped
+  def color=: (untyped value) -> untyped
   def color_changed?: () -> bool
 ",
             ),
             (
                 "  store :settings, accessors: [ :color ], prefix: true\n",
                 "  def settings_color: () -> untyped
-  def settings_color=: (untyped) -> untyped
+  def settings_color=: (untyped value) -> untyped
   def settings_color_changed?: () -> bool
 ",
             ),
@@ -1069,33 +1110,33 @@ mod tests {
             (
                 "  has_secure_password :recovery\n",
                 "  def recovery: () -> String?
-  def recovery=: (untyped) -> untyped
+  def recovery=: (untyped value) -> untyped
   def recovery_confirmation: () -> String?
-  def recovery_confirmation=: (untyped) -> untyped
+  def recovery_confirmation=: (untyped value) -> untyped
   def recovery_challenge: () -> String?
-  def recovery_challenge=: (untyped) -> untyped
+  def recovery_challenge=: (untyped value) -> untyped
   def recovery_salt: () -> String?
-  def authenticate_recovery: (String) -> untyped
+  def authenticate_recovery: (String) -> (self | false)
 ",
             ),
             (
                 "  composed_of :balance, class_name: \"Money\"\n",
-                "  def balance: () -> Money\n  def balance=: (untyped) -> untyped\n",
+                "  def balance: () -> Money\n  def balance=: (untyped value) -> untyped\n",
             ),
             (
                 "  has_one_attached :avatar\n",
                 "  def avatar: () -> ActiveStorage::Attached::One\n  \
-                 def avatar=: (untyped) -> untyped\n",
+                 def avatar=: (untyped value) -> untyped\n",
             ),
             (
                 "  has_many_attached :images\n",
                 "  def images: () -> ActiveStorage::Attached::Many\n  \
-                 def images=: (untyped) -> untyped\n",
+                 def images=: (untyped value) -> untyped\n",
             ),
             (
                 "  has_rich_text :body\n",
                 "  def body: () -> ActionText::RichText
-  def body=: (untyped) -> untyped
+  def body=: (untyped value) -> untyped
   def body?: () -> bool
 ",
             ),
@@ -1149,7 +1190,7 @@ class Story
   # From `app/models/story.rb`, `store :color`.
   def settings_color: () -> untyped
   # From `app/models/story.rb`, `store :color`.
-  def settings_color=: (untyped) -> untyped
+  def settings_color=: (untyped value) -> untyped
   # From `app/models/story.rb`, `store :color`.
   def settings_color_changed?: () -> bool
 end
@@ -1192,11 +1233,11 @@ end
     fn the_bare_authenticate_is_only_installed_for_the_default_attribute() {
         let declared = without_provenance(&rbs("  has_secure_password\n"));
         assert!(
-            declared.contains("  def authenticate: (String) -> untyped\n"),
+            declared.contains("  def authenticate: (String) -> (self | false)\n"),
             "{declared}"
         );
         assert!(
-            declared.contains("  def authenticate_password: (String) -> untyped\n"),
+            declared.contains("  def authenticate_password: (String) -> (self | false)\n"),
             "{declared}"
         );
     }
@@ -1206,6 +1247,7 @@ end
     /// [`Tail::emit`] resolves that variant to the one class the call names, which a
     /// [`Typing::Fixed`] row never has, so a shape added to the wrong list would declare a member
     /// returning the empty string: RBS nothing can parse, costing the whole generated document.
+    /// [`Returns::Written`] needs no class: it is the sentinel or `untyped`.
     #[test]
     fn no_fixed_family_names_a_class() {
         for (called, installs) in LONG_TAIL {
@@ -1215,7 +1257,7 @@ end
                     table
                         .shapes
                         .iter()
-                        .all(|shape| matches!(shape.returns, super::Returns::Fixed(_))),
+                        .all(|shape| !matches!(shape.returns, super::Returns::Named)),
                     "{called} has a type nothing resolves"
                 );
             }
@@ -1224,7 +1266,7 @@ end
 
     /// A `def` in the same body wins, and the macro's member is not declared beside it.
     ///
-    /// Solidus writes `mattr_accessor :user_class` in `module Spree` and a `def self.user_class`
+    /// An engine writes `mattr_accessor :user_class` in `module Spree` and a `def self.user_class`
     /// two lines below. Rails' macro really defines `def self.user_class`, and the `def` then
     /// replaces it, so declaring both would put a Rails line beside the one that really answers,
     /// for a heavily used method.
@@ -1238,11 +1280,11 @@ end
         assert_eq!(
             declared,
             "  def pam: () -> untyped
-  def self.pam=: (untyped) -> untyped
-  def pam=: (untyped) -> untyped
+  def self.pam=: (untyped value) -> untyped
+  def pam=: (untyped value) -> untyped
   def self.other: () -> untyped
   def other: () -> untyped
-  def self.other=: (untyped) -> untyped
+  def self.other=: (untyped value) -> untyped
 "
         );
         // Phase two must ask the same question: an `alias_attribute` plus a `def` of the aliased
@@ -1258,7 +1300,7 @@ end
         );
         assert_eq!(
             derived,
-            "  def sent_at: () -> untyped\n  def sent_at=: (untyped) -> untyped\n"
+            "  def sent_at: () -> untyped\n  def sent_at=: (untyped value) -> untyped\n"
         );
     }
 
@@ -1383,13 +1425,13 @@ end
             "\
 module Storyish
   # From `app/models/concerns/storyish.rb`, `mattr_accessor :pam`.
-  def self.pam: () -> untyped
+  def self.pam: () -> WrittenByItsWriter
   # From `app/models/concerns/storyish.rb`, `mattr_accessor :pam`.
   def pam: () -> untyped
   # From `app/models/concerns/storyish.rb`, `mattr_accessor :pam`.
-  def self.pam=: (untyped) -> untyped
+  def self.pam=: (untyped value) -> untyped
   # From `app/models/concerns/storyish.rb`, `mattr_accessor :pam`.
-  def pam=: (untyped) -> untyped
+  def pam=: (untyped value) -> untyped
 end
 "
         );
@@ -1433,6 +1475,7 @@ end
             at: None,
             from: Source::Column,
             overloads: Vec::new(),
+            private: false,
         });
         assert_eq!(
             without_provenance(
@@ -1442,7 +1485,7 @@ end
                     .rbs
             ),
             "  def sent_at: () -> Time
-  def sent_at=: (untyped) -> untyped
+  def sent_at=: (untyped value) -> untyped
   def sent_at?: () -> bool
 "
         );
@@ -1465,7 +1508,7 @@ end
                     .rbs
             ),
             "  def sent_at: () -> untyped
-  def sent_at=: (untyped) -> untyped
+  def sent_at=: (untyped value) -> untyped
   def sent_at?: () -> bool
 "
         );
@@ -1516,11 +1559,7 @@ end
         // every card). What this checks is the other half: the member reaches the editor and says
         // which line of the user's own file declared it.
         let predicate = card(&mut harness, &uri, source, "setting?");
-        assert_eq!(
-            predicate,
-            "```ruby\nStory#setting?\n```\n\n*From `app/models/story.rb`, \
-             `class_attribute :setting`.*"
-        );
+        assert_eq!(predicate, "```ruby\nStory#setting? -> bool\n```");
         // Asked after the hover, because a completion fixture replaces the document's text, and the
         // hover's positions refer to the old text.
         let offered = harness.declarations_at(&uri, "Story.~\n");

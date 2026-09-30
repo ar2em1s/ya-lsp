@@ -56,23 +56,29 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ruby_prism::{CallNode, StatementsNode};
 
-use super::syntax::{constant_spelling, def_span, parameters_of, spellable, symbol_or_string};
-use crate::generated::{At, Declared, Facts, Namespaces, Owner, Source};
+use super::syntax::{
+    bodies_named, constant_spelling, def_span, parameters_of, spellable, symbol_or_string,
+};
+use crate::generated::{At, DEFINED, Declared, Facts, Namespaces, Owner, Source};
 
-/// One `def` written as a statement of a `class_methods do` block.
+/// One method written as a statement of a `class_methods do` block: a `def`, or one side of an
+/// `attr_*`.
 #[derive(Debug)]
 pub struct ClassMethod {
-    name: String,
+    pub(super) name: String,
+    /// What the line says, for the provenance sentence: `def tally_by`, or `attr_accessor :limit`
+    /// for both the reader and the writer it makes.
+    pub(super) written: String,
     /// Which of the two spellings wrote it, for the provenance sentence: a reader sent to the `def`
     /// should be told whether the file says `class_methods do` or `module ClassMethods`, the two
     /// lines they will be looking at.
     spelled: &'static str,
     /// The RBS parameter list the `def`'s own parameters imply, every type `untyped`.
-    parameters: String,
+    pub(super) parameters: String,
     /// The `def` keyword through the end of the parameter list, and the name inside it, so the
     /// rendered declaration maps back to the line a user wrote.
-    at: (u32, u32),
-    name_at: (u32, u32),
+    pub(super) at: (u32, u32),
+    pub(super) name_at: (u32, u32),
 }
 
 /// The block's statements, when this call is the one that opens one.
@@ -223,6 +229,35 @@ pub(super) fn extended(
     found
 }
 
+/// Where each block `ActiveSupport::Concern` evaluates on the including class is passed: the start
+/// of every `included do` and `prepended do` written as a statement of a module body.
+///
+/// `append_features` and `prepend_features` `class_eval` the stored block on each class that
+/// includes the concern, so its `self` is a class some **other** file's `include` decides, and a
+/// callback block inside it runs against that class's records. rubydex files the block's calls on
+/// the module's class object, which Ruby never makes `self` there; the caller says so with
+/// `Facts::runs` and no class, which the type side reads as a refusal.
+///
+/// A **class** is declined for [`extended`]'s reason, and only a bare call with a block counts.
+pub(super) fn evaluated_elsewhere(statements: &StatementsNode<'_>, module: bool) -> Vec<u32> {
+    if !module {
+        return Vec::new();
+    }
+    statements
+        .body()
+        .iter()
+        .filter_map(|statement| statement.as_call_node())
+        .filter(|call| {
+            call.receiver().is_none()
+                && matches!(call.name().as_slice(), b"included" | b"prepended")
+                && call
+                    .block()
+                    .is_some_and(|block| block.as_block_node().is_some())
+        })
+        .map(|call| call.location().start_offset() as u32)
+        .collect()
+}
+
 /// The `def`s one module declares in its own body, read out of that module's own file.
 ///
 /// The far end of [`extended`]. `extend ActiveModel::Naming` inside an `included do` says which
@@ -243,61 +278,21 @@ pub(super) fn extended(
 #[must_use]
 pub fn installed(source: &str, module_name: &str) -> Vec<ClassMethod> {
     let parsed = ruby_prism::parse(source.as_bytes());
-    let mut found = Vec::new();
-    let mut nesting: Vec<String> = Vec::new();
-    walk_bodies(
+    let mut bodies = Vec::new();
+    bodies_named(
         source,
         parsed
             .node()
             .as_program_node()
             .map(|program| program.statements()),
         module_name,
-        &mut nesting,
-        &mut found,
+        &mut Vec::new(),
+        &mut bodies,
     );
-    found
-}
-
-/// One body, then the class and module bodies written as statements of it.
-///
-/// The shape of `models::Models::walk`, for its reason: a generic visitor descends into every
-/// method body in the file, which on a large one is thousands of frames on a 2 MiB stack.
-fn walk_bodies(
-    source: &str,
-    statements: Option<StatementsNode<'_>>,
-    wanted: &str,
-    nesting: &mut Vec<String>,
-    found: &mut Vec<ClassMethod>,
-) {
-    let Some(statements) = statements else {
-        return;
-    };
-    if !nesting.is_empty() && nesting.join("::") == wanted {
-        found.extend(read(source, &statements, EXTENDED));
-        return;
-    }
-
-    for statement in statements.body().iter() {
-        // A `class` body is descended into as well as a `module`'s, because the wanted module may
-        // be nested in one (`Random::Formatter`). What is *matched* is still a module: an `extend`
-        // names one, and the name is the whole path, not its last segment.
-        let (path, body) = if let Some(module) = statement.as_module_node() {
-            (module.constant_path(), module.body())
-        } else if let Some(class) = statement.as_class_node() {
-            (class.constant_path(), class.body())
-        } else {
-            continue;
-        };
-        nesting.push(constant_spelling(source, &path));
-        walk_bodies(
-            source,
-            body.and_then(|body| body.as_statements_node()),
-            wanted,
-            nesting,
-            found,
-        );
-        nesting.pop();
-    }
+    bodies
+        .iter()
+        .flat_map(|body| read(source, body, EXTENDED))
+        .collect()
 }
 
 /// The nested module Rails builds, spelled as Ruby spells it.
@@ -314,7 +309,13 @@ pub(super) const BLOCK: &str = "class_methods do";
 const MODULE: &str = "module ClassMethods";
 const EXTENDED: &str = "included do … extend";
 
-/// Every `def` this block installs on the includer's singleton, in source order.
+/// Every method this block installs on the includer's singleton, in source order.
+///
+/// **A `def`, and each side of an `attr_accessor`, `attr_reader` or `attr_writer`**: `module_eval`
+/// runs those on the module like any other statement, so `ActiveRecord::Inheritance`'s
+/// `attr_accessor :abstract_class` is what `self.abstract_class = true` calls. The name must be
+/// one Ruby accepts for an attribute (no `?`, `!` or `=`); a name only running Ruby knows is
+/// skipped alone.
 ///
 /// Visibility is the file's own, read exactly as [`super::entrypoints`] reads a mailer's: a bare
 /// `private` or `protected` closes the public section, and `private :name` names one already
@@ -364,15 +365,58 @@ pub(super) fn read(
             let at = written.name_loc();
             found.push(ClassMethod {
                 parameters: parameters_of(source, written.parameters().as_ref()),
+                written: format!("def {name}"),
                 name,
                 spelled,
                 at: def_span(&written),
                 name_at: (at.start_offset() as u32, at.end_offset() as u32),
             });
         }
+        if let Some(call) = statement.as_call_node()
+            && visible
+            && call.receiver().is_none()
+            && let Some((reads, writes)) = accessor(call.name().as_slice())
+            && let Some(arguments) = call.arguments()
+        {
+            let word = String::from_utf8_lossy(call.name().as_slice());
+            let at = call.location();
+            let at = (at.start_offset() as u32, at.end_offset() as u32);
+            for (name, name_at) in arguments
+                .arguments()
+                .iter()
+                .filter_map(|argument| symbol_or_string(source, &argument))
+                .filter(|(name, _)| spellable(name) && !name.ends_with(['?', '!', '=']))
+            {
+                let written = format!("{word} :{name}");
+                let side = |name: String, parameters: &str| ClassMethod {
+                    name,
+                    written: written.clone(),
+                    spelled,
+                    parameters: parameters.to_owned(),
+                    at,
+                    name_at,
+                };
+                if reads {
+                    found.push(side(name.clone(), "()"));
+                }
+                if writes {
+                    found.push(side(format!("{name}="), "(untyped)"));
+                }
+            }
+        }
     }
     found.retain(|method| !hidden.contains(&method.name));
     found
+}
+
+/// Which sides an `attr_*` call makes, reader then writer: `None` for any other call.
+fn accessor(called: &[u8]) -> Option<(bool, bool)> {
+    match called {
+        b"attr_accessor" => Some((true, true)),
+        b"attr_reader" => Some((true, false)),
+        b"attr_writer" => Some((false, true)),
+        _ => None,
+    }
 }
 
 /// Where a set of class methods came from, for the sentence above each declaration.
@@ -404,7 +448,10 @@ pub struct From<'a> {
 /// place.
 ///
 /// `Source::Convention`, as for a mailer's action: the `def` is really in the file and the class
-/// method is really installed, but the *type* is this table's, not the file's.
+/// method is really installed.
+///
+/// **Its type is the `def`'s own** ([`DEFINED`]): the types table reads that body with the
+/// including class as `self`, which is what Ruby runs.
 ///
 /// A concern **nothing includes** declares nothing. That is Ruby, not caution: the module itself
 /// never answers these names (`Tallyable.tally_by` raises), and with no includer there is no class
@@ -430,26 +477,37 @@ pub fn declare(
             continue;
         }
         for method in methods {
+            // The module rubydex files the `def` under: the extended module, the hand-written
+            // `ClassMethods`, or, for a `def` in the block, the concern itself.
+            let holder = match (via, method.spelled) {
+                (Some(module), _) => module.to_owned(),
+                (None, MODULE) => format!("{concern}::{CLASS_METHODS}"),
+                (None, _) => concern.to_owned(),
+            };
             facts.declare(Declared {
                 owner: Owner::Singleton(includer.clone()),
                 name: method.name.clone(),
-                returns: "untyped".to_owned(),
-                parameters: method.parameters.clone(),
+                returns: format!("{DEFINED}[::{holder}]"),
+                // A Rails method whose block runs against something else says so
+                // (`super::blocks`); every other member keeps what its `def` implies.
+                parameters: super::blocks::class_method(concern, &method.name)
+                    .unwrap_or_else(|| method.parameters.clone()),
                 because: match via {
                     None => format!(
-                        "From `{file}`, `def {}` in `{}` in `{concern}`, which `{includer}` \
+                        "From `{file}`, `{}` in `{}` in `{concern}`, which `{includer}` \
                          includes.",
-                        method.name, method.spelled
+                        method.written, method.spelled
                     ),
                     Some(module) => format!(
-                        "From `{file}`, `def {}` in `{module}`, which `{concern}`'s `{}` puts on \
+                        "From `{file}`, `{}` in `{module}`, which `{concern}`'s `{}` puts on \
                          every including class — here `{includer}`.",
-                        method.name, method.spelled
+                        method.written, method.spelled
                     ),
                 },
                 at: Some((method.at, method.name_at)),
                 from: Source::Convention,
                 overloads: Vec::new(),
+                private: false,
             });
         }
     }
@@ -549,13 +607,70 @@ class Ledger
   # From `app/models/concerns/tallyable.rb`, `def tally_by` in `class_methods do` in `Tallyable`, \
 which `Ledger` includes.
   def self.tally_by: (untyped, ?untyped, *untyped, scale: untyped, ?unit: untyped, **untyped) -> \
-untyped
+AnsweredByItsDef[::Tallyable]
   # From `app/models/concerns/tallyable.rb`, `def primary_key=` in `class_methods do` in \
 `Tallyable`, which `Ledger` includes.
-  def self.primary_key=: (untyped) -> untyped
+  def self.primary_key=: (untyped value) -> AnsweredByItsDef[::Tallyable]
   # From `app/models/concerns/tallyable.rb`, `def still_public` in `class_methods do` in \
 `Tallyable`, which `Ledger` includes.
-  def self.still_public: () -> untyped
+  def self.still_public: () -> AnsweredByItsDef[::Tallyable]
+end
+"
+        );
+    }
+
+    /// An `attr_*` in the block is two methods, or one, installed like a `def`.
+    ///
+    /// `ActiveRecord::Inheritance::ClassMethods` writes `attr_accessor :abstract_class`, which is
+    /// what every `self.abstract_class = true` calls. Each side keeps the call's line as its place
+    /// and the symbol as its name, and the privacy rules are the `def`'s.
+    #[test]
+    fn an_attr_in_the_block_installs_its_reader_and_its_writer() {
+        assert_eq!(
+            rbs(
+                "\
+module Tallyable
+  extend ActiveSupport::Concern
+
+  module ClassMethods
+    attr_accessor :abstract_class, 'tally_limit'
+    attr_reader :counted
+    attr_writer :scale
+    attr_reader :ready?, :'not a name'
+    attr_accessor
+    self.attr_reader :on_the_module
+    attr_reader :hidden
+    private :hidden
+
+    private
+
+    attr_accessor :after_private
+  end
+end
+",
+                &["Tallyable", "Ledger"],
+                INCLUDED,
+            ),
+            "\
+class Ledger
+  # From `app/models/concerns/tallyable.rb`, `attr_accessor :abstract_class` in `module \
+ClassMethods` in `Tallyable`, which `Ledger` includes.
+  def self.abstract_class: () -> AnsweredByItsDef[::Tallyable::ClassMethods]
+  # From `app/models/concerns/tallyable.rb`, `attr_accessor :abstract_class` in `module \
+ClassMethods` in `Tallyable`, which `Ledger` includes.
+  def self.abstract_class=: (untyped value) -> AnsweredByItsDef[::Tallyable::ClassMethods]
+  # From `app/models/concerns/tallyable.rb`, `attr_accessor :tally_limit` in `module \
+ClassMethods` in `Tallyable`, which `Ledger` includes.
+  def self.tally_limit: () -> AnsweredByItsDef[::Tallyable::ClassMethods]
+  # From `app/models/concerns/tallyable.rb`, `attr_accessor :tally_limit` in `module \
+ClassMethods` in `Tallyable`, which `Ledger` includes.
+  def self.tally_limit=: (untyped value) -> AnsweredByItsDef[::Tallyable::ClassMethods]
+  # From `app/models/concerns/tallyable.rb`, `attr_reader :counted` in `module ClassMethods` in \
+`Tallyable`, which `Ledger` includes.
+  def self.counted: () -> AnsweredByItsDef[::Tallyable::ClassMethods]
+  # From `app/models/concerns/tallyable.rb`, `attr_writer :scale` in `module ClassMethods` in \
+`Tallyable`, which `Ledger` includes.
+  def self.scale=: (untyped value) -> AnsweredByItsDef[::Tallyable::ClassMethods]
 end
 "
         );
@@ -605,10 +720,10 @@ end
 class Ledger
   # From `app/models/concerns/tallyable.rb`, `def tally_by` in `class_methods do` in `Tallyable`, \
 which `Ledger` includes.
-  def self.tally_by: (untyped) -> untyped
+  def self.tally_by: (untyped) -> AnsweredByItsDef[::Tallyable]
   # From `app/models/concerns/tallyable.rb`, `def counted_name` in `module ClassMethods` in \
 `Tallyable`, which `Ledger` includes.
-  def self.counted_name: (untyped) -> untyped
+  def self.counted_name: (untyped) -> AnsweredByItsDef[::Tallyable::ClassMethods]
 end
 "
         );
@@ -644,6 +759,45 @@ end
     ///
     /// A block that is not written out reaches none of them, and an `include` cannot name a
     /// `class`.
+    /// Only a bare `included do` or `prepended do` in a module body runs on the includers: not a
+    /// call with no block or a stored one, not somebody else's method, not a class's body.
+    #[test]
+    fn a_block_the_concern_evaluates_on_its_includers_is_said_to_run_elsewhere() {
+        let starts = |source: &str| {
+            let parsed = ruby_prism::parse(source.as_bytes());
+            let program = parsed.node();
+            let first = program
+                .as_program_node()
+                .and_then(|program| program.statements().body().iter().next())
+                .expect("one body");
+            let (body, module) = match first.as_module_node() {
+                Some(module) => (module.body(), true),
+                None => (first.as_class_node().expect("a class").body(), false),
+            };
+            let statements = body
+                .and_then(|body| body.as_statements_node())
+                .expect("statements");
+            super::evaluated_elsewhere(&statements, module)
+        };
+        let source = "\
+module M
+  included do
+  end
+  prepended do
+  end
+  included
+  Other.included do
+  end
+  included(&:stored)
+  validates :title do
+  end
+end
+";
+        let at = |needle: &str| source.find(needle).unwrap() as u32;
+        assert_eq!(starts(source), vec![at("included do"), at("prepended do")]);
+        assert!(starts("class M\n  included do\n  end\nend\n").is_empty());
+    }
+
     #[test]
     fn an_included_block_that_extends_nothing_installs_nothing() {
         for source in [

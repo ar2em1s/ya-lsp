@@ -49,23 +49,73 @@ pub const ENTRYPOINTS: ListId = ListId("rails.entrypoints");
 /// routes, as [`rails::is_schema`] does for schemas. Files a routes file *draws* are not on this
 /// list: only the drawing file says which they are.
 pub const ROUTES: ListId = ListId("rails.routes");
-/// The one document named `config/application.rb`, which hosts what the **framework's own
-/// singletons** return: `Rails.root`, `Rails.cache`, `Rails.application`, `Time.zone`.
+/// The one document named `config/application.rb`, read for the one thing only it says: the
+/// `class < Rails::Application` that `Rails.application` is an instance of.
 ///
-/// **Its generator reads almost nothing from the file.** Those returns belong to the framework, not
-/// to any document, so this list answers *where to write them*, not *what to read*.
-/// `config/application.rb` is the honest host:
-///
-/// - every Rails application has it and no other kind of project does (the same marker
-///   [`Features::resolve`](crate::workspace::Features::resolve) detects `auto` by)
-/// - the one thing the generator does read is in it: the `class < Rails::Application` that
-///   `Rails.application` is an instance of
+/// **It hosts nothing.** It once hosted every framework row, which made the rows depend on the
+/// project being an application: an engine or a gem monorepo got none. Each row is now hosted on the
+/// file declaring the class or module it is on, the component's own (see
+/// `Rails::framework_declarations`).
 ///
 /// A full path, not a suffix: `app/models/application.rb` is a common model file.
 pub const FRAMEWORK: ListId = ListId("rails.framework");
+/// Documents that move Rails' time-zone default ([`rails::TIME_ZONE_SETTINGS`]).
+///
+/// **Membership is the whole fact**, so nothing on it is read: while the list is empty, a
+/// `datetime` column is the `ActiveSupport::TimeWithZone` Rails' railtie makes it, and once a file
+/// writes one of the settings, which class it holds is a value this pass does not follow.
+pub const ZONES: ListId = ListId("rails.zones");
 
-/// The seven lists, one row each.
-static WANTS: [Wants; 7] = [
+/// Documents that name an engine: `engine_name` and `isolate_namespace`, which say the helper Rails
+/// defines where it is mounted (`spree.admin_orders_path`). Read by the routes generator, which
+/// declares each on the route helpers; nothing is declared from this list alone.
+pub const ENGINES: ListId = ListId("rails.engines");
+
+/// Documents that may register a connection adapter: a gem's `*adapter.rb` files, where every
+/// adapter gem read writes its `ActiveRecord::ConnectionAdapters.register` and its class
+/// (`activerecord-postgis-adapter.rb`, `sqlserver_adapter.rb`). Read only, for
+/// [`rails::Resolver`].
+pub const ADAPTERS: ListId = ListId("rails.adapters");
+
+/// Documents that call `config` or `configuration`, where a project assigns its own settings
+/// (`Rails.configuration.dispatcher = …`): [`rails::read_config_writes`].
+pub const CONFIGURED: ListId = ListId("rails.configured");
+
+/// The eleven lists, one row each.
+static WANTS: [Wants; 11] = [
+    Wants {
+        list: CONFIGURED,
+        calls: &["config", "configuration"],
+        constants: &[],
+        modules: &[],
+        defines: &[],
+        path: None,
+        spells: &[],
+        tags: false,
+        inherits: false,
+        // an engine's `initializer` writes `app.config.<name>` for the application it is loaded into
+        engines: true,
+        gems: false,
+        reads_only: false,
+        buffers: false,
+    },
+    Wants {
+        list: ADAPTERS,
+        calls: &[],
+        constants: &[],
+        modules: &[],
+        defines: &[],
+        path: Some("adapter.rb"),
+        spells: &[],
+        tags: false,
+        inherits: false,
+        // an adapter is a gem's, or the application's own; an engine names none
+        engines: false,
+        gems: true,
+        // what it registers decides which class a connection is, declared elsewhere
+        reads_only: true,
+        buffers: false,
+    },
     Wants {
         list: SCHEMAS,
         calls: &[],
@@ -73,12 +123,14 @@ static WANTS: [Wants; 7] = [
         modules: &[],
         defines: &[],
         path: Some("schema.rb"),
+        spells: &[],
         tags: false,
         inherits: false,
         // an engine ships migrations, never a `schema.rb`, and gate 1 does not walk a gem's `db/`
         engines: false,
         gems: false,
         reads_only: false,
+        buffers: false,
     },
     Wants {
         list: RENAMED,
@@ -87,6 +139,7 @@ static WANTS: [Wants; 7] = [
         modules: &[],
         defines: &["table_name_prefix", "table_name_suffix"],
         path: None,
+        spells: &[],
         tags: false,
         inherits: false,
         // the input to a generator that is itself closed
@@ -95,6 +148,7 @@ static WANTS: [Wants; 7] = [
         // and it declares nothing on its own: it renames a table for a schema that has to exist
         // somewhere else
         reads_only: true,
+        buffers: false,
     },
     Wants {
         list: MODELS,
@@ -103,12 +157,14 @@ static WANTS: [Wants; 7] = [
         modules: &[],
         defines: &[],
         path: None,
+        spells: &[],
         tags: false,
         inherits: false,
         // `has_many` on `ActiveStorage::Blob` is a member of a class the user names
         engines: true,
         gems: false,
         reads_only: false,
+        buffers: false,
     },
     Wants {
         list: CONCERNS,
@@ -117,6 +173,7 @@ static WANTS: [Wants; 7] = [
         modules: &[rails::CLASS_METHODS],
         defines: &[],
         path: None,
+        spells: &[],
         tags: false,
         inherits: false,
         // a concern's class methods are members of whatever includes it, which is a class the
@@ -126,6 +183,7 @@ static WANTS: [Wants; 7] = [
         // `ClassMethods` holds `validates`, which every model in the project calls
         gems: true,
         reads_only: false,
+        buffers: false,
     },
     Wants {
         list: ENTRYPOINTS,
@@ -134,12 +192,14 @@ static WANTS: [Wants; 7] = [
         modules: &[],
         defines: &[],
         path: None,
+        spells: &[],
         tags: false,
         inherits: true,
         // `ActiveStorage::AnalyzeJob` really does get `perform_later`
         engines: true,
         gems: false,
         reads_only: false,
+        buffers: false,
     },
     Wants {
         list: ROUTES,
@@ -148,6 +208,7 @@ static WANTS: [Wants; 7] = [
         modules: &[],
         defines: &[],
         path: Some("routes.rb"),
+        spells: &[],
         tags: false,
         inherits: false,
         // an engine's `config/routes.rb` may name the *host application's* helpers, and
@@ -155,6 +216,7 @@ static WANTS: [Wants; 7] = [
         engines: true,
         gems: false,
         reads_only: false,
+        buffers: false,
     },
     Wants {
         list: FRAMEWORK,
@@ -163,6 +225,7 @@ static WANTS: [Wants; 7] = [
         modules: &[],
         defines: &[],
         path: Some("config/application.rb"),
+        spells: &[],
         tags: false,
         inherits: false,
         // an engine has no `config/application.rb`, and the application it is loaded into does:
@@ -170,6 +233,43 @@ static WANTS: [Wants; 7] = [
         engines: false,
         gems: false,
         reads_only: false,
+        buffers: false,
+    },
+    Wants {
+        list: ZONES,
+        calls: &rails::TIME_ZONE_SETTINGS,
+        constants: &[],
+        modules: &[],
+        defines: &[],
+        path: None,
+        spells: &[],
+        tags: false,
+        inherits: false,
+        // the application's configuration and its own models; an engine or a gem that turned the
+        // default off would be turning it off for an application it does not own
+        engines: false,
+        gems: false,
+        // and it declares nothing: it decides what the schema's columns are
+        reads_only: true,
+        buffers: false,
+    },
+    Wants {
+        list: ENGINES,
+        calls: &["engine_name", "isolate_namespace"],
+        constants: &[],
+        modules: &[],
+        defines: &[],
+        path: None,
+        spells: &[],
+        tags: false,
+        inherits: false,
+        // the project's own engines, which its routes files draw for; a gem's is mounted, and so
+        // named, only by an application's `mount`, which is not read
+        engines: false,
+        gems: false,
+        // the routes generator declares from it, and only where there are routes
+        reads_only: true,
+        buffers: false,
     },
 ];
 
@@ -191,6 +291,12 @@ struct Wanted {
     schema: Option<bool>,
     names: bool,
     entrypoints: bool,
+    /// A gem's `*adapter.rb`, for the connection adapters it registers.
+    adapters: bool,
+    /// The application's `config/database.yml`.
+    database: bool,
+    /// A file that may assign a setting of the project's own.
+    configured: bool,
 }
 
 /// One source file as this module's readers last saw it, and the evidence it has not changed.
@@ -206,6 +312,10 @@ pub struct Source {
     pub schema: Option<Arc<rails::Schema>>,
     pub names: Option<Arc<rails::TableNames>>,
     pub entrypoints: Option<Arc<rails::Entrypoints>>,
+    pub registered: Option<Arc<rails::Registered>>,
+    pub database: Option<Arc<rails::DatabaseConfig>>,
+    /// The settings it assigns ([`rails::read_config_writes`]).
+    pub configured: Option<Arc<Vec<(String, At)>>>,
 }
 
 impl Source {
@@ -229,6 +339,15 @@ impl Source {
             entrypoints: wanted
                 .entrypoints
                 .then(|| Arc::new(rails::read_entrypoints(source))),
+            registered: wanted
+                .adapters
+                .then(|| Arc::new(rails::read_registered(source))),
+            database: wanted
+                .database
+                .then(|| Arc::new(rails::read_database_config(source))),
+            configured: wanted
+                .configured
+                .then(|| Arc::new(rails::read_config_writes(source))),
         }
     }
 }
@@ -251,6 +370,31 @@ pub struct Rails {
 }
 
 impl Rails {
+    /// Every `config.<name> =` a file writes, where the bundle declares the class that keeps it.
+    fn setting_declarations(&self, declaring: &Declaring<'_>, into: &mut Declared) -> usize {
+        if !declaring
+            .context
+            .namespaces
+            .declares(rails::RAILTIE_CONFIGURATION)
+        {
+            return 0;
+        }
+        let mut settings = 0;
+        for uri in declaring.context.documents(CONFIGURED) {
+            let (Some(source), Some(document)) =
+                (self.sources.get(uri), DocUri::from_graph_uri(uri))
+            else {
+                continue;
+            };
+            let Some(writes) = source.configured.as_deref() else {
+                continue;
+            };
+            settings += writes.len();
+            super::add(into, &document, rails::config_facts(writes, &source.name));
+        }
+        settings
+    }
+
     /// What this module last parsed of one document, or nothing.
     #[must_use]
     pub fn source(&self, uri: &str) -> Option<&Source> {
@@ -276,23 +420,52 @@ impl Rails {
         declaring: &Declaring<'_>,
         models: &[(DocUri, String, Arc<rails::Model>)],
     ) -> Views {
-        if declaring.features.views {
-            view_context(declaring.context, models)
+        let views = if declaring.features.views {
+            view_context(
+                declaring.context,
+                models,
+                self.template_paths(declaring.context),
+            )
         } else {
             Views::default()
-        }
+        };
+        let (callbacks, loose) = controller_callbacks(models);
+        views.with_callbacks(callbacks, loose)
     }
 
-    fn schema_dumps(reading: &Reading<'_>) -> Vec<DocUri> {
-        let Ok(entries) = std::fs::read_dir(reading.root.join("db")) else {
-            return Vec::new();
-        };
-        entries
+    /// Every mailer that wrote `default template_path:`, and where to, from the entry-point reader,
+    /// which opens every mailer by its superclass. A class two files reopen keeps the later file's.
+    fn template_paths(&self, context: &Context) -> BTreeMap<String, rails::TemplatePath> {
+        let mut moved = BTreeMap::new();
+        for key in context.documents(ENTRYPOINTS) {
+            let Some(entrypoints) = self
+                .sources
+                .get(key)
+                .and_then(|held| held.entrypoints.as_ref())
+            else {
+                continue;
+            };
+            for (mailer, setting) in entrypoints.template_paths() {
+                moved.insert(mailer.to_owned(), setting.clone());
+            }
+        }
+        moved
+    }
+
+    /// The files this module reads that are not graph documents: every `db/*structure.sql`, and
+    /// the application's `config/database.yml`.
+    fn unindexed(reading: &Reading<'_>) -> Vec<DocUri> {
+        let dumps = std::fs::read_dir(reading.root.join("db"))
+            .into_iter()
+            .flatten()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| {
-                reading.features.schema && rails::is_structure(path) && (reading.admits)(path)
-            })
+            .filter(|path| reading.features.schema && rails::is_structure(path));
+        let database = Some(reading.root.join("config").join("database.yml"))
+            .filter(|path| reading.features.rails && path.is_file());
+        dumps
+            .chain(database)
+            .filter(|path| (reading.admits)(path))
             .filter_map(|path| DocUri::from_path(&path))
             .collect()
     }
@@ -339,6 +512,8 @@ impl Rails {
         &self,
         declaring: &Declaring<'_>,
         retyped: &BTreeMap<String, BTreeSet<String>>,
+        defined: &BTreeMap<String, BTreeSet<String>>,
+        (recast, picked): (&Recast, &mut rails::Picked),
         into: &mut Declared,
     ) -> usize {
         // Every schema before any writes a line, because the ambiguity rule below is about tables
@@ -383,13 +558,39 @@ impl Rails {
         let mut tables = self.model_tables(declaring.context);
         tables.retain(|table, _| once.get(table.as_str()) == Some(&1));
 
+        let zoned = declaring.context.documents(ZONES).is_empty();
         let mut columns = 0;
         for (uri, name, schema) in &schemas {
-            let facts = schema.signatures(name, &tables, retyped);
+            let mut facts = schema.signatures(name, &tables, retyped, zoned);
+            schema.attribute_methods(name, &tables, retyped, defined, zoned, &mut facts);
+            // What `pick` hands back per column, for the relation classes the models write.
+            schema.picked(&tables, &recast.on, &recast.anywhere, zoned, picked);
             columns += facts.len();
             super::add(into, uri, facts);
         }
         columns
+    }
+
+    /// Which adapter class a connection is: the registrations on [`ADAPTERS`], the drivers the
+    /// bundle declares, the application's `config/database.yml`, and whether this is an
+    /// application at all (its `config/application.rb`), since an engine is connected by its host.
+    fn resolver(&self, declaring: &Declaring<'_>) -> rails::Resolver {
+        let context = declaring.context;
+        let registered: Vec<Arc<rails::Registered>> = context
+            .documents(ADAPTERS)
+            .iter()
+            .filter_map(|key| self.sources.get(key)?.registered.clone())
+            .collect();
+        let config = projection_of(context)
+            .dumps
+            .iter()
+            .find_map(|uri| self.sources.get(uri.as_str())?.database.clone());
+        rails::Resolver::new(
+            &registered.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+            &|driver| context.namespaces.declares(driver),
+            config.map(|config| (*config).clone()),
+            !context.documents(FRAMEWORK).is_empty(),
+        )
     }
 
     /// Every file on the model list, read and parsed once.
@@ -434,7 +635,8 @@ impl Rails {
         &self,
         declaring: &Declaring<'_>,
         models: &[(DocUri, String, Arc<rails::Model>)],
-        columns: &BTreeSet<(String, String)>,
+        (columns, picked): (&BTreeSet<(String, String)>, &rails::Picked),
+        resolver: &rails::Resolver,
         into: &mut Declared,
     ) -> usize {
         // A class gets a relation class for either of two reasons:
@@ -479,7 +681,7 @@ impl Rails {
                 !declaring
                     .context
                     .classes
-                    .contains(&rails::relation_of(element))
+                    .contains(&crate::generated::collection_of(element))
             })
             // A name **rubydex invented** is not a constant path, and a generated declaration on
             // one costs the whole document (see `generated::is_constant_path`). An anonymous
@@ -567,6 +769,9 @@ impl Rails {
             }
         }
 
+        let current = inheriting(&declaring.context.superclasses, |written| {
+            written.trim_start_matches("::") == rails::CURRENT_ATTRIBUTES
+        });
         let mut members = 0;
         for (at, (uri, name, model)) in models.iter().enumerate() {
             let mut facts = model.signatures(
@@ -581,10 +786,25 @@ impl Rails {
                     includers: &declaring.context.includers,
                     namespaces: &declaring.context.namespaces,
                     columns,
+                    zoned: declaring.context.documents(ZONES).is_empty(),
+                    picked,
+                    current: &current,
                 },
             );
+            // Each class's own `connects_to` or `establish_connection`, on its class object.
+            for (class, connection) in model.connections() {
+                if let Some(adapter) = resolver.connection(connection) {
+                    rails::connection_rows(
+                        &mut facts,
+                        (name, class),
+                        &adapter,
+                        connection,
+                        &declaring.context.namespaces,
+                    );
+                }
+            }
             if shared == Some(at) {
-                rails::relation_base(&mut facts);
+                rails::relation_base(&mut facts, &projection_of(declaring.context).framework);
             }
             members += facts.len();
             super::add(into, uri, facts);
@@ -694,34 +914,92 @@ impl Rails {
         members
     }
 
-    /// What the framework's own singletons return.
+    /// What the framework's own singletons return, and what a controller and a template call on
+    /// themselves.
     ///
-    /// Its facts belong to the **framework**, not to the file it is keyed by, so it writes them
-    /// once. The host is `config/application.rb`, the first in URI order if a workspace holds two:
-    /// arbitrary but deterministic, which is enough because nothing it declares is mapped to a
-    /// file. `Rails.root` is really declared in railties and `Time.zone` in activesupport; only
-    /// their return types are written here, so those declarations keep their places.
+    /// **Each owner's rows are hosted on the file that declares that owner**, the component's own:
+    /// railties' `module Rails`, actionpack's `ActionController::Metal`. So they are written
+    /// wherever that component is indexed, an application, an engine or a gem monorepo alike, and
+    /// never where it is not. Nothing they declare is mapped to a file, so the host only names the
+    /// generated document.
     ///
-    /// The one thing read from the document is its `class < Rails::Application`, which
-    /// `Rails.application` is an instance of. Without one (or with the class written somewhere this
-    /// list does not reach), it falls back to [`rails::APPLICATION`](crate::workspace::rails) and
-    /// loses only the members the project hung off its own class.
-    fn framework_declarations(&self, declaring: &Declaring<'_>, into: &mut Declared) -> usize {
-        let Some(uri) = declaring
+    /// `config/application.rb` is still read, for the one thing only it says: the
+    /// `class < Rails::Application` that `Rails.application` is an instance of. Without one it
+    /// falls back to [`rails::APPLICATION`](crate::workspace::rails) and loses only the members the
+    /// project hung off its own class.
+    ///
+    /// **A migration's rows ride on the same graph question**
+    /// ([`rails::read_migrations`](crate::workspace::rails)): the statement and column modules are
+    /// asked for beside the owners, since each question walks every definition in the graph. Those
+    /// rows are placed in the files they were read from, so the file declaring the module is also
+    /// the one it is read out of. The second count is theirs.
+    fn framework_declarations(
+        &self,
+        declaring: &Declaring<'_>,
+        connection: Option<&str>,
+        into: &mut Declared,
+    ) -> (usize, usize) {
+        // The umbrella, asked here because nothing else gates this generator: the host list it
+        // once needed is only read for the application's class now. [`Self::wanted`] says why the
+        // umbrella and no key of its own.
+        if !declaring.features.rails {
+            return (0, 0);
+        }
+        let application = declaring
             .context
             .documents(FRAMEWORK)
             .iter()
             .filter_map(|uri| DocUri::from_graph_uri(uri))
             .min_by(|left, right| left.as_str().cmp(right.as_str()))
-        else {
-            return 0;
-        };
-        let application =
-            (declaring.text)(&uri).and_then(|source| rails::application_class(&source));
-        let facts = rails::read_framework(application.as_deref(), &declaring.context.namespaces);
-        let declared = facts.len();
-        super::add(into, &uri, facts);
-        declared
+            .and_then(|uri| (declaring.text)(&uri))
+            .and_then(|source| rails::application_class(&source));
+        // Every helper module the application writes, which a controller's `helpers` holds.
+        let helpers: Vec<String> = projection_of(declaring.context)
+            .helpers
+            .iter()
+            .cloned()
+            .collect();
+        let by_owner = rails::read_framework(
+            application.as_deref(),
+            &helpers,
+            connection,
+            &declaring.context.namespaces,
+        );
+        let sources = rails::migration_sources();
+        let hosts = (declaring.declares)(
+            &by_owner
+                .keys()
+                .chain(&sources)
+                .map(|owner| (*owner).to_owned())
+                .collect(),
+        );
+        let mut declared = 0;
+        for (owner, facts) in by_owner {
+            // Declared by the bundle, or the row would not be here, so a host is found; a name the
+            // pass cannot place in a file is left unsaid rather than put somewhere else.
+            if let Some(uri) = hosts.get(owner) {
+                declared += facts.len();
+                super::add(into, uri, facts);
+            }
+        }
+        let mut forwarded = 0;
+        for module in sources {
+            let Some((uri, text)) = hosts
+                .get(module)
+                .and_then(|uri| Some((uri, (declaring.text)(uri)?)))
+            else {
+                continue;
+            };
+            let facts = rails::read_migrations(
+                &text,
+                module,
+                &(declaring.caption)(uri),
+                &declaring.context.namespaces,
+            );
+            forwarded += facts.len();
+            super::add(into, uri, facts);
+        }
+        (declared, forwarded)
     }
 
     /// What a mailer's actions and a job's `perform` install on the class side.
@@ -802,6 +1080,9 @@ impl Rails {
         if mains.is_empty() {
             return 0;
         }
+        let proxied = projection_of(declaring.context)
+            .framework
+            .contains(rails::ROUTES_PROXY);
         let mut sources: Vec<(DocUri, String, rails::Routes)> = Vec::new();
         for uri in mains {
             let Some(source) = (declaring.text)(&uri) else {
@@ -859,12 +1140,56 @@ impl Rails {
             let mut facts = routes.signatures(name, emit);
             // The `include`s go in one document, the first, for the `MessageDelivery` stub's
             // reason: they belong to the *application*, not to any routes file, and N copies would
-            // be N identical declarations.
+            // be N identical declarations. So do `main_app` and what a proxy answers, where the
+            // bundle declares the proxy.
             if index == 0 {
                 facts.extend(rails::mixins(&projection_of(declaring.context).hosts));
+                if proxied {
+                    facts.extend(rails::proxies());
+                }
             }
             helpers += facts.len();
             super::add(into, uri, facts);
+        }
+        if proxied {
+            helpers += Self::mounted_helpers(declaring, into);
+        }
+        helpers
+    }
+
+    /// The helper each of the project's engines defines where it is mounted, in the engine's own
+    /// document, placed at the call that names it. The first engine to claim a name keeps it, in
+    /// URI order, as a route helper does.
+    fn mounted_helpers(declaring: &Declaring<'_>, into: &mut Declared) -> usize {
+        let context = declaring.context;
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        let mut helpers = 0;
+        for uri in context.documents(ENGINES) {
+            let Some(uri) = DocUri::from_graph_uri(uri) else {
+                continue;
+            };
+            let Some(source) = (declaring.text)(&uri) else {
+                continue;
+            };
+            let file = (declaring.caption)(&uri);
+            let mut facts = Facts::default();
+            for engine in rails::read_engines(&source) {
+                // `isolate_namespace` names the module its constant resolves to, which is the one
+                // the application declares.
+                let name = match &engine.name {
+                    rails::EngineName::Written(name) => Some(name.clone()),
+                    rails::EngineName::Isolated(candidates) => candidates
+                        .iter()
+                        .find(|candidate| context.classes.contains(*candidate))
+                        .and_then(|module| rails::engine_prefix(module))
+                        .map(|prefix| prefix.trim_end_matches('_').to_owned()),
+                };
+                if let Some(name) = name.filter(|name| named.insert(name.clone())) {
+                    facts.declare(rails::mounted_helper(&file, &name, &engine));
+                }
+            }
+            helpers += facts.len();
+            super::add(into, &uri, facts);
         }
         helpers
     }
@@ -929,7 +1254,7 @@ impl Rails {
     /// The rule "a table two classes claim is claimed by neither" guards against one thing: the
     /// inflector landing two *different* names on one table, where at most one can be right. It
     /// must not catch the same convention applied twice: `Account` and
-    /// `Mastodon::CLI::Maintenance::Account` both really read `accounts`.
+    /// `Admin::CLI::Maintenance::Account` both really read `accounts`.
     ///
     /// So several claimants are kept when they all **demodulize to the same name**. A table two
     /// *different* names reach is still claimed by neither.
@@ -1057,10 +1382,18 @@ impl Rails {
     }
 }
 
-fn view_context(context: &Context, models: &[(DocUri, String, Arc<rails::Model>)]) -> Views {
+fn view_context(
+    context: &Context,
+    models: &[(DocUri, String, Arc<rails::Model>)],
+    template_paths: BTreeMap<String, rails::TemplatePath>,
+) -> Views {
     let mut exports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut included: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut layouts: BTreeMap<String, rails::Layout> = BTreeMap::new();
     for (_, _, model) in models {
+        for (owner, layout) in model.layouts() {
+            layouts.insert(owner.to_owned(), layout.clone());
+        }
         for (owner, names) in model.exports() {
             exports
                 .entry(owner.to_owned())
@@ -1085,7 +1418,28 @@ fn view_context(context: &Context, models: &[(DocUri, String, Arc<rails::Model>)
         exports,
         included,
         mailers,
+        layouts,
+        template_paths,
     )
+}
+
+/// What every body runs before a controller's actions, and the callback calls no body holds, from
+/// every file the model reader opened. A body two files reopen keeps both files' calls.
+fn controller_callbacks(
+    models: &[(DocUri, String, Arc<rails::Model>)],
+) -> (BTreeMap<String, rails::Callbacks>, rails::Callbacks) {
+    let mut callbacks: BTreeMap<String, rails::Callbacks> = BTreeMap::new();
+    let mut loose = rails::Callbacks::default();
+    for (_, _, model) in models {
+        for (owner, said) in model.callbacks() {
+            let held = callbacks.entry(owner.to_owned()).or_default();
+            held.before.extend(said.before.iter().cloned());
+            held.skips.extend(said.skips.iter().cloned());
+            held.named.extend(said.named.iter().cloned());
+        }
+        rails::absorb_callbacks(&mut loose, model.loose_callbacks());
+    }
+    (callbacks, loose)
 }
 
 /// Every ActiveRecord model, found by climbing what each class says it inherits.
@@ -1103,8 +1457,64 @@ fn view_context(context: &Context, models: &[(DocUri, String, Arc<rails::Model>)
 /// a real model whose base is in a gem, and this answers `false` for it. That is why the relation
 /// set is a **union** with what the macros ask for, not a replacement: dropping those classes'
 /// relation classes would make answers worse, not absent.
+/// Every class whose primary key may not be its table's: each class that writes
+/// `self.primary_key =` or `def self.primary_key`, every includer of a module that does, and every
+/// class below any of them, since a subclass inherits the key. `ids` is typed for none of them.
+fn rekeyed<'a>(
+    models: impl Iterator<Item = &'a (DocUri, String, Arc<rails::Model>)>,
+    includers: &BTreeMap<String, BTreeSet<String>>,
+    superclasses: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let mut moved: BTreeSet<String> = BTreeSet::new();
+    for (_, _, model) in models {
+        for (name, module) in model.rekeyed() {
+            if module {
+                moved.extend(includers.get(name).into_iter().flatten().cloned());
+            } else {
+                moved.insert(name.to_owned());
+            }
+        }
+    }
+    if moved.is_empty() {
+        return moved;
+    }
+    let below: Vec<String> = superclasses
+        .keys()
+        .filter(|name| {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            let mut current = name.as_str();
+            while seen.insert(current) {
+                if moved.contains(current) {
+                    return true;
+                }
+                let Some(next) = superclasses.get(current).and_then(|written| {
+                    candidates(current, written)
+                        .into_iter()
+                        .find_map(|candidate| superclasses.get_key_value(&candidate))
+                }) else {
+                    return false;
+                };
+                current = next.0;
+            }
+            false
+        })
+        .cloned()
+        .collect();
+    moved.extend(below);
+    moved
+}
+
 fn models_of(superclasses: &BTreeMap<String, String>) -> BTreeSet<String> {
-    let mut models: BTreeSet<String> = BTreeSet::new();
+    inheriting(superclasses, rails::is_record_base)
+}
+
+/// Every class whose superclass chain, as [`models_of`] climbs it, reaches a superclass `stops`
+/// accepts as written.
+fn inheriting(
+    superclasses: &BTreeMap<String, String>,
+    stops: impl Fn(&str) -> bool,
+) -> BTreeSet<String> {
+    let mut found: BTreeSet<String> = BTreeSet::new();
     for name in superclasses.keys() {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         let mut current = name.as_str();
@@ -1112,8 +1522,8 @@ fn models_of(superclasses: &BTreeMap<String, String>) -> BTreeSet<String> {
             let Some(written) = superclasses.get(current) else {
                 break;
             };
-            if rails::is_record_base(written) {
-                models.insert(name.clone());
+            if stops(written) {
+                found.insert(name.clone());
                 break;
             }
             // The candidate list is owned and `current` outlives it, so the name it walks on to
@@ -1127,7 +1537,7 @@ fn models_of(superclasses: &BTreeMap<String, String>) -> BTreeSet<String> {
             current = next;
         }
     }
-    models
+    found
 }
 
 /// The class a model's class side goes on: the topmost model in its own superclass chain.
@@ -1213,6 +1623,56 @@ fn declared_members(generated: &Declared) -> BTreeSet<(String, String)> {
 /// A typed `attribute` travels the same way, because Rails documents that a cast type "will
 /// override the type of existing attributes if needed". Only types this crate has a class for
 /// are here, so `attribute :payload, :json` leaves `t.string "payload"` answering as before.
+/// Every instance method each model class's own file writes with `def`, for the schema's attribute
+/// methods to defer to.
+fn defined_members(
+    models: &[(DocUri, String, Arc<rails::Model>)],
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut defined: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (_, _, model) in models {
+        for (class, name) in model.defined_members() {
+            defined
+                .entry(class.to_owned())
+                .or_default()
+                .insert(name.to_owned());
+        }
+    }
+    defined
+}
+
+/// The columns `pick` must not answer for: per class, and by name on every class.
+///
+/// `Model::recast_columns` of every file on either list. A module's names go in the second half,
+/// since the classes it re-types are its includers, and a concern's `serialize :preferences`
+/// can reach any of them.
+struct Recast {
+    on: BTreeMap<String, BTreeSet<String>>,
+    anywhere: BTreeSet<String>,
+}
+
+fn recast_columns<'a>(
+    models: impl Iterator<Item = &'a (DocUri, String, Arc<rails::Model>)>,
+) -> Recast {
+    let mut recast = Recast {
+        on: BTreeMap::new(),
+        anywhere: BTreeSet::new(),
+    };
+    for (_, _, model) in models {
+        for (host, column, module) in model.recast_columns() {
+            if module {
+                recast.anywhere.insert(column.to_owned());
+            } else {
+                recast
+                    .on
+                    .entry(host.to_owned())
+                    .or_default()
+                    .insert(column.to_owned());
+            }
+        }
+    }
+    recast
+}
+
 fn retyped_columns(
     models: &[(DocUri, String, Arc<rails::Model>)],
 ) -> BTreeMap<String, BTreeSet<String>> {
@@ -1257,9 +1717,9 @@ impl super::Knowledge for Rails {
 
     /// Whether this project asked for the body of knowledge a list feeds.
     ///
-    /// Seven rows, five keys: [`SCHEMAS`] and [`RENAMED`] are one family (a `schema.rb` and the
-    /// macros that rename its tables), and [`MODELS`] and [`CONCERNS`] are the same macros seen
-    /// from either side. [`Features::resolve`](crate::workspace::Features::resolve) already folds
+    /// Nine rows, five keys: [`SCHEMAS`], [`RENAMED`] and [`ZONES`] are one family (a
+    /// `schema.rb`, the macros that rename its tables and the settings that decide its time
+    /// columns), and [`MODELS`] and [`CONCERNS`] are the same macros seen from either side. [`Features::resolve`](crate::workspace::Features::resolve) already folds
     /// `rails.enabled` into every Rails flag, so nothing here asks twice.
     ///
     /// **[`FRAMEWORK`] has no key of its own; the umbrella gates it.** Every other key lets a
@@ -1269,11 +1729,11 @@ impl super::Knowledge for Rails {
     /// are checked against the graph first.
     fn wanted(&self, list: ListId, features: Features) -> bool {
         match list {
-            SCHEMAS | RENAMED => features.schema,
+            SCHEMAS | RENAMED | ZONES => features.schema,
             MODELS | CONCERNS => features.models,
-            ROUTES => features.routes,
+            ROUTES | ENGINES => features.routes,
             ENTRYPOINTS => features.entrypoints,
-            FRAMEWORK => features.rails,
+            FRAMEWORK | ADAPTERS | CONFIGURED => features.rails,
             _ => false,
         }
     }
@@ -1293,12 +1753,18 @@ impl super::Knowledge for Rails {
     /// reopens Ruby's `class Time`, and the render key is `(is_module, name)`.
     fn spellable_names(&self) -> Vec<&'static str> {
         let mut names = rails::framework_classes();
-        names.extend(rails::singleton_classes());
+        names.extend(rails::framework_constants());
+        names.extend(rails::migration_constants());
+        names.extend(rails::adapter_constants());
         names.push(rails::MESSAGE_DELIVERY);
         names.push(rails::ROUTE_HELPERS);
         names.push(rails::RELATION_BASE);
         names.push(rails::RECORD_BASE);
         names
+    }
+
+    fn shown(&self) -> &'static [(&'static str, &'static str)] {
+        &rails::SHOWN
     }
 
     /// Five projections, each a fold over what the walk already saw.
@@ -1414,11 +1880,18 @@ impl super::Knowledge for Rails {
         context.documents.entry(MODELS).or_default().extend(joining);
     }
 
-    /// What a directory conjures that nothing else declares.
+    /// What a directory conjures that no `class` declares.
     ///
-    /// A directory conjures a name only where **nothing else declares it**: a `user.rb` beside the
-    /// `user/` directory, a `module Chat` in a plugin, a gem. So the filter runs here, once both
-    /// the application's and the bundle's names are recorded.
+    /// **A directory declares its namespace even where a file does too.** Zeitwerk defines the
+    /// module from the directory whether or not a `module Chat` line exists, so deleting every such
+    /// line leaves the constant, and the files that confirm the directory are places of it too (the
+    /// user's operational test). Their generated bodies sort behind every written one
+    /// (`locator::definitions_of`), so the written lines come first.
+    ///
+    /// **Not where a `class` declares it**: a `user.rb` writing `class User` beside the `user/`
+    /// directory. A directory conjures a `module`, and rubydex holds one declaration per constant,
+    /// so the two kinds would be a coin toss. So the filter runs here, once both the application's
+    /// and the bundle's names are recorded.
     ///
     /// The caller then declares the survivors, which makes every prefix of a conjured name
     /// spellable: `Chat::Thread::Policy` needs `Chat::Thread`, which is either declared already or
@@ -1427,7 +1900,7 @@ impl super::Knowledge for Rails {
         let conjured: Vec<String> = projection_of(context)
             .autoloaded
             .keys()
-            .filter(|name| !context.namespaces.declares(name))
+            .filter(|name| context.namespaces.admits_a_module(name))
             .cloned()
             .collect();
         // And the class side's own base, plus every gem class the long-tail macros install on:
@@ -1450,14 +1923,14 @@ impl super::Knowledge for Rails {
         Some(self.view_context_if_wanted(declaring, &self.model_sources(declaring.context)))
     }
 
-    /// Where Rails writes the query interface: the relation on the instance side, and the four
-    /// class-side bases on the other.
+    /// Where Rails writes the query interface: the relation on the instance side, and the six
+    /// class-side owners on the other.
     fn places_members_on(&self) -> [&'static [&'static str]; 2] {
         [&rails::RAILS_RELATION, &rails::RAILS_CLASS_SIDE]
     }
 
     fn discover(&self, reading: &Reading<'_>) -> Vec<DocUri> {
-        Self::schema_dumps(reading)
+        Self::unindexed(reading)
     }
 
     fn discovered(&mut self, found: Vec<DocUri>) {
@@ -1488,26 +1961,44 @@ impl super::Knowledge for Rails {
     /// The first two travel on `retyped` and `columns`, both private to this module.
     fn declare(&mut self, declaring: &Declaring<'_>, into: &mut Declared) -> Counted {
         let sources = self.model_sources(declaring.context);
+        let concerns = self.concern_sources(declaring.context);
         let retyped = retyped_columns(&sources);
-        let schemas = self.schema_declarations(declaring, &retyped, into);
+        let defined = defined_members(&sources);
+        let recast = recast_columns(sources.iter().chain(&concerns));
+        let mut picked = rails::Picked::default();
+        let schemas =
+            self.schema_declarations(declaring, &retyped, &defined, (&recast, &mut picked), into);
+        // `ids` reads the model's primary key, which a `self.primary_key =` moves.
+        let moved = rekeyed(
+            sources.iter().chain(&concerns),
+            &declaring.context.includers,
+            &declaring.context.superclasses,
+        );
+        picked.keys.retain(|class, _| !moved.contains(class));
         // What the schemas just said, so an untyped `attribute` of the same name can defer to it.
         // The rank already says the column wins (`Source::Column` 4, `Source::Attribute` 7), but
         // `Facts::declare` only settles collisions *inside* one document, and these two are in
         // different ones. So the loser declines, as an `enum` and a `delegate` do.
         let columns = declared_members(into);
-        let models = self.model_declarations(declaring, &sources, &columns, into);
+        let resolver = self.resolver(declaring);
+        let models =
+            self.model_declarations(declaring, &sources, (&columns, &picked), &resolver, into);
         let entrypoints = self.entrypoint_declarations(declaring, into);
         let routes = self.route_declarations(declaring, into);
-        let framework = self.framework_declarations(declaring, into);
-        let concerns = self.concern_sources(declaring.context);
+        let primary = resolver.primary();
+        let (framework, migrations) =
+            self.framework_declarations(declaring, primary.as_deref(), into);
         let installed = self.class_method_declarations(declaring, &concerns, into);
         let extended = self.concern_declarations(declaring, &concerns, into);
+        let settings = self.setting_declarations(declaring, into);
         vec![
+            ("settings a project assigns", settings),
             ("columns", schemas),
             ("members", models),
             ("entry points", entrypoints),
             ("route helpers", routes),
             ("framework returns", framework),
+            ("what a migration sends to its connection", migrations),
             ("class methods a concern installs", installed),
             ("more a concern's `included do` extends", extended),
         ]
@@ -1555,7 +2046,21 @@ impl super::Knowledge for Rails {
             }
         }
         for uri in &projection_of(context).dumps {
-            wants.entry(uri.as_str().to_owned()).or_default().schema = Some(true);
+            let wanted = wants.entry(uri.as_str().to_owned()).or_default();
+            if uri
+                .to_file_path()
+                .is_some_and(|path| rails::is_database_config(&path))
+            {
+                wanted.database = true;
+            } else {
+                wanted.schema = Some(true);
+            }
+        }
+        for uri in context.documents(ADAPTERS) {
+            wants.entry(uri.clone()).or_default().adapters = true;
+        }
+        for uri in context.documents(CONFIGURED) {
+            wants.entry(uri.clone()).or_default().configured = true;
         }
 
         // A file that left every list keeps nothing here. Not an optimisation: the memo is keyed by

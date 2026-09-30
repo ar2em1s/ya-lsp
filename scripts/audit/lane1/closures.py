@@ -7,23 +7,26 @@ stratified draw to land on. A draw of the sample's size reaches none of its site
 
 `self` inside `rule(:colon) { … }` or `scope :recent, -> { … }` is the class object until whoever
 takes the block re-binds it, and every DSL that takes a block does. So a bare name there may be on
-the class object or on an instance. `locator`'s closure rung answers the second, with a card reading
-*Found on an instance of `X`*. `completion` at the same cursor must then offer that instance's
-members too; otherwise the card names a member the list beside it lacks.
+the class object or on an instance. `locator`'s closure rung answers the second (and a signature
+that rebinds the block's `self` does the same), with a card naming an instance member,
+`Owner#name`. `completion` at the same cursor must then offer that instance's members too;
+otherwise the card names a member the list beside it lacks.
 
-# The footnote is the filter, so the scan may be crude
+# The card is the filter, so the scan may be crude
 
 The scan is a floor, not a census. It reaches a macro call opening a block at two-space indentation,
 in a file whose first construct is a `class` or `module`: RuboCop's layout, not Ruby's grammar. That
 is deliberate.
-- **The server's own sentence decides whether a candidate counts.** A card carrying the closure
-  footnote is `locator` saying the rung fired, which means the class object holds no such name.
+- **The server's own answer decides whether a candidate counts.** At a bare word written straight
+  into a class body's block, rubydex's own answer is the class object's member (`Owner.name`). A
+  card naming an **instance** member there, and not guessing, is a rung that found the name on an
+  instance: what the list beside it must hold too.
 - A candidate the scan invents costs one pipelined hover and is dropped.
 - A site it misses is not counted, and the number is honest about being a lower bound.
 
-No mask is run, for the same reason: a word in a string or a comment is a candidate the footnote
-throws away, and `ruby.masked` over every `.rb` file in six corpora is the one step here that would
-cost real time.
+No mask is run, for the same reason: a word in a string or a comment is a candidate the card throws
+away, and `ruby.masked` over every `.rb` file in six corpora is the one step here that would cost
+real time.
 
 # The prefix is the word
 
@@ -34,7 +37,7 @@ these cursors, so a key posed there scores the cap. The cursor goes at the end o
 import re
 
 from audit import site
-from audit.answers import card_of
+from audit.answers import GUESSED, card_of
 from audit.client import uri
 from audit.lane1.completion import CONTEXT, IN_FLIGHT, METHOD, rank_of
 from audit.sample import SKIP
@@ -54,12 +57,9 @@ WORD = re.compile(r"^(\s{4,})([a-z_][A-Za-z0-9_]*)")
 KEYWORDS = {"end", "if", "unless", "while", "until", "case", "when", "else", "elsif", "begin",
             "rescue", "ensure", "return", "yield", "def", "do", "then", "in", "and", "or",
             "not", "next", "break", "redo", "retry", "super", "self", "nil", "true", "false"}
-# `hover.rs`' closure footnote, quoted exactly, for `answers.GUESSED`'s reason: a reworded sentence
-# would turn this key off without failing it. `under` says so when the scan finds candidates and the
-# footnote finds none.
-CLOSURE = "Found on an instance of `"
-# The code fence a card opens with, as `Owner#member` or `Owner.member`.
-NAMES = re.compile(r"^```ruby\n(?:private |protected )?.*?[#.]([A-Za-z0-9_?!]+)")
+# The code fence a card opens with, as `Owner#member` (an instance's) or `Owner.member` (the class
+# object's), and which of the two separators it wrote.
+NAMES = re.compile(r"^```ruby\n(?:private |protected )?.*?([#.])([A-Za-z0-9_?!]+)")
 # How many rows a list may hold before an absence is the ceiling talking: `MAX_COMPLETION_ITEMS`.
 CEILING = 512
 # How deep below the opener to look for the first statement.
@@ -123,15 +123,15 @@ def ask(corpus, client, seed, opened=None, drawn=None, answers=None):
     for key, result in client.drain():
         cards[key] = result
 
-    # Only cursors where the server says the rung fired. The card must also *name this word*: a
+    # Only cursors where the card names this word as an instance's member and does not guess: a
     # hover that landed on something else is the scan's mistake, not the server's.
     fired = []
     for index, (path, line, column, word) in enumerate(rows):
         card = card_of(cards.get((index, "closure-hover")))
-        if not card or CLOSURE not in card:
+        if not card or any(mark in card for mark in GUESSED):
             continue
         named = NAMES.match(card)
-        if not named or named.group(1) != word:
+        if not named or named.group(1) != "#" or named.group(2) != word:
             continue
         fired.append((index, path, line, column, word))
 
@@ -189,8 +189,8 @@ summary = line
 def under(counts):
     out = []
     if counts.get("scanned") and not counts.get("answered"):
-        out.append("no candidate carried the closure footnote — if the scan found any, "
-                   "`hover.rs`'s sentence has been reworded and this key is reading nothing")
+        out.append("no candidate was answered with an instance's member — if the scan found "
+                   "any, the rung stopped firing or the card's spelling changed")
     if counts.get("capped"):
         out.append(f"{counts['capped']} not read — the list came back at the {CEILING}-row "
                    f"ceiling, so an absence there is the cap and not the candidate set")

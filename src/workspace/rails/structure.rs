@@ -140,7 +140,7 @@ const MODIFIERS: [&str; 7] = [
 /// `tinyint(1)` and `t.integer limit: 1` becomes `tinyint`, so the width is the only discriminator,
 /// the same one ActiveRecord's `emulate_booleans` uses. So lookup tries the spelling with its width
 /// first, then without.
-const TYPES: [(&str, &str); 48] = [
+const TYPES: [(&str, &str); 49] = [
     // Postgres, as pg_dump spells it.
     ("character varying", "string"),
     ("character", "string"),
@@ -157,14 +157,17 @@ const TYPES: [(&str, &str); 48] = [
     ("numeric", "decimal"),
     ("boolean", "boolean"),
     ("timestamp without time zone", "datetime"),
-    ("timestamp with time zone", "datetime"),
+    // What Rails dumps under the default `datetime_type`, and not a `datetime`: see `COLUMN_TYPES`.
+    ("timestamp with time zone", "timestamptz"),
     ("timestamp", "datetime"),
-    ("timestamptz", "datetime"),
+    ("timestamptz", "timestamptz"),
     ("date", "date"),
     ("time without time zone", "time"),
-    ("time with time zone", "time"),
-    ("timetz", "time"),
+    // No ActiveRecord type reads it, so the driver's `String` stands.
+    ("time with time zone", "timetz"),
+    ("timetz", "timetz"),
     ("time", "time"),
+    ("bit varying", "bit_varying"),
     // The catalog spellings, for a hand-edited `structure.sql`, which is common in projects that
     // chose this format, so the rows are worth having.
     ("int2", "integer"),
@@ -316,6 +319,7 @@ impl<'src> Scan<'src> {
                     .filter_map(|(from, to)| self.column(from, to, dialect))
                     .collect(),
                 name,
+                key: None,
             });
         }
         None
@@ -504,10 +508,11 @@ impl<'src> Scan<'src> {
         if !is_column_name(&name) {
             return None;
         }
-        let (kind, array) = column_type(&self.source[after..to]);
+        let (kind, array, whole) = column_type(&self.source[after..to]);
         Some(Column {
             name,
             kind,
+            whole,
             nullable: !self.says_not_null(after, to),
             array,
             at: (start as u32, self.source[..to].trim_end().len() as u32),
@@ -573,10 +578,10 @@ fn is_name_byte(byte: u8) -> bool {
 
 /// What a column of this declaration returns, in the Ruby dumper's vocabulary.
 ///
-/// The word `schema.rb` would have used, and whether there are many. An unknown spelling passes
-/// through under its own name and lands on `untyped`: the same answer, reached the same way, as a
-/// `t.jsonb` in a Ruby schema.
-fn column_type(rest: &str) -> (String, bool) {
+/// The word `schema.rb` would have used, whether there are many, and whether it is a `decimal` with
+/// no digits after the point ([`whole`]). An unknown spelling passes through under its own name and
+/// lands on `untyped`: the same answer, reached the same way, as a `t.jsonb` in a Ruby schema.
+fn column_type(rest: &str) -> (String, bool, bool) {
     // A terminator, not a filter: the first token that cannot be part of a type name ends the type,
     // and if that is the *first* token, the column has no type written at all.
     let mut words = rest.split_whitespace();
@@ -585,7 +590,7 @@ fn column_type(rest: &str) -> (String, bool) {
         .filter(|word| is_type_word(word))
         .map(str::to_ascii_lowercase)
     else {
-        return ("untyped".to_owned(), false);
+        return ("untyped".to_owned(), false, false);
     };
     // A qualified type belongs to an enum or extension (`public.halfvec`), and its schema is noise,
     // as a table's is.
@@ -593,7 +598,7 @@ fn column_type(rest: &str) -> (String, bool) {
     if NOT_COLUMNS.contains(&spelling.as_str()) || MODIFIERS.contains(&spelling.as_str()) {
         // A column with no type written at all, which only a hand-edited file has: SQLite accepts
         // `"a" NOT NULL`, and reading `not` as the type would put the word in the card.
-        return ("untyped".to_owned(), false);
+        return ("untyped".to_owned(), false, false);
     }
     // One word, unless the words so far begin a compound name. The test uses the bare spelling,
     // because `timestamp(6) without time zone` has a width mid-name and `character varying[]` an
@@ -614,14 +619,35 @@ fn column_type(rest: &str) -> (String, bool) {
         .iter()
         .find(|(sql, _)| *sql == spelling.trim_end_matches("[]"))
         .or_else(|| TYPES.iter().find(|(sql, _)| *sql == bare));
-    (mapped.map_or(bare, |(_, ruby)| (*ruby).to_owned()), array)
+    let kind = mapped.map_or(bare, |(_, ruby)| (*ruby).to_owned());
+    let whole = kind == "decimal" && whole(&spelling);
+    (kind, array, whole)
+}
+
+/// Whether a `numeric`/`decimal` spelling has a precision and no digits after the point:
+/// `numeric(10)` or `decimal(10,0)`, which ActiveRecord's `extract_scale` answers 0 for, so it
+/// registers `DecimalWithoutScale`, an `Integer`. A bare `numeric` has no precision and is a
+/// `BigDecimal`.
+fn whole(spelling: &str) -> bool {
+    let Some(width) = spelling
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(width, _)| width)
+    else {
+        return false;
+    };
+    // The scale is the second number, and a width with none has no digits after the point.
+    width
+        .split(',')
+        .nth(1)
+        .is_none_or(|scale| scale.trim() == "0")
 }
 
 /// Whether `word` can be a type name at all.
 ///
 /// Asked of the **first** token only, and it exists for a real MySQL type, not as a defence:
 /// `enum('draft','live')` and `set('a','b')` carry string literals, so they are declined and the
-/// column is `untyped`, which is right, since neither is one of `COLUMN_TYPES`' ten and
+/// column is `untyped`, which is right, since neither is one of `COLUMN_TYPES` and
 /// ActiveRecord does not treat them as `t.string`. Later tokens are decided by the stricter
 /// compound table: no compound type name contains anything but bare words.
 fn is_type_word(word: &str) -> bool {
@@ -878,7 +904,7 @@ CREATE UNIQUE INDEX "index_solid_cache_entries_on_key_hash" ON "solid_cache_entr
             .map(|table| (table.to_owned(), vec![table.to_owned()]))
             .collect();
         let rbs = schema
-            .signatures("db/structure.sql", &classes, &BTreeMap::new())
+            .signatures("db/structure.sql", &classes, &BTreeMap::new(), true)
             .render(&declaring(&[]))
             .rbs;
         let mut owner = String::new();
@@ -902,7 +928,7 @@ CREATE UNIQUE INDEX "index_solid_cache_entries_on_key_hash" ON "solid_cache_entr
             .map(|table| (table.to_owned(), vec![table.to_owned()]))
             .collect();
         let mut kinds: Vec<String> = schema
-            .signatures("db/structure.sql", &classes, &BTreeMap::new())
+            .signatures("db/structure.sql", &classes, &BTreeMap::new(), true)
             .render(&declaring(&[]))
             .rbs
             .lines()
@@ -933,14 +959,14 @@ CREATE UNIQUE INDEX "index_solid_cache_entries_on_key_hash" ON "solid_cache_entr
         assert_eq!(
             postgres,
             vec![
-                "ar_internal_metadata#created_at: () -> Time",
+                "ar_internal_metadata#created_at: () -> ActiveSupport::TimeWithZone",
                 "ar_internal_metadata#key: () -> String",
-                "ar_internal_metadata#updated_at: () -> Time",
+                "ar_internal_metadata#updated_at: () -> ActiveSupport::TimeWithZone",
                 // The one nullable column in the file, and all three dumps say so the same way.
                 "ar_internal_metadata#value: () -> String?",
                 "schema_migrations#version: () -> String",
                 "solid_cache_entries#byte_size: () -> Integer",
-                "solid_cache_entries#created_at: () -> Time",
+                "solid_cache_entries#created_at: () -> ActiveSupport::TimeWithZone",
                 "solid_cache_entries#id: () -> Integer",
                 // `t.binary`, which is `bytea`, `varbinary(1024)` and `blob(1024)`.
                 "solid_cache_entries#key: () -> String",
@@ -1027,7 +1053,7 @@ CREATE UNIQUE INDEX "index_solid_cache_entries_on_key_hash" ON "solid_cache_entr
             .into_iter()
             .collect();
         schema
-            .signatures("db/structure.sql", &classes, &BTreeMap::new())
+            .signatures("db/structure.sql", &classes, &BTreeMap::new(), true)
             .render(&declaring(&[]))
             .rbs
             .lines()
@@ -1181,15 +1207,23 @@ CREATE TABLE public.after (
             "bigserial",
             "double precision",
             "numeric(10,2)",
+            "numeric(10)",
+            "numeric(10,0)",
+            "numeric",
             "boolean",
             "timestamp(6) without time zone",
             "timestamp with time zone",
+            "timestamptz",
             "date",
             "time without time zone",
             "integer[]",
             "character varying[]",
             "jsonb",
             "public.some_enum",
+            "uuid",
+            "inet",
+            "citext",
+            "bit varying(8)",
             // MySQL.
             "varchar(255)",
             "int",
@@ -1201,6 +1235,8 @@ CREATE TABLE public.after (
             "longtext",
             "double",
             "decimal(10,2)",
+            "decimal(10,0)",
+            "timestamp",
             // SQLite.
             "varchar",
             "integer(8)",
@@ -1213,10 +1249,15 @@ CREATE TABLE public.after (
         ]
         .into_iter()
         .map(|declaration| {
-            let (kind, array) = column_type(declaration);
+            let (kind, array, whole) = column_type(declaration);
+            let kind = if whole {
+                super::super::WHOLE_DECIMAL.to_owned()
+            } else {
+                kind
+            };
             (
                 declaration,
-                super::super::schema::rbs_type(&kind, false, array),
+                super::super::schema::rbs_type(&kind, true, false, array),
             )
         })
         .collect();
@@ -1232,30 +1273,56 @@ CREATE TABLE public.after (
             ("bigserial", "Integer"),
             ("double precision", "Float"),
             ("numeric(10,2)", "BigDecimal"),
+            // No digits after the point: `DecimalWithoutScale`, an `Integer`. A bare `numeric` has
+            // no precision at all, and stays a `BigDecimal`.
+            ("numeric(10)", "Integer"),
+            ("numeric(10,0)", "Integer"),
+            ("numeric", "BigDecimal"),
             ("boolean", "bool"),
-            ("timestamp(6) without time zone", "Time"),
-            ("timestamp with time zone", "Time"),
+            (
+                "timestamp(6) without time zone",
+                "ActiveSupport::TimeWithZone",
+            ),
+            // Time-zone aware only from Rails 7.1 on, so the class rests on a version this cannot
+            // see.
+            (
+                "timestamp with time zone",
+                "ActiveSupport::TimeWithZone | Time",
+            ),
+            ("timestamptz", "ActiveSupport::TimeWithZone | Time"),
             ("date", "Date"),
-            // `t.time` is not one of `COLUMN_TYPES`' ten in a Ruby schema either, and this answers
+            // `t.time` is not one of `COLUMN_TYPES` in a Ruby schema either, and this answers
             // exactly what that does, without being cleverer.
-            ("time without time zone", "untyped"),
+            (
+                "time without time zone",
+                "ActiveSupport::TimeWithZone | Time",
+            ),
             ("integer[]", "Array[Integer]"),
             ("character varying[]", "Array[String]"),
             ("jsonb", "untyped"),
             // A Postgres enum or extension type: the schema qualification is noise, the name is
             // quoted in the card, and the answer is no claim.
             ("public.some_enum", "untyped"),
+            // Postgres' own types pass through under their own names, which are the words the Ruby
+            // dumper writes, except the one compound.
+            ("uuid", "String"),
+            ("inet", "IPAddr"),
+            ("citext", "String"),
+            ("bit varying(8)", "String"),
             ("varchar(255)", "String"),
             ("int", "Integer"),
             // The one row that carries its width, and the reason: MySQL has no boolean.
             ("tinyint(1)", "bool"),
             ("tinyint", "Integer"),
-            ("datetime(6)", "Time"),
+            ("datetime(6)", "ActiveSupport::TimeWithZone"),
             ("longblob", "String"),
             ("varbinary(1024)", "String"),
             ("longtext", "String"),
             ("double", "Float"),
             ("decimal(10,2)", "BigDecimal"),
+            ("decimal(10,0)", "Integer"),
+            // MySQL's `timestamp` is ActiveRecord's `:datetime` there, and converted.
+            ("timestamp", "ActiveSupport::TimeWithZone"),
             ("varchar", "String"),
             ("integer(8)", "Integer"),
             ("blob(536870912)", "String"),
@@ -1293,7 +1360,7 @@ CREATE TABLE public.after (
             .into_iter()
             .collect();
         let signatures = schema
-            .signatures("db/structure.sql", &classes, &BTreeMap::new())
+            .signatures("db/structure.sql", &classes, &BTreeMap::new(), true)
             .render(&declaring(&[]));
         let optional: Vec<&str> = signatures
             .rbs
@@ -1316,7 +1383,7 @@ CREATE TABLE public.after (
             .into_iter()
             .collect();
         let signatures = read_structure(source)
-            .signatures("db/structure.sql", &classes, &BTreeMap::new())
+            .signatures("db/structure.sql", &classes, &BTreeMap::new(), true)
             .render(&declaring(&[]));
         assert_eq!(
             signatures.rbs,
@@ -1396,7 +1463,7 @@ CREATE TABLE public.after (
             .collect();
         assert_eq!(
             schema
-                .signatures("db/structure.sql", &classes, &BTreeMap::new())
+                .signatures("db/structure.sql", &classes, &BTreeMap::new(), true)
                 .render(&declaring(&[]))
                 .rbs
                 .lines()
@@ -1417,7 +1484,7 @@ CREATE TABLE public.after (
                 // SQLite takes a column with no type written at all; `PRIMARY KEY` is not one.
                 "untypedish: () -> untyped",
                 // MySQL's inline `enum`, which carries string literals and is declined: it is not
-                // one of `COLUMN_TYPES`' ten, and Rails does not treat it as `t.string`.
+                // one of `COLUMN_TYPES`, and Rails does not treat it as `t.string`.
                 "kind: () -> untyped",
             ]
         );
@@ -1519,16 +1586,17 @@ CREATE TABLE public.after (id bigint NOT NULL);
             "{definition}"
         );
 
-        // And the card says which file, in the dump's own vocabulary mapped to the schema's.
+        // And the card says what each column holds, a `null: false` one and a nullable one.
         let column = card(&mut harness, &uri, source, "title");
-        assert!(column.contains("db/structure.sql"), "{column}");
-        assert!(column.contains("stories"), "{column}");
-        assert!(column.contains("`null: false`"), "{column}");
+        assert!(column.contains("Story#title -> String\n"), "{column}");
         let nullable = "Story.new.description\n";
         let other = harness.write("app/other.rb", nullable);
         harness.watch(&[&other]);
         let nullable = card(&mut harness, &other, nullable, "description");
-        assert!(nullable.contains("may be `nil`"), "{nullable}");
+        assert!(
+            nullable.contains("Story#description -> String?"),
+            "{nullable}"
+        );
     }
 
     #[test]
@@ -1552,7 +1620,7 @@ CREATE TABLE public.after (id bigint NOT NULL);
         // And the card on the column itself says there are many, because a hover shows a name, not
         // a return type: the same argument as `null: false`.
         let column = card(&mut harness, &uri, source, "tags");
-        assert!(column.contains("`string[]`"), "{column}");
+        assert!(column.contains("Story#tags -> Array"), "{column}");
     }
 
     #[test]

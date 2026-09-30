@@ -1,4 +1,4 @@
-"""Check 10: the box a rename opens sits exactly where the cursor's own word is lit.
+"""Check 9: the box a rename opens sits exactly where the cursor's own word is lit.
 
 `prepareRename` answers with **one** range: the part of the rename the cursor stands in. An editor
 puts its rename box over that range and pre-fills it with the text inside, so the range *is* the

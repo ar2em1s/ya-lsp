@@ -1,8 +1,627 @@
 # Changelog
 
-The server and the VS Code extension ship as one version. Format follows
+The server, the VS Code extension and the Claude Code plugin ship as one version. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.0.0] — 2026-09-30
+
+### Added
+
+- **`ya-lsp coverage [DIR]` says how much of a project ya-lsp can type.** It indexes the project
+  and its gems, samples 2,000 of the calls its own code makes outside test and migration folders
+  (as `[trees]` says), and prints the share it types for certain with the sample's 95% error:
+  `Type coverage: 47.3% ± 2.1% (2,000 of 37,909 calls sampled)`. Any Ruby project, Rails or not.
+- **`ActiveSupport::CurrentAttributes` attributes are typed.** `attribute :account` declares
+  `Current.account` and its writer (and the instance's), and the reader is what the application
+  assigns (`Current.account = …`, `Current.set(account: …)`), with `nil`, or beside a literal
+  `default:`. A value nothing types, `set(**options)`, a `send` of the writer, or a hand-written
+  writer leaves it unanswered.
+- **An empty array or hash a method fills holds what it was given.** `r = []`, then
+  `items.each { |i| r << Foo.new(i) }`, then `r` is an `Array[Foo]` (`h[k] = v` gives a
+  `Hash[K, V]`). Passing the local anywhere, storing it, or any other method on it leaves it as
+  before, and so does a value only a name guesses.
+- **An instance variable just written is that value.** `@label = "x"` followed by `@label` (or
+  `@label.upcase`, or `touch(@label)`) in the same method is a `String`, whatever other methods
+  write, as long as nothing that could run code sits between them.
+- **A `before_action` that always writes a variable keeps `nil` out of the actions it runs
+  before.** With `before_action :set_post, only: %i[show edit]` and `def set_post; @post =
+  Post.find(params[:id]); end`, `@post` in `show` is a `Post`, not a `Post?`. An `if:`, a skip on
+  the class, an ancestor or a subclass, an early `return` in the callback, or an action the
+  controller also calls by name keeps the `?`.
+- **An `attr_writer`'s variable is what its calls pass.** `box.label = 1` and `self.label ||= "y"`
+  type `@label` in `Box`, where the receiver can be a `Box`. A receiver or value nothing types, a
+  hand-written `label=`, and a `send`/`public_send` that can call `label=` on the object leave it
+  unanswered, as before. So does `new(attributes)` on an Active Record or `ActiveModel` class.
+- **`pluck`, `ids` and `group` know their columns.** `Comment.where(…).pluck(:depth)` is an
+  `Array[Integer]` (a nullable column's element is left open), `Comment.ids` an array of the
+  primary key's type unless a `self.primary_key =` can move it, and `Comment.group(:x).count` a
+  `Hash` by group, through any chain after `group`. `Comment.pick(:depth)` and `Comment.pluck` on
+  the class answer as the relation does.
+- **A jbuilder view is read as a template.** `@story` in `show.json.jbuilder` is what the
+  controller assigns, the view's helpers answer bare calls, `json` is a `JbuilderTemplate`, and a
+  jbuilder partial's locals come from `json.partial!`, `json.array!` and `json.key …, partial:`
+  calls. A JSON render finds jbuilder partials only.
+- **A partial's locals are typed from the calls that render it.** In `_story.html.erb`, `story`
+  is what every `render "stories/story", story: …`, `locals: { … }`, `object:`, `collection:`
+  (with `as:`, `_counter` and `_iteration`) and `render @stories` passes, joined; hover shows it
+  as a variable and go-to-definition lists each value passed. A strict-locals comment decides
+  which names are locals. A call whose locals cannot be read, a component's `render`, or a helper
+  of the same name leaves the name unanswered rather than guessed.
+- **A check narrows the local it reads.** Below `return unless user`, `raise if user.nil?` or
+  `user = User.create unless user`, `user` is a `User`, not a `User?`; inside `if user`, `unless
+  user.nil?`, `x.is_a?(Hash)` or `case x when Hash`, and on the right of `user && …`, it is what
+  the check says. An untyped value checked with `is_a?` becomes that class. A write after the
+  check, one inside a block or lambda that may run later, and instance variables are left as they
+  were.
+- **`self` in a concern's `included do` is each class that includes it.** A macro or a call there
+  resolves on every including model, a callback block inside it runs against their records, and a
+  hover counts each model's own method under *N definitions*.
+  Only where the project's own `include`s name the classes; a concern nobody includes stays
+  unanswered. A scope the concern writes, called on one model, is that model's relation. The margin
+  skips a union of more than four including classes.
+- **A method whose own code writes `raise` or `fail` is marked `!`** in the margin and on its card:
+  `-> String!`, `-> String?!`. Every `raise` in the method counts, in blocks and `rescue` clauses
+  too, as a warning. A variable holding what the method returned is not marked.
+- **A call whose arguments pick no signature is every signature it could reach**:
+  `Story.find(params[:id])` is `Story | Array[Story]`, since a request can send a list. A call on
+  such a union runs on each class that has the method, so `.title` on it is `Story#title`'s answer,
+  and go-to-definition goes there.
+- **Completion on a union lists every class's methods**, each row naming its class: after
+  `@invite = Invite.find(params[:id])`, `@invite.` offers `Invite`'s methods beside `Array`'s. A
+  name two classes define is one row naming both.
+- **Completion at a bare word offers what the block runs against**, as hover already answers it:
+  `let` and `subject` in a `describe` block, `eq` and FactoryBot's `create` in an example, a
+  model's class methods in a concern's `included do`, and a block a signature rebinds.
+- **A call on a union answers each class's own method**: `URI.parse(link).host` is
+  `URI::Generic#host` on hover and go-to, and `to_i` on a `Float | Integer` is its two definitions,
+  not a guess among every method of that name.
+- **A conditional used as a value is whichever branch ran**: `x = ok ? "a" : 1` is
+  `String | Integer`, and so for `if`, `unless`, `case`, `case … in`, `begin … rescue … end` and
+  `a rescue b`. A missing branch is `nil`; one that raises or returns adds nothing.
+- **`rescue Foo => e` makes `e` a `Foo`**, and a bare `rescue => e` a `StandardError`.
+- **A block runs against what its method's signature says** (RBS `[self: T]`), for types and for
+  go-to-definition. In Rails: a model's, controller's, job's and mailer's callbacks and their `if:`
+  and `unless:` lambdas, `validate`, `validates`, `rescue_from`, `after_discard`, `initializer`
+  and `content_security_policy` run against the object; `scope` lambdas against the relation;
+  `Rails.application.configure` against the application; `routes.draw` against the route mapper.
+- **`config` is typed**: `Rails::Application::Configuration`, a framework's namespace
+  (`config.action_mailer`) is `ActiveSupport::OrderedOptions`, and a few settings Rails fills
+  (`hosts`, `paths`, `middleware`) are typed.
+- **A migration's own calls go where Rails sends them.** `add_column`, `create_table`, `execute`
+  and the rest reach the connection through `method_missing`, so go-to-definition, hover and
+  completion now answer each with the `def` in activerecord's `SchemaStatements`,
+  `DatabaseStatements` or `Quoting`, read from the installed version. The `t` of
+  `create_table … do |t|` is a `TableDefinition` (`change_table`'s a `Table`), and `t.string`,
+  `t.integer` and the other column methods `define_column_methods` writes are found.
+- **`to_s` is a `String` whatever it is called on**: `params[:id].to_s.strip` is typed, and
+  `x&.to_s` is a `String?`. Every object answers `to_s`, and Ruby raises where it converts with one
+  that returns another class. A method's own body or signature still answers first.
+- **What Ruby's syntax fixes is typed**: a `*rest` parameter is an `Array`, `**rest` a `Hash` and
+  `&block` a `Proc?`, in a method, a block or a lambda; `a, *rest = x` makes `rest` an `Array`;
+  `defined?(x)` is a `String?`; and `obj&.x = v` is `v`'s type or `nil`.
+- **Blocks, procs and lambdas are typed at each call.** A method returning `yield` (or its
+  `&block.call`) returns the block's value; a block's `next` values count, and a `break` value is
+  one more value of the call; `map(&:to_s)` knows its element. A block parameter takes what the
+  method's own `yield`s hand it, `nil` where they hand fewer. A local, instance variable or constant
+  holding only proc or lambda literals is read at each `.call`, `.()` or `[]`, and where passed as
+  `&fmt`; a class's own `proc` or `lambda` method is not taken for Ruby's.
+- **`block_given?` is read for each call.** A method that writes
+  `return to_enum(:each) unless block_given?`, `if block_given? … else … end` or `unless block`
+  answers a call with a block from the block's side, and a call without one from the other, so
+  `CSV.open(path) { … }` is the block's value and no longer a union with `CSV`.
+- **A signature that returns one of several classes is typed as that union**:
+  `relation.count` is `Integer | Hash`, `Float#round(1)` is `Integer | Float`. A union whose
+  classes all inherit one of them is drawn as that one: `URI.parse` is `URI::Generic`.
+- **More of Rails is typed:** `Rails.env.test?` and its siblings; a `TimeWithZone`'s `year`,
+  `to_date`, `strftime`, `beginning_of_day` and the rest; `Time.zone.now`, `parse` and `today`;
+  `Time.current`; a model's `arel_table`, `model_name`, `sanitize_sql_array` and `transaction`
+  (the block's value); a relation's `to_sql`, `arel` and `load`; `find_each` and its siblings
+  without a block; `errors.empty?`; and an attachment's `blob` and `filename`.
+- **A mounted engine's route helpers are typed**: `spree.admin_orders_path` and
+  `main_app.root_path` are `String`. The proxy's name is read from the engine's `engine_name` or
+  `isolate_namespace`, and `spree` jumps there.
+- **A module's `thread_mattr_accessor` or `mattr_accessor` is what the application writes to
+  it**: with `Current.account = @account` in a controller, `Current.account` is `Account?`. Every
+  write the application makes counts, templates included and specs not, and one ya-lsp cannot
+  type leaves the accessor untyped. A plain `mattr_accessor` whose `@@` variable something writes
+  directly stays untyped.
+- **A concern's class methods answer from their `def`**: `Account.find_local(name)` is what the
+  `def` in `class_methods do` returns, read with `self` as the class, so its calls reach the
+  class's own class methods. The same holds for Rails' own: `ActiveStorage::Blob.find_signed` is a
+  `Blob?`, a mailer's `with` an `ActionMailer::Parameterized::Mailer`.
+- **A `delegate` answers what its target's method does**, where the target is a method (a private
+  one too) or a constant: with `delegate :total, to: :order`, `updater.total` is what
+  `order.total` is. `allow_nil: true` adds `nil`.
+- **More Rails returns:** `perform_later` is the job or `false`; `insert_all`, `upsert_all` and
+  their siblings are an `ActiveRecord::Result`; a model's `table_name` is a `String?`,
+  `column_names` an `Array[String]`, `table_exists?` a `bool`; and an `id: :serial` or
+  `:bigserial` primary key is an `Integer`.
+- **RSpec is read**, in spec files the editor holds: each `describe` and `context` is a class, so
+  inside an `it`, a hook or a `let` block `self` is the example and its members complete and hover.
+  `let(:story) { Story.new }` and `subject` are what their blocks return, a nested group inherits
+  and overrides them, and `described_class` and the implicit `subject` come from what a group
+  describes. `config.include` and `config.extend` reach the groups their `type:` or tag names
+  (rspec-rails' directory types included), and a shared context's `let`s reach the groups that
+  include it. `[rspec] enabled` turns it off; `auto` asks the lockfile for `rspec-core`.
+  - `expect(x)`, `expect { }`, `allow(x)`, `receive(:name)` and its `and_return`, `with`, `once`
+    and the rest are what rspec-expectations and rspec-mocks make, though both gems define them
+    at run time.
+  - Go-to-definition on `expect`, `allow`, `receive`, `and_return`, `with`, `let`, `before` and
+    `shared_examples` goes to the `def` the gem writes it in. `describe`, `it` and
+    `allow(x).to`, which the gems make with `define_method`, go nowhere, instead of to any
+    method of that name in the bundle.
+  - test-prof's `let_it_be` is a `let`, unless the project registers a modifier of its own.
+  - A `def` written in a group is that group's method: its margin and card read its own body, not
+    every spec's `def` of the same name.
+  - A `context` written inside a shared group is a group of its own, whose examples see its `let`s
+    and the shared group's.
+- **A FactoryBot factory builds its class**: `create(:user)`, `build`, `build_stubbed` and their
+  `_list` and `_pair` forms hover and complete as the `User` the factory says, read as FactoryBot
+  reads it: `class:`, a nested factory's or `parent:`'s class, `aliases:`. A factory whose
+  `initialize_with` returns something other than the class (in a trait, a parent, or the global
+  one) stays untyped, and so does a strategy `FactoryBot.register_strategy` replaces.
+  Go-to-definition on `create(:user)` opens the `factory :user` line. A gem's factories are read
+  too, where the project defines none of that name. `[types] factories` turns it off.
+- **A connection is its adapter**: `ActiveRecord::Base.connection`, `lease_connection` and the
+  block of `with_connection` are the adapter `config/database.yml` names
+  (`ActiveRecord::ConnectionAdapters::PostgreSQLAdapter`), or the class every adapter the bundle
+  can load shares. A model's own `connects_to database: { writing: :animals }` is the `animals`
+  database's adapter, and its `connection_pool.with_connection` hands the block the same class. An
+  adapter a gem registers (`postgis`) is read from the gem; an engine's connection is any adapter.
+  The transaction methods Rails makes with `delegate` (`open_transactions`, `current_transaction`
+  and eight more) are found on it.
+- **`Rails.logger` is typed**: the `ActiveSupport::BroadcastLogger` Rails wraps every logger in,
+  so `Rails.logger.info` goes to its method. Where the application assigns `Rails.logger`
+  itself, what it assigns joins: `Rails.logger = Logger.new(STDOUT)` makes it
+  `ActiveSupport::BroadcastLogger | Logger`.
+- **A call returning a tuple is an `Array`**: `Array(x)` is an `Array` whatever `x` is, and so
+  is `IO.pipe` or `divmod` taken whole.
+- **A method's own type variable is the argument passed for it**, where that argument is typed:
+  `ENV.fetch("PORT", 3000)` is `String | Integer`, `ENV.fetch("HOST", "x")` a `String`, and
+  `each_with_object({})` a `Hash`.
+- **A controller's `helpers` reaches the application's helpers**: `helpers.cover_url(image)` in a
+  controller and `ApplicationController.helpers.cover_url(image)` anywhere are what the helper
+  returns, and `ActionController::Base.helpers.strip_tags` is Rails' own. A helper made with
+  `helper_method` or added by a gem is not reached.
+- **`pick(:column)` on a relation is that column's type or `nil`**:
+  `Comment.where(id: id).pick(:depth)` is `Integer?`. A column an `enum`, `attribute`,
+  `serialize` or `store` re-types, a string or several columns, and `pick` on the model itself
+  stay untyped.
+- **A column's `x?`, `x_changed?`, `saved_change_to_x?` and `x_was` are declared**, so
+  `user.admin?` on a boolean column is `bool`, unless the model writes its own `def admin?`.
+- **`where.not`, `where.missing` and `where.associated` are typed.** A bare `where` is
+  ActiveRecord's `WhereChain`, holding the relation it was made from, so `Story.where.not(…)` is
+  a `Story::Relation` and the chain goes on: `Story.where.not(…).first` is a `Story?`.
+- **A model's class method answers on a relation**, as Rails forwards it: `Story.where(…).digest`
+  and `digest` inside a `scope` lambda.
+- **What a relation hands its records is typed**: `Story.where(…).reverse`, `sample`, `index`,
+  `join`, `[]` and the rest Rails forwards to the loaded array.
+- **`include Singleton` gives the class `instance`**: `TagManager.instance.url_for(x)` is typed
+  and jumps. Ruby adds `instance` when the module is included, which no file writes down.
+- **A setting the application assigns is what it was assigned**: after
+  `config.dispatcher = Dispatcher.new`, `Rails.configuration.dispatcher` is a `Dispatcher`, and
+  go-to-definition opens each assignment. Every engine's and railtie's `config` shares the store,
+  so their writes join; one on a receiver ya-lsp cannot type leaves it untyped.
+- **A mailbox's `mail` is a `Mail::Message`** and its `inbound_email` an
+  `ActionMailbox::InboundEmail`: Rails makes both with `delegate` and `attr_reader`.
+- **`send(:title)` is the call `title`**: `send`, `__send__`, `public_send` and ActiveSupport's
+  `try`/`try!` with a symbol answer what the method they name answers (`try` on a value that may be
+  `nil` may be `nil` too). `public_send` and `try` reach no private method.
+- **The `:name` in `send(:name)`, `method(:name)`, `try(:name)`, `respond_to?(:name)` or
+  `instance_method(:name)` goes to that method**, found on the object the call is sent to, in a
+  method body as well as a class body. Hover and highlight answer there too.
+- **A method `define_method(:name) { … }` makes exists**: calls of it are typed by what its block
+  returns, go-to-definition lands on the `:name`, and completion offers it. The same for
+  `define_singleton_method`, and for `define_method` in `class << self`. A `private` section or
+  `private define_method(…)` makes it private. Names built in a loop are not read.
+- **An `alias` or `alias_method` of a method with no signature answers as that method**, including
+  one the class inherits.
+- **`method(:shout)` is a `Method[Widget#shout]`**: calling it (`.call`, `.()`, `[]`), straight or
+  from a local, answers what `shout` does, and so does passing it as a block
+  (`list.map(&method(:shout))`).
+- **References to a method list where its name is handed as a symbol**: `send(:shout)`,
+  `try(:shout)`, `method(:shout)`, `respond_to?(:shout)`. Highlight lights them too, and asking for
+  references on the symbol itself lists the method's uses.
+- **More of Rails is typed, from its own source** (checked in 7.2, 8.0 and 8.1):
+  - a record's `save` (`bool?`), `save!`, `update!` (`true?`), `update`, `update_column(s)`,
+    `new_record?`, `persisted?`, `destroyed?`, `destroy!` and `attributes`;
+  - `errors.full_messages` (`Array[String]`); a controller's `redirect_to` (the status,
+    `Integer`), `params.expect(user: [...])` (`ActionController::Parameters | Array`, Rails 8),
+    `flash.now`, `request.env`, `request.host` and `request.format`;
+  - `Rails.application.credentials`; `2.days.ago` and its siblings (`TimeWithZone | Time`, or the
+    class of the time handed to them); `duration.to_i`;
+  - `Rails.cache.fetch(key) { … }` is the block's value (not with `raw:`), and `write`, `delete`,
+    `exist?` and `fetch_multi` are typed;
+  - a mailer's `mail`, a delivery's `deliver_now` and `deliver_later`; `strip_tags`; `Arel.sql`;
+    a connection's `exec_query` and `select_all`; `Rails.application.configure { … }` and
+    `RSpec.configure { … }` are their block's value;
+  - `relation.minimum(:col)` and `maximum` are the column's type (or a `Hash` after `group`), and
+    `unscoped { … }` is the block's value; `each_with_object` is its memo; `async_count` and its
+    siblings are an `ActiveRecord::Promise`;
+  - `has_secure_password`'s `authenticate` is the record or `false`; a `has_many` whose class
+    cannot be read is an `ActiveRecord::Associations::CollectionProxy`;
+  - more column types: `time`, `timestamp` and `timestamptz` (`TimeWithZone | Time`), `interval`
+    (`ActiveSupport::Duration`), a PostgreSQL `enum`, the range types, `point` and the geometric
+    types, and a `virtual` column's `type:`. A `datetime` in a project that moves Rails' time-zone
+    default is `TimeWithZone | Time` instead of untyped.
+- **`-> void` and `-> bot` on the card** of a method whose signature says it hands back nothing,
+  and **`-> bot` in the margin** of a `def` whose every path raises.
+- **Translation keys.** Inside `t("…")`, `translate`, `t!` and `I18n.t`, completion offers the next
+  segment of the key, go-to-definition opens the YAML line that writes it, and hover shows its text.
+  A call is typed by what the key holds: `String`, `ActiveSupport::SafeBuffer` for an `_html` key in
+  a view or controller, `Hash` for a subtree (a `String` for a plural given `count:`), `Array` for a
+  list. Keys come from Rails' own locale files, every gem's `config/locales` and the project's, in
+  i18n's load order, read as Ruby's YAML reads them (`yes` is not a string). Only the main locale is
+  read: `[i18n] locale` (`en` by default); `[i18n] paths` replaces where the project's own files
+  are. `I18n.locale` is a `Symbol`, `I18n.l` a `String`, `I18n.with_locale { … }` the block's value,
+  and `model_name.human` a `String`.
+
+### Changed
+
+- **A hover card says what the answer is, not how ya-lsp found it.** ya-lsp adds two lines, above
+  the documentation where a long comment cannot hide them: *Guessed from name alone.* on any
+  answer that rests on a name, and *Defined in N places.* on a method or a variable written in more
+  than one place. Gone: the lines naming the signatures, assignments, renderers and bodies a type
+  was followed through, a generated member's provenance, and the note that a type is this call's.
+  A derived answer now reads like one the code states; the audit scores the same two tiers.
+- **A method's card shows its return type whenever ya-lsp has one**: declared, read from its body,
+  or this call's. A column's card is `Story#title -> String?`.
+- **An instance variable's card is the variable and its type**: `Story#@title: Title`, not the card
+  of `class Title`. A constant's card shows what it holds: `Keystore::MAX_KEY_LENGTH: Integer`.
+- **Parameters are what the `def` wrote**: real names wherever a Ruby `def` exists, a generated
+  method's included (`ActiveRecord::Base.sanitize_sql_for_order(condition)`, not `(arg0)`), and
+  defaults as written where they fit on the line (`limit = 10`, not `limit = ...`). A generated
+  writer's parameter is `value`. RSpec's words are named as the gems name them (`expect(value)`,
+  `let(name, &block)`), and FactoryBot's strategies as they are called:
+  `create_list(factory, amount, *args, **kwargs, &block)`.
+- **An alias's card has the parameters of the method it renames**: `alias send __send__` is
+  `send(name, *args, **kwargs, &block)`, where it read as taking nothing, and i18n's `t` is
+  `t(key = nil, **options)`.
+- **Class names ya-lsp invents are shown as Rails' own**: `ActiveRecord::Relation#where`, not
+  `ActiveRecordRelation#where`; a route helper as `story_path`; a controller's `helpers` as
+  `ActionView::Base`. A project's own class of that name keeps its name.
+- **A list card counts and no longer lists**: *N possible definitions* with the guess line, or *N
+  definitions* for each class a concern runs on. Go-to-definition lists them with their files.
+- **A translation key's card is the YAML the main locale holds**: a plural or a subtree nested and
+  cut after ten lines, where it said *a subtree of 4 keys*, and no *Written at* line.
+- **Inlay hints have no tooltip**, and the server no longer offers `inlayHint/resolve`.
+
+### Fixed
+
+- **An index call on a constant that holds an object is typed**: `ENV["HOME"]` is `String?`, as
+  `ENV.fetch("HOME")` was already typed.
+- **A constant alias is the module it names**: `YAML.` lists `Psych`'s methods, and a call on it
+  is typed like one on `Psych`.
+- **Inside a module's method, completion offers `Object`'s methods too**, after the module's own:
+  `self.class`, `format`, `raise`, as hover resolves them.
+- **Hovering `new` no longer shows what `initialize` returns.** `Sponge.new` was carded
+  `Sponge#initialize -> Integer` (its last statement's type), though `new` hands back the object.
+- **`initialize` stops counting writes at an early `return`.** `return if skip` above `@seed = 1`
+  used to drop `nil` from `@seed` everywhere.
+
+- **Ruby's own class docs no longer open with `<!-- rdoc-file=string.rb -->`** on the hover card.
+- **A module only the test suite mixes in is not on the application's path.** One application's spec
+  helper reopens `MessageBus` and `extend`s a wrapper around `publish`, so a plugin's
+  `MessageBus.publish` jumped into `spec/support/` with a *Resolved* card. It now goes to
+  `MessageBus::Implementation#publish`, the method the application runs. A call written inside the
+  suite still reaches the wrapper.
+- **A layout knows its controllers.** `@title` in `layouts/application.html.erb` has a type, a
+  card and a jump to where it is set, and `current_user` there reaches the controllers'
+  `helper_method`. Which controllers and mailers render in a layout is Rails' own lookup: the
+  nearest `layout "admin"`, else a layout named after the controller, else the parent's, so an
+  admin controller's variables never reach the application layout. A `layout :method` or a lambda
+  counts for every layout. Layouts written in HAML or Slim are still not read.
+- **A mailer's `default template_path:` is where its views are read from.** A
+  `->(mailer) { "mailers/#{mailer.class.name.underscore}" }` puts `NotifyMailer`'s views under
+  `app/views/mailers/notify_mailer/`, whose `@ivar`s had no type and no jump. A written directory
+  and a string around the mailer's own name are read; any other value only stops the default
+  directory from counting.
+- **A module included or prepended from outside a class is one of its ancestors.**
+  `Paperclip::Attachment.prepend(Extensions)`, or a plugin's `Post.include(Extension)` in an
+  `after_initialize` block, now makes the module's methods the class's own (they were name
+  guesses) and its instance variables read the class's writes. Only calls that run when the file
+  loads count, never one in a method, a condition or a spec file.
+- **A column's writer has a card and a place.** `self.user_id = nil` in a model jumps to the
+  schema's line and says Rails defines it, as `user_id` did; it used to answer nothing. Completion
+  lists `user_id=` beside the reader.
+- **A concern's `attr_accessor` in `class_methods` is a class method of every includer.**
+  `self.abstract_class = true`, Rails' own `attr_accessor` in `ActiveRecord::Inheritance`, used to
+  answer nothing; only a `def` there was read.
+- **A call on a class answers nothing rather than another class's instance method.** Where a
+  class has no such method (a gem's macro made it, or a YAML file declares it), the name match
+  used to fall back to any instance method of that name, which that class can never reach: a
+  `Settings::General.app_domain` went to the application's `config.app_domain =`, a
+  `SiteSetting.uncategorized_category_id` to a serializer, `I18n.locale =` to five unrelated
+  classes. A module's method is still offered, since an `extend` may reach it, and so is a call in
+  a block written into a class body, which may run on something else.
+- **Hover and go-to-definition answer on two calls rubydex misfiles.** The member of
+  `record.name ||= value` (and `&&=`, `+=` and the other operator writes) is answered on its name,
+  where it used to answer nothing or only by a name match. A call inside a constant path's parent,
+  `record.class::LIMITS`, has no reference at all upstream and is now read from the code.
+- **An instance variable read with no type gets the card of its write**, where it showed nothing.
+  Where the file itself never writes it (a subclass reading what its parent's `before_action`
+  sets), go-to-definition now lists the writes in the parent, the included modules and the
+  subclasses: the same writes its type is read from.
+- **An instance variable in a partial, or in a lambda a Rails macro runs on the object, is
+  answered.** A partial's variables come from every controller and mailer that renders a view, even
+  where its folder names no class (`user_notifications/digest/_stats`), and go-to-definition lists
+  each write instead of none. A read in `after_action …, if: -> { @payload }`, in a mailer's
+  `default to: -> { @user.email }`, or in `included do` of a concern with one includer is that
+  object's variable, and highlight lights it with the method that writes it.
+- **An instance variable named by a symbol is answered like a read of it**:
+  `delegate :render, to: :@template`, `def_delegators :@items, :size` and
+  `record.instance_variable_get(:@x)` get the card and the go-to-definition a read gets.
+- **A helper's instance variables are its views' controllers'**: a helper reading `@home_page`
+  jumps to the controller that sets it. A controller that renders another folder's view by name
+  (`render template: "articles/index"`) now counts as a renderer for partials and helpers.
+- **Go-to-definition lands on the `instance_variable_set` or `attr_writer` that writes a
+  variable** where no line spells it, and a partial's jump lists every controller's writes it can
+  read, even when one controller's ancestors cannot be read.
+- **A variable an application's `instance_variable_set("@#{name}", …)` can write is no longer
+  typed from the other writes alone.** The file was skipped for not spelling the name, so the
+  type ignored a write it cannot know.
+- **A namespace a directory declares lists the files that open it, even where a `module` line
+  declares it too.** Zeitwerk defines the module from the directory either way, so each file that
+  opens it is one of its places. The written lines come first. Not where a `class` declares it.
+- **A call on `self` in a concern's `included do` no longer claims the module is the receiver**,
+  which Rails never makes it.
+- **A `has_many`'s generated signature no longer calls the collection one record**:
+  `has_many :comments`, *a collection of `Comment`*, where it said *which is a `Comment`*.
+- **Rails types**
+  - **A `belongs_to` reader is always `nil`-able**, whatever `optional:`, `required:` or
+    `belongs_to_required_by_default` says: those are a validation run on save, and
+    `Comment.new.post` is `nil` all the same, as is a key whose row was deleted where no foreign
+    key constrains it. A call on the reader keeps its type where `nil` has no such method
+    (`comment.post.title` is still a `String`). Columns declared `null: false` stay non-`nil`.
+  - **`relation.each { }` is the loaded `Array`**, not the relation: Rails hands `each` to the
+    records.
+  - **An association's `delete` and `destroy` hand back the removed records, or `nil`**, and its
+    `destroy_all` is `nil` for an empty one; they read as a count and a record.
+    `Story.destroy(id)` is the record or `false`.
+  - **`relation.new([{…}, {…}])` is an `Array`**, as `build` already was.
+  - **A `scope` whose lambda returns something else answers that**: Rails hands back the lambda's
+    value unless it is `nil` or `false`, so `scope :latest, -> { order(:id).first }` is the record
+    or the relation, not the relation.
+  - **A model with an `interval` column no longer says its `sum` and `average` are `Numeric`**:
+    they are a `Duration` there, and both now answer nothing on that model.
+- **Types**
+  - **`Foo.new`, where `Foo = Bar`, builds a `Bar`**: arel's `table[:name]` is an
+    `Arel::Attributes::Attribute`, so `matches`, `lt` and the other predicates answer.
+  - **A top-level constant used in a `SimpleDelegator` subclass keeps its answer after an edit**:
+    `Current.account` in a presenter lost its type and jump once the file was re-indexed, since
+    `Delegator` inherits from `BasicObject`. Ruby finds it through `Delegator.const_missing`, and so
+    does ya-lsp now.
+  - **The first hover or jump in a spec file just opened waits for its groups** (one short settle)
+    instead of answering from before them: a `let` answered with every method of its name.
+  - **Inside a `define_method` block, `self` is the instance**, not the class: a call there reached
+    the class object's method of the same name and could show its type. A block whose signature
+    says `self` is something ya-lsp cannot read now answers nothing there, instead of the code
+    around it.
+  - **Inside a module's method, `Object`'s and `Kernel`'s methods are found**: `send`, `format`
+    or `instance_variable_get` called on `self` there answer, since whatever includes the module
+    is an object.
+  - **A call with keywords reaches the signatures its keywords can run.** A signature that
+    requires a keyword is no longer one a call without it can reach, and a call writing a keyword
+    no signature takes reaches none. `CSV.read(path)` is `Array`, and `CSV.read(path, headers: true)`
+    is `CSV::Table | Array`: before, the method's own code answered, and it said `Array`, which is
+    wrong. `foo(**opts)` also reaches the signatures of `foo()`, since `opts` may be empty.
+  - **A `datetime` column is an `ActiveSupport::TimeWithZone`**, not a `Time`, as Rails returns
+    it. A project that changes Rails' time-zone setting (`time_zone_aware_attributes`,
+    `time_zone_aware_types`, `skip_time_zone_conversion_for_attributes` or PostgreSQL's
+    `datetime_type`) gets no type for these columns. `attribute :at, :datetime` is a
+    `TimeWithZone` on a model and untyped elsewhere, where Rails makes it a plain `Time`.
+  - **A `decimal` column with no digits after the point is an `Integer`**, as Rails reads it:
+    `t.decimal "x", precision: 10` in `schema.rb`, `numeric(10)` in `structure.sql`.
+  - **More PostgreSQL column types are typed:** `uuid`, `citext`, `ltree`, `tsvector`, `xml`,
+    `macaddr` and `bit` are `String`, `inet` and `cidr` are `IPAddr`, `hstore` a `Hash`, `money` a
+    `BigDecimal` and `oid` an `Integer`. `timestamptz` is no longer typed: Rails 7.0 reads it as a
+    `Time`, and 7.1 and later as a `TimeWithZone`.
+  - **`attribute`'s cast type is looked up in Rails' own list**, which is not the schema's: `:bigint`
+    is not a cast type (Rails raises), and `:big_integer` and `:immutable_string` are.
+  - **Several YARD `@return` tags are read together**, as YARD's one-tag-per-case convention
+    means: `@return [String]` beside `@return [NilClass]` is `String?`, and `[TrueClass]` beside
+    `[FalseClass]` is `bool`. Only the last tag was read, which answered `nil` or `false` for such
+    a method.
+  - **An `attribute` with a type ya-lsp cannot name replaces the column's type**, as Rails does:
+    `attribute :price, :money` or `attribute :price, Money::Type.new` on a `decimal` column is
+    untyped, no longer the column's `BigDecimal`.
+  - A call on a value that may be `nil` also asks what `nil` answers. `user.nil?` is `bool`, not
+    `false`. `record.present?` is `bool`, not `true`. `record.dup` is `Record?`. Where `nil` has
+    no such method, the answer is unchanged.
+  - `a&.b` can be `nil`: `user&.id` is `Integer?`, not `Integer`. Only that one call is skipped,
+    so `user&.name.nil?` is `bool`.
+  - `!x` is `bool` where `x` is typed only by its name (`!admin`). It used to draw no label at all.
+  - **A variable's type is every value that can reach it**, not its last assignment.
+    - A write in a branch, a loop or a block adds to the one before it:
+      `x = "a"; x = 1 if c; x` is `String | Integer`, where it used to be `Integer`.
+    - A variable that no write sets on every path can be `nil`: `x = 1 if c; x` is `Integer?`.
+    - `x ||= v`, `x &&= v` and `x += v` count as writes.
+  - **A variable with a write ya-lsp cannot type gets no label**, even when another write could
+    be typed. Labels that were right only by luck are gone with it. One wrong label this removes
+    is `-> nil` on every Rails controller action that ends in `render`.
+  - **An instance variable is every write any class of its object makes**, because methods run in
+    any order and any of them can run on it: a superclass, an included module, a subclass, and
+    another file reopening the class. It is `nil`-able unless every class the object can be sets
+    it in `initialize` (directly or through `super`), or the reading method sets it first. A
+    template's instance variable is every write its controller's classes make.
+    - `attr_writer` and `attr_accessor` store whatever a caller passes, so a variable they write
+      gets no label.
+    - A write in an included gem module counts: a class's own `@errors = []` beside
+      `ActiveModel::Validations` is `ActiveModel::Errors? | Array`.
+    - A method read for a known receiver hears only that receiver's classes: `record.errors` on a
+      `Story` is not widened by another class that includes the same module.
+    - A class whose superclass Ruby itself could not load is refused, because its real superclass
+      is unknown.
+    - `instance_variable_set` and `remove_instance_variable` count as writes. One on another
+      object (`record.instance_variable_set(:@tags, v)`) refuses every variable of that name,
+      since the receiver is rarely known; an interpolated or passed-in name refuses the names it
+      can spell.
+    - A class that inherits from a library's class keeps its `?` even when `initialize` sets the
+      variable: a library can build it without running `initialize`, as Active Record does for a
+      record it loads.
+  - **ActiveRecord's query interface no longer answers one shape for a call that can return two.**
+    - `Story.find(x)`, `destroy(x)`, `create(x)` and `build(x)` are a record for one thing and an
+      `Array` for an array. The argument's class decides, and an argument nothing types (like
+      `params[:id]`, which a request can send as an array) gets no label.
+    - A relation's `count`, `sum` and `average` can be a `Hash`, after `group`. `Story.count` is
+      still an `Integer`.
+    - A bare `where` (`Story.where.not(…)`) is no longer called a relation.
+  - **A method read for a known receiver calls that receiver's methods**, as Ruby does. Inside an
+    inherited method, a call like `parse` reaches the receiver's class first:
+    `CsvImporter.new.run` uses `CsvImporter#parse`, not the `parse` beside `Importer#run`. A
+    service's `self.call` builds and calls the service it was called on, and a module's method
+    read for a class that includes it calls that class's methods. Labels that took the ancestor's
+    step (a `nil` from a base class's empty hook) are corrected.
+  - `x.class` is `x`'s own class, not any `Class`: `self.class.new(…)` is another object of the
+    same class, and `self.class.default_scope_name` is that class's method. A class that defines
+    its own `class` keeps its answer.
+  - A class object is labelled `Foo:class`: `def model_class; User; end` is `-> User:class`, and
+    so is `self.class` inside `User`. A module object is still not labelled.
+  - **A call is typed by its method's body with the arguments it passed**, where the method's
+    parameters have no type: `Foo.bar(1)` is `Integer` and `Foo.bar("x")` a `String` for
+    `def self.bar(baz) = baz`, whose own label stays empty. Positionals bind by position and
+    keywords by name; an argument left out holds its default at that call. The call's hover card
+    shows its type and says it is the call's.
+  - **An `attr_reader` returns its instance variable**, typed by every write to it: `attr_reader
+    :topic` with `@topic = Topic.new` is `-> Topic`. A reader in `class << self` returns the class
+    object's variable. An `attr_accessor` answers nothing, since its setter can write anything.
+  - A signature's `attr_reader name: T` (and `attr_accessor`) types the reader, as a `def` would:
+    `uri.host` is `String?` and `response.code` a `String`.
+  - **An object holds what `new` passed it**: `Service.new(story).call` reads `@story = story` in
+    `initialize` as a `Story`, for that object only. A class with its own `self.new` binds
+    nothing.
+  - A receiverless call in a helper or a template is typed through the view context, as its hover
+    card already was: `def headline; shout; end` in one helper is what another helper's `shout`
+    returns, and `link_to …` in a helper is an `ActiveSupport::SafeBuffer`.
+  - A method only the test suite mixes into a class (a spec file's `extend`) no longer answers for
+    that class in application code: `MessageBus.publish` is the gem's, not a spec helper's.
+  - A hover card whose return was read out of a method body built on a guessed name now says it
+    was guessed, as the margin already treated it.
+  - A class declared inside `class << self` is never drawn under rubydex's name for it
+    (`Orchestrator::<Orchestrator>::Params`), which no Ruby can write.
+  - A call written with keywords reaches the arms that take them, and one taking an options
+    `Hash`: `update_all(status: "x")` is an `Integer`, and `transform_keys(a: :b)` is a `Hash`, not
+    an `Enumerator`.
+  - **A template's instance variable is every write of every class that renders it**: the
+    controller its path names, and any class that renders it by name (`render "stories/show"`).
+    A partial is every class a view is rendered by, since its path names none. A template
+    rendered with `ApplicationController.render(…)` gets no label: its variables come from
+    `assigns:`.
+  - A method's parameter is no longer typed by a same-named local in another method.
+  - A type read off a name is never drawn inside another type. For example, `[1].map { |v| prep(v) }`
+    was labelled `Array[Ledger]` because a local inside `prep` was spelled `ledger`.
+  - A block on a value that may be `nil` is handed `nil` too, where `nil` has the method:
+    `maybe.then { |v| v }` makes `v` a `String?`, and the call a `String?`. `&.then` does not.
+  - **A parameter is no longer typed by its default.** `def f(limit = 10)` says nothing about
+    `limit`, because a caller may pass anything. A declared type (RBS, a Sorbet `sig`, a YARD
+    `@param`) still types it.
+  - An element that may be `nil` is no longer drawn as if it never is: `Array[String?]` and a
+    `map` whose block can return `nil` are drawn `Array`, not `Array[String]`.
+  - A method ending in a long `elsif` chain, a conditional inside an `else`, or a `begin`/`rescue`
+    holding one is typed again. Every `elsif` and `else` counted as a level of nesting of its own,
+    so a fourth branch was given up on even when every branch is a `String`. Conditionals nested
+    up to nine deep are read; four was the limit before.
+  - Limits on how far a type is followed no longer cut real code. A call with more than 20
+    arguments or keywords binds them all, a chain of more than 20 calls is followed, a method
+    whose answer is more than ten methods deep is read, and a constant built from constants four
+    deep (addressable's `QUERY`) is a `String`.
+  - **A controller's `params`, `request`, `response`, `session`, `flash` and `cookies` have their
+    Rails classes**, and so do a template's and a helper's `request`, `response`, `session`,
+    `flash` and `cookies`. `params.permit(…)` is an `ActionController::Parameters`, and
+    `request.original_url` a `String`. `session` is the application's session, not the one a
+    controller test stores. A template's `request` can be `nil`, as it is in a mailer's template.
+    A controller's `cookies` stays private.
+  - **`Rails.root`, `Time.zone` and the controller types no longer need a
+    `config/application.rb`**: an engine or a gem monorepo whose bundle holds the framework gets
+    them too.
+  - **A class whose superclass is spelled like itself inherits from the class Ruby names**:
+    `class ApplicationController < ApplicationController` inside `module Admin` is the top-level
+    `ApplicationController`'s subclass, and `class Scope < Scope` inside a policy is its parent
+    policy's `Scope`'s. The class and every class below it reach the parent's methods, completions,
+    instance variables, supertypes and subtypes, and so do their templates. Hover and go-to
+    definition on that superclass name go to the parent; where Ruby would raise, they answer
+    nothing.
+  - **A `raise` no longer erases a method's type.** `return name if name; raise "missing"` is a
+    `String`: a `raise` or `fail` hands nothing back, so it is left out of what a method or a block
+    returns. `x || raise` is `x` without its `nil`.
+  - **Inlay hints read a file once per request**, not four times on first open and twice after.
+  - **A block's type reads every branch.** `map { c ? "x" : maybe }` was `Array[String]` where
+    `maybe` can be `nil`, and `then { c ? true : flag }` was `true`; they are `Array` and `bool`.
+    The answer no longer depends on which branch is written first.
+  - **`new` in a subclass is the subclass**, not the parent an inherited signature names
+    (`Tempfile.new` reached from `Paperclip::Tempfile`).
+  - **A method two Ruby bodies define beside a signature shows the same union in the margin as in
+    a chain**, instead of the signature alone.
+  - **A method written inside a block (`class_eval`, `Struct.new do`) no longer types calls on
+    every object**, and a private method hands a block nothing on another object. Navigation
+    already refused both.
+  - **Hover, completion and go-to answer from the same per-request memory as inlay hints**, so an
+    answer no longer depends on which request asked. A union lists its classes before `true` and
+    `false` everywhere, as variables already did.
+  - **A private method no longer types a call written on another object**, where Ruby raises.
+    `Oj.load(…)` was `bool` and `Process.spawn(…)` was `Integer`, both read from `Kernel`'s
+    private copies.
+  - **`Story.all` and `Story.unscoped` are a `Story::Relation`**, on a model and on a relation, so
+    the calls after them are typed too. `Story.unscoped { … }` returns what its block returns, and
+    gets no type. Go-to definition on `Story.all` goes to Rails' `Scoping::Named#all`, as before.
+  - **A `def` written in an RSpec group no longer takes its margin from every spec's `def` of that
+    name.** rubydex files them all as one `Object` method, so two spec files' `def helper` read
+    `-> String | Integer` in both.
+  - **A hover no longer says a method's body was read where its signatures answered.** A call whose
+    arguments pick one of several signatures, or whose receiver fills in a generated return, now
+    reads "what the method declares, read with this call's receiver and arguments".
+- **Go to definition**
+  - **`count`, `sum`, `average`, `first`, `last`, `pluck`, `merge`, `empty?` and `create` on a
+    model or relation go to the `def` Rails calls**: `Calculations#count`, `SpawnMethods#merge`.
+    They went to a class inside `ActiveRecord::Relation` with a method of that name
+    (`explain.count`'s proxy, the `Merger`). `+`, `-` and `|`, which Rails hands to the records,
+    now go nowhere instead of to `WhereClause`.
+- **Speed**
+  - **Every re-index after an edit takes a third less time** on a large app: 217 ms,
+    was 336 ms. Finding ActiveRecord's classes scanned every name in the bundle, seven times; four
+    readers each walked every class in it; every spec file was checked on disk, though only open
+    ones are read; and each column's generated methods were filed twice.
+  - **Opening or closing a spec file costs a third of what it did**: 96 ms on a large app, was
+    294 ms. Only the RSpec reading runs again, not every model, schema and struct in the
+    project, and only its own documents are looked up afterwards.
+  - **A hover inside a gem whose base class has hundreds of subclasses takes 30 ms, was 190 ms**
+    (`shopify_api`'s REST resources). Reading an instance variable asks every file of every
+    class the object can be; those files are now kept between requests, parsed and unparsed,
+    instead of read from disk and parsed again each time.
+  - **Go-to-definition on `describe` or `it` in a spec being edited no longer re-indexes first**
+    to find it still has nowhere to go.
+  - **Hover and go-to-definition spend a quarter to two thirds less time**, with the same answers:
+    on the largest app a third of what they did, on smaller ones 18–37% less. The classes a
+    view or partial can be rendered by are kept until the project changes, not found again for
+    every request. Finding which constant a call's receiver names searches a sorted index of a
+    large file's spans, not the whole file. An instance variable's writers are checked for
+    `instance_variable_set` in the index, not by scanning each file's text twice. And the file and
+    line a hover's note names are worked out once, not for every value a method can return.
+  - **A hover on an instance variable in a view or a helper takes under 2 ms, was 5–7 ms**, with
+    the same answers. The classes an object can be, and the files that can
+    write its variables, are kept until the project changes, not worked out again for every
+    request by reading each subclass's path. Hover's slowest twentieth takes 29% less time.
+  - **Hover takes another fifth less time on Apple silicon**, with the same answers (slowest
+    twentieth 1.6 ms, was 2.0). Reading an instance variable searches the text
+    of every file that could write it for its name, and that search is now vectorised on ARM too.
+  - **Hover parses the file under the cursor once**, not up to six times, with the same answers:
+    its typical answer takes an eighth to a third less time, and its slowest twentieth 1.1–1.3 ms,
+    was 1.7. Go-to-definition, highlight and completion share
+    one parse between their own questions too.
+  - **Hover's slowest twentieth takes about 1.0 ms**, was 1.2–1.3,
+    with the same answers. Checking whether a `private` inside a block reaches the methods below
+    it no longer re-reads the file on every request, only when its text changes. Whether a file
+    is a test, a migration or a generator template is worked out once, not on every request.
+  - **A long session peaks 35–100 MB lower**, with the same answers and the same speed: 543 MB
+    on a small app, was 578; 921 MB on a mid-size one, was 986; 1.1 GB on the largest, was 1.2. What a file
+    is kept as between requests takes 29% less room: a method parameter is stored once, not once
+    per read of it. A file's text is shared with each request instead of copied into it. And at
+    most 32 MB of text is kept, not 64.
+  - **The check after an edit to a model takes a fifth less of ya-lsp's own time**: 101 ms on
+    a large app, was 128. Files with a `Struct.new` or a `define_method` are read again only when
+    they change, not after every edit, and gathering what every file declares no longer copies
+    each one's list first.
 
 ## [0.6.0] — 2026-09-23
 
@@ -167,7 +786,7 @@ The server and the VS Code extension ship as one version. Format follows
   of the 127 names, **125 resolve and all 125 land on the line Ruby names**. One `def` that several
   declarations name is still one place, so a model no longer offers the same line five times.
 
-- **A namespace a directory declares.** `class Discourse::Utils` where no file declares `Discourse`
+- **A namespace a directory declares.** `class Shop::Utils` where no file declares `Shop`
   raises `NameError` in Ruby and runs under Rails, because a directory with no matching `.rb` *is*
   the declaration. ya-lsp reads it, with Rails' own three bounds — the `app` anchor an engine keeps,
   the `assets`/`javascript`/`views` exclusion, and `app/{*,*/concerns}`. Over six applications, jump
@@ -326,8 +945,8 @@ The server and the VS Code extension ship as one version. Format follows
   a bare `private` as a statement that governs the body it is written in until that body ends, and a
   block is not a body to it — so `class_methods do … private … end` in an ordinary Rails concern set
   the *module's* default visibility, and every method declared below the block was recorded private.
-  Nothing acted on that record until the refusal above shipped; then it took them all. Discourse's
-  `HasCustomFields#upsert_custom_fields` is the measured one: a public method the application calls
+  Nothing acted on that record until the refusal above shipped; then it took them all. One
+  application's `HasCustomFields#upsert_custom_fields` is the measured one: a public method the application calls
   on explicit receivers, answered with no card, no jump and no place in any completion list. The
   declaring file is reread at the point the refusal would be made, and the record is overturned
   where a bare modifier that escaped a block is the whole reason for it. **The card and the outline
@@ -1079,7 +1698,9 @@ name wherever the receiver cannot be named.
   ya-lsp can be confidently wrong rather than merely absent.
 - **A Ruby file outside every workspace folder gets no server**, because there is no root to index.
 
-[Unreleased]: https://github.com/ar2em1s/ya-lsp/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/ar2em1s/ya-lsp/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v1.0.0
+[0.6.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.6.0
 [0.5.1]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.5.1
 [0.5.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.5.0
 [0.4.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.4.0

@@ -276,16 +276,14 @@ pub fn server_capabilities(encoding: PositionEncoding, root: &Path) -> ServerCap
         // announced further out, in `Advertised`, which exists because `lsp-types` 0.97 can spell
         // this capability but not that one.
         call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
-        // `resolveProvider: true`: the opposite decision from the document link's, for the opposite
-        // reason. A link's target is known when the link is made; a hint's tooltip is a sentence
-        // nobody sees until they point at one, and building it for every visible hint would put a
-        // paragraph of markdown on the wire per line. Hints with no tooltip ship no `data`, so the
-        // client never asks about those.
+        // `resolveProvider: false`, as for document links: a hint is its label, and there is no
+        // tooltip to fetch. A tooltip said how the type was found, which no surface says any more
+        // (decided 2026-09-29), and a guess is never drawn.
         //
         // Nothing is taken away by this one: no editor draws Ruby types in the margin otherwise.
         inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
             InlayHintOptions {
-                resolve_provider: Some(true),
+                resolve_provider: Some(false),
                 work_done_progress_options: WorkDoneProgressOptions::default(),
             },
         ))),
@@ -338,6 +336,14 @@ pub fn server_info() -> serde_json::Value {
 /// Ruby patterns.
 const SCHEMA_DUMP_GLOB: &str = "db/*structure.sql";
 
+/// The application's database configuration, which says which adapter its connection is. YAML, so
+/// never indexed, and read by the generator pass like a schema dump.
+const DATABASE_CONFIG_GLOB: &str = "config/database.yml";
+
+/// The project's locale files, YAML, read beside the pass like `database.yml`. The
+/// `.rb` ones are Ruby, which `index.include` already watches.
+const LOCALES_GLOB: &str = "**/config/locales/**/*.yml";
+
 /// The id the watcher registration is made under.
 ///
 /// Fixed, not generated: the protocol identifies a registration by this string, so anything that
@@ -356,9 +362,10 @@ const WATCHED_FILES_ID: &str = "ya-lsp-watched-files";
 /// narrows it on arrival. Watching too much costs dropped notifications; watching too little leaves
 /// a file that never refreshes.
 ///
-/// **Two patterns are constants, and neither is indexed**, by design. `ya-lsp.toml` is watched and
-/// never indexed, and [`SCHEMA_DUMP_GLOB`] sits beside it for the same reason: a `db/structure.sql`
-/// is read by the generator pass, is not Ruby, and must never reach rubydex. Being constants makes
+/// **Four patterns are constants, and none is indexed**, by design. `ya-lsp.toml` is watched and
+/// never indexed, and [`SCHEMA_DUMP_GLOB`], [`DATABASE_CONFIG_GLOB`] and [`LOCALES_GLOB`] sit
+/// beside it for the same reason: a `db/structure.sql`, a `config/database.yml` and a locale file
+/// are read beside the graph, are not Ruby, and must never reach rubydex. Being constants makes
 /// them safe: this registration is made once, at `initialize`, so anything derived from reloadable
 /// configuration would be stale for the life of the process.
 #[must_use]
@@ -377,18 +384,23 @@ pub fn watched_files(
     }
     let relative = watched.relative_pattern_support == Some(true);
     let options = DidChangeWatchedFilesRegistrationOptions {
-        watchers: [CONFIG_FILE_NAME, SCHEMA_DUMP_GLOB]
-            .into_iter()
-            .chain(index.include.iter().map(String::as_str))
-            .map(|pattern| FileSystemWatcher {
-                glob_pattern: watch_glob(root, pattern, relative),
-                // All three kinds, which is what omitting `kind` means. A deleted `ya-lsp.toml` is
-                // a configuration change (back to defaults), and so is one written for the first
-                // time; a deleted `.rb` is the one case the index cannot learn any other way, since
-                // nothing else says a declaration has gone.
-                kind: None,
-            })
-            .collect(),
+        watchers: [
+            CONFIG_FILE_NAME,
+            SCHEMA_DUMP_GLOB,
+            DATABASE_CONFIG_GLOB,
+            LOCALES_GLOB,
+        ]
+        .into_iter()
+        .chain(index.include.iter().map(String::as_str))
+        .map(|pattern| FileSystemWatcher {
+            glob_pattern: watch_glob(root, pattern, relative),
+            // All three kinds, which is what omitting `kind` means. A deleted `ya-lsp.toml` is
+            // a configuration change (back to defaults), and so is one written for the first
+            // time; a deleted `.rb` is the one case the index cannot learn any other way, since
+            // nothing else says a declaration has gone.
+            kind: None,
+        })
+        .collect(),
     };
     Some(Registration {
         id: WATCHED_FILES_ID.to_owned(),
@@ -466,9 +478,9 @@ struct Dynamic {
 /// claimed for `didOpen` and silent for that one request, which looks like it works and is worse
 /// than a file that is silent for everything.
 ///
-/// `completionItem/resolve`, `inlayHint/resolve` and the four hierarchy walks are deliberately
-/// absent: the protocol registers each through its parent's options, so they arrive with
-/// `resolveProvider` and the `prepare` entry, not under their own methods.
+/// `completionItem/resolve` and the four hierarchy walks are deliberately absent: the protocol
+/// registers each through its parent's options, so they arrive with `resolveProvider` and the
+/// `prepare` entry, not under their own methods.
 const DYNAMIC: [Dynamic; 19] = [
     Dynamic {
         advertised: "hoverProvider",
@@ -879,18 +891,16 @@ mod tests {
     }
 
     #[test]
-    fn the_inlay_hint_provider_says_it_resolves_the_tooltip() {
-        // The opposite answer from the document link's, for the opposite reason. A link's target is
-        // known when the link is made, so resolving would only add a round trip per link; a hint's
-        // tooltip is a paragraph nobody sees until they point at it, and shipping it eagerly puts
-        // markdown on the wire for every line on every scroll.
+    fn the_inlay_hint_provider_resolves_nothing() {
+        // A hint is its label: no tooltip says how the type was found, so there is nothing to
+        // fetch, and `Some(false)` says so outright, as the document link's does.
         let capabilities = server_capabilities(PositionEncoding::Utf8, Path::new("/project"));
         let Some(OneOf::Right(InlayHintServerCapabilities::Options(hints))) =
             capabilities.inlay_hint_provider
         else {
             panic!("an inlay hint provider with options");
         };
-        assert_eq!(hints.resolve_provider, Some(true));
+        assert_eq!(hints.resolve_provider, Some(false));
     }
 
     #[test]
@@ -1019,9 +1029,13 @@ mod tests {
             vec![
                 // A client without relative patterns gets absolute ones, with `/` separators.
                 GlobPattern::String("/tmp/ya-lsp-watch/project/ya-lsp.toml".to_owned()),
-                // The two constants come first, and neither is from `index.include`: both name a
-                // file this server reads and never indexes.
+                // The constants come first, and none is from `index.include`: each names a file
+                // this server reads and never indexes.
                 GlobPattern::String("/tmp/ya-lsp-watch/project/db/*structure.sql".to_owned()),
+                GlobPattern::String("/tmp/ya-lsp-watch/project/config/database.yml".to_owned()),
+                GlobPattern::String(
+                    "/tmp/ya-lsp-watch/project/**/config/locales/**/*.yml".to_owned(),
+                ),
                 GlobPattern::String("/tmp/ya-lsp-watch/project/**/*.rb".to_owned()),
                 GlobPattern::String("/tmp/ya-lsp-watch/project/sig/**/*.rbs".to_owned()),
             ],
@@ -1052,11 +1066,16 @@ mod tests {
         // Derived from the default, not spelled out: this test is about the *form* of each pattern,
         // and `the_watchers_cover_the_config_and_everything_the_index_includes` above already pins
         // that the list is `index.include` verbatim.
-        let expected: Vec<GlobPattern> = [CONFIG_FILE_NAME.to_owned(), SCHEMA_DUMP_GLOB.to_owned()]
-            .into_iter()
-            .chain(IndexConfig::default().include)
-            .map(|pattern| relative(&pattern))
-            .collect();
+        let expected: Vec<GlobPattern> = [
+            CONFIG_FILE_NAME.to_owned(),
+            SCHEMA_DUMP_GLOB.to_owned(),
+            DATABASE_CONFIG_GLOB.to_owned(),
+            LOCALES_GLOB.to_owned(),
+        ]
+        .into_iter()
+        .chain(IndexConfig::default().include)
+        .map(|pattern| relative(&pattern))
+        .collect();
         assert_eq!(
             watchers(&registration)
                 .iter()
@@ -1307,7 +1326,7 @@ mod tests {
         );
         assert_eq!(options("textDocument/didSave")["includeText"], false);
         assert_eq!(options("textDocument/rename")["prepareProvider"], true);
-        assert_eq!(options("textDocument/inlayHint")["resolveProvider"], true);
+        assert_eq!(options("textDocument/inlayHint")["resolveProvider"], false);
     }
 
     /// `didOpen` is registered last, because registering it is what sends the notifications.

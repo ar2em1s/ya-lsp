@@ -322,7 +322,7 @@ def ask_all(client, corpus, drawn, methods=("textDocument/hover", "textDocument/
 
     **A method the stride or shape skipped has no key in the result.** Every downstream check must
     keep *not asked here* apart from *asked and answered nothing*, the way `lane2.context.Row` keeps
-    `listed` apart from `offered`.
+    `referenced` apart from `references`.
 
     **Pipelined and matched by id, with a cap on requests in flight.** Posting a whole corpus at
     once gains nothing (the server answers in order anyway) and holds every reply in memory before
@@ -340,7 +340,7 @@ def ask_all(client, corpus, drawn, methods=("textDocument/hover", "textDocument/
     # reached it made an answer depend on where its cursor sat in the draw: a reference in an
     # unopened document is not in the graph if the project's `.gitignore` names that file (lobsters
     # gitignores some tracked templates). The same cursor then answered differently early and late
-    # in the pass, and check 9 read the difference as missed call sites. One document set for the
+    # in the pass, and check 8 read the difference as missed call sites. One document set for the
     # whole pass is what makes two replies comparable.
     for _, _, path, _, _, _, _ in drawn:
         if path not in opened:

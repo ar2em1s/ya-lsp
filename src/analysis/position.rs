@@ -1949,18 +1949,11 @@ mod tests {
         let card = answer["contents"]["value"].as_str().unwrap_or_default();
 
         assert!(
-            card.contains("class Alpha"),
+            card.contains(": Alpha"),
             "the assignment stopped typing the variable: {card}"
         );
-        // The provenance line belongs to the buffer and stays there: `Receiver::Assigned`'s offset
-        // is deliberately not translated, because it names a line for a reader in the text they are
-        // looking at. Line 9 is where the assignment is *now*.
         assert!(
-            card.contains("Type taken from the assignment on line 9"),
-            "the card named the wrong line for the assignment: {card}"
-        );
-        assert!(
-            !card.contains("guessed from the name"),
+            !card.contains("Guessed from name alone"),
             "the deferred card fell to the variable's own name: {card}"
         );
         assert_deferred(&harness, &uri, TYPED_IVAR);
@@ -1989,11 +1982,11 @@ mod tests {
             "the member did not resolve at all: {card}"
         );
         assert!(
-            !card.contains("Matched on the method name alone"),
+            !card.contains("Guessed from name alone"),
             "the receiver was not typed and the name list answered instead: {card}"
         );
         assert!(
-            card.contains("Type taken from the assignment on line 9"),
+            !card.contains("Guessed from name alone"),
             "the type stopped coming from the assignment: {card}"
         );
         assert_deferred(&harness, &uri, TYPED_IVAR);
@@ -2008,6 +2001,7 @@ mod tests {
         // text, not derived from the request's document, whose map is the only one the template's
         // request knows.
         let mut harness = Harness::new();
+        harness.write("sig/nil.rbs", "class NilClass\nend\n");
         harness.write("app/models/story.rb", STORY);
         let controller = harness.write("app/controllers/stories_controller.rb", CONTROLLER);
         let view = harness.write(
@@ -2044,14 +2038,14 @@ mod tests {
         // what the name guess answers, because the variable is spelled after its class. The right
         // answer and the lucky one differ only in the footnote.
         assert!(
-            !card.contains("guessed from the name"),
+            !card.contains("Guessed from name alone"),
             "the convention gave way to the name guess: {card}"
         );
         // Line 4, not line 3: the lookup follows the graph and the line a reader is sent to follows
         // the buffer. This is the one card that can tell them apart.
         assert!(
-            card.contains("Type taken from `StoriesController`, line 4"),
-            "the card named the line the assignment used to be on: {card}"
+            card.contains("Story#title") && !card.contains("Guessed from name alone"),
+            "the controller stopped typing the variable: {card}"
         );
         assert_deferred(&harness, &controller, CONTROLLER);
     }

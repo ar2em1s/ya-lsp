@@ -48,5 +48,5 @@ used by `signatures::without_interfaces` and `cursor::Finder::without_the_half_t
   - They keep their diagnostics. A syntax error there is the user's own bug. Held by
     `a_jbuilder_is_indexed_whole_and_keeps_the_squiggle_a_template_beside_it_loses`.
   - They get no view context yet: no `current_user`, no `*_path` helpers, no controller `@ivar`s
-    (`views.md`). mastodon's `.rss.ruby` files are the fixture to write that against.
+    (`views.md`). A corpus's `.rss.ruby` files are the fixture to write that against.
 - **Gems never contribute templates.** `gems.rs` has its own `.rb` filter.

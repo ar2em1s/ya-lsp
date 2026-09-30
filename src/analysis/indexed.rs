@@ -39,22 +39,33 @@
 //! [`Analysis::graph_holds`](super::Analysis::graph_holds) asks the same hash one step earlier,
 //! where both the parse and the invalidation can still be skipped.
 
-use std::{cell::OnceCell, collections::HashSet, ops::Deref};
+use std::{
+    cell::OnceCell,
+    collections::{HashMap, HashSet, VecDeque},
+    ops::Deref,
+    rc::Rc,
+};
 
 use rubydex::{
     indexing::{self, LanguageId},
     model::{
+        declaration::{Ancestor, Ancestors, Declaration, Namespace},
+        definitions::{Definition, Mixin},
         graph::Graph,
         identity_maps::{IdentityHashBuilder, IdentityHashMap},
-        ids::{DeclarationId, StringId, UriId},
+        ids::{DeclarationId, NameId, StringId, UriId},
+        name::ParentScope,
     },
 };
 
 use super::{
     completion::directory_of,
     environment,
+    locator::Spans,
     synthesized::{GENERATED_SCHEME, source_of},
+    types,
 };
+use crate::workspace::rails;
 
 /// The graph, and what is indexed beside it.
 ///
@@ -70,7 +81,37 @@ pub struct Indexed {
     members: OnceCell<Members>,
     /// The second thing indexed beside the graph, and lazy for the same reason. See [`Placed`].
     placed: OnceCell<Placed>,
+    /// Every namespace whose linearization rubydex found cyclic, by the last segment of its name.
+    /// Lazy for [`Self::members`]' reason. See [`Self::cyclic_named`].
+    cycles: OnceCell<HashMap<String, Vec<DeclarationId>>>,
+    /// Every document that calls `instance_variable_set` or `remove_instance_variable`. Lazy for
+    /// [`Self::members`]' reason. See [`Self::reflective_documents`].
+    reflective: OnceCell<Vec<UriId>>,
+    /// Every call of a method, by the name it is called by: filled one name at a time, as asked.
+    /// See [`Self::calls_named`].
+    calls: std::cell::RefCell<HashMap<StringId, Rc<[Call]>>>,
+    /// Every class a view can run on. Lazy for [`Self::members`]' reason. See [`Self::renderers`].
+    renderers: OnceCell<Rc<[DeclarationId]>>,
+    /// Each of those and the layouts its views are rendered in. See [`Self::layouts`].
+    layouts: OnceCell<Rc<[(DeclarationId, rails::Layouts)]>>,
+    /// A large document's spans, by the document: filled one document at a time, as asked. See
+    /// [`Self::spans`].
+    spans: std::cell::RefCell<HashMap<UriId, Rc<Spans>>>,
+    /// Each object's classes and its writers' documents: filled one object at a time, as asked.
+    /// See [`Self::hierarchy`].
+    hierarchies: std::cell::RefCell<Hierarchies>,
+    /// What the fences read off each document's path: filled one document at a time, as asked.
+    /// See [`Self::paths`].
+    paths: environment::HeldPaths,
 }
+
+/// One call site: its document and the span rubydex filed it under.
+pub type Call = (UriId, u32, u32);
+
+/// [`Indexed::hierarchy`]'s: by the namespace, whether it is the class object's side, and the fence
+/// it was built under.
+type Hierarchies =
+    HashMap<(DeclarationId, bool, environment::FenceKey), Option<Rc<types::Hierarchy>>>;
 
 impl Default for Indexed {
     /// `Graph::new`, not `Graph::default`, which is a different graph: `new` installs `Object`,
@@ -89,6 +130,14 @@ impl Default for Indexed {
             graph,
             members: OnceCell::new(),
             placed: OnceCell::new(),
+            cycles: OnceCell::new(),
+            reflective: OnceCell::new(),
+            calls: std::cell::RefCell::default(),
+            renderers: OnceCell::new(),
+            layouts: OnceCell::new(),
+            spans: std::cell::RefCell::default(),
+            hierarchies: std::cell::RefCell::default(),
+            paths: environment::HeldPaths::default(),
         }
     }
 }
@@ -181,6 +230,14 @@ impl Indexed {
     pub fn graph_mut(&mut self) -> &mut Graph {
         self.members.take();
         self.placed.take();
+        self.cycles.take();
+        self.reflective.take();
+        self.calls.get_mut().clear();
+        self.renderers.take();
+        self.layouts.take();
+        self.spans.get_mut().clear();
+        self.hierarchies.get_mut().clear();
+        self.paths.forget();
         &mut self.graph
     }
 
@@ -193,6 +250,159 @@ impl Indexed {
         self.members
             .get_or_init(|| Members::of(&self.graph))
             .named(member)
+    }
+
+    /// Every namespace named `unqualified` (the last segment) whose linearization rubydex found
+    /// cyclic.
+    ///
+    /// **The shape it finds is rubydex resolving a superclass to the class being opened**
+    /// (an upstream defect): `class ApplicationController < ApplicationController` inside
+    /// `module Admin`. The superclass it dropped is spelled like the class, so a class of that last
+    /// name may be missing a subclass from its descendants, and a question over its descendants
+    /// must know.
+    pub fn cyclic_named(&self, unqualified: &str) -> &[DeclarationId] {
+        self.cycles
+            .get_or_init(|| {
+                let mut cycles: HashMap<String, Vec<DeclarationId>> = HashMap::new();
+                for (id, declaration) in self.graph.declarations() {
+                    if let Declaration::Namespace(namespace) = declaration
+                        && matches!(namespace.ancestors(), Ancestors::Cyclic(_))
+                    {
+                        // Only the class whose own superclass is spelled like it: the one the
+                        // upstream defect makes. A subclass inherits the short chain without
+                        // dropping any link of its own.
+                        let own = declaration.unqualified_name();
+                        if self.superclass_spelled(declaration, &own) {
+                            cycles.entry(own).or_default().push(*id);
+                        }
+                    }
+                }
+                cycles
+            })
+            .get(unqualified)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether one of `declaration`'s `class` definitions writes a superclass whose last segment is
+    /// `spelled`.
+    fn superclass_spelled(&self, declaration: &Declaration, spelled: &str) -> bool {
+        declaration
+            .definitions()
+            .iter()
+            .filter_map(|id| self.graph.definitions().get(id))
+            .any(|definition| {
+                let Definition::Class(class) = definition else {
+                    return false;
+                };
+                class
+                    .superclass_ref()
+                    .and_then(|reference| self.graph.constant_references().get(reference))
+                    .and_then(|reference| self.graph.names().get(reference.name_id()))
+                    .and_then(|name| self.graph.strings().get(name.str()))
+                    .is_some_and(|written| written.as_str() == spelled)
+            })
+    }
+
+    /// Every document with a call to `instance_variable_set` or `remove_instance_variable`, from
+    /// rubydex's call index: the only documents that can write a variable no `@name =` spells on
+    /// an object they do not own. Sorted, so a reader walks them in a stable order.
+    pub fn reflective_documents(&self) -> &[UriId] {
+        self.reflective.get_or_init(|| {
+            let names = super::scopes::REFLECTIVE_WRITERS.map(StringId::from);
+            let mut documents: Vec<UriId> = self
+                .graph
+                .method_references()
+                .values()
+                .filter(|reference| names.contains(reference.str()))
+                .map(|reference| reference.uri_id())
+                .collect();
+            documents.sort_unstable();
+            documents.dedup();
+            documents
+        })
+    }
+
+    /// Every call of a method named `name`, sorted, whatever it is called on.
+    ///
+    /// A scan of rubydex's whole call index, so each name is scanned once per graph, not once per
+    /// request.
+    pub fn calls_named(&self, name: &str) -> Rc<[Call]> {
+        let wanted = StringId::from(name);
+        if let Some(held) = self.calls.borrow().get(&wanted) {
+            return Rc::clone(held);
+        }
+        let mut calls: Vec<Call> = self
+            .graph
+            .method_references()
+            .values()
+            .filter(|reference| *reference.str() == wanted)
+            .map(|reference| {
+                (
+                    reference.uri_id(),
+                    reference.offset().start(),
+                    reference.offset().end(),
+                )
+            })
+            .collect();
+        calls.sort_unstable();
+        let calls: Rc<[Call]> = Rc::from(calls);
+        self.calls.borrow_mut().insert(wanted, Rc::clone(&calls));
+        calls
+    }
+
+    /// `uri_id`'s spans, sorted for [`locator::locate_held`](super::locator::locate_held): built
+    /// by the first question about that document, and held until the graph changes.
+    pub fn spans(&self, uri_id: UriId, build: impl FnOnce() -> Spans) -> Rc<Spans> {
+        if let Some(held) = self.spans.borrow().get(&uri_id) {
+            return Rc::clone(held);
+        }
+        let spans = Rc::new(build());
+        self.spans.borrow_mut().insert(uri_id, Rc::clone(&spans));
+        spans
+    }
+
+    /// Link every class rubydex resolved as its own superclass to the class Ruby names there. Run
+    /// after each resolve, by `analysis::resolve`.
+    ///
+    /// - **The upstream defect.** `class ApplicationController < ApplicationController` inside
+    ///   `module Admin` names the top-level class, because Ruby evaluates the superclass before the
+    ///   constant exists. rubydex finds `Admin::ApplicationController` itself, marks the chain
+    ///   cyclic, and ends it, and the chain of every class below it, at an `Object` it estimates.
+    /// - **Repaired in the graph, once, not at each reader.** About thirty places read a chain or a
+    ///   set of descendants, rubydex's own member search and completion among them. A chain written
+    ///   into the graph reaches every one of them.
+    /// - **What is written.** The parent is [`superclass_outside`]. Each class below the cycle keeps
+    ///   its own head (itself and its modules, down to the cycle) and takes the parent's whole chain
+    ///   after it, less the modules the parent already has, which Ruby's `include` skips too. Each
+    ///   class in the parent's chain gains it as a descendant. The class side takes the same from
+    ///   the parent's singleton ([`splice`]).
+    /// - **rubydex keeps it consistent.** An edit to a class takes it out of every ancestor its chain
+    ///   lists and relinks every descendant it lists, so an edit on either side unlinks the repair
+    ///   with the chain, and the next resolve's pass writes it again.
+    /// - **Left as it was:** a parent nothing names, and a parent below the class, which Ruby cannot
+    ///   load either. Both keep the cycle, and the readers that refuse one (`types::ancestry`,
+    ///   [`Self::cyclic_named`]) still do.
+    pub fn repair_superclasses(&mut self) {
+        let mut pending = cut_short(&self.graph);
+        if pending.is_empty() {
+            return;
+        }
+        let found = pending.len();
+        let graph = self.graph_mut();
+        // A parent may sit below another such class (`Admin::Reports::ApplicationController <
+        // ApplicationController` reaching `Admin::ApplicationController`), so a class waits until
+        // its parent's chain is whole. Each round repairs one or more, or stops.
+        while !pending.is_empty() {
+            let before = pending.len();
+            pending.retain(|&(class, parent)| !splice(graph, class, parent));
+            if pending.len() == before {
+                break;
+            }
+        }
+        tracing::debug!(
+            "relinked {} of {found} classes resolved as their own superclass",
+            found - pending.len()
+        );
     }
 
     /// Where every document in the graph sits, built by the first request that asks.
@@ -212,9 +422,87 @@ impl Indexed {
     /// Called from the two places that can change it: a `ya-lsp.toml` reload, which can move
     /// `[trees]` and the load paths, and gem discovery, where `foreign_prefixes` learns a directory
     /// inside the workspace root is somebody else's bundle. Every other input is the graph's
-    /// contents, which [`Self::graph_mut`] invalidates.
+    /// contents, which [`Self::graph_mut`] invalidates. [`Self::renderers`] reads whose code a
+    /// document is too, so it goes with it, and [`Self::hierarchy`] reads the fence, whose
+    /// [`Layout`](environment::Layout) is those same inputs, as are [`Self::paths`].
     pub(super) fn forget_placement(&mut self) {
         self.placed.take();
+        self.renderers.take();
+        self.layouts.take();
+        self.hierarchies.get_mut().clear();
+        self.paths.forget();
+    }
+
+    /// What the fences have read off each document's path ([`environment::HeldPaths`]), for
+    /// `Analysis::layout` to carry.
+    ///
+    /// **Held across requests** for [`Self::hierarchy`]'s reason: a hover asks the same few
+    /// hundred paths on every request, and each answer is a function of the path and the
+    /// [`Layout`](environment::Layout) alone. The layout is a non-graph input, dropped by
+    /// [`Self::forget_placement`]; [`Self::graph_mut`] drops it too, for `HeldPaths`' reason.
+    pub(super) fn paths(&self) -> &environment::HeldPaths {
+        &self.paths
+    }
+
+    /// Every class a view can run on (`types::every_renderer`), built by the first request that
+    /// asks and held until the graph changes.
+    ///
+    /// **Held across requests**, not one request's memo: it walks every document in the graph and
+    /// parses each one's URI, and a partial or a helper asks it on every read (a tenth of two
+    /// corpora's audits). `find` receives nothing, for [`Self::placed`]'s reason: its answer
+    /// reads the view convention and whose code a document is. Those are its non-graph inputs,
+    /// dropped by [`Self::forget_placement`] and [`Self::forget_renderers`].
+    pub(super) fn renderers(
+        &self,
+        find: impl FnOnce() -> Rc<[DeclarationId]>,
+    ) -> Rc<[DeclarationId]> {
+        Rc::clone(self.renderers.get_or_init(find))
+    }
+
+    /// Each class a view can run on and the layouts its views are rendered in
+    /// (`types::layout_renderers`), built by the first layout read that asks and held with
+    /// [`Self::renderers`], from which it is found: dropped wherever they are.
+    pub(super) fn layouts(
+        &self,
+        find: impl FnOnce() -> Rc<[(DeclarationId, rails::Layouts)]>,
+    ) -> Rc<[(DeclarationId, rails::Layouts)]> {
+        Rc::clone(self.layouts.get_or_init(find))
+    }
+
+    /// Every class an object can be and every document its writers are written in
+    /// (`types::hierarchy`), built by the first request that asks and held until the graph
+    /// changes.
+    ///
+    /// **Held across requests**, for [`Self::renderers`]' reason: `build` walks every descendant of
+    /// the object and reads each one's paths against the fence, and a template's or a helper's
+    /// variable asks it once per class that renders it, on every hover. Rebuilt per request, it was
+    /// most of what a slow hover cost (2026-09-29).
+    ///
+    /// - **A refusal is held too.** `None` is as much the graph's answer as a hierarchy is.
+    /// - **The fence is in the key** ([`environment::Fence::key`]), so a spec and a loose file each
+    ///   keep their own answer. Its [`Layout`](environment::Layout) is not: that is a non-graph
+    ///   input, dropped by [`Self::forget_placement`].
+    pub(super) fn hierarchy(
+        &self,
+        base: DeclarationId,
+        class_side: bool,
+        fence: environment::FenceKey,
+        build: impl FnOnce() -> Option<types::Hierarchy>,
+    ) -> Option<Rc<types::Hierarchy>> {
+        let key = (base, class_side, fence);
+        if let Some(held) = self.hierarchies.borrow().get(&key) {
+            return held.clone();
+        }
+        let made = build().map(Rc::new);
+        self.hierarchies.borrow_mut().insert(key, made.clone());
+        made
+    }
+
+    /// Drop the renderers because the view convention was rebuilt: the generator pass rebuilds it,
+    /// and need not write the graph to do so.
+    pub(super) fn forget_renderers(&mut self) {
+        self.renderers.take();
+        self.layouts.take();
     }
 
     /// Whether the index is built, for tests about it surviving (or not) a route into
@@ -229,6 +517,373 @@ impl Indexed {
     pub(super) fn placement_is_built(&self) -> bool {
         self.placed.get().is_some()
     }
+
+    /// How many documents' spans are held, for the same kind of test.
+    #[cfg(test)]
+    pub(super) fn spans_held(&self) -> usize {
+        self.spans.borrow().len()
+    }
+}
+
+/// Every class whose chain rubydex ended at a superclass resolved to the class itself, with the
+/// class Ruby names there. Sorted, so the repair runs in the same order on every resolve.
+fn cut_short(graph: &Graph) -> Vec<(DeclarationId, DeclarationId)> {
+    let mut found: Vec<(DeclarationId, DeclarationId)> = graph
+        .declarations()
+        .keys()
+        .filter(|id| is_class(graph, **id) && is_cut(graph, **id))
+        .filter_map(|id| Some((*id, superclass_outside(graph, *id)?)))
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// The class Ruby names as `class`'s superclass, where rubydex resolved that name to `class`
+/// itself. `None` for every other class, and where Ruby would raise.
+///
+/// Ruby evaluates the superclass before it creates the constant, so its lookup cannot find the
+/// class being opened. This is that lookup with the class skipped, in Ruby's order:
+/// 1. each scope the code is lexically inside, innermost first;
+/// 2. the ancestors of the innermost one, so `class Scope < Scope` inside a policy reaches its
+///    parent policy's `Scope`;
+/// 3. the top level.
+///
+/// The first constant found is the answer, and it must be a class: a module there is Ruby's
+/// `TypeError`, not a reason to look further. **Only a bare name**, which is the defect's shape:
+/// Ruby cannot resolve `Outer::Name` to a class that does not exist yet, so a qualified name that
+/// reached the class itself is Ruby's `NameError`.
+pub fn superclass_outside(graph: &Graph, class: DeclarationId) -> Option<DeclarationId> {
+    superclass_names(graph, class)
+        .filter(|name| graph.name_id_to_declaration_id(*name) == Some(&class))
+        .filter_map(|name| graph.names().get(&name))
+        .filter(|name| matches!(name.parent_scope(), ParentScope::None))
+        .find_map(|name| {
+            let spelled = graph.strings().get(name.str())?.as_str();
+            looked_up(graph, class, *name.nesting(), spelled)
+        })
+}
+
+/// The name each of `class`'s `class` definitions writes as its superclass.
+fn superclass_names(graph: &Graph, class: DeclarationId) -> impl Iterator<Item = NameId> + '_ {
+    graph
+        .declarations()
+        .get(&class)
+        .into_iter()
+        .flat_map(Declaration::definitions)
+        .filter_map(|id| match graph.definitions().get(id)? {
+            Definition::Class(written) => written.superclass_ref(),
+            _ => None,
+        })
+        .filter_map(|reference| graph.constant_references().get(reference))
+        .map(|reference| *reference.name_id())
+}
+
+/// Ruby's constant lookup for `spelled`, written inside `nesting`, skipping `class`. See
+/// [`superclass_outside`].
+fn looked_up(
+    graph: &Graph,
+    class: DeclarationId,
+    nesting: Option<NameId>,
+    spelled: &str,
+) -> Option<DeclarationId> {
+    let named = |name: String| types::declared(graph, &name).filter(|id| *id != class);
+    let inside = |owner: &DeclarationId| {
+        let owner = graph.declarations().get(owner)?.name();
+        named(format!("{owner}::{spelled}"))
+    };
+    // A scope rubydex could not resolve is no place to look; the scopes around it still are.
+    let scopes: Vec<DeclarationId> =
+        std::iter::successors(nesting, |name| *graph.names().get(name)?.nesting())
+            .filter_map(|name| graph.name_id_to_declaration_id(name).copied())
+            .collect();
+    let found = scopes
+        .iter()
+        .find_map(inside)
+        .or_else(|| {
+            let innermost = graph.declarations().get(scopes.first()?)?.as_namespace()?;
+            innermost
+                .ancestors()
+                .iter()
+                .find_map(|ancestor| match ancestor {
+                    Ancestor::Complete(id) => inside(id),
+                    Ancestor::Partial(_) => None,
+                })
+        })
+        .or_else(|| named(spelled.to_owned()))?;
+    is_class(graph, found).then_some(found)
+}
+
+/// Give `class`, and every class below it, the chain Ruby builds on `parent`, on both sides.
+/// `false` while `parent`'s own chain is still cut, so [`Indexed::repair_superclasses`] asks again
+/// once it is not.
+///
+/// - **A parent below `class` never gets here.** Its chain runs through `class`, so it is cut
+///   until this very call repairs it, and [`whole_chain`] refuses it: the cycle stays, as in Ruby.
+/// - **Rebuilt from each class's own mixins, not from the cut chain.** rubydex resolves a bare
+///   `include Shared` in a class body through the class's own chain, so in a class it cut, those
+///   names resolve only after the cut chain is cached, and never reach it. [`linearized`] reads
+///   them now that they have.
+/// - **Every class below a cut is cut**, since its chain runs through it, so each is written over.
+fn splice(graph: &mut Graph, class: DeclarationId, parent: DeclarationId) -> bool {
+    let Some(tail) = whole_chain(graph, parent) else {
+        return false;
+    };
+    // **The class side.** rubydex gives a class a singleton only where it declares a class method
+    // or extends a module, so a class without one adds nothing to the chain, and the nearest class
+    // above the parent that has one stands in for it.
+    let stand_in = tail
+        .ancestors
+        .iter()
+        .filter_map(complete)
+        .filter(|id| is_class(graph, *id))
+        .find_map(|id| singleton_class_of(graph, id))
+        .and_then(|singleton| whole_chain(graph, singleton));
+
+    // Each class's chains, by the class: `top_down` puts a superclass before its subclasses, so the
+    // chains a class builds on are here before it is.
+    let mut instance: HashMap<DeclarationId, Chain> = HashMap::new();
+    let mut class_side: HashMap<DeclarationId, (DeclarationId, Chain)> = HashMap::new();
+    for (id, superclass) in top_down(graph, class) {
+        let above = superclass.map_or(Some(&tail), |superclass| instance.get(&superclass));
+        let above_class_side = superclass.map_or(stand_in.as_ref(), |superclass| {
+            class_side.get(&superclass).map(|(_, chain)| chain)
+        });
+        let built = singleton_class_of(graph, id)
+            .zip(above_class_side)
+            .map(|(singleton, above)| (id, (singleton, linearized(graph, singleton, above, true))));
+        class_side.extend(built);
+        let built = above.map(|above| (id, linearized(graph, id, above, false)));
+        instance.extend(built);
+    }
+    let class_side = class_side.into_values();
+    for (id, chain) in instance.into_iter().chain(class_side) {
+        write(graph, id, chain);
+    }
+    true
+}
+
+/// A chain as [`linearized`] builds it, with the two facts rubydex's [`Ancestors`] states carry.
+struct Chain {
+    ancestors: Vec<Ancestor>,
+    /// A name in it has not resolved.
+    partial: bool,
+    /// A module in it is cyclic itself, which is not this repair's to undo.
+    cyclic: bool,
+}
+
+/// `id`'s chain, or `None` while it is still cut (or was never linearized).
+fn whole_chain(graph: &Graph, id: DeclarationId) -> Option<Chain> {
+    let chain = chain_of(graph, id)?;
+    (!chain.cyclic && !chain.ancestors.is_empty()).then_some(chain)
+}
+
+/// `id`'s chain as rubydex holds it, cut or not.
+fn chain_of(graph: &Graph, id: DeclarationId) -> Option<Chain> {
+    let (ancestors, partial, cyclic) =
+        match graph.declarations().get(&id)?.as_namespace()?.ancestors() {
+            Ancestors::Complete(ancestors) => (ancestors, false, false),
+            Ancestors::Partial(ancestors) => (ancestors, true, false),
+            Ancestors::Cyclic(ancestors) => (ancestors, false, true),
+        };
+    Some(Chain {
+        ancestors: ancestors.clone(),
+        partial,
+        cyclic,
+    })
+}
+
+/// `class` first, then every class rubydex lists below it, each after its superclass, with that
+/// superclass. The top's is the parent, which the caller holds.
+fn top_down(graph: &Graph, class: DeclarationId) -> Vec<(DeclarationId, Option<DeclarationId>)> {
+    let below: Vec<DeclarationId> = graph
+        .declarations()
+        .get(&class)
+        .and_then(Declaration::as_namespace)
+        .into_iter()
+        .flat_map(|namespace| namespace.descendants().iter().copied())
+        .filter(|id| *id != class)
+        .collect();
+    // How many superclasses up `class` is: the order to build in. A class that does not reach it
+    // within that many steps is not below it, whatever rubydex listed, so it is left alone.
+    let depth = |id: DeclarationId| {
+        std::iter::successors(Some(id), |at| superclass_of(graph, *at))
+            .take(below.len() + 1)
+            .position(|at| at == class)
+    };
+    let mut ordered: Vec<(usize, DeclarationId)> = below
+        .iter()
+        .filter_map(|id| Some((depth(*id)?, *id)))
+        .collect();
+    ordered.sort_unstable();
+    std::iter::once((class, None))
+        .chain(
+            ordered
+                .into_iter()
+                .map(|(_, id)| (id, superclass_of(graph, id))),
+        )
+        .collect()
+}
+
+/// The superclass rubydex picks: the first `class` definition whose superclass resolved.
+fn superclass_of(graph: &Graph, id: DeclarationId) -> Option<DeclarationId> {
+    superclass_names(graph, id).find_map(|name| {
+        graph
+            .name_id_to_declaration_id(name)
+            .copied()
+            .filter(|id| is_namespace(graph, *id))
+    })
+}
+
+/// What rubydex's `linearize_ancestors` builds for `id` on top of `above`, from the mixins `id`'s
+/// definitions write: its prepends, itself, its includes, then `above`.
+///
+/// **rubydex's own rules** (`resolution.rs`'s `linearize_mixins`), which are Ruby's: the last
+/// mixin written comes first, a prepend already prepended changes nothing, and an include is
+/// skipped when the class already has the module, above or below itself. A class side reads the
+/// attached class's `extend`s as includes, first, as rubydex does. A name that has not resolved
+/// stays in the chain as a partial entry, and a name that resolved to something other than a class
+/// or a module is skipped.
+fn linearized(graph: &Graph, id: DeclarationId, above: &Chain, class_side: bool) -> Chain {
+    let declaration = graph.declarations().get(&id);
+    let attached = declaration
+        .filter(|_| class_side)
+        .and_then(|declaration| graph.declarations().get(declaration.owner_id()));
+    let extends = attached
+        .into_iter()
+        .flat_map(|attached| mixins_of(graph, attached))
+        .filter(|mixin| matches!(mixin, Mixin::Extend(_)));
+    let own = declaration
+        .into_iter()
+        .flat_map(|declaration| mixins_of(graph, declaration))
+        .filter(|mixin| !matches!(mixin, Mixin::Extend(_)));
+
+    let (mut partial, mut cyclic) = (above.partial, above.cyclic);
+    let mut prepends: VecDeque<Ancestor> = VecDeque::new();
+    let mut includes: VecDeque<Ancestor> = VecDeque::new();
+    for (prepend, name) in extends.chain(own).filter_map(|mixin| {
+        let reference = graph
+            .constant_references()
+            .get(mixin.constant_reference_id())?;
+        Some((matches!(mixin, Mixin::Prepend(_)), *reference.name_id()))
+    }) {
+        let module = match graph.name_id_to_declaration_id(name) {
+            Some(module) => chain_of(graph, *module),
+            None => Some(Chain {
+                ancestors: vec![Ancestor::Partial(name)],
+                partial: true,
+                cyclic: false,
+            }),
+        };
+        let Some(module) = module else {
+            continue;
+        };
+        partial |= module.partial;
+        cyclic |= module.cyclic;
+        let mut ids = module.ancestors;
+        if prepend {
+            if ids.iter().any(|id| !prepends.contains(id)) {
+                prepends.retain(|id| !ids.contains(id));
+                for id in ids.into_iter().rev() {
+                    prepends.push_front(id);
+                }
+            }
+        } else {
+            ids.retain(|id| {
+                !prepends.contains(id) && !includes.contains(id) && !above.ancestors.contains(id)
+            });
+            for id in ids.into_iter().rev() {
+                includes.push_front(id);
+            }
+        }
+    }
+    let mut ancestors: Vec<Ancestor> = prepends.into_iter().collect();
+    ancestors.push(Ancestor::Complete(id));
+    ancestors.extend(includes);
+    ancestors.extend_from_slice(&above.ancestors);
+    Chain {
+        ancestors,
+        partial,
+        cyclic,
+    }
+}
+
+/// Every mixin `declaration`'s definitions write, in the order rubydex reads them.
+fn mixins_of<'g>(
+    graph: &'g Graph,
+    declaration: &'g Declaration,
+) -> impl Iterator<Item = &'g Mixin> {
+    declaration
+        .definitions()
+        .iter()
+        .filter_map(|id| graph.definitions().get(id))
+        .flat_map(|definition| match definition {
+            Definition::Class(class) => class.mixins(),
+            Definition::Module(module) => module.mixins(),
+            Definition::SingletonClass(singleton) => singleton.mixins(),
+            _ => &[],
+        })
+}
+
+/// Write `chain` as `id`'s, and record `id` as a descendant of every class and module in it, as
+/// rubydex does for a chain it builds.
+fn write(graph: &mut Graph, id: DeclarationId, chain: Chain) -> Option<()> {
+    let above: Vec<DeclarationId> = chain.ancestors.iter().filter_map(complete).collect();
+    let ancestors = match (chain.cyclic, chain.partial) {
+        (true, _) => Ancestors::Cyclic(chain.ancestors),
+        (false, true) => Ancestors::Partial(chain.ancestors),
+        (false, false) => Ancestors::Complete(chain.ancestors),
+    };
+    graph
+        .declarations_mut()
+        .get_mut(&id)?
+        .as_namespace_mut()?
+        .set_ancestors(ancestors);
+    for above in above {
+        graph
+            .declarations_mut()
+            .get_mut(&above)?
+            .as_namespace_mut()?
+            .add_descendant(id);
+    }
+    Some(())
+}
+
+fn complete(ancestor: &Ancestor) -> Option<DeclarationId> {
+    match ancestor {
+        Ancestor::Complete(id) => Some(*id),
+        Ancestor::Partial(_) => None,
+    }
+}
+
+fn is_class(graph: &Graph, id: DeclarationId) -> bool {
+    matches!(
+        graph.declarations().get(&id),
+        Some(Declaration::Namespace(Namespace::Class(_)))
+    )
+}
+
+fn is_cut(graph: &Graph, id: DeclarationId) -> bool {
+    graph
+        .declarations()
+        .get(&id)
+        .and_then(Declaration::as_namespace)
+        .is_some_and(|namespace| matches!(namespace.ancestors(), Ancestors::Cyclic(_)))
+}
+
+fn is_namespace(graph: &Graph, id: DeclarationId) -> bool {
+    graph
+        .declarations()
+        .get(&id)
+        .is_some_and(|declaration| declaration.as_namespace().is_some())
+}
+
+fn singleton_class_of(graph: &Graph, id: DeclarationId) -> Option<DeclarationId> {
+    graph
+        .declarations()
+        .get(&id)?
+        .as_namespace()?
+        .singleton_class()
+        .copied()
 }
 
 /// How many declarations the graph holds per distinct member name, rounded down.
@@ -484,16 +1139,19 @@ impl Placed {
 mod tests {
     use rubydex::{
         model::{
-            declaration::{Ancestor, ConstantDeclaration, Declaration, MethodDeclaration},
+            declaration::{
+                Ancestor, Ancestors, ConstantDeclaration, Declaration, MethodDeclaration,
+            },
             ids::DeclarationId,
         },
         resolution::Resolver,
     };
 
     use super::{HashSet, Indexed, LanguageId, OBJECT_MIXINS_URI, Placed, UriId};
+    use crate::analysis::testing::{Harness, linked};
     use crate::{
         analysis::{
-            environment::{Layout, Names},
+            environment::{Fence, Layout, Names},
             indexer,
         },
         workspace::DocUri,
@@ -615,6 +1273,104 @@ mod tests {
         );
     }
 
+    /// Found once, and again after anything it reads moves: the graph, whose code a document is,
+    /// or the view convention.
+    #[test]
+    fn the_renderers_are_found_once_until_something_they_read_moves() {
+        let mut indexed = a_graph_holding_every_shape();
+        let found = std::cell::Cell::new(0);
+        let laid = std::cell::Cell::new(0);
+        // Each renderer's layouts are found from the renderers, so they go wherever those go.
+        let ask = |indexed: &Indexed| {
+            indexed.layouts(|| {
+                laid.set(laid.get() + 1);
+                std::rc::Rc::from([(
+                    DeclarationId::from("Store"),
+                    super::rails::Layouts::default(),
+                )])
+            });
+            indexed.renderers(|| {
+                found.set(found.get() + 1);
+                std::rc::Rc::from([DeclarationId::from("Store")].as_slice())
+            })
+        };
+        assert_eq!(*ask(&indexed), [DeclarationId::from("Store")]);
+        ask(&indexed);
+        assert_eq!((found.get(), laid.get()), (1, 1), "held across questions");
+        indexed.forget_placement();
+        ask(&indexed);
+        assert_eq!(
+            (found.get(), laid.get()),
+            (2, 2),
+            "whose code a document is may have moved"
+        );
+        indexed.forget_renderers();
+        ask(&indexed);
+        assert_eq!(
+            (found.get(), laid.get()),
+            (3, 3),
+            "the view convention was rebuilt"
+        );
+        indexer::index_source(
+            indexed.graph_mut(),
+            "file:///p/app/models/order.rb",
+            "class Order\nend\n",
+            &LanguageId::Ruby,
+        );
+        ask(&indexed);
+        assert_eq!((found.get(), laid.get()), (4, 4), "the graph moved");
+    }
+
+    /// Built once per object, side and fence, and again after anything it reads moves: the graph,
+    /// or the layout under the fence.
+    #[test]
+    fn a_hierarchy_is_built_once_until_something_it_reads_moves() {
+        let mut indexed = a_graph_holding_every_shape();
+        let built = std::cell::Cell::new(0);
+        let fence = |cursor| Fence::at(Some(cursor), Layout::default()).key();
+        let app = fence("file:///p/app/models/store.rb");
+        let ask = |indexed: &Indexed, class_side, fence| {
+            indexed.hierarchy(DeclarationId::from("Store"), class_side, fence, || {
+                built.set(built.get() + 1);
+                None
+            })
+        };
+        assert!(ask(&indexed, false, app).is_none());
+        ask(
+            &indexed,
+            false,
+            fence("file:///p/app/controllers/stores_controller.rb"),
+        );
+        assert_eq!(
+            built.get(),
+            1,
+            "held across questions, a refusal too, for any cursor the fence treats alike"
+        );
+        ask(&indexed, true, app);
+        assert_eq!(built.get(), 2, "the class object's side is another object");
+        ask(
+            &indexed,
+            false,
+            fence("file:///p/spec/models/store_spec.rb"),
+        );
+        assert_eq!(
+            built.get(),
+            3,
+            "a spec keeps the tree rules off, so its own"
+        );
+        indexed.forget_placement();
+        ask(&indexed, false, app);
+        assert_eq!(built.get(), 4, "the layout under the fence may have moved");
+        indexer::index_source(
+            indexed.graph_mut(),
+            "file:///p/app/models/order.rb",
+            "class Order\nend\n",
+            &LanguageId::Ruby,
+        );
+        ask(&indexed, false, app);
+        assert_eq!(built.get(), 5, "the graph moved");
+    }
+
     /// The other invalidation, which is the one that has to be remembered.
     #[test]
     fn a_question_that_moved_is_what_forget_placement_is_for() {
@@ -649,6 +1405,50 @@ mod tests {
             !row(&indexed, moved),
             "asked again, and `spec/` is not a test tree under a replaced list"
         );
+    }
+
+    /// The fences' path memo, held beside the placement and dropped with it.
+    #[test]
+    fn the_paths_a_fence_read_are_held_until_the_layout_or_the_graph_moves() {
+        // The same stale answer as above, by the other road: `Fence::unloadable` through the memo
+        // `Analysis::layout` hands every request.
+        let mut indexed = a_graph_holding_every_shape();
+        let spec = "file:///p/spec/models/store_spec.rb";
+        let unloadable = |indexed: &Indexed, names: Names<'_>| {
+            let layout = Layout {
+                names,
+                held: Some(indexed.paths()),
+                ..Layout::default()
+            };
+            Fence::at(Some("file:///p/app/models/store.rb"), layout).unloadable(spec)
+        };
+        assert!(unloadable(&indexed, Names::default()));
+        assert_eq!(
+            indexed.paths().len(),
+            2,
+            "the spec's answer, and the cursor's for the gate"
+        );
+
+        let elsewhere = crate::workspace::config::TreesConfig {
+            test: Some(vec!["qa".to_owned()]),
+            ..crate::workspace::config::TreesConfig::default()
+        };
+        let moved = Names::of(&elsewhere);
+        assert!(unloadable(&indexed, moved), "the held answer");
+        indexed.forget_placement();
+        assert!(
+            !unloadable(&indexed, moved),
+            "read again under the replaced list"
+        );
+
+        assert!(indexed.paths().len() > 0);
+        indexer::index_source(
+            indexed.graph_mut(),
+            "file:///p/app/models/order.rb",
+            "class Order\nend\n",
+            &LanguageId::Ruby,
+        );
+        assert_eq!(indexed.paths().len(), 0, "a write drops it too");
     }
 
     /// The seed is only a repair while it sorts first, and nothing in the type system enforces
@@ -762,5 +1562,459 @@ mod tests {
             "nor parenthesised"
         );
         assert!(indexed.members_named("baz()").is_empty(), "not a method");
+    }
+
+    /// A graph of `sources`, resolved and repaired as `analysis::resolve` does.
+    fn repaired(sources: &[(&str, &str)]) -> Indexed {
+        let mut indexed = Indexed::default();
+        for (uri, source) in sources {
+            assert!(indexer::index_source(
+                indexed.graph_mut(),
+                uri,
+                source,
+                &LanguageId::Ruby,
+            ));
+        }
+        Resolver::new(indexed.graph_mut()).resolve();
+        indexed.repair_superclasses();
+        indexed
+    }
+
+    /// `name`'s chain state (`complete`, `partial` or `cut`), and every class and module in it, in
+    /// order.
+    fn chain_of(indexed: &Indexed, name: &str) -> (&'static str, Vec<String>) {
+        let ancestors = indexed
+            .declarations()
+            .get(&DeclarationId::from(name))
+            .and_then(Declaration::as_namespace)
+            .unwrap_or_else(|| panic!("{name} is not a namespace"))
+            .ancestors();
+        let names = ancestors
+            .iter()
+            .filter_map(|ancestor| match ancestor {
+                Ancestor::Complete(id) => indexed
+                    .declarations()
+                    .get(id)
+                    .map(|declaration| declaration.name().to_owned()),
+                Ancestor::Partial(_) => Some("?".to_owned()),
+            })
+            .collect();
+        let state = match ancestors {
+            Ancestors::Complete(_) => "complete",
+            Ancestors::Partial(_) => "partial",
+            Ancestors::Cyclic(_) => "cut",
+        };
+        (state, names)
+    }
+
+    fn descends(indexed: &Indexed, from: &str, below: &str) -> bool {
+        indexed
+            .declarations()
+            .get(&DeclarationId::from(from))
+            .and_then(Declaration::as_namespace)
+            .is_some_and(|namespace| {
+                namespace
+                    .descendants()
+                    .contains(&DeclarationId::from(below))
+            })
+    }
+
+    const BASE: &str = "\
+module Shared
+end
+
+module Front
+end
+
+module Audited
+end
+
+module Configurable
+end
+
+class ApplicationController
+  include Shared
+  extend Configurable
+
+  def self.configure
+  end
+end
+";
+
+    const ADMIN: &str = "\
+module Admin
+  class ApplicationController < ApplicationController
+    prepend Front
+    include Shared
+    include Audited
+
+    def self.admin
+    end
+  end
+
+  class UsersController < ApplicationController
+    include Audited
+
+    def self.users
+    end
+  end
+end
+";
+
+    #[test]
+    fn a_superclass_spelled_like_its_class_is_linked_to_the_class_ruby_names() {
+        // Ruby reads `< ApplicationController` before `Admin::ApplicationController` exists, so it
+        // names the top-level class. rubydex names the class being opened, and cuts the chain there
+        // and below it. Every chain below is `Module#ancestors` as Ruby 4.0 prints it for these
+        // files.
+        let indexed = repaired(&[
+            ("file:///p/app/controllers/application_controller.rb", BASE),
+            ("file:///p/app/controllers/admin/base.rb", ADMIN),
+        ]);
+        let chain = |names: &[&str]| -> (&'static str, Vec<String>) {
+            (
+                "complete",
+                names.iter().map(|name| (*name).to_owned()).collect(),
+            )
+        };
+        // `Front` stays prepended, `Audited` is included, and `Shared` only where the parent has it:
+        // an include of a module the superclass already has is skipped. The bare `include` names
+        // resolve only after rubydex caches the cut chain, so they are read again.
+        assert_eq!(
+            chain_of(&indexed, "Admin::ApplicationController"),
+            chain(&[
+                "Front",
+                "Admin::ApplicationController",
+                "Audited",
+                "ApplicationController",
+                "Shared",
+                "Object",
+                "Kernel",
+                "BasicObject",
+            ])
+        );
+        // A class below the cut builds on it, and its own `include Audited` is skipped for the
+        // same reason.
+        assert_eq!(
+            chain_of(&indexed, "Admin::UsersController"),
+            chain(&[
+                "Admin::UsersController",
+                "Front",
+                "Admin::ApplicationController",
+                "Audited",
+                "ApplicationController",
+                "Shared",
+                "Object",
+                "Kernel",
+                "BasicObject",
+            ])
+        );
+        // And the other direction: everything above records everything below.
+        for above in [
+            "ApplicationController",
+            "Shared",
+            "Audited",
+            "Front",
+            "Object",
+        ] {
+            for below in ["Admin::ApplicationController", "Admin::UsersController"] {
+                assert!(descends(&indexed, above, below), "{above} -> {below}");
+            }
+        }
+
+        // The class side, from the parent's singleton, with the parent's `extend` in it.
+        assert_eq!(
+            chain_of(&indexed, "Admin::UsersController::<UsersController>"),
+            chain(&[
+                "Admin::UsersController::<UsersController>",
+                "Admin::ApplicationController::<ApplicationController>",
+                "ApplicationController::<ApplicationController>",
+                "Configurable",
+                "Object::<Object>",
+                "BasicObject::<BasicObject>",
+                "Class",
+                "Module",
+                "Object",
+                "Kernel",
+                "BasicObject",
+            ])
+        );
+        assert!(descends(
+            &indexed,
+            "Configurable",
+            "Admin::UsersController::<UsersController>"
+        ));
+
+        // Nothing is cut after the pass, so a second one writes nothing.
+        let before = chain_of(&indexed, "Admin::UsersController");
+        let mut again = indexed;
+        again.repair_superclasses();
+        assert_eq!(chain_of(&again, "Admin::UsersController"), before);
+    }
+
+    #[test]
+    fn the_parent_is_found_where_ruby_finds_it() {
+        // Checked against Ruby 4.0: the lexical scopes first, innermost out, then the ancestors of
+        // the innermost, then the top level.
+        let indexed = repaired(&[(
+            "file:///p/lib/shapes.rb",
+            "\
+class X
+end
+
+module A
+  class X
+  end
+
+  module Admin
+    class X < X
+    end
+  end
+end
+
+class ApplicationPolicy
+  class Scope
+  end
+end
+
+class EventPolicy < ApplicationPolicy
+  class Scope < Scope
+  end
+end
+
+module Lonely
+  class Thing < Thing
+  end
+end
+
+class Plain
+end
+
+class Loud
+  def self.shout
+  end
+end
+
+module Admin
+  class Plain < Plain
+    def self.admin
+    end
+  end
+end
+",
+        )]);
+        // `A::X`, not the top-level `X`: an outer scope comes before the top level.
+        assert_eq!(
+            chain_of(&indexed, "A::Admin::X").1[..2],
+            ["A::Admin::X", "A::X"]
+        );
+        // No `Scope` in any scope around it, so the ancestors of `EventPolicy` answer.
+        assert_eq!(
+            chain_of(&indexed, "EventPolicy::Scope").1[..2],
+            ["EventPolicy::Scope", "ApplicationPolicy::Scope"]
+        );
+        // Ruby would raise here, so there is no chain to write: the cycle stays.
+        assert_eq!(chain_of(&indexed, "Lonely::Thing").0, "cut");
+        // A parent with no class method has no singleton in rubydex, so the nearest one above it
+        // stands in. Ruby lists `#<Class:Plain>` second; it declares nothing, so nothing is lost.
+        assert_eq!(
+            chain_of(&indexed, "Admin::Plain::<Plain>"),
+            (
+                "complete",
+                [
+                    "Admin::Plain::<Plain>",
+                    "Object::<Object>",
+                    "BasicObject::<BasicObject>",
+                    "Class",
+                    "Module",
+                    "Object",
+                    "Kernel",
+                    "BasicObject",
+                ]
+                .map(str::to_owned)
+                .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn where_ruby_raises_the_cycle_stays() {
+        // Each checked against Ruby 4.0, which raises at every one of these.
+        let indexed = repaired(&[(
+            "file:///p/lib/raises.rb",
+            "\
+module Outer
+  module Thing
+  end
+
+  module Admin
+    class Thing < Thing
+    end
+  end
+end
+
+class Thing
+end
+
+module Admin
+  class Foo < Admin::Foo
+  end
+end
+
+module Loop
+  include Loop
+end
+
+class Base
+  include Loop
+end
+
+module Admin
+  class Base < Base
+  end
+end
+",
+        )]);
+        // The first `Thing` the lookup meets is a module: `TypeError`, whatever is further out.
+        assert_eq!(chain_of(&indexed, "Outer::Admin::Thing").0, "cut");
+        // A qualified name cannot reach a class that does not exist yet: `NameError`.
+        assert_eq!(chain_of(&indexed, "Admin::Foo").0, "cut");
+        // The parent's own chain is a cycle, so there is nothing whole to build on.
+        assert_eq!(chain_of(&indexed, "Admin::Base").0, "cut");
+    }
+
+    #[test]
+    fn a_cut_class_s_own_mixins_follow_rubydex_s_rules() {
+        let indexed = repaired(&[(
+            "file:///p/lib/mixins.rb",
+            "\
+module Front
+end
+
+module Audited
+end
+
+module Loop
+  include Loop
+end
+
+module Half
+  include Missing
+end
+
+NOT_A_MODULE = 1
+
+class Parent
+end
+
+module Admin
+  class Parent < Parent
+    prepend Front
+    prepend Front
+    include Audited
+    include Audited
+    include Front
+    include NOT_A_MODULE
+  end
+
+  class Unknown < Parent
+    include Gone
+    prepend Lost
+  end
+
+  class Halved < Parent
+    include Half
+  end
+
+  class Looped < Parent
+    include Loop
+  end
+end
+",
+        )]);
+        // A second `prepend Front` changes nothing, a second `include Audited` is skipped, and an
+        // `include Front` of a module already prepended is skipped too, as Ruby 4.0 prints it. A
+        // name that resolved to a value is skipped, as rubydex skips it.
+        assert_eq!(
+            chain_of(&indexed, "Admin::Parent").1[..4],
+            ["Front", "Admin::Parent", "Audited", "Parent"]
+        );
+        // A name that never resolved is a partial entry where the module would go.
+        assert_eq!(
+            chain_of(&indexed, "Admin::Unknown"),
+            (
+                "partial",
+                [
+                    "?",
+                    "Admin::Unknown",
+                    "?",
+                    "Front",
+                    "Admin::Parent",
+                    "Audited",
+                    "Parent",
+                    "Object",
+                    "Kernel",
+                    "BasicObject",
+                ]
+                .map(str::to_owned)
+                .to_vec()
+            )
+        );
+        // A module with an unresolved include of its own makes the chain partial; one that
+        // includes itself leaves it a cycle, which is not this repair's to undo.
+        assert_eq!(chain_of(&indexed, "Admin::Halved").0, "partial");
+        assert_eq!(chain_of(&indexed, "Admin::Looped").0, "cut");
+    }
+
+    #[test]
+    fn every_reader_sees_the_repaired_chain_and_it_survives_an_edit_to_either_side() {
+        // Through the analysis thread, so the repair runs where `analysis::resolve` runs it, and
+        // `definition` and `completion` read the graph the way they always do.
+        let mut harness = Harness::new();
+        let base_source = "class ApplicationController\n  def authenticate\n  end\nend\n";
+        let base = harness.write("app/controllers/application_controller.rb", base_source);
+        let admin_source = "\
+module Admin
+  class ApplicationController < ApplicationController
+    def show
+      authenticate
+      audit
+    end
+  end
+end
+";
+        let admin = harness.write("app/controllers/admin/base.rb", admin_source);
+        harness.index();
+        assert_eq!(
+            linked(&harness.definition_at(&admin, admin_source, "authenticate")),
+            ["application_controller.rb:1:6"]
+        );
+        let offered = harness.complete(&admin, &admin_source.replace("audit", "authen~"));
+        assert!(
+            offered["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["label"] == "authenticate")),
+            "{offered}"
+        );
+
+        // An edit to the parent unlinks the class with the chain, and the next resolve links it
+        // again, new method and all.
+        let base_edited =
+            "class ApplicationController\n  def authenticate\n  end\n\n  def audit\n  end\nend\n";
+        harness.open(&base, base_source);
+        harness.change(&base, base_edited);
+        harness.open(&admin, admin_source);
+        assert_eq!(
+            linked(&harness.definition_at(&admin, admin_source, "audit")),
+            ["application_controller.rb:4:6"]
+        );
+
+        // An edit to the class itself: rubydex cuts its chain again, and the pass repairs it again.
+        let admin_edited = admin_source.replace("def show", "def edit\n    end\n\n    def show");
+        harness.change(&admin, &admin_edited);
+        assert_eq!(
+            linked(&harness.definition_at(&admin, &admin_edited, "authenticate")),
+            ["application_controller.rb:1:6"]
+        );
     }
 }

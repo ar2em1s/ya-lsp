@@ -50,7 +50,7 @@ paths:
    on `Persistence`, below which sits every model. `Resolution::receiver` is set only on a precise
    answer. Otherwise use the declaration's owner.
 3. **A guessed receiver answers `null`.** The gate is `requests::jumpable`, a single `match` on
-   `Tier` shared with `typeDefinition` and `declaration`. Hover still answers, with its footnote.
+   `Tier` shared with `typeDefinition` and `declaration`. Hover still answers, with its guess line.
 4. **Ask `Foo.new` below `Foo`, not below `Foo::<Foo>`.** The `NEW` arm of `resolve_call` sets
    `receiver` to `attached_class`.
 5. **Each goto has its own `linkSupport` flag.** Claude Code sets it for `definition` only.

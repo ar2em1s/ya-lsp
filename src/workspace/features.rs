@@ -32,6 +32,13 @@ use crate::workspace::{
 /// depending on the pieces, and every Rails application has railties whether or not it names it.
 const RAILS_GEM: &str = "railties";
 
+/// The gem whose presence in a lockfile says this project runs RSpec. `rspec-core`, not `rspec`,
+/// for [`RAILS_GEM`]'s reason: `rspec` is a metapackage, and `rspec-rails` depends on the core.
+const RSPEC_GEM: &str = "rspec-core";
+
+/// The gem whose presence in a lockfile says this project translates with i18n.
+const I18N_GEM: &str = "i18n";
+
 /// The file a Rails **application** has and nothing else does.
 const RAILS_ENTRY: &str = "config/application.rb";
 
@@ -59,6 +66,12 @@ pub struct Features {
     pub structs: bool,
     /// A Sorbet `sig` and a YARD `@return`. Not Rails, for `structs`' reason.
     pub annotations: bool,
+    /// FactoryBot's factories. Not Rails, for `structs`' reason.
+    pub factories: bool,
+    /// RSpec's example groups, `let`, `subject` and what `self` is in their blocks, after `auto`.
+    pub rspec: bool,
+    /// The project's translations: what `t("…")` names, after `auto`.
+    pub i18n: bool,
 }
 
 impl Features {
@@ -86,6 +99,9 @@ impl Features {
             Some((_, why)) => format!("rails knowledge {}, detected: {why}", on_or_off(rails)),
             None => format!("rails knowledge {} by rails.enabled", on_or_off(rails)),
         };
+        let rspec = locked(root, config.rspec.enabled, RSPEC_GEM, "rspec");
+        let i18n = locked(root, config.i18n.enabled, I18N_GEM, "i18n");
+        let why = format!("{why}; {}; {}", rspec.1, i18n.1);
         let features = Self {
             rails,
             schema: rails && config.rails.schema,
@@ -94,7 +110,10 @@ impl Features {
             entrypoints: rails && config.rails.entrypoints,
             views: rails && config.rails.views,
             structs: config.types.structs,
+            factories: config.types.factories,
             annotations: config.types.annotations,
+            rspec: rspec.0,
+            i18n: i18n.0,
         };
         (features, why)
     }
@@ -102,6 +121,49 @@ impl Features {
 
 fn on_or_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
+}
+
+/// A body of knowledge a gem's presence decides (`[rspec]`, `[i18n]`): `switch` decided, and the
+/// sentence that says why, `knowledge` naming it.
+fn locked(root: &Path, switch: Switch, gem: &str, knowledge: &str) -> (bool, String) {
+    match switch {
+        Switch::Word(Word::Auto) => {
+            let (yes, found) = detect_locked(root, gem);
+            (
+                yes,
+                format!(
+                    "{knowledge} knowledge {}, detected: {found}",
+                    on_or_off(yes)
+                ),
+            )
+        }
+        switch => {
+            let yes = switch.decide(false);
+            (
+                yes,
+                format!(
+                    "{knowledge} knowledge {} by {knowledge}.enabled",
+                    on_or_off(yes)
+                ),
+            )
+        }
+    }
+}
+
+/// Whether the lockfile locks `gem`, and the sentence that says why.
+///
+/// The lockfile alone, read directly for [`detect`]'s reason: a spec directory is no evidence (a
+/// Minitest suite has `test/`, and some keep RSpec-free helpers under `spec/`), and a fresh clone
+/// with no lockfile has no bundle to read the gem's own classes from either.
+fn detect_locked(root: &Path, gem: &str) -> (bool, String) {
+    let lockfile = root.join(bundler::LOCKFILE_NAME);
+    match std::fs::read_to_string(&lockfile) {
+        Ok(text) if bundler::locks(&text, gem) => {
+            (true, format!("{gem} is in {}", bundler::LOCKFILE_NAME))
+        }
+        Ok(_) => (false, format!("no {gem} in {}", bundler::LOCKFILE_NAME)),
+        Err(_) => (false, format!("no {}", bundler::LOCKFILE_NAME)),
+    }
 }
 
 /// Whether this looks like a Rails project, and the sentence that says why.
@@ -231,7 +293,55 @@ mod tests {
         assert!(why.contains(RAILS_ENTRY), "{why}");
 
         let (_, why) = Features::resolve(dir.path(), &config("[rails]\nenabled = false\n"));
-        assert_eq!(why, "rails knowledge off by rails.enabled");
+        assert_eq!(
+            why,
+            "rails knowledge off by rails.enabled; rspec knowledge off, detected: no Gemfile.lock; \
+             i18n knowledge off, detected: no Gemfile.lock"
+        );
+    }
+
+    /// RSpec is found by its lockfile alone, and says so either way; a project that answered is not
+    /// asked.
+    #[test]
+    fn rspec_is_found_by_the_lockfile_and_says_which_way_it_went() {
+        let dir = tempfile::tempdir().unwrap();
+        let (features, why) = Features::resolve(dir.path(), &Config::default());
+        assert!(!features.rspec);
+        assert!(
+            why.contains("rspec knowledge off, detected: no Gemfile.lock"),
+            "{why}"
+        );
+
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "GEM\n  specs:\n    rake (13.0.6)\n",
+        )
+        .unwrap();
+        let (features, why) = Features::resolve(dir.path(), &Config::default());
+        assert!(!features.rspec);
+        assert!(why.contains("no rspec-core in Gemfile.lock"), "{why}");
+
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "GEM\n  specs:\n    rspec-core (3.13.6)\n",
+        )
+        .unwrap();
+        let (features, why) = Features::resolve(dir.path(), &Config::default());
+        assert!(features.rspec);
+        assert!(
+            why.contains("rspec knowledge on, detected: rspec-core is in Gemfile.lock"),
+            "{why}"
+        );
+
+        let (features, why) = Features::resolve(dir.path(), &config("[rspec]\nenabled = false\n"));
+        assert!(
+            !features.rspec,
+            "the lockfile is not asked once the project answered"
+        );
+        assert!(
+            why.contains("rspec knowledge off by rspec.enabled;"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -262,5 +372,25 @@ mod tests {
         assert!(features.models);
         assert!(!features.structs);
         assert!(features.annotations);
+    }
+
+    /// i18n is found by its lockfile alone, as RSpec is, and a project that answered is not asked.
+    #[test]
+    fn i18n_is_found_by_the_lockfile_and_says_which_way_it_went() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "GEM\n  specs:\n    i18n (1.14.7)\n",
+        )
+        .unwrap();
+        let (features, why) = Features::resolve(dir.path(), &Config::default());
+        assert!(features.i18n);
+        assert!(
+            why.ends_with("i18n knowledge on, detected: i18n is in Gemfile.lock"),
+            "{why}"
+        );
+        let (features, why) = Features::resolve(dir.path(), &config("[i18n]\nenabled = false\n"));
+        assert!(!features.i18n);
+        assert!(why.ends_with("i18n knowledge off by i18n.enabled"), "{why}");
     }
 }

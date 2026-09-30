@@ -34,8 +34,15 @@ export interface ServerOptions {
     entrypoints?: boolean;
     views?: boolean;
   };
+  rspec?: { enabled?: string | boolean };
+  i18n?: { enabled?: string | boolean; locale?: string; paths?: string[] };
   trees?: { test?: string[]; test_support?: string[]; migration?: string[] };
-  types?: { structs?: boolean; annotations?: boolean; guess_from_names?: boolean };
+  types?: {
+    structs?: boolean;
+    annotations?: boolean;
+    factories?: boolean;
+    guess_from_names?: boolean;
+  };
   hints?: { block_parameters?: boolean; locals?: boolean; returns?: boolean };
   diagnostics?: { enabled?: boolean; rules?: Record<string, string> };
 }
@@ -185,6 +192,31 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
     options.rails = rails;
   }
 
+  // A word, as `rails.enabled` is, and sent as written for its reason.
+  const rspecEnabled = settings.explicit<string>('rspec.enabled');
+  if (typeof rspecEnabled === 'string' && rspecEnabled.trim() !== '') {
+    options.rspec = { enabled: rspecEnabled.trim() };
+  }
+
+  // The translations: a word, a locale and a list. An empty list of paths is sent, as `trees`'
+  // are: it reads none of the project's own files, which a project may mean.
+  const i18n: NonNullable<ServerOptions['i18n']> = {};
+  const i18nEnabled = settings.explicit<string>('i18n.enabled');
+  if (typeof i18nEnabled === 'string' && i18nEnabled.trim() !== '') {
+    i18n.enabled = i18nEnabled.trim();
+  }
+  const locale = settings.explicit<string>('i18n.locale');
+  if (typeof locale === 'string' && locale.trim() !== '') {
+    i18n.locale = locale.trim();
+  }
+  const localePaths = strings(settings, 'i18n.paths');
+  if (localePaths) {
+    i18n.paths = localePaths;
+  }
+  if (Object.keys(i18n).length > 0) {
+    options.i18n = i18n;
+  }
+
   // **An empty list is a value here, and is sent as one** (unlike `""` for `gems.rubyVersion` and
   // `rbs.path`). `trees.test = []` turns the suite fence off, and `trees.migration = []` the
   // migration fence. A project may mean either, and dropping them would turn a deliberate setting
@@ -218,6 +250,10 @@ export function serverOptions(settings: Settings): ServerOptions | undefined {
   const annotations = settings.explicit<boolean>('types.annotations');
   if (typeof annotations === 'boolean') {
     types.annotations = annotations;
+  }
+  const factories = settings.explicit<boolean>('types.factories');
+  if (typeof factories === 'boolean') {
+    types.factories = factories;
   }
   if (Object.keys(types).length > 0) {
     options.types = types;

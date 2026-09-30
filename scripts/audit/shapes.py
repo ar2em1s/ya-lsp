@@ -6,6 +6,7 @@ This is the second of the sample's two strata (directory is the first). A benchm
 
 import re
 
+from audit.routes import parameters
 from audit.ruby import at_offset, line_starts, masked, ruby_regions
 
 MEMBER = re.compile(r"(?<![.\d])\.\s*([a-z_][A-Za-z0-9_]*[?!]?)")
@@ -68,10 +69,14 @@ def find(text, is_erb=False, not_routes=frozenset()):
     writes itself, which Rails therefore did not generate. Without it the `route` shape is a suffix
     match, and samples columns (`normalized_url`), plain methods (`avatar_url`) and SQL aliases far
     more often than real helpers.
+
+    This file's own parameters join it (`routes.parameters`): `def hosts?(base_url, comparison_url)`
+    reads a local, which no route helper can answer for.
     """
     regions = ruby_regions(text, is_erb)
     hidden = masked(text)
     starts = line_starts(text)
+    not_routes = not_routes | parameters(text)
 
     def inside(offset):
         return any(lo <= offset < hi for lo, hi in regions) and not hidden[offset]

@@ -1,4 +1,4 @@
-"""Check 9: every call a call hierarchy shows is a reference the references list already had.
+"""Check 8: every call a call hierarchy shows is a reference the references list already had.
 
 `callHierarchy/incomingCalls` and `textDocument/references` answer the same question about the same
 name, printed two ways: one groups call sites by the `def` they are in, the other lists them flat.

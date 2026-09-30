@@ -26,6 +26,33 @@ paths:
 4. **A literal receiver with no declaration (`[rbs]` off) falls through to `by_name`**, never to
    silence. `completion::declared` returns `None`.
 5. **`Receiver::SelfObject` carries the offset where `self` was written** (`types.md`).
+6. **The repaired text blanks only a `.` whose message Prism took from a later token**
+   (`Finder::took_a_later_token`): a line break before it, or a closing word (`i.| end`). A member
+   already written on the line (`items.|size`, `items.first|(1)`) parses as written; blanking it
+   left `items size`, a call to a method `items`, and the local was lost.
+7. **The message of an operator write is a call** (`a.b ||= c`, `&&=`, `+=`;
+   `Finder::operator_written`): the cursor on `b` is `MethodCall { receiver: a }`, by
+   `visit_call_node`'s span test.
+
+## A union receiver
+
+**Every class's members, each row marked with its class** (decided 2026-09-30): a call on a union
+runs on each class that has the member (`types::narrowed`), so each row is right for the values
+that have it.
+
+- **rubydex is asked once per class** (`receiver_for`, `from_graph`), each with its own chain
+  numbered. Past `MAX_UNION_CLASSES` (64) the receiver is untyped and the name rung answers, as
+  for every union before. `nil` stays folded out, as for a `T?`.
+- **One row per name** (`one_row_per_name`). A name two classes declare apart is one row whose
+  detail names both; the card is the kept row's.
+- **A name several classes offer ranks at the farthest distance any gives it.** Every object's
+  members sit three steps from an `Array` and sixty from a model, and the nearest would put
+  `frozen?` above the model's own `save`.
+- **The list's tier is the union's**, as for one class.
+- **A bare word's rebound `self` is asked the same way** (`completion::rebound`,
+  `types::rebound_self`): an example group, a concern's `included do`, a `[self: T]` block. Each
+  class is one more `Expression` receiver beside the lexical one, since hover asks it first
+  (`locator::rebound_call`) and falls back to the lexical answer.
 
 ## What `self` is
 
@@ -112,7 +139,13 @@ The key is `(tier, internal, group, distance, length, generated, locality, seque
 | `Extended`: `locator::extended_modules` | before `take_best` | Singletons only (`class_object`). `NamespaceAccess` looks up the singleton itself. Test the prefix before deduping |
 | `InClosure`: a block written straight into a class body | before the cap; `add_closure` **fills gaps, never shadows** | Methods only, from the instance side. Declined in a `def`, a module, or when a receiver is written |
 | View context (`in_view`) | before the cap; `add_view` **replaces** the graph's row | Carries its own step. `views.md` |
+| `Object` beside a module's instance (`objects_side`) | in `ranked_for`; **fills gaps, never shadows** | A module's instance is some class's (`types::member_of`); numbered past the module's chain. After a `.` it is asked as a call, at a bare word as an expression, so private `Kernel` methods come |
 
+- **A translation key is asked first, and alone** (`completion::keyed`): inside the
+  literal key of a member that looks one up (`cursor::keyed_literal`, `locator::resolve_keyed`),
+  the keys one segment on from what is written, from the main locale (`Knowledge::keyed_under`).
+  A key with keys under it is a `Module` item, a leaf a `Field` with its text as the detail; the
+  range starts after the last `.`. A `scope:` is not applied here.
 - **Rows added here pass ya-lsp's `reachable`, not rubydex's filter.** `protected` is left alone;
   it is rare.
 - **The audit's completion key poses only `member` cursors**, so it cannot see bare-word rows.

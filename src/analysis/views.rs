@@ -57,6 +57,10 @@
 //!   context, not just read by it, so [`Views::reachable`] answers for one. But `helper_method` is
 //!   a permission one controller grants, and a helper module is included into every controller's
 //!   context, so there is no class to name and none is picked.
+//! - **A layout gets only the exports of the classes whose views it wraps.** Its path names no
+//!   class (`layouts/application` spells a `LayoutsController` nobody writes), so
+//!   [`Views::lays_out`] marks it and [`Views::layouts_of`] runs Rails' own lookup per renderer: a
+//!   controller whose `layout "admin"` puts it elsewhere hands this layout nothing.
 //!
 //! Three bounds, stated up front:
 //!
@@ -84,6 +88,13 @@ use super::erb;
 use super::types::declared;
 use crate::workspace::{DocUri, rails};
 
+/// Whether `path` is a view the conventions read: an ERB template, or a jbuilder view,
+/// which is indexed whole, as Ruby, and otherwise read as a template is.
+#[must_use]
+pub fn is_view(path: &Path) -> bool {
+    erb::is_template(path) || rails::is_jbuilder(path)
+}
+
 /// How a bare name in a template was reached, for the card to say.
 ///
 /// Both are conventions, not facts a file states, which puts this answer in the *derived* tier
@@ -96,6 +107,9 @@ pub enum InView {
     /// A `helper_method` written by the class the template's path names, or by one of its
     /// ancestors. The name is the class Rails renders the template from.
     Exported(String),
+    /// The same, in a **layout**: the name is one of the classes whose views Rails renders in it
+    /// ([`Views::lays_out`]), the first that reaches the export.
+    Laid(String),
     /// A `def` in one of the modules ActionView puts in every view context
     /// ([`rails::VIEW_CONTEXT`]). The outermost rung, so an application's own helper shadows it.
     Framework,
@@ -151,6 +165,15 @@ pub struct Views {
     /// controller has, while `rails::mailer_of` produces whatever the directory spells
     /// (`app/views/shared/` spells `Shared`), so the second is only ever checked against this list.
     mailers: BTreeSet<String>,
+    /// A body that wrote a `layout`, and what the last one said.
+    ///
+    /// Keyed by the body, like [`Views::exports`], for the same reason: `layout` in
+    /// `ApplicationController` or in a concern's `included do` is the layout of every class below
+    /// it that writes none, which the ancestor walk in [`Views::layouts_of`] finds.
+    layouts: BTreeMap<String, rails::Layout>,
+    /// A mailer that wrote `default template_path:`, and where that moved the views of every mailer
+    /// below it ([`Views::moved`]).
+    template_paths: BTreeMap<String, rails::TemplatePath>,
     /// Whether this project wants a view context at all: `[rails] views`.
     ///
     /// A flag, not an empty map, because the module's two halves fail differently when empty:
@@ -162,6 +185,12 @@ pub struct Views {
     /// So `Views::default()` is **off**, which is also what the pass leaves when the switch says
     /// so.
     enabled: bool,
+    /// What each body runs before a controller's actions, keyed like
+    /// [`Views::layouts`]. Not a view-context fact, and read whatever `[rails] views` says: a
+    /// controller runs its callbacks whether or not its views are read.
+    callbacks: BTreeMap<String, rails::Callbacks>,
+    /// Every document's callback calls no body holds ([`rails::Callbacks`] of skips and names only).
+    loose_callbacks: rails::Callbacks,
 }
 
 impl Views {
@@ -171,14 +200,66 @@ impl Views {
         exports: BTreeMap<String, BTreeSet<String>>,
         included: BTreeMap<String, BTreeSet<String>>,
         mailers: BTreeSet<String>,
+        layouts: BTreeMap<String, rails::Layout>,
+        template_paths: BTreeMap<String, rails::TemplatePath>,
     ) -> Self {
         Self {
             helpers,
             exports,
             included,
             mailers,
+            layouts,
+            template_paths,
             enabled: true,
+            callbacks: BTreeMap::new(),
+            loose_callbacks: rails::Callbacks::default(),
         }
+    }
+
+    /// The same, with what each body runs before a controller's actions.
+    #[must_use]
+    pub fn with_callbacks(
+        mut self,
+        callbacks: BTreeMap<String, rails::Callbacks>,
+        loose: rails::Callbacks,
+    ) -> Self {
+        self.callbacks = callbacks;
+        self.loose_callbacks = loose;
+        self
+    }
+
+    /// The methods that surely run before the action `action` on an instance of `object`, by
+    /// Rails' callback rules ([`rails::runs_before`]) over its ancestors, nearest first.
+    ///
+    /// Empty where an ancestor rubydex could not resolve may hold a skip, and where no body wrote a
+    /// callback.
+    #[must_use]
+    pub fn runs_before(&self, graph: &Graph, object: DeclarationId, action: &str) -> Vec<String> {
+        if self.callbacks.is_empty() {
+            return Vec::new();
+        }
+        self.callback_chain(graph, object)
+            .map(|chain| rails::runs_before(&chain, &self.loose_callbacks, action))
+            .unwrap_or_default()
+    }
+
+    /// What each of `object`'s ancestors wrote, nearest first, or `None` where one is not resolved.
+    fn callback_chain(
+        &self,
+        graph: &Graph,
+        object: DeclarationId,
+    ) -> Option<Vec<Option<&rails::Callbacks>>> {
+        let namespace = graph.declarations().get(&object)?.as_namespace()?;
+        namespace
+            .ancestors()
+            .iter()
+            .map(|ancestor| match ancestor {
+                Ancestor::Complete(id) => {
+                    Some(self.callbacks.get(graph.declarations().get(id)?.name()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// What the document filed under `uri_id` can call, or nothing.
@@ -197,37 +278,63 @@ impl Views {
     /// every controller's view context, so there is no class for [`rails::controller_of`] to name
     /// and no honest way to pick one. That is why the renderer lookup below sits inside the
     /// template arm.
+    ///
+    /// **A layout's renderers are every class whose views it wraps** ([`Views::lays_out`]), which
+    /// `laid_out` answers for its name: its path names none, and each of them hands it their
+    /// exports, so a bare word reaches whichever of them holds it.
     #[must_use]
-    pub fn reachable(&self, graph: &Graph, uri_id: UriId) -> Option<Reachable> {
+    pub fn reachable(
+        &self,
+        graph: &Graph,
+        uri_id: UriId,
+        laid_out: &dyn Fn(&str) -> Vec<DeclarationId>,
+    ) -> Option<Reachable> {
         if !self.enabled {
             return None;
         }
         let path = DocUri::from_graph_uri(graph.documents().get(&uri_id)?.uri())?.to_file_path()?;
-        let template = erb::is_template(&path);
+        let template = is_view(&path);
         if !template && !rails::is_helper(&path) {
             return None;
         }
 
-        let renderer = self.rendered_by(graph, &path);
-        let named = renderer
-            .as_ref()
-            .map(|rendered| self.named_by(graph, rendered.declaration))
-            .unwrap_or_default();
-        let renderer = renderer.map(|rendered| Renderer {
-            exported: self.exported_by(graph, rendered.declaration),
-            name: rendered.name,
-            declaration: rendered.declaration,
-            controller: rendered.controller,
-        });
+        let (rendered, layout) = match self.rendered_by(graph, &path) {
+            Some(rendered) => (vec![rendered], false),
+            None => match self.lays_out(&path) {
+                Some(logical) => (
+                    laid_out(&logical)
+                        .into_iter()
+                        .filter_map(|declaration| self.renderer_named(graph, declaration))
+                        .collect(),
+                    true,
+                ),
+                None => (Vec::new(), false),
+            },
+        };
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        for rendered in &rendered {
+            named.extend(self.named_by(graph, rendered.declaration));
+        }
+        let renderers: Vec<Renderer> = rendered
+            .into_iter()
+            .map(|rendered| Renderer {
+                exported: self.exported_by(graph, rendered.declaration),
+                name: rendered.name,
+                declaration: rendered.declaration,
+                controller: rendered.controller,
+            })
+            .collect();
         // A mailer's own views are the one place the glob does not apply (see the module docs),
         // while a template whose class does not exist still gets it, which is what a partial under
         // `shared/` relies on. A mailer gets instead what it asked for by name, which is `helper`'s
-        // whole purpose.
-        let globbed: &[String] = if renderer.as_ref().is_none_or(|renderer| renderer.controller) {
-            &self.helpers
-        } else {
-            &[]
-        };
+        // whole purpose. A layout any controller renders in gets it, as that controller's view
+        // would.
+        let globbed: &[String] =
+            if renderers.is_empty() || renderers.iter().any(|renderer| renderer.controller) {
+                &self.helpers
+            } else {
+                &[]
+            };
         let helpers = deduplicated(
             globbed
                 .iter()
@@ -247,11 +354,35 @@ impl Views {
             .collect();
 
         let reachable = Reachable {
-            renderer,
+            renderers,
+            layout,
             helpers,
             framework,
         };
         (!reachable.is_empty()).then_some(reachable)
+    }
+
+    /// Whether `[rails] views` is on: the one gate, for a question about no single path (which
+    /// classes a view can run on, `types::every_renderer`).
+    #[must_use]
+    pub fn on(&self) -> bool {
+        self.enabled
+    }
+
+    /// Whether `path` is a template the convention reads at all: `[rails] views` is on and it is a
+    /// template. A partial's path names no class, so [`Self::rendered_by`] cannot say it for one,
+    /// and [`types`](super::types) reads a partial's variables from its renderers.
+    #[must_use]
+    pub fn reads(&self, path: &Path) -> bool {
+        self.enabled && is_view(path)
+    }
+
+    /// Whether `path` is an application helper the convention reads: `[rails] views` is on and
+    /// it sits under `app/helpers` ([`rails::is_helper`]). Its instance methods run on the view,
+    /// so [`types`](super::types) reads their variables from every renderer.
+    #[must_use]
+    pub fn helps(&self, path: &Path) -> bool {
+        self.enabled && rails::is_helper(path)
     }
 
     /// Which class Rails renders `path` from: the controller, or the mailer where there is no
@@ -277,7 +408,7 @@ impl Views {
     /// `None` for everything when `[rails] views` is off.
     #[must_use]
     pub fn rendered_by(&self, graph: &Graph, path: &Path) -> Option<RenderedBy> {
-        if !self.enabled || !erb::is_template(path) {
+        if !self.enabled || !is_view(path) {
             return None;
         }
         rails::controller_of(path)
@@ -293,12 +424,106 @@ impl Views {
                 if !self.mailers.contains(&name) {
                     return None;
                 }
+                let declaration = declared(graph, &name)?;
+                // A mailer whose `template_path` moved its views is not rendered from here.
+                if self.template_path_of(graph, declaration).is_some() {
+                    return None;
+                }
                 Some(RenderedBy {
-                    declaration: declared(graph, &name)?,
+                    declaration,
                     name,
                     controller: false,
                 })
             })
+            .or_else(|| self.moved(graph, path))
+    }
+
+    /// The mailer a `default template_path:` moved to `path`'s directory, where one did.
+    ///
+    /// Each setting is read backwards ([`rails::mailer_in`] for the mailer's own name, the written
+    /// directory for a fixed one, whose writer stands for every mailer below it), and the answer
+    /// counts only where that class is a mailer and the setting is the one nearest it: a subclass
+    /// that wrote its own moved its views again.
+    fn moved(&self, graph: &Graph, path: &Path) -> Option<RenderedBy> {
+        if self.template_paths.is_empty() {
+            return None;
+        }
+        let (logical, _) = rails::template_of(path)?;
+        let (directory, _) = logical.rsplit_once('/')?;
+        self.template_paths.iter().find_map(|(writer, setting)| {
+            let name = match setting {
+                rails::TemplatePath::Fixed(fixed) => {
+                    (fixed.trim_matches('/') == directory).then(|| writer.clone())
+                }
+                rails::TemplatePath::Named { before, after } => {
+                    rails::mailer_in(directory, before, after)
+                }
+                rails::TemplatePath::Unknown => None,
+            }?;
+            if !self.mailers.contains(&name) {
+                return None;
+            }
+            let declaration = declared(graph, &name)?;
+            (self.template_path_of(graph, declaration)? == writer.as_str()).then_some(RenderedBy {
+                name,
+                declaration,
+                controller: false,
+            })
+        })
+    }
+
+    /// The class nearest `mailer` up its ancestors that wrote a `default template_path:`, which is
+    /// the one Rails reads (`default` merges into a class attribute each subclass inherits).
+    fn template_path_of<'a>(&'a self, graph: &'a Graph, mailer: DeclarationId) -> Option<&'a str> {
+        ancestors_of(graph, mailer)
+            .into_iter()
+            .find_map(|(name, _)| self.template_paths.get_key_value(name))
+            .map(|(writer, _)| writer.as_str())
+    }
+
+    /// The name a layout template is found by, where `path` is one the convention reads and a
+    /// layout's name can find ([`rails::is_layout`]); `None` for anything else.
+    ///
+    /// Asked only where [`Self::rendered_by`] names no class: `layouts/application` spells a
+    /// `LayoutsController` nobody writes, and an application that does write one has said
+    /// something this must not override.
+    #[must_use]
+    pub fn lays_out(&self, path: &Path) -> Option<String> {
+        if !self.enabled || !erb::is_template(path) {
+            return None;
+        }
+        let (logical, partial) = rails::template_of(path)?;
+        (!partial && rails::is_layout(&logical)).then_some(logical)
+    }
+
+    /// The layouts `renderer`'s views are rendered in ([`rails::layouts_of`]): the nearest `layout`
+    /// its ancestors wrote, else the first class whose own name `exists` finds a layout for.
+    #[must_use]
+    pub fn layouts_of(
+        &self,
+        graph: &Graph,
+        renderer: DeclarationId,
+        exists: &dyn Fn(&str) -> bool,
+    ) -> rails::Layouts {
+        let chain: Vec<rails::Link<'_>> = ancestors_of(graph, renderer)
+            .into_iter()
+            .map(|(name, namespace)| rails::Link {
+                name,
+                class: matches!(namespace, Namespace::Class(_)),
+                layout: self.layouts.get(name),
+            })
+            .collect();
+        rails::layouts_of(&chain, exists)
+    }
+
+    /// A class a layout's lookup found, as [`Self::rendered_by`] would name it.
+    fn renderer_named(&self, graph: &Graph, declaration: DeclarationId) -> Option<RenderedBy> {
+        let name = graph.declarations().get(&declaration)?.name().to_owned();
+        Some(RenderedBy {
+            controller: !self.mailers.contains(&name),
+            name,
+            declaration,
+        })
     }
 
     /// Every module `declaration` or one of its ancestors named with `helper`.
@@ -365,7 +590,11 @@ struct Renderer {
 
 /// One template's view context, resolved against the graph.
 pub struct Reachable {
-    renderer: Option<Renderer>,
+    /// The class the template's path names, or every class a layout wraps; none for a partial or
+    /// a helper.
+    renderers: Vec<Renderer>,
+    /// Whether the renderers are a layout's, which the card says.
+    layout: bool,
     helpers: Vec<DeclarationId>,
     /// The framework's own half: whichever of [`rails::VIEW_CONTEXT`] the graph holds.
     ///
@@ -380,9 +609,9 @@ impl Reachable {
         self.helpers.is_empty()
             && self.framework.is_empty()
             && self
-                .renderer
-                .as_ref()
-                .is_none_or(|renderer| renderer.exported.is_empty())
+                .renderers
+                .iter()
+                .all(|renderer| renderer.exported.is_empty())
     }
 
     /// The declaration a bare `member` written in this template names.
@@ -398,15 +627,21 @@ impl Reachable {
     pub fn member(&self, graph: &Graph, member: &str) -> Option<Found> {
         let name = member.strip_suffix("()").unwrap_or(member);
         let id = StringId::from(member);
-        if let Some(renderer) = &self.renderer
-            && renderer.exported.contains(name)
-            && let Ok(found) =
-                query::find_member_in_ancestors(graph, renderer.declaration, id, false)
-        {
-            return Some(Found {
-                declaration: found,
-                how: InView::Exported(renderer.name.clone()),
-            });
+        for renderer in &self.renderers {
+            if renderer.exported.contains(name)
+                && let Ok(found) =
+                    query::find_member_in_ancestors(graph, renderer.declaration, id, false)
+            {
+                let name = renderer.name.clone();
+                return Some(Found {
+                    declaration: found,
+                    how: if self.layout {
+                        InView::Laid(name)
+                    } else {
+                        InView::Exported(name)
+                    },
+                });
+            }
         }
         if let Some(found) = self
             .helpers
@@ -443,17 +678,23 @@ impl Reachable {
     pub fn members(&self, graph: &Graph) -> Vec<Reached> {
         let mut seen: BTreeSet<StringId> = BTreeSet::new();
         let mut found: Vec<Reached> = Vec::new();
-        if let Some(renderer) = &self.renderer {
+        // The exports already offered: a layout's renderers often reach one `helper_method` through
+        // the same `ApplicationController`, and one name is one row.
+        let mut offered: BTreeSet<StringId> = BTreeSet::new();
+        for renderer in &self.renderers {
             for name in &renderer.exported {
                 let id = StringId::from(format!("{name}()").as_str());
-                // Recorded whether or not it resolves, and never tested here: the export list is a
-                // set, so it cannot repeat itself. What this is for is the helpers half below:
+                // Recorded whether or not it resolves. What this is for is the helpers half below:
                 // exports often name a method that is also an `app/helpers` `def`, and one name is
                 // one row.
                 seen.insert(id);
+                if offered.contains(&id) {
+                    continue;
+                }
                 if let Ok(member) =
                     query::find_member_in_ancestors(graph, renderer.declaration, id, false)
                 {
+                    offered.insert(id);
                     found.push(Reached {
                         declaration: member,
                         step: EXPORTED,
@@ -636,7 +877,7 @@ mod tests {
         let source = "<%= current_user %>\n";
         let fallen = card(&mut harness, &view, source, "current_user");
         assert!(
-            fallen.contains("method name alone"),
+            fallen.contains("Guessed from name alone"),
             "the view context is still answering: {fallen}"
         );
 
@@ -649,7 +890,67 @@ mod tests {
         harness.index();
         let cited = card(&mut harness, &view, source, "current_user");
         assert!(cited.contains("StoriesController#current_user"), "{cited}");
-        assert!(!cited.contains("method name alone"), "{cited}");
+        assert!(!cited.contains("Guessed from name alone"), "{cited}");
+    }
+
+    #[test]
+    fn a_layout_calls_what_the_classes_whose_views_it_wraps_exported() {
+        // A layout's path names no class, so the export half comes from every class Rails renders
+        // in it. Two of them reach `current_user` through one `ApplicationController`, which is
+        // one row, and the admin controllers' `layout "admin"` keeps their export out of the
+        // application layout.
+        let mut harness = Harness::new();
+        harness.write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController\n  helper_method :current_user\n\n  def current_user\n  \
+             end\nend\n",
+        );
+        for name in ["stories", "feeds"] {
+            harness.write(
+                &format!("app/controllers/{name}_controller.rb"),
+                &format!(
+                    "class {}Controller < ApplicationController\nend\n",
+                    rails::camelize(name).unwrap()
+                ),
+            );
+            harness.write(&format!("app/views/{name}/index.html.erb"), "x\n");
+        }
+        harness.write(
+            "app/controllers/admin/users_controller.rb",
+            "module Admin\n  class UsersController < ApplicationController\n    layout \"admin\"\n    \
+             helper_method :admin_only\n\n    def admin_only\n    end\n  end\nend\n",
+        );
+        harness.write("app/views/admin/users/index.html.erb", "x\n");
+        let source = "<%= current_user %>\n<%= admin_only %>\n";
+        let application = harness.write("app/views/layouts/application.html.erb", source);
+        let admin = harness.write("app/views/layouts/admin.html.erb", source);
+        harness.index();
+
+        let exported = card(&mut harness, &application, source, "current_user");
+        assert!(
+            exported.contains("ApplicationController#current_user")
+                && !exported.contains("Guessed from name alone"),
+            "{exported}"
+        );
+        let other = card(&mut harness, &application, source, "admin_only");
+        assert!(other.contains("Guessed from name alone"), "{other}");
+
+        let admin_only = card(&mut harness, &admin, source, "admin_only");
+        assert!(
+            !admin_only.contains("Guessed from name alone"),
+            "{admin_only}"
+        );
+
+        // Last: the completion replaces the layout's text.
+        let offered = harness.declarations_at(&application, "<%= curr~ %>\n");
+        assert_eq!(
+            offered
+                .iter()
+                .filter(|name| *name == "current_user")
+                .count(),
+            1,
+            "{offered:?}"
+        );
     }
 
     #[test]
@@ -669,15 +970,9 @@ mod tests {
             exported.contains("StoriesController#current_user"),
             "{exported}"
         );
+        assert!(!exported.contains("Guessed from name alone"), "{exported}");
         assert!(
-            exported.contains(
-                "Reached through `helper_method` in `StoriesController` — the class Rails \
-                 renders this template from."
-            ),
-            "{exported}"
-        );
-        assert!(
-            !exported.contains("Matched on the method name alone"),
+            !exported.contains("Guessed from name alone"),
             "a convention that names a class is not a name match: {exported}"
         );
 
@@ -703,7 +998,7 @@ mod tests {
         harness.watch(&[&other]);
         let private = card(&mut harness, &other, unexported, "set_story");
         assert!(
-            private.contains("Matched on the method name alone"),
+            private.contains("Guessed from name alone"),
             "`helper_method` is the gate, per name: {private}"
         );
         let offered = harness.declarations_at(&other, "<%= set_s~ %>\n");
@@ -730,7 +1025,7 @@ mod tests {
 
         let card = card(&mut harness, &view, source, "render_story");
         assert!(
-            card.contains("Matched on the method name alone"),
+            card.contains("Guessed from name alone"),
             "a name no literal spelled is a name nobody exported: {card}"
         );
     }
@@ -748,7 +1043,7 @@ mod tests {
             "app/helpers/stories_helper.rb",
             "module StoriesHelper\n  def byline\n  end\nend\n",
         );
-        // Under `app/helpers` but not named as Rails' glob names them: solidus'
+        // Under `app/helpers` but not named as Rails' glob names them: an engine's
         // `controller_helpers/auth.rb` shape, reached by an `include` a controller writes, and in
         // no view context by default.
         harness.write(
@@ -761,17 +1056,11 @@ mod tests {
 
         let globbed = card(&mut harness, &view, source, "time_ago");
         assert!(globbed.contains("ApplicationHelper#time_ago"), "{globbed}");
-        assert!(
-            globbed.contains(
-                "Reached through the view context — Rails includes every `app/helpers` module \
-                 in it."
-            ),
-            "{globbed}"
-        );
+        assert!(!globbed.contains("Guessed from name alone"), "{globbed}");
 
         let unglobbed = card(&mut harness, &view, source, "sign_out");
         assert!(
-            unglobbed.contains("Matched on the method name alone"),
+            unglobbed.contains("Guessed from name alone"),
             "a file Rails' own glob does not name is in no view context: {unglobbed}"
         );
 
@@ -824,14 +1113,11 @@ mod tests {
             shared.contains("StoriesController#current_user"),
             "the proxy is written on `_helpers` and the module is included into it: {shared}"
         );
-        assert!(
-            shared.contains("`helper_method` in `StoriesController`"),
-            "{shared}"
-        );
+        assert!(!shared.contains("Guessed from name alone"), "{shared}");
 
         let unwritten = card(&mut harness, &view, source, "missing");
         assert!(
-            unwritten.contains("Matched on the method name alone"),
+            unwritten.contains("Guessed from name alone"),
             "a permission for a method nobody wrote is not an answer: {unwritten}"
         );
 
@@ -876,10 +1162,7 @@ mod tests {
         assert!(through.contains("Authentication#current_user"), "{through}");
         // The class the *template* names, not the module the macro is in: what a reader must be
         // able to check is that Rails renders this template from there.
-        assert!(
-            through.contains("`helper_method` in `StoriesController`"),
-            "{through}"
-        );
+        assert!(!through.contains("Guessed from name alone"), "{through}");
     }
 
     #[test]
@@ -905,14 +1188,11 @@ mod tests {
 
         let exported = card(&mut harness, &view, source, "sender_name");
         assert!(exported.contains("UserMailer#sender_name"), "{exported}");
-        assert!(
-            exported.contains("`helper_method` in `UserMailer`"),
-            "{exported}"
-        );
+        assert!(!exported.contains("Guessed from name alone"), "{exported}");
 
         let helper = card(&mut harness, &view, source, "time_ago");
         assert!(
-            helper.contains("Matched on the method name alone"),
+            helper.contains("Guessed from name alone"),
             "a mailer's views are not a controller's: {helper}"
         );
 
@@ -928,10 +1208,7 @@ mod tests {
         harness.watch(&[&mailer]);
         let named = card(&mut harness, &view, source, "time_ago");
         assert!(named.contains("ApplicationHelper#time_ago"), "{named}");
-        assert!(
-            named.contains("Reached through the view context"),
-            "{named}"
-        );
+        assert!(!named.contains("Guessed from name alone"), "{named}");
 
         // And the directory must name a **mailer**: `mailer_of` spells whatever the path spells, so
         // the gate is the application's own superclass table, not the path.
@@ -940,7 +1217,7 @@ mod tests {
         harness.watch(&[&other]);
         let elsewhere = card(&mut harness, &other, shared, "sender_name");
         assert!(
-            elsewhere.contains("Matched on the method name alone"),
+            elsewhere.contains("Guessed from name alone"),
             "`app/views/shared/` names `Shared`, which renders nothing: {elsewhere}"
         );
     }
@@ -972,24 +1249,18 @@ mod tests {
 
         let own = card(&mut harness, &view, source, "tag");
         assert!(own.contains("ApplicationHelper#tag"), "{own}");
-        assert!(!own.contains("Matched on the method name alone"), "{own}");
+        assert!(!own.contains("Guessed from name alone"), "{own}");
 
         let shipped = card(&mut harness, &view, source, "link_to");
         assert!(
             shipped.contains("ActionView::Helpers::UrlHelper#link_to"),
             "{shipped}"
         );
-        assert!(
-            shipped.contains(
-                "Reached through the view context — ActionView includes its own helper \
-                 modules in it."
-            ),
-            "{shipped}"
-        );
+        assert!(!shipped.contains("Guessed from name alone"), "{shipped}");
 
         let outside = card(&mut harness, &plain, script, "tag");
         assert!(
-            outside.contains("Matched on the method name alone"),
+            outside.contains("Guessed from name alone"),
             "nothing outside a template changes: {outside}"
         );
     }
@@ -1015,7 +1286,7 @@ mod tests {
 
         let fallen = card(&mut harness, &view, source, "can?");
         assert!(
-            fallen.contains("Matched on the method name alone"),
+            fallen.contains("Guessed from name alone"),
             "a name the view context does not hold falls through, it is not swallowed: {fallen}"
         );
     }
@@ -1045,7 +1316,7 @@ mod tests {
 
         let missing = card(&mut harness, &view, source, "link_to");
         assert!(
-            missing.contains("Matched on the method name alone"),
+            missing.contains("Guessed from name alone"),
             "nothing is invented for a gem that is not there: {missing}"
         );
     }
@@ -1093,14 +1364,14 @@ mod tests {
 
         let exported = card(&mut harness, &helper, source, "current_user");
         assert!(
-            exported.contains("Matched on the method name alone"),
+            exported.contains("Guessed from name alone"),
             "a helper module belongs to no one controller, so it is granted no permission by \
              one: {exported}"
         );
 
         let outside = card(&mut harness, &unglobbed, unglobbed_source, "link_to");
         assert!(
-            outside.contains("Matched on the method name alone"),
+            outside.contains("Guessed from name alone"),
             "Rails' own glob decides which file is a helper, here as everywhere: {outside}"
         );
     }
@@ -1138,7 +1409,7 @@ mod tests {
 
         let refused = card(&mut harness, &mailer, source, "time_ago");
         assert!(
-            refused.contains("Matched on the method name alone"),
+            refused.contains("Guessed from name alone"),
             "a mailer gets no application helper it did not name: {refused}"
         );
         let globbed = card(&mut harness, &orphan, source, "time_ago");

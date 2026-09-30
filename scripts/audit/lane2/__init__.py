@@ -30,24 +30,24 @@ where it needs them. Adding a check is one file and one name in `CHECKS`; nothin
 **`POST` is one request per eligible position; `ask` is everything else.**
 - A `Post` is declarative (a method, its params, its legal shapes, its stride), and `ask_all` sends
   it beside the others in one pass.
-- `ask` covers conversations: a request whose unit is not a drawn position (check 8 asks per file),
-  or whose params are a previous reply (check 9's `incomingCalls` carries the item
+- `ask` covers conversations: a request whose unit is not a drawn position (check 7 asks per file),
+  or whose params are a previous reply (check 8's `incomingCalls` carries the item
   `prepareCallHierarchy` returned).
 A check that needs neither has neither.
 """
 
 from audit.answers import first_place, names_an_id
-from audit.lane2 import (footnotes, highlight, incoming, margins, rebase, receiver, references,
-                         renaming, resolved, spans)
+from audit.lane2 import (footnotes, highlight, incoming, margins, rebase, references, renaming,
+                         resolved, spans)
 from audit.lane2.context import Corpus, Row
 
 # The order is the numbering: `check 1` is the first entry. Findings print in this order too, so a
 # reader meets `check 2`'s findings right after its line.
 #
 # Append; never insert. Readers remember last week's numbering, and an insertion renumbers every
-# check after it.
-CHECKS = (highlight, resolved, spans, footnotes, rebase, receiver, references, margins, incoming,
-          renaming)
+# check after it. (Check 6, `receiver`, was removed on 2026-09-29 with the card sentences it read:
+# the checks after it moved up one.)
+CHECKS = (highlight, resolved, spans, footnotes, rebase, references, margins, incoming, renaming)
 
 # What lane 2 needs asked. `hover` and `definition` are the pair every lane reads;
 # `documentHighlight` is check 1's alone; check 5 asks the first two a second time.
@@ -58,9 +58,7 @@ CHECKS = (highlight, resolved, spans, footnotes, rebase, receiver, references, m
 # widest answer the server gives, so its share of the draw is a measurement. All of that lives in
 # `lane2/references.py`, beside the check that reads the reply: a request posted here with its
 # meaning written there would drift.
-#
-# **`completion` is not here, on purpose.** Check 6 reads it, but lane 1's key sends it, and it is
-# the largest single cost in the budget, so it has one owner. See `lane2.context.Row`.
+
 METHODS = ("textDocument/hover", "textDocument/definition", "textDocument/documentHighlight",
            references.POST, renaming.POST)
 
@@ -102,7 +100,7 @@ def run(corpus, drawn, answers, rebased=None, shifted=None, places=None):
     #   counter;
     # - a card printing an internal id instead of a name leaves the tier and the count unchanged.
     counts = {"positions": len(drawn), "hover": 0, "definition": 0, "highlight": 0,
-              "tiers": {"resolved": 0, "derived": 0, "guessed": 0},
+              "tiers": {"resolved": 0, "guessed": 0},
               "first-place": {"one-library": 0, "majority": 0, "minority": 0},
               "cards-anonymous": 0,
               # Counted per distinct place, not per position, so it arrives already summed instead

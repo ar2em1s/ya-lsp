@@ -1,6 +1,6 @@
 [package]
 name = "ya-lsp"
-version = "0.6.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -39,6 +39,10 @@ toml = "1.1"
 glob = "0.3"
 ignore = "0.4"
 anyhow = "1.0"
+# Searching a whole file's text for a name (`types::spells`): a vectorised `memmem`, where
+# `str::contains` is a scalar two-way search on aarch64 and ran 5-11 times slower over a gem's
+# sources. Already linked through `ignore`'s `globset`, so it adds no crate and no notice.
+memchr = "2.8"
 # The filesystem watcher, for every client that cannot take a `didChangeWatchedFiles`
 # registration: Claude Code, Helix, eglot, Neovim on Linux. The crate rust-analyzer watches with.
 # `CC0-1.0`, which is a licence decision, not a default: see `about.toml`. Default features:

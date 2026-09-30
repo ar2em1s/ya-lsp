@@ -726,7 +726,7 @@ def cmd_score(args):
         # - `window/showMessage` is collected because a server saying only part of the bundle is
         #   installed invalidates every absolute taken from it.
         # - Some messages are about **one request** instead (`messages.md` lists the exception), and
-        #   a sweep asks thousands. Check 10 posts `prepareRename` at every constant, and each
+        #   a sweep asks thousands. Check 9 posts `prepareRename` at every constant, and each
         #   refusal names its constant.
         # - The startup messages arrive first and are never the ones cut.
         said = counts.get("warnings") or ()
