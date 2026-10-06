@@ -393,7 +393,13 @@ pub struct Declaring<'a> {
     /// template (`environment::Fence::unloadable`'s reading, never a copy of it). For a fact that
     /// changes what the application's own classes are, which a file only the suite loads must not.
     pub loaded: &'a dyn Fn(&DocUri) -> bool,
+    /// Which of the project's own documents write a `def` of each of these method names.
+    pub methods: Methods<'a>,
 }
+
+/// Which of the project's own documents write a `def` of each of a set of method names: whether a
+/// call a routes file makes is the project's own method or a gem's.
+pub type Methods<'a> = &'a dyn Fn(&BTreeSet<String>) -> BTreeMap<String, Vec<DocUri>>;
 
 /// What a module may read while it looks for files nothing has indexed.
 ///
@@ -587,6 +593,69 @@ pub trait Knowledge {
         None
     }
 
+    /// What a read whose receiver a member made hands back ([`generated::READ_OFF`]), as an RBS
+    /// union with `nil` written out, or `None` where this module does not say.
+    ///
+    /// [`generated::READ_OFF`]: crate::generated::READ_OFF
+    fn read_type(&self, _read: &Read<'_>) -> Option<String> {
+        None
+    }
+
+    /// What a call whose value is made from its literal arguments hands back
+    /// ([`generated::SHAPED`]): its type, and what a read of one key of it hands back, which the
+    /// value carries. `None` where this module does not say, and the member's body answers.
+    ///
+    /// [`generated::SHAPED`]: crate::generated::SHAPED
+    fn shaped_type(&self, _shaping: &Shaping<'_>) -> Option<Shape> {
+        None
+    }
+
+    /// Whether a framework this module knows calls `method` on an object with these ancestors (by
+    /// name), with arguments no written call shows: a job's `perform` is handed what
+    /// `perform_later` was. The types table then does not type its parameters from its callers.
+    fn called_by_a_framework(&self, _method: &str, _ancestors: &[&str]) -> bool {
+        false
+    }
+
+    /// The class methods a framework this module knows installs beside `method` on an object with
+    /// these ancestors (by name), which run it on a new instance of the class they are called on,
+    /// handed what they were: ActiveJob's `perform_later(user)` runs `perform(user)`. The types
+    /// table then reads their calls as the method's callers. `None` where this module does not say.
+    fn run_from_the_class(&self, _method: &str, _ancestors: &[&str]) -> Option<FromTheClass> {
+        None
+    }
+
+    /// Whether what the class method `method` hands back, called on the class object of a class
+    /// with these ancestors (by name), takes the class methods a convention declared for that class
+    /// as the class does: ActionMailer's `UserMailer.with(user: u).welcome` is
+    /// `UserMailer.welcome`.
+    fn passes_to_the_class(&self, _method: &str, _ancestors: &[&str]) -> bool {
+        false
+    }
+
+    /// The class method whose calls' keywords a literal key read off `reader` (by its declaration's
+    /// name) holds, each made on the class object of a class whose instance runs the read, or `nil`
+    /// where an instance was made without one: ActionMailer's `params[:user]` is what each
+    /// `with(user: …)` passed. `None` where this module does not say.
+    fn keyed_by_a_class_call(&self, _reader: &str) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether a call reaching `owner`'s `method` (by name) hands back a value nothing reads: a
+    /// framework's macro, called for what it declares (`belongs_to`, a migration's `add_column`).
+    /// The type coverage leaves such a call out of the calls whose value is used.
+    fn discards_value(&self, _owner: &str, _method: &str) -> bool {
+        false
+    }
+
+    /// What a framework this module knows does with a method's name a call of its own is passed:
+    /// `before_action :load` calls `load` with nothing, `only: [:new]` names an action and calls
+    /// nothing. `None` where this module does not say, and the types table then takes the name for
+    /// a caller it cannot read.
+    fn spelled_use(&self, _spelled: &Spelled<'_>) -> Option<NameUse> {
+        None
+    }
+
     /// Where a call's literal key is written and what it holds, for a jump and a card.
     fn keyed_entry(&self, _keyed: &Keyed<'_>) -> Option<KeyedEntry> {
         None
@@ -633,6 +702,104 @@ pub struct Keyed<'a> {
     pub block: bool,
 }
 
+/// A literal spelling a method's name, passed to a call ([`Knowledge::spelled_use`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Spelled<'a> {
+    /// The call's name as written: `before_action`.
+    pub call: &'a str,
+    /// The keyword whose value holds the literal, or `None` for a positional.
+    pub key: Option<&'a str>,
+    /// The path of the document the call is written in, where it has one.
+    pub path: Option<&'a std::path::Path>,
+}
+
+/// What a framework does with a method's name it is passed ([`Knowledge::spelled_use`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameUse {
+    /// It reads, filters or defines by the name, and calls nothing by it.
+    Named,
+    /// It calls the method with no arguments on an object of the class whose body writes the call.
+    CalledBare,
+}
+
+/// The class methods that run a method on a new instance of the class they are called on
+/// ([`Knowledge::run_from_the_class`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FromTheClass {
+    /// Each class method's name: `perform_later`, or a mailer's action itself.
+    pub names: Vec<String>,
+    /// Whether something may run the method where no call is written (a scheduler enqueues a job
+    /// by its class's name), so the answer always says more may come.
+    pub unwritten: bool,
+}
+
+/// A read whose value depends on what made its receiver ([`Knowledge::read_type`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Read<'a> {
+    /// The member the call reached, as its declaration is named:
+    /// `ActionController::Parameters#[]()`.
+    pub member: &'a str,
+    /// The member a receiverless call with no arguments, written as the receiver, reached:
+    /// `ActionController::StrongParameters#params()`.
+    pub reader: &'a str,
+    /// Each positional argument, and what it is where the text says.
+    pub arguments: &'a [Written],
+    /// Whether the call writes a block.
+    pub block: bool,
+    /// Whether the read is written in the project's own code, whose routes and writes the module
+    /// has read.
+    pub own: bool,
+    /// Every ancestor of the class `self` is where the read is written, its own class first, as
+    /// rubydex names each.
+    pub ancestors: &'a [&'a str],
+    /// The `def` the read is written in, by name, or `None` outside one.
+    pub def: Option<&'a str>,
+}
+
+/// A call whose value a member makes from its literal arguments ([`Knowledge::shaped_type`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Shaping<'a> {
+    /// The member the call reached, as its declaration is named:
+    /// `ActionController::Parameters#permit()`.
+    pub member: &'a str,
+    /// Each positional argument, and what it is where the text says.
+    pub arguments: &'a [Written],
+    /// The keywords written without braces, by name, or `None` where they cannot be read (a `**`
+    /// splat, a key that is no plain symbol).
+    pub keywords: Option<&'a [(String, Written)]>,
+    /// The receiver, where it is written as a chain of calls down to one with no receiver, no
+    /// arguments and no block: that call's member (`ActionController::StrongParameters#params()`),
+    /// then each call on what the one before handed back, as each is looked up on the class the
+    /// first one answers. `None` for any other receiver.
+    pub chain: Option<(&'a str, &'a [Link])>,
+    /// Whether the call is written in the project's own code, whose writes the module has read.
+    pub own: bool,
+    /// Every ancestor of the class `self` is where the call is written, its own class first.
+    pub ancestors: &'a [&'a str],
+}
+
+/// One call of a receiver's chain ([`Shaping::chain`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    /// The member it reached: `ActionController::Parameters#require()`.
+    pub member: String,
+    /// Each positional argument.
+    pub arguments: Vec<Written>,
+    /// Whether it wrote keywords or a block, which no read written as data does.
+    pub more: bool,
+}
+
+/// What a shaping call hands back ([`Knowledge::shaped_type`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shape {
+    /// Its type, an RBS union with `nil` written out.
+    pub spelled: String,
+    /// What a read of the value hands back, by the member a call reaches (as its declaration is
+    /// named) and the one literal key it is written with: an RBS union with `nil` written out. A
+    /// read this does not list answers as any read of such a value does.
+    pub reads: std::collections::BTreeMap<(String, String), String>,
+}
+
 /// A keyword's value as the call writes it, where that is a literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Written {
@@ -640,6 +807,10 @@ pub enum Written {
     Text(String),
     /// A symbol literal, and its name.
     Symbol(String),
+    /// An array literal of names and such literals: `[:title, tags: []]`.
+    List(Vec<Written>),
+    /// A hash literal whose every key is a name, by the key's text: `{ tags: [] }`.
+    Pairs(Vec<(String, Written)>),
     /// Anything else: a variable, a call, an interpolation.
     Other,
 }

@@ -16,7 +16,7 @@
 //! # Which methods, and which `self`
 //!
 //! Read off the Rails 8.1 source, where each one calls `instance_exec` or `instance_eval` on the
-//! block it was handed (the scan and its list are in `tmp/bench/selfblocks/`):
+//! block it was handed:
 //!
 //! | methods | `self` inside |
 //! | --- | --- |

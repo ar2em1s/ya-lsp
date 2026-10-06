@@ -62,15 +62,16 @@ pub struct Batch {
     /// The documents whose indexing panicked: not in the graph, and *named* rather than silently
     /// absent, which is the whole difference between this and a wrapper.
     pub skipped: Vec<DocUri>,
-    /// Each document indexed, with which of the texts asked for it spells ([`spells`]).
-    pub spelled: Vec<(DocUri, u64)>,
+    /// Each document indexed, with which of the texts asked for it spells ([`spells`]), and every
+    /// name it spells as a symbol or a one-word string ([`named`]).
+    pub spelled: Vec<(DocUri, u64, Named)>,
 }
 
 /// What one file's worth of work produced.
 enum Built {
     /// Boxed: a `LocalGraph` is an order of magnitude larger than the other two arms, and this
     /// travels down a channel once per file.
-    Indexed(Box<LocalGraph>, DocUri, u64),
+    Indexed(Box<LocalGraph>, DocUri, u64, Named),
     Failed(Errors),
     Panicked(DocUri),
 }
@@ -129,9 +130,9 @@ pub fn index_files(graph: &mut Graph, paths: Vec<PathBuf>, texts: &[&str]) -> Ba
         // Merged as they arrive, overlapping with the workers, exactly as rubydex does.
         for outcome in built_rx {
             match outcome {
-                Built::Indexed(local, uri, spelled) => {
+                Built::Indexed(local, uri, spelled, names) => {
                     graph.consume_document_changes(*local);
-                    batch.spelled.push((uri, spelled));
+                    batch.spelled.push((uri, spelled, names));
                 }
                 Built::Failed(error) => batch.errors.push(error),
                 Built::Panicked(uri) => batch.skipped.push(uri),
@@ -171,7 +172,7 @@ fn build(path: &Path, texts: &[&str]) -> Built {
     })) {
         Ok(local) => {
             let spelled = spells(&source, texts);
-            Built::Indexed(Box::new(local), uri, spelled)
+            Built::Indexed(Box::new(local), uri, spelled, named(&source, &language))
         }
         // The default panic hook has already put rubydex's own file and line on stderr, which is
         // what a bug report is made of. Silencing it would make a contained panic unreportable: the
@@ -221,6 +222,61 @@ pub fn spells(source: &str, texts: &[&str]) -> u64 {
         .filter(|(_, text)| memchr::memmem::find(source.as_bytes(), text.as_bytes()).is_some())
         .fold(0, |mask, (bit, _)| mask | 1 << bit)
 }
+
+/// Every name `source` spells as a symbol (`:name`), a `%i[]` word or a one-word string, sorted and
+/// once each: what `send`, `public_send`, `try`, `method`, a callback or a `delegate` can call a
+/// method by. And every name a call that sends by name builds around an interpolation
+/// (`send("handle_#{event}", payload)`), as the literal head and tail it keeps. Read here, while
+/// the worker holds the text, for the callers rung, which reads each literal of a name only in the
+/// documents that spell it (`types::spelled_as`) and refuses a method an interpolation can reach.
+///
+/// **Ruby only**: a signature calls nothing, and its `:user` literal types are no names. Core's RBS
+/// parsed as Ruby (its comments hold `send` and `#{`) overflowed an indexing worker's stack in a
+/// debug build.
+#[must_use]
+pub fn named(source: &str, language: &LanguageId) -> Named {
+    if !matches!(language, LanguageId::Ruby) {
+        return Named::default();
+    }
+    let mut found = std::collections::HashSet::new();
+    super::types::spell(source.as_bytes(), &mut found);
+    let mut names: Vec<String> = found.into_iter().collect();
+    names.sort_unstable();
+    let patterns = if memchr::memmem::find(source.as_bytes(), b"#{").is_some()
+        && SENDERS
+            .iter()
+            .any(|sender| memchr::memmem::find(source.as_bytes(), sender.as_bytes()).is_some())
+    {
+        super::cursor::sent_patterns(source, &SENDERS)
+    } else {
+        Vec::new()
+    };
+    Named { names, patterns }
+}
+
+/// [`named`]'s answer.
+#[derive(Debug, Default, Clone)]
+pub struct Named {
+    pub names: Vec<String>,
+    /// `(head, tail, passed)`: a name an interpolation builds starts with `head` and ends with `tail`,
+    /// and the call passes `passed` positional arguments after it (`None`: any). Only
+    /// patterns that keep at least one literal part: a name built from nothing literal could be any
+    /// name, which the callers rung assumes no call builds.
+    pub patterns: Vec<super::cursor::SentPattern>,
+}
+
+/// The calls that send to, or look up, a method by a name their first argument builds.
+pub(super) const SENDERS: [&str; 9] = [
+    "send",
+    "__send__",
+    "public_send",
+    "try",
+    "try!",
+    "method",
+    "public_method",
+    "instance_method",
+    "public_instance_method",
+];
 
 /// Index one in-memory document, and say whether it survived.
 ///

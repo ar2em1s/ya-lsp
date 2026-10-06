@@ -36,7 +36,7 @@ static WANTS: [Wants; 1] = [Wants {
 /// Every definition file, read.
 #[derive(Debug, Default)]
 pub struct Factories {
-    sources: BTreeMap<String, (Fresh, Arc<factories::Read>)>,
+    sources: BTreeMap<String, (Fresh, Arc<factories::Read>, DocUri)>,
     /// Where each factory is written, as the last pass found them ([`factories::Classes::places`]).
     places: BTreeMap<String, (String, At)>,
     /// How many files were parsed, for a test that asserts an unchanged one is not.
@@ -83,7 +83,7 @@ impl super::Knowledge for Factories {
             if self
                 .sources
                 .get(key)
-                .is_some_and(|(held, _)| *held == fresh)
+                .is_some_and(|(held, _, _)| *held == fresh)
             {
                 continue;
             }
@@ -94,7 +94,8 @@ impl super::Knowledge for Factories {
             self.reads += 1;
             let mut read = factories::read_factories(&text);
             read.uri.clone_from(key);
-            self.sources.insert(key.clone(), (fresh, Arc::new(read)));
+            self.sources
+                .insert(key.clone(), (fresh, Arc::new(read), uri));
         }
     }
 
@@ -109,7 +110,7 @@ impl super::Knowledge for Factories {
         let reads: Vec<factories::Read> = self
             .sources
             .values()
-            .map(|(_, read)| factories::Read {
+            .map(|(_, read, _)| factories::Read {
                 gem: !(declaring.own)(&read.uri),
                 ..(**read).clone()
             })
@@ -134,7 +135,15 @@ impl super::Knowledge for Factories {
                 super::add(into, uri, facts);
             }
         }
+        // What each factory's blocks run as, written beside the file that defines it: a block's
+        // `self` is looked up where its call is written.
+        let uris: Vec<&DocUri> = self.sources.values().map(|(_, _, uri)| uri).collect();
+        let mut defined = 0;
+        for (index, facts) in factories::proxies(&reads, &classes, namespaces) {
+            defined += 1;
+            super::add(into, uris[index], facts);
+        }
         self.places = classes.places;
-        vec![("factories", built)]
+        vec![("factories", built), ("definition files", defined)]
     }
 }

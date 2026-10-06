@@ -266,6 +266,12 @@ pub(super) struct Body<'a> {
 }
 
 impl Association {
+    /// Whether `later`, read after this in the same body, replaces it: a `scope` defined again by
+    /// name is Rails defining the method once more, and the last lambda is the one that runs.
+    pub(super) fn replaced_by(&self, later: &Self) -> bool {
+        self.kind == Kind::Scope && later.kind == Kind::Scope && self.name == later.name
+    }
+
     /// The class this macro names, or `None` where the application defines none of the candidates.
     ///
     /// Rails' order, and the order is the whole point: where both a bare name and a nested name

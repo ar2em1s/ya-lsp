@@ -636,6 +636,96 @@ impl Reader<'_> {
     }
 }
 
+/// Whether Rails calls `method` on an object with these ancestors with arguments no written call
+/// shows, so its parameters are not what its callers pass:
+///
+/// - **A Sidekiq worker's `perform`**: Sidekiq hands it what `perform_async` was, after a round
+///   trip through JSON, which turns a `Symbol` into a `String` and a record into whatever its
+///   `to_json` wrote. A non-Rails gem, so its calls are not read ([`run_from_the_class`] reads
+///   ActiveJob's).
+/// - **A channel's public methods**: ActionCable runs the action a client names, with what the client
+///   sent.
+#[must_use]
+pub fn called_by_rails(method: &str, ancestors: &[&str]) -> bool {
+    let worker = ancestors.iter().any(|ancestor| WORKERS.contains(ancestor));
+    let channel = ancestors.contains(&"ActionCable::Channel::Base");
+    (worker && method == "perform") || channel
+}
+
+/// The class methods Rails installs beside `method` on an object with these ancestors that run it
+/// on a new instance of the class they are called on, handed what they were.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FromTheClass {
+    /// Each class method's name.
+    pub names: Vec<String>,
+    /// Whether something may run the method where no call is written.
+    pub unwritten: bool,
+}
+
+/// What runs `method` from the class, on an object with these ancestors ([`FromTheClass`]):
+///
+/// - **A job's `perform`** is run by `perform_later(args)` and `perform_now(args)` on the job's
+///   class, and by both after `set(wait: …)` ([`passes_to_the_class`]). `perform_now` hands the
+///   arguments straight on.
+///   `perform_later`'s go through the queue, and ActiveJob's serializers hand back the class they
+///   were given for every type they accept (a record is found again by its `GlobalID`) and raise
+///   on any other. A scheduler enqueues a job by its class's name with arguments no Ruby call
+///   shows, so the answer always says more may come.
+/// - **A mailer's action** is run by the same name on the mailer's class, and after `with(params)`:
+///   ActionMailer makes a mailer and calls the action with what the class method was handed, after
+///   the same queue for `deliver_later`. `initialize` is no action.
+///
+/// The convention's class methods are what [`Entrypoints::signatures`] declares, so a call
+/// reaching one reaches the `def` it was declared beside. Sidekiq's are not read
+/// ([`called_by_rails`]).
+#[must_use]
+pub fn run_from_the_class(method: &str, ancestors: &[&str]) -> Option<FromTheClass> {
+    if ancestors.iter().any(|ancestor| WORKERS.contains(ancestor)) {
+        return None;
+    }
+    if method == "perform" && ancestors.contains(&"ActiveJob::Base") {
+        return Some(FromTheClass {
+            names: vec!["perform_later".to_owned(), "perform_now".to_owned()],
+            unwritten: true,
+        });
+    }
+    if method != "initialize" && ancestors.contains(&"ActionMailer::Base") {
+        return Some(FromTheClass {
+            names: vec![method.to_owned()],
+            unwritten: false,
+        });
+    }
+    None
+}
+
+/// Whether what the class method `method` hands back, on the class object of a class with these
+/// ancestors, takes the class methods [`Entrypoints::signatures`] declared for that class as the
+/// class does, with the same arguments to the same instance method:
+///
+/// - **A mailer's `with(params)`** is a `Parameterized::Mailer`, which answers each of the mailer's
+///   actions with a delivery of it, the parameters set on the mailer first.
+/// - **A job's `set(wait: …)`** is a `ConfiguredJob`, whose `perform_later` and `perform_now` make
+///   the job as the class's do, with the options set.
+///
+/// Sidekiq's `set` is a non-Rails gem's ([`called_by_rails`]).
+#[must_use]
+pub fn passes_to_the_class(method: &str, ancestors: &[&str]) -> bool {
+    if ancestors.iter().any(|ancestor| WORKERS.contains(ancestor)) {
+        return false;
+    }
+    (method == "with" && ancestors.contains(&"ActionMailer::Base"))
+        || (method == "set" && ancestors.contains(&"ActiveJob::Base"))
+}
+
+/// The class method whose calls' keywords a literal key read off `reader` holds: ActionMailer keeps
+/// what `with(params)` was handed as the mailer's `params` (`@params ||= {}` where it was made
+/// without one), through the queue for `deliver_later`, so `params[:user]` in a mailer is each
+/// `with(user: …)`'s value, or `nil`.
+#[must_use]
+pub fn keyed_by_a_class_call(reader: &str) -> Option<&'static str> {
+    (reader == "ActionMailer::Parameterized#params()").then_some("with")
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
@@ -1429,6 +1519,67 @@ end
                 ("Passed", &TemplatePath::Unknown),
                 ("Selfish", &TemplatePath::Fixed("own".to_owned())),
             ]
+        );
+    }
+
+    #[test]
+    fn rails_calls_a_workers_perform_and_a_channels_actions_itself() {
+        assert!(!called_by_rails(
+            "perform",
+            &["MyJob", "ApplicationJob", "ActiveJob::Base"]
+        ));
+        assert!(called_by_rails("perform", &["MyWorker", "Sidekiq::Job"]));
+        assert!(!called_by_rails("enqueue", &["MyJob", "ActiveJob::Base"]));
+        assert!(called_by_rails(
+            "speak",
+            &["ChatChannel", "ActionCable::Channel::Base"]
+        ));
+        assert!(!called_by_rails("perform", &["Service"]));
+    }
+
+    /// A job's `perform` is run by its class's `perform_later` and `perform_now`, also after
+    /// `set`; a mailer's action by its own name on the class, also after `with`. Sidekiq's are not
+    /// read, and neither is anything else.
+    #[test]
+    fn a_job_and_a_mailer_run_their_methods_from_the_class() {
+        let job = run_from_the_class("perform", &["MyJob", "ApplicationJob", "ActiveJob::Base"])
+            .expect("a job");
+        assert_eq!(job.names, ["perform_later", "perform_now"]);
+        assert!(job.unwritten);
+        let mailer =
+            run_from_the_class("welcome", &["UserMailer", "ActionMailer::Base"]).expect("a mailer");
+        assert_eq!(mailer.names, ["welcome"]);
+        assert!(!mailer.unwritten);
+        assert_eq!(
+            run_from_the_class("initialize", &["UserMailer", "ActionMailer::Base"]),
+            None
+        );
+        assert_eq!(
+            run_from_the_class("helper", &["MyJob", "ActiveJob::Base"]),
+            None
+        );
+        assert_eq!(
+            run_from_the_class("perform", &["MyWorker", "Sidekiq::Job", "ActiveJob::Base"]),
+            None
+        );
+        assert_eq!(run_from_the_class("perform", &["Service"]), None);
+        let job = ["MyJob", "ActiveJob::Base"];
+        let mailer = ["UserMailer", "ActionMailer::Base"];
+        assert!(passes_to_the_class("set", &job));
+        assert!(passes_to_the_class("with", &mailer));
+        assert!(!passes_to_the_class("with", &job));
+        assert!(!passes_to_the_class("set", &mailer));
+        assert!(!passes_to_the_class(
+            "set",
+            &["MyWorker", "Sidekiq::Job", "ActiveJob::Base"]
+        ));
+        assert_eq!(
+            keyed_by_a_class_call("ActionMailer::Parameterized#params()"),
+            Some("with")
+        );
+        assert_eq!(
+            keyed_by_a_class_call("ActionController::StrongParameters#params()"),
+            None
         );
     }
 }

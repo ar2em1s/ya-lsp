@@ -8,7 +8,7 @@
 pub mod capabilities;
 pub(crate) mod watcher;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
@@ -119,6 +119,7 @@ fn serve(connection: Connection, reload: crate::logging::Reload) -> anyhow::Resu
         &params.capabilities,
         &root,
         &workspace.config().index,
+        &workspace.lockfiles(),
     );
     // Cloned before the workspace moves onto the analysis thread. The watcher outlives it and keeps
     // the startup configuration; see `watcher::Collector`.
@@ -177,7 +178,8 @@ fn serve(connection: Connection, reload: crate::logging::Reload) -> anyhow::Resu
     outcome
 }
 
-/// Ask the client to watch `ya-lsp.toml` and the project's Ruby. Returns whether it will.
+/// Ask the client to watch `ya-lsp.toml`, the project's Ruby and its lockfiles. Returns whether it
+/// will.
 ///
 /// `false` is not a failure and is not logged as one: many clients take no dynamic registration. It
 /// decides whether [`watcher::watch`] runs. **A client that took the registration keeps sending
@@ -187,8 +189,10 @@ fn register_file_watchers(
     capabilities: &ClientCapabilities,
     root: &Path,
     index: &IndexConfig,
+    lockfiles: &[PathBuf],
 ) -> bool {
-    let Some(registration) = capabilities::watched_files(root, index, capabilities) else {
+    let Some(registration) = capabilities::watched_files(root, index, lockfiles, capabilities)
+    else {
         return false;
     };
     // A string id in the server's own id space, as `Progress::begin` uses. Client and server number

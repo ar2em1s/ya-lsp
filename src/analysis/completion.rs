@@ -441,6 +441,7 @@ fn receiver_for(
                 | Receiver::Assigned { .. }
                 | Receiver::Destructured { .. }
                 | Receiver::Spelled { .. }
+                | Receiver::Stored(_)
                 // `super::Bar` parses and means nothing: `super` returns a value, and a value is
                 // not a namespace. `(a || b)::Bar` likewise (a shortcut returns one of its
                 // operands, which are values), and `param::Bar` (a parameter holds whatever the
@@ -491,16 +492,27 @@ fn receiver_for(
         // class that has the member (`types::narrowed`), and Ruby raises on the rest, so each row
         // is right for the values that have it; the detail names its class. `nil` stays folded
         // out, as for a `T?`.
+        //
+        // **`self.` in a module's instance method offers each running class's members too**
+        // ([`running`]), as a call there is made on one of them.
         Context::MethodCall { receiver } => {
             let typed = types::method_receiver(sources, uri_id, receiver, scope)?;
-            let classes = typed.classes();
+            let mut classes = typed.classes().to_vec();
+            if let cursor::Receiver::SelfObject(written) = receiver
+                && typed.one() == scope.caller(graph)
+            {
+                let running = running(sources, uri_id, *written);
+                if classes.len() + running.len() <= MAX_UNION_CLASSES {
+                    classes.extend(running);
+                }
+            }
             if classes.len() > MAX_UNION_CLASSES {
                 return None;
             }
             let self_decl_id = scope.caller(graph);
             let receivers = classes
-                .iter()
-                .map(|&receiver_decl_id| CompletionReceiver::MethodCall {
+                .into_iter()
+                .map(|receiver_decl_id| CompletionReceiver::MethodCall {
                     self_decl_id,
                     receiver_decl_id,
                 })
@@ -511,8 +523,56 @@ fn receiver_for(
     let mut receivers = vec![receiver];
     if matches!(context, Context::Expression | Context::Argument { .. }) {
         receivers.extend(rebound(sources, uri_id, at, scope.nesting));
+        let running = running(sources, uri_id, at);
+        if running.len() <= MAX_UNION_CLASSES {
+            receivers.extend(
+                running
+                    .into_iter()
+                    .map(|class| CompletionReceiver::Expression {
+                        self_decl_id: Some(class),
+                        nesting_name_id: scope.nesting,
+                    }),
+            );
+        }
     }
     Some((receivers, only, derivation))
+}
+
+/// The classes whose objects run the module's instance method `self` is written in
+/// ([`types::running_self`]): hover answers a name the module lacks from them
+/// ([`types::self_runners`]), so the list offers their members beside the module's. None where a
+/// block around the word rebinds `self` ([`rebound`] decides there).
+///
+/// **Past [`MAX_UNION_CLASSES`], the ones nearest the module**: those no other of them is above.
+/// Every other one inherits all their members, so each row stays right for the values that have
+/// it, and only a name a subclass alone declares is left off. A concern on a base class with a
+/// hundred subclasses lists the base's members.
+fn running(sources: &Sources<'_>, uri_id: UriId, at: u32) -> Vec<DeclarationId> {
+    if types::rebound_self(sources, uri_id, at).is_some() {
+        return Vec::new();
+    }
+    let classes = types::running_self(sources, uri_id, at)
+        .map(|(_, classes)| classes.to_vec())
+        .unwrap_or_default();
+    if classes.len() <= MAX_UNION_CLASSES {
+        return classes;
+    }
+    let graph = sources.graph;
+    let held: HashSet<DeclarationId> = classes.iter().copied().collect();
+    classes
+        .into_iter()
+        .filter(|class| {
+            graph
+                .declarations()
+                .get(class)
+                .and_then(Declaration::as_namespace)
+                .is_some_and(|namespace| {
+                    !namespace.ancestors().iter().any(|ancestor| {
+                        matches!(ancestor, Ancestor::Complete(id) if id != class && held.contains(id))
+                    })
+                })
+        })
+        .collect()
 }
 
 /// The classes a block around a bare word runs against, as receivers beside the lexical one.
@@ -2426,6 +2486,84 @@ mod tests {
         // Outside the block the lexical `self` alone answers.
         let (labels, _) = offered(&harness.complete(&uri, "App.new.configure do\nend\nna~\n"));
         assert!(!labels.iter().any(|label| label == "name"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_bare_word_in_a_modules_def_lists_what_its_running_classes_have() {
+        // Hover answers a name the module lacks from each class that runs the method
+        // (`types::self_runners`); the list offers their members beside the module's, after `self.`
+        // too, each row naming its class. Not in a `def` written in a block, which runs elsewhere.
+        let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
+        let uri = harness.write("lib/main.rb", "");
+        harness.index();
+        harness.index_gems();
+        let fixture = "\
+module Greeting
+  def greet
+    ~
+  end
+
+  class_methods do
+    def build
+      ^
+    end
+  end
+end
+
+class Person
+  include Greeting
+  def title = 1
+end
+
+module Wide
+  def wide
+    ~
+  end
+end
+
+class Base
+  include Wide
+  def base_name = 1
+end
+";
+        let detail = |answer: &serde_json::Value| {
+            answer["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|item| item["label"] == "title")
+                .and_then(|item| item["detail"].as_str())
+                .map(str::to_owned)
+        };
+        for written in ["ti~", "self.ti~"] {
+            let text = fixture.replace('~', written).replace('^', "");
+            let answer = harness.complete(&uri, &text);
+            assert_eq!(
+                detail(&answer).as_deref(),
+                Some("Person#title"),
+                "{written}"
+            );
+        }
+        let text = fixture.replace('~', "").replace('^', "ti~");
+        let (labels, _) = offered(&harness.complete(&uri, &text));
+        assert!(!labels.iter().any(|label| label == "title"), "{labels:?}");
+        // Past `MAX_UNION_CLASSES` running classes, the ones nearest the module: `Base`'s members,
+        // which every subclass has.
+        let mut wide = fixture.replace('^', "");
+        for index in 0..MAX_UNION_CLASSES {
+            wide.push_str(&format!(
+                "\nclass Leaf{index} < Base\n  def leaf_{index} = 1\nend\n"
+            ));
+        }
+        let text = wide.replacen('~', "", 1).replacen('~', "base_na~", 1);
+        let (labels, _) = offered(&harness.complete(&uri, &text));
+        assert!(
+            labels.iter().any(|label| label == "base_name"),
+            "{labels:?}"
+        );
+        let text = wide.replacen('~', "", 1).replacen('~', "leaf_1~", 1);
+        let (labels, _) = offered(&harness.complete(&uri, &text));
+        assert!(!labels.iter().any(|label| label == "leaf_1"), "{labels:?}");
     }
 
     #[test]

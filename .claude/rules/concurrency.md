@@ -71,6 +71,26 @@ paths:
    offset 0 loses its place while you type.
 5. **Map a span coming out of the graph by its own document's map.** `Analysis::link` does this for
    jumps. `references`, highlights and hierarchies don't, which is why they are not in `defers`.
+6. **An `inlayHint` waits for the edit's settle instead of forcing it** (`Analysis::holds`, `hold`).
+   VS Code asks for the margin again once typing pauses as long as the last answers took, shorter
+   than the gap between keys on a mid-size app, so each ask settled the edit and labelled the window
+   while the next completion queued behind (measured 2026-10-05: completion p50 4 → 30–120 ms on
+   four reference apps).
+   - **Held, never answered empty or with an error early.** VS Code clears the margin for any
+     answer that is not hints. A pending request keeps the labels drawn, and VS Code cancels it
+     itself when it asks again.
+   - **Only while `pending_index` is non-empty and the timer is armed, and not during a cold
+     start.** `pending_index` is fed by `didChange` alone; anything else would wait for a settle
+     no timer brings.
+   - **Answered one per loop turn, with the queue empty, once `pending_index` is** (the timer's
+     settle or any request that settled). A completion typed meanwhile goes first.
+   - **A held request the client cancelled, or one for the same params as a newer one, is answered
+     when the newer arrives** (`supersede`: `RequestCanceled`, else `ContentModified`).
+     `MAX_HELD_HINTS` (16) is a sanity guard: past it the oldest is served at once.
+   - **Answers leave the order they arrived in.** This is the one request answered after requests
+     sent behind it. The loop's exit settles and then answers whatever is still held.
+   - **Only the loop holds.** `handle` serves everything, so the `Harness` never sees a held
+     request. Held by the four `threaded_tests` named for the margin.
 
 ## Settle, debounce and the cold start
 

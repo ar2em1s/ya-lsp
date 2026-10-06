@@ -117,7 +117,10 @@ pub struct Gem {
 }
 
 /// Everything discovery found, plus everything it could not.
-#[derive(Debug, Clone, Default)]
+///
+/// Comparable, so a lockfile that changed on disk can be told apart from a bundle that changed:
+/// [`super::Workspace::bundle_changed`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Gems {
     pub gems: Vec<Gem>,
     /// Gem roots that exist, in search order. Logged, because "which directories did you look in"
@@ -418,9 +421,23 @@ pub fn discover(workspace_root: &Path, config: &GemsConfig, env: &Env) -> Gems {
     gems
 }
 
-/// Bundler accepts `Gemfile`/`Gemfile.lock` and the newer `gems.rb`/`gems.locked`, and
-/// `BUNDLE_GEMFILE` overrides both.
+/// The first lockfile here that can be read, and what it says.
 fn read_lockfile(root: &Path, env: &Env) -> Option<(PathBuf, Lockfile)> {
+    for path in lockfiles(root, env) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            return Some((path, bundler::parse(&text)));
+        }
+    }
+    None
+}
+
+/// Every lockfile Bundler could use here, in the order it looks, whether or not one exists yet.
+///
+/// Bundler accepts `Gemfile`/`Gemfile.lock` and the newer `gems.rb`/`gems.locked`, and
+/// `BUNDLE_GEMFILE` overrides both. The list, not the first hit, because a watcher needs all of
+/// them: a fresh clone has no lockfile until the first `bundle install` writes one.
+#[must_use]
+pub fn lockfiles(root: &Path, env: &Env) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(gemfile) = env.bundle_gemfile.as_deref() {
         let gemfile = root.join(gemfile);
@@ -436,13 +453,7 @@ fn read_lockfile(root: &Path, env: &Env) -> Option<(PathBuf, Lockfile)> {
     }
     candidates.push(root.join("Gemfile.lock"));
     candidates.push(root.join("gems.locked"));
-
-    for path in candidates {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            return Some((path, bundler::parse(&text)));
-        }
-    }
-    None
+    candidates
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,6 +1037,30 @@ mod tests {
             let names: Vec<&str> = gems.gems.iter().map(|gem| gem.name.as_str()).collect();
             assert_eq!(names, vec!["rails"], "BUNDLE_GEMFILE={gemfile}");
         }
+    }
+
+    #[test]
+    fn every_lockfile_bundler_could_use_is_listed_whether_or_not_it_exists() {
+        // The watcher registers this list, not the lockfile discovery found: a fresh clone has
+        // none until the first `bundle install` writes one. Nothing here exists on disk.
+        let root = Path::new("/tmp/ya-lsp-lockfiles/project");
+        assert_eq!(
+            lockfiles(root, &Env::default()),
+            vec![root.join("Gemfile.lock"), root.join("gems.locked")]
+        );
+        let env = Env {
+            bundle_gemfile: Some(PathBuf::from("gemfiles/rails.gemfile")),
+            ..Env::default()
+        };
+        assert_eq!(
+            lockfiles(root, &env),
+            vec![
+                root.join("gemfiles/rails.gemfile.lock"),
+                root.join("Gemfile.lock"),
+                root.join("gems.locked"),
+            ],
+            "BUNDLE_GEMFILE's lockfile first, the order discovery reads them in"
+        );
     }
 
     #[test]

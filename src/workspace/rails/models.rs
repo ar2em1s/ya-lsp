@@ -1126,6 +1126,8 @@ impl Models<'_> {
             } else if let Some(association) =
                 associations::read(self.source, &self.nesting, &call, hosts)
             {
+                into.associations
+                    .retain(|earlier| !earlier.replaced_by(&association));
                 into.associations.push(association);
             }
         }
@@ -2043,6 +2045,30 @@ end
         );
         let card = card(&mut harness, &uri, source, "user");
         assert!(card.contains("Story#user"), "{card}");
+    }
+
+    #[test]
+    fn a_scope_written_again_is_the_one_that_runs() {
+        // Rails defines the method once more, so the last `scope` of a name is the one a call
+        // runs, and its place is the member's. An association between them, and another scope,
+        // stay.
+        let source = "Ledger.recent\nLedger.other\nLedger.new.comments\n";
+        let (mut harness, _story, uri) = models_project(source);
+        harness.write(
+            "app/models/ledger.rb",
+            "class Ledger < ApplicationRecord\n  scope :recent, -> { order(:id) }\n  \
+             has_many :comments\n  scope :recent, ->(n) { limit(n) }\n  scope :other, -> { all }\n\
+             end\n",
+        );
+        harness.index();
+        for (needle, place) in [
+            ("recent", "ledger.rb:3:9"),
+            ("other", "ledger.rb:4:9"),
+            ("comments", "ledger.rb:2:12"),
+        ] {
+            let definition = harness.definition_at(&uri, source, needle);
+            assert_eq!(linked(&definition), [place], "{needle}");
+        }
     }
 
     #[test]

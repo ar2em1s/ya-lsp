@@ -95,13 +95,20 @@ fn label(graph: &Graph, typed: &types::Typed, raises: bool) -> Option<String> {
         spelled.push(name);
     }
     // Wherever the name stands, not only at the head: `TrueClass` is the carrier the boolean fold
-    // leaves, and a union can put it anywhere (`bool | String` is one exit that answered a
-    // predicate beside one that answered a name). `NilClass` can only stand alone, because the fold
-    // lifts it out of every union, and it goes through the same loop so there is one place, not
-    // two.
+    // leaves, and a union keeps both halves as classes wherever it put them (`bool | String` is one
+    // exit that answered a predicate beside one that answered a name). The pair is spelled `bool`
+    // where `TrueClass` stands, and `FalseClass` then says nothing more. `NilClass` can only stand
+    // alone, because the fold lifts it out of every union, and it goes through the same loop so
+    // there is one place, not two.
+    let pair = typed.boolean
+        || (spelled.iter().any(|name| name == "TrueClass")
+            && spelled.iter().any(|name| name == "FalseClass"));
+    if pair {
+        spelled.retain(|name| name != "FalseClass");
+    }
     for name in &mut spelled {
         let word = match name.as_str() {
-            "TrueClass" if typed.boolean => "bool",
+            "TrueClass" if pair => "bool",
             "TrueClass" => "true",
             "FalseClass" => "false",
             "NilClass" => "nil",
@@ -489,12 +496,25 @@ pub fn parameter_list(
     signatures: &Signatures,
     written: &[(ParameterSlot, String)],
 ) -> String {
+    typed_parameter_list(graph, signatures, written, &[])
+}
+
+/// [`parameter_list`], with the type written before each parameter one is known for:
+/// `(String | untyped name, Integer count: 1)`, as RBS puts a type before a positional's name. A
+/// card's line, where the parameter's own type is the one thing about it not in the `def`.
+#[must_use]
+pub fn typed_parameter_list(
+    graph: &Graph,
+    signatures: &Signatures,
+    written: &[(ParameterSlot, String)],
+    typed: &[(ParameterSlot, String)],
+) -> String {
     // Ruby has exactly one signature per method; overloads only come from RBS.
     signatures
         .as_slice()
         .first()
         .map_or_else(String::new, |signature| {
-            labelled(graph, "", signature, written).label
+            labelled(graph, "", signature, written, typed).label
         })
 }
 
@@ -516,7 +536,7 @@ const LONGEST_DEFAULT: usize = 32;
 /// (`def приветствие(имя)` is legal), so the two counts really differ.
 #[must_use]
 pub fn signature_label(graph: &Graph, name: &str, signature: &[Parameter]) -> Signature {
-    labelled(graph, name, signature, &[])
+    labelled(graph, name, signature, &[], &[])
 }
 
 /// [`signature_label`], with the defaults a `def` writes ([`parameter_list`]).
@@ -525,6 +545,7 @@ fn labelled(
     name: &str,
     signature: &[Parameter],
     written: &[(ParameterSlot, String)],
+    typed: &[(ParameterSlot, String)],
 ) -> Signature {
     let mut label = name.to_owned();
     let mut at = utf16_len(name);
@@ -558,11 +579,20 @@ fn labelled(
             Parameter::OptionalKeyword(_) => Some(ParameterSlot::Keyword(name.clone())),
             _ => None,
         };
+        let held = match parameter {
+            Parameter::RequiredKeyword(_) => Some(ParameterSlot::Keyword(name.clone())),
+            _ => slot.clone(),
+        }
+        .and_then(|held| typed.iter().find(|(slot, _)| *slot == held))
+        .map(|(_, spelled)| spelled.as_str());
         let default = slot
             .and_then(|slot| written.iter().find(|(held, _)| *held == slot))
             .map(|(_, text)| text.as_str())
             .filter(|text| !text.contains('\n') && text.chars().count() <= LONGEST_DEFAULT);
-        let written = spell(parameter, name, default);
+        let written = match held {
+            Some(spelled) => format!("{spelled} {}", spell(parameter, name, default)),
+            None => spell(parameter, name, default),
+        };
         let width = utf16_len(&written);
         parameters.push((at, at + width));
         label.push_str(&written);

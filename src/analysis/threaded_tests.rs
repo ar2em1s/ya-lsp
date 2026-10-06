@@ -633,6 +633,161 @@ fn a_request_queued_behind_an_edit_is_answered_against_the_edit() {
     server.join();
 }
 
+/// One method whose local carries exactly one label, as in [`a_large_hinted_file`].
+fn a_hinted_method(n: usize) -> String {
+    format!("def method_{n}(scale)\n  size = \"x\".upcase\n  size.length\nend\n")
+}
+
+/// A server with [`a_hinted_method`] open and settled, and a second method typed into it, so an
+/// edit waits for the debounce. Returns the server, the document and the margin's params.
+fn typing_into_a_hinted_file() -> (Threaded, DocUri, serde_json::Value) {
+    let root = project_with_a_signature();
+    let source = a_hinted_method(0);
+    let uri = write(root.path(), "app/typing.rb", &source);
+    let mut server = Threaded::start(root);
+    server.open(&uri, &source);
+    // The open settles here, so the only edit waiting below is the one typed.
+    server.ask("workspace/symbol", json!({ "query": "method_0" }));
+
+    server.send(Task::DidChange {
+        uri: uri.clone(),
+        changes: vec![TextChange {
+            range: None,
+            text: format!("{source}{}", a_hinted_method(1)),
+        }],
+        version: Some(2),
+    });
+    let margin = json!({
+        "textDocument": { "uri": uri.as_str() },
+        "range": {
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 8, "character": 0 },
+        },
+    });
+    (server, uri, margin)
+}
+
+/// How many labels an answered margin carries.
+fn labels(server: &mut Threaded, id: &RequestId) -> Option<usize> {
+    let answer = server
+        .response(id)
+        .response_result
+        .expect("handlers never error");
+    answer.as_array().map(Vec::len)
+}
+
+#[test]
+fn a_completion_typed_while_an_edit_waits_goes_before_the_margin() {
+    // VS Code asks for the margin again once typing pauses for as long as the last answers took,
+    // which on a mid-size app is shorter than the gap between keys. A hint request reads the graph,
+    // so it used to settle the edit and label the window while the next keystroke's completion
+    // queued behind both. Held until the debounce settles the edit, it costs the keystroke nothing,
+    // and its answer still reads what was typed.
+    let (mut server, uri, margin) = typing_into_a_hinted_file();
+
+    let hints = server.request("textDocument/inlayHint", margin);
+    let completion = server.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri.as_str() },
+            "position": { "line": 2, "character": 7 },
+        }),
+    );
+
+    let completed = server.response_at(&completion);
+    let hinted = server.response_at(&hints);
+    assert!(
+        completed < hinted,
+        "the completion waited for the margin: {}",
+        server.summary()
+    );
+    // Both methods' `size`: the second exists only in the edit.
+    assert_eq!(labels(&mut server, &hints), Some(2));
+    server.join();
+}
+
+#[test]
+fn a_held_margin_asked_for_again_is_answered_without_being_computed() {
+    // Only the last ask for a range is worth computing after the pause. VS Code cancels its last
+    // ask before it sends the next; a client that does not sends the same range again. Either way
+    // the earlier ones are answered as soon as the next arrives, not after the settle.
+    let (mut server, _uri, margin) = typing_into_a_hinted_file();
+
+    let cancelled = server.request("textDocument/inlayHint", margin.clone());
+    server.cancellations.cancel(cancelled.clone());
+    let replaced = server.request("textDocument/inlayHint", margin.clone());
+    let last = server.request("textDocument/inlayHint", margin);
+
+    let error = server
+        .response(&cancelled)
+        .response_result
+        .expect_err("a cancelled request is answered with an error");
+    assert_eq!(error.code, ErrorCode::RequestCanceled as i32, "{error:?}");
+    let error = server
+        .response(&replaced)
+        .response_result
+        .expect_err("a replaced request is answered with an error");
+    assert_eq!(error.code, ErrorCode::ContentModified as i32, "{error:?}");
+    assert!(
+        server.response_at(&replaced) < server.response_at(&last),
+        "{}",
+        server.summary()
+    );
+    assert_eq!(labels(&mut server, &last), Some(2));
+    server.join();
+}
+
+#[test]
+fn past_the_cap_the_oldest_held_margin_is_answered_at_once() {
+    // A sanity guard on what typing can leave held: ranges that differ are all kept, so a client
+    // that scrolls while it types and never cancels could pile them up. The oldest past the cap is
+    // answered the way every hint request was before holding, settle and all.
+    let (mut server, uri, _margin) = typing_into_a_hinted_file();
+
+    let held: Vec<RequestId> = (0..=MAX_HELD_HINTS)
+        .map(|n| {
+            server.request(
+                "textDocument/inlayHint",
+                json!({
+                    "textDocument": { "uri": uri.as_str() },
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 8 + n, "character": 0 },
+                    },
+                }),
+            )
+        })
+        .collect();
+    let completion = server.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri.as_str() },
+            "position": { "line": 2, "character": 7 },
+        }),
+    );
+
+    assert!(
+        server.response_at(&held[0]) < server.response_at(&completion),
+        "the oldest waited for the settle: {}",
+        server.summary()
+    );
+    for id in &held {
+        assert_eq!(labels(&mut server, id), Some(2), "request {id}");
+    }
+    server.join();
+}
+
+#[test]
+fn a_margin_still_held_when_the_client_leaves_is_answered() {
+    // Every request is answered, and the shutdown's own settle is the one this one waited for.
+    let (mut server, _uri, margin) = typing_into_a_hinted_file();
+
+    let hints = server.request("textDocument/inlayHint", margin);
+    server.join();
+
+    assert_eq!(labels(&mut server, &hints), Some(2));
+}
+
 #[test]
 fn the_thread_answers_a_request_that_arrived_over_the_channel() {
     // The harness, proven: a task goes in one end and the answer comes out the other, with the

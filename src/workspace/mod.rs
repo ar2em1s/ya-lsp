@@ -100,14 +100,47 @@ impl Workspace {
     /// Re-read `ya-lsp.toml` after a `workspace/didChangeWatchedFiles`.
     pub fn reload(&mut self) -> Vec<String> {
         let loaded = config::load(&self.root, self.initialization_options.as_ref());
-        (self.features, self.rails_detection) = Features::resolve(&self.root, &loaded.config);
         self.config = loaded.config;
         self.config_path = loaded.path;
-        // `[gems]` and `[rbs]` may have moved. The next caller re-discovers instead of trusting a
-        // stale result.
+        // `[gems]` and `[rbs]` may have moved, and the `auto` switches with them.
+        self.forget_bundle();
+        loaded.problems
+    }
+
+    /// Drop everything the lockfile decided, for the next caller to find again: the gems, Ruby's
+    /// signatures (the lockfile's `RUBY VERSION` picks the Ruby) and the `auto` switches.
+    pub fn forget_bundle(&mut self) {
+        (self.features, self.rails_detection) = Features::resolve(&self.root, &self.config);
         self.gems = None;
         self.signatures = None;
-        loaded.problems
+    }
+
+    /// Every lockfile Bundler could use here, whether or not one exists yet. See
+    /// [`gems::lockfiles`].
+    #[must_use]
+    pub fn lockfiles(&self) -> Vec<PathBuf> {
+        gems::lockfiles(&self.root, &self.env)
+    }
+
+    /// Whether the bundle on disk is no longer the one this workspace was indexed with: a gem
+    /// locked, unlocked, installed or moved, another Ruby, or an `auto` switch the lockfile now
+    /// turns the other way.
+    ///
+    /// **Asked, not assumed from the lockfile changing.** Bundler touches an unchanged lockfile at
+    /// the end of every `bundle install`, and what follows a yes is a whole re-index. Asking is one
+    /// discovery, a few hundred `read_dir` calls; a wrong yes costs seconds of answers from a
+    /// half-built index.
+    ///
+    /// A bundle not yet discovered cannot be stale: the first [`Self::gems`] reads the disk as it
+    /// is now.
+    #[must_use]
+    pub fn bundle_changed(&self) -> bool {
+        if Features::resolve(&self.root, &self.config).0 != self.features {
+            return true;
+        }
+        self.gems
+            .as_ref()
+            .is_some_and(|gems| *gems != gems::discover(&self.root, &self.config.gems, &self.env))
     }
 
     #[must_use]
@@ -1271,5 +1304,92 @@ mod tests {
             vec![root.join("lib")],
             "a file and a missing directory are both dropped, and the real one survives"
         );
+    }
+
+    /// A gem installed the way RubyGems lays one out: its code, and the gemspec that names its
+    /// load path.
+    fn install(home: &Path, full_name: &str) {
+        write(
+            home,
+            &format!("gems/{full_name}/lib/thing.rb"),
+            "class Thing; end\n",
+        );
+        write(
+            home,
+            &format!("specifications/{full_name}.gemspec"),
+            "Gem::Specification.new do |s|\n  s.require_paths = [\"lib\".freeze]\nend\n",
+        );
+    }
+
+    const TWO_GEMS: &str =
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    shouty (1.0.0)\n    quiet (1.0.0)\n";
+
+    #[test]
+    fn a_bundle_changes_with_what_its_lockfile_resolves_to_not_with_the_lockfile_being_written() {
+        // Bundler touches an unchanged lockfile at the end of every `bundle install`, and a yes
+        // here re-indexes the whole workspace. So the same lockfile written again is no change,
+        // and a gem it locked appearing on disk is one, though the lockfile never changed.
+        let dir = tempfile::tempdir().unwrap();
+        let (project, home) = (dir.path().join("project"), dir.path().join("home"));
+        write(&project, "Gemfile.lock", TWO_GEMS);
+        install(&home, "shouty-1.0.0");
+        let env = gems::Env {
+            gem_home: Some(home.clone()),
+            ..gems::Env::default()
+        };
+        let (mut workspace, _) = Workspace::load_with_env(project.clone(), None, env);
+        assert!(
+            !workspace.bundle_changed(),
+            "a bundle not yet discovered cannot be stale"
+        );
+
+        let found = |workspace: &mut Workspace| -> Vec<String> {
+            workspace
+                .gems()
+                .gems
+                .iter()
+                .map(|gem| gem.name.clone())
+                .collect()
+        };
+        assert_eq!(found(&mut workspace), vec!["shouty"]);
+        write(&project, "Gemfile.lock", TWO_GEMS);
+        assert!(
+            !workspace.bundle_changed(),
+            "the same lockfile, written again"
+        );
+
+        install(&home, "quiet-1.0.0");
+        assert!(workspace.bundle_changed(), "a locked gem installed since");
+        workspace.forget_bundle();
+        assert_eq!(found(&mut workspace), vec!["shouty", "quiet"]);
+        assert!(!workspace.bundle_changed());
+    }
+
+    #[test]
+    fn a_lockfile_that_turns_a_switch_changes_the_bundle_even_with_gems_off() {
+        // `auto` reads the lockfile itself, not through discovery, so locking `rspec-core` turns
+        // RSpec's words on for every spec whether or not gems are indexed.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "ya-lsp.toml", "[gems]\nenabled = false\n");
+        write(
+            dir.path(),
+            "Gemfile.lock",
+            "GEM\n  specs:\n    rake (13.3.0)\n",
+        );
+        let (mut workspace, _) =
+            Workspace::load_with_env(dir.path().to_path_buf(), None, gems::Env::default());
+        assert!(workspace.gems().gems.is_empty());
+        assert!(!workspace.features().rspec);
+        assert!(!workspace.bundle_changed());
+
+        write(
+            dir.path(),
+            "Gemfile.lock",
+            "GEM\n  specs:\n    rake (13.3.0)\n    rspec-core (3.13.6)\n",
+        );
+        assert!(workspace.bundle_changed());
+        workspace.forget_bundle();
+        assert!(workspace.features().rspec);
+        assert!(!workspace.bundle_changed());
     }
 }

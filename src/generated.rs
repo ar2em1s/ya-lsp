@@ -954,6 +954,10 @@ pub enum Runs {
     /// The class object of **each** class that includes `of`, whichever runs the block: a block
     /// handed to every includer. Every includer is one this project writes.
     Each { of: String, classes: Vec<String> },
+    /// An object of the class the generator names, which a library runs the block on with
+    /// `instance_exec`: a FactoryBot factory's block runs on its definition's proxy, which
+    /// [`Facts::inherits`] can make one class per factory.
+    Instance(String),
     /// A `self` nothing here can name: a class some other file decides, none of which is known.
     Refused,
 }
@@ -1246,6 +1250,28 @@ pub const SCOPED: &str = "ScopedByItsLambda";
 /// module's table, not in RBS. The types table asks the registry at the call
 /// ([`crate::knowledge::Knowledge::keyed_type`]; [`ELEMENT`]'s contract otherwise).
 pub const KEYED: &str = "NamedByItsKey";
+
+/// How a generated signature says "what this read hands back depends on the member that made its
+/// receiver", with no arguments: `def []: (untyped key) -> ReadOffItsReceiver`.
+///
+/// For a read whose value a body of knowledge knows for one receiver alone: a key read straight off
+/// the request's `params` is what a request can carry, while the same `[]` on a `Parameters` the
+/// application built holds whatever it was given. The receiver must be a call with no receiver and
+/// no arguments; the types table asks the registry with the member that call reached
+/// ([`crate::knowledge::Knowledge::read_type`]; [`ELEMENT`]'s contract otherwise).
+pub const READ_OFF: &str = "ReadOffItsReceiver";
+
+/// How a generated signature says "what this call hands back is made from the literal arguments
+/// it is written with", with no arguments: `def permit: (*untyped filters) -> ShapedByItsArguments`.
+///
+/// For a member whose value a body of knowledge reads off the call as written: `permit(:title,
+/// tags: [])` hands back a `Parameters` holding those keys and nothing else, and a read of one of
+/// them is what the filter lets through. The types table asks the registry at the call, with the
+/// arguments as written and the receiver's chain of calls
+/// ([`crate::knowledge::Knowledge::shaped_type`]), and carries what a later read of the value
+/// hands back on the value itself. Where the registry says nothing the arm is no vote, and the
+/// member's body answers ([`ELEMENT`]'s contract otherwise).
+pub const SHAPED: &str = "ShapedByItsArguments";
 
 /// The name a [`Facts::whole`] document is filed under, in place of a body's.
 pub const WHOLE: &str = "whole";

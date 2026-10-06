@@ -43,6 +43,9 @@ impl Server {
     /// synthetic gem home, since gem discovery reads the process environment.
     fn start_with_env(root: &std::path::Path, env: &[(&str, &std::path::Path)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ya-lsp"));
+        // It names which lockfile the server reads and watches, and the registration below is
+        // pinned on the wire. A shell that exported it would fail that pin for nothing.
+        command.env_remove("BUNDLE_GEMFILE");
         for (name, value) in env {
             command.env(name, value);
         }
@@ -2655,10 +2658,14 @@ fn the_index_follows_files_written_deleted_and_rewritten_on_disk() {
             spelled("**/*.ru"),
             spelled("**/Rakefile"),
             spelled("**/Gemfile"),
+            // Last, every lockfile Bundler could use: a `bundle install` changes the bundle under
+            // a running server, and gem discovery runs once per session.
+            spelled("Gemfile.lock"),
+            spelled("gems.locked"),
         ],
-        "the config, and index.include verbatim — spelled out here rather than derived because \
-         this is the wire, and a widened default that reaches an editor by accident is exactly \
-         what an end-to-end pin is for"
+        "the config, index.include verbatim, then the lockfiles — spelled out here rather than \
+         derived because this is the wire, and a widened default that reaches an editor by \
+         accident is exactly what an end-to-end pin is for"
     );
     server.send(Message::Response(Response::new_ok(
         registration.id,

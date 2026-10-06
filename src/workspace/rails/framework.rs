@@ -118,7 +118,9 @@ use std::collections::BTreeMap;
 
 use ruby_prism::Node;
 
-use crate::generated::{At, Declared, Facts, Namespaces, Owner, SENT, SHARED, Source, WRITTEN};
+use crate::generated::{
+    At, Declared, Facts, Namespaces, Owner, READ_OFF, SENT, SHAPED, SHARED, Source, WRITTEN,
+};
 
 use super::adapters::{self, CONNECTION_HANDLING, CONNECTION_POOL, DATABASE_STATEMENTS, LEASING};
 use super::syntax::constant_spelling;
@@ -358,6 +360,38 @@ const CALLBACK_HOSTS: [&str; 3] = [
     "ActionController::Base",
     "ActionController::API",
     "ActionMailer::Base",
+];
+
+/// The controller class an API-only application's controllers inherit.
+const API: &str = "ActionController::API";
+
+/// The modules [`API`] includes, in its order: its `MODULES`, included in a loop
+/// (`MODULES.each { |mod| include mod }`) that rubydex does not read, where `ActionController::Base`
+/// writes each `include` out. Without them an API controller's `params` was `Metal`'s, and
+/// `render`, `redirect_to` and the callbacks were nobody's.
+///
+/// The same seventeen in 7.2, 8.0 and 8.1. Written only where every one is declared: a bundle
+/// missing one is a Rails this list was not checked against. A table, not a reader of the loop:
+/// across every gem the corpora install, only actionpack writes `CONSTANT.each` with an `include`
+/// of the block's parameter, and listing the files that might would read thousands for one class.
+const API_MODULES: [&str; 17] = [
+    "AbstractController::Rendering",
+    "ActionController::UrlFor",
+    "ActionController::Redirecting",
+    "ActionController::ApiRendering",
+    "ActionController::Renderers::All",
+    "ActionController::ConditionalGet",
+    "ActionController::BasicImplicitRender",
+    "ActionController::StrongParameters",
+    "ActionController::RateLimiting",
+    "ActionController::Caching",
+    "ActionController::DataStreaming",
+    "ActionController::DefaultHeaders",
+    "ActionController::Logging",
+    "AbstractController::Callbacks",
+    "ActionController::Rescue",
+    "ActionController::Instrumentation",
+    "ActionController::ParamsWrapper",
 ];
 
 /// What `config` is, and what a few of its settings hold: `(owner, side, method, returns, how
@@ -903,7 +937,10 @@ const SAVES: [&str; 4] = [
 ///   adapter Rails ships.
 /// - **`destroy!`** is `destroy || _raise_record_not_destroyed`, and `destroy` hands back the frozen
 ///   record.
-const RETURNS: [(&str, &str, &str, &str); 35] = [
+/// - **A record's changes**: `changes` is the mutation tracker's `HashWithIndifferentAccess`.
+///   `previous_changes` and `saved_changes` are the last save's tracker's, or before any save
+///   `NullMutationTracker`'s empty `Hash`.
+const RETURNS: [(&str, &str, &str, &str); 38] = [
     (PERSISTENCE, "update", "(untyped)", "bool?"),
     (PERSISTENCE, "update!", "(untyped)", "true?"),
     (
@@ -1024,7 +1061,64 @@ const RETURNS: [(&str, &str, &str, &str); 35] = [
         "ActiveRecord::Result",
     ),
     (PERSISTENCE, "destroy!", "()", "self"),
+    ("ActiveModel::Dirty", "changes", "()", INDIFFERENT),
+    (
+        "ActiveModel::Dirty",
+        "previous_changes",
+        "()",
+        SAVED_CHANGES,
+    ),
+    (
+        "ActiveRecord::AttributeMethods::Dirty",
+        "saved_changes",
+        "()",
+        SAVED_CHANGES,
+    ),
 ];
+
+/// ActiveSupport's methods on Ruby's own classes whose `def` ya-lsp cannot read to a type:
+/// `(owner, side, method, parameters, returns)`. Checked against 7.2, 8.0 and 8.1, which write each
+/// the same way. Written only where the bundle declares [`ACTIVE_SUPPORT`]: Ruby's classes are
+/// declared everywhere, so the owner proves nothing.
+///
+/// - **`String#blank?`** is `empty? ||` a regexp match, whose `rescue` matches through a
+///   `Concurrent::Map` of regexps.
+/// - **`String#parameterize`** is `Inflector.parameterize`, which hands back the `String` it built.
+/// - **`Array.wrap`** is `[]`, `[object]`, or `object.to_ary || [object]`: an `Array`, as `to_ary`
+///   is the conversion Ruby refuses any other value from wherever it converts, and RBS's `_ToAry`
+///   declares. Rails' comment allows a `to_ary` answering something else; no class keeping Ruby's
+///   protocol writes one.
+///
+/// **`Object#blank?` is left out**, though its `!!empty?` is as sure: once a generated
+/// `class Object` is edited or leaves the graph, rubydex's next resolve records `Kernel`'s reference
+/// a second time, which a debug build (the test suite) panics on and the resolution seam answers by
+/// indexing everything again.
+const CORE_EXTENSIONS: [(&str, Side, &str, &str, &str); 3] = [
+    ("String", Side::Instance, "blank?", "()", "bool"),
+    (
+        "String",
+        Side::Instance,
+        "parameterize",
+        "(?separator: untyped, ?preserve_case: untyped, ?locale: untyped)",
+        "String",
+    ),
+    (
+        "Array",
+        Side::Singleton,
+        "wrap",
+        "(untyped)",
+        "Array[untyped]",
+    ),
+];
+
+/// The gem that writes [`CORE_EXTENSIONS`].
+const ACTIVE_SUPPORT: &str = "ActiveSupport";
+
+/// What a record's `changes` is (see [`RETURNS`]).
+const INDIFFERENT: &str = "ActiveSupport::HashWithIndifferentAccess";
+
+/// What the changes of a record's last save are (see [`RETURNS`]).
+const SAVED_CHANGES: &str = "ActiveSupport::HashWithIndifferentAccess | Hash[String, untyped]";
 
 const PERSISTENCE: &str = "ActiveRecord::Persistence";
 const ERRORS: &str = "ActiveModel::Errors";
@@ -1156,15 +1250,28 @@ const SQL: &[(&str, &str)] = &[
     ),
 ];
 
-/// `params.expect` (see [`ARMS`]).
+/// `params.expect` (see [`ARMS`]). A filter written as keywords is made from them ([`SHAPED`]):
+/// one key's array or hash, several keys' values in an array.
 const EXPECTED: &[(&str, &str)] = &[
-    (
-        "(**untyped)",
-        "ActionController::Parameters | Array[untyped]",
-    ),
-    ("(Symbol)", "untyped"),
+    ("(**untyped)", SHAPED),
+    ("(Symbol)", READ_OFF),
     ("(Symbol, Symbol, *untyped)", "untyped"),
 ];
+
+/// The reads of one key off an `ActionController::Parameters`, each a Ruby `def` in 7.2, 8.0 and
+/// 8.1 (`required` is `require`'s `alias`): what they hand back is what the receiver holds, which
+/// only the request's own params say ([`READ_OFF`], answered by the types table at the call).
+const READS: [(&str, &str); 4] = [
+    ("[]", "(untyped key)"),
+    ("dig", "(*untyped keys)"),
+    ("fetch", "(untyped key, *untyped args) ?{ () -> untyped }"),
+    ("require", "(untyped key)"),
+];
+
+/// What `permit` hands back is a `Parameters` holding what its filters let through, a Ruby `def`
+/// in 7.2, 8.0 and 8.1: made from the call's arguments ([`SHAPED`], answered by the types table at
+/// the call), so a key read off it is what the filter keeps of what the request carries there.
+const SHAPES: [(&str, &str); 1] = [("permit", "(*untyped filters)")];
 
 /// What a framework class hands on to another object with a macro rubydex does not read in a gem:
 /// `(owner, method, returns, the macro)`.
@@ -1395,7 +1502,7 @@ fn names_in(parameters: &'static str, returns: &'static str) -> impl Iterator<It
         .filter(move |name| {
             !matches!(
                 *name,
-                "bool" | "untyped" | "void" | "self" | "true" | "false" | "nil"
+                "bool" | "untyped" | "void" | "self" | "true" | "false" | "nil" | READ_OFF | SHAPED
             ) && !variables.contains(name)
         })
 }
@@ -1497,7 +1604,15 @@ pub fn framework_constants() -> Vec<&'static str> {
         .flat_map(|(_, gate, holds)| [*gate, *holds])
         .chain([RAILTIE_CONFIGURATION])
         .chain(HELPERS.iter().map(|(owner, _)| *owner))
-        .chain([VIEW, HELPER_PROXY, TRYABLE]);
+        .chain([VIEW, HELPER_PROXY, TRYABLE, API, ACTIVE_SUPPORT])
+        .chain(API_MODULES)
+        .chain(
+            CORE_EXTENSIONS
+                .iter()
+                .flat_map(|(owner, _, _, parameters, returns)| {
+                    [*owner].into_iter().chain(names_in(parameters, returns))
+                }),
+        );
     let members = members()
         .into_iter()
         .flat_map(|(owner, _, _, parameters, returns, _)| {
@@ -1788,6 +1903,78 @@ pub fn read_framework(
                 .collect(),
             private: false,
         });
+    }
+    if backed(API, &API_MODULES) {
+        let facts = by_owner.entry(API).or_default();
+        let owner = owned(API, Side::Instance);
+        facts.note(
+            owner.clone(),
+            "Rails includes these in a loop over `MODULES`, which is not read, so ya-lsp writes \
+             them out."
+                .to_owned(),
+        );
+        for module in API_MODULES {
+            facts.mixin(owner.clone(), module.to_owned());
+        }
+    }
+    if backed(PARAMETERS, &[]) {
+        for (name, parameters) in SHAPES {
+            by_owner.entry(PARAMETERS).or_default().declare(Declared {
+                owner: owned(PARAMETERS, Side::Instance),
+                name: name.to_owned(),
+                returns: SHAPED.to_owned(),
+                parameters: parameters.to_owned(),
+                because: format!(
+                    "What `{name}` hands back holds what its filters let through: a key read off it \
+                     is what the filter keeps of what the request carries there; {}.",
+                    said(Made::Def)
+                ),
+                at: None,
+                from: Source::Interface,
+                overloads: Vec::new(),
+                private: false,
+            });
+        }
+        for (name, parameters) in READS {
+            by_owner.entry(PARAMETERS).or_default().declare(Declared {
+                owner: owned(PARAMETERS, Side::Instance),
+                name: name.to_owned(),
+                returns: READ_OFF.to_owned(),
+                parameters: parameters.to_owned(),
+                because: format!(
+                    "What `{name}` hands back is what the receiver holds: a key read straight off \
+                     the request's own params is what a request can carry; {}.",
+                    said(Made::Def)
+                ),
+                at: None,
+                from: Source::Interface,
+                overloads: Vec::new(),
+                private: false,
+            });
+        }
+    }
+    if namespaces.declares(ACTIVE_SUPPORT) {
+        for (owner, side, name, parameters, returns) in CORE_EXTENSIONS {
+            let named: Vec<&str> = names_in(parameters, returns).collect();
+            if !backed(owner, &named) {
+                continue;
+            }
+            by_owner.entry(owner).or_default().declare(Declared {
+                owner: owned(owner, side),
+                name: name.to_owned(),
+                returns: returns.to_owned(),
+                parameters: parameters.to_owned(),
+                because: format!(
+                    "ActiveSupport's `{name}` is a `{returns}`. It ships no signature for it, so \
+                     ya-lsp writes the return type; {}.",
+                    said(Made::Def)
+                ),
+                at: None,
+                from: Source::Interface,
+                overloads: Vec::new(),
+                private: false,
+            });
+        }
     }
     if backed(TRYABLE, &[]) {
         for name in TRIES {
@@ -2220,6 +2407,92 @@ end
         );
     }
 
+    /// ActiveSupport's `blank?`, `parameterize` and `Array.wrap`, and a record's changes, each a
+    /// `def` whose body ya-lsp cannot read to a type ([`super::CORE_EXTENSIONS`], [`super::RETURNS`]).
+    #[test]
+    fn what_activesupport_adds_to_ruby_s_classes_and_a_record_s_changes() {
+        let every = [
+            "String",
+            "Object",
+            "Array",
+            "Hash",
+            "ActiveSupport::HashWithIndifferentAccess",
+        ];
+        let modules = [
+            "ActiveSupport",
+            "ActiveModel",
+            "ActiveModel::Dirty",
+            "ActiveRecord",
+            "ActiveRecord::AttributeMethods",
+            "ActiveRecord::AttributeMethods::Dirty",
+        ];
+        let written = rbs(None, &declaring_kinds(&every, &modules));
+        for line in [
+            "class String\n",
+            "  def blank?: () -> bool\n",
+            "  def parameterize: (?separator: untyped, ?preserve_case: untyped, \
+             ?locale: untyped) -> String\n",
+            "class Array\n",
+            "  def self.wrap: (untyped) -> Array[untyped]\n",
+            "module ActiveModel::Dirty\n",
+            "  def changes: () -> ActiveSupport::HashWithIndifferentAccess\n",
+            "  def previous_changes: () -> (ActiveSupport::HashWithIndifferentAccess | \
+             Hash[String, untyped])\n",
+            "module ActiveRecord::AttributeMethods::Dirty\n",
+            "  def saved_changes: () -> (ActiveSupport::HashWithIndifferentAccess | \
+             Hash[String, untyped])\n",
+        ] {
+            assert!(written.contains(line), "{line}{written}");
+        }
+        // Not `Object#blank?`: a generated `class Object` panics rubydex once it is removed.
+        assert!(!written.contains("class Object"), "{written}");
+        assert!(
+            crate::analysis::types::Types::new().harvest("file:///framework.rbs", &written),
+            "{written}"
+        );
+        // A record's changes need the class they are.
+        let without = rbs(None, &declaring_kinds(&every[..4], &modules));
+        assert!(!without.contains("changes"), "{without}");
+        assert!(without.contains("  def blank?: () -> bool\n"), "{without}");
+        // Ruby's own classes are declared everywhere: ActiveSupport's rows need ActiveSupport.
+        let bare = rbs(None, &declaring_kinds(&every, &modules[1..]));
+        assert!(!bare.contains("blank?"), "{bare}");
+        assert!(!bare.contains("wrap"), "{bare}");
+    }
+
+    /// `ActionController::API` includes its `MODULES` in a loop rubydex does not read, so the
+    /// table writes the seventeen out, in Rails' order, only where the bundle declares them all.
+    #[test]
+    fn an_api_controller_includes_what_its_loop_includes() {
+        let modules: Vec<&str> = super::API_MODULES
+            .into_iter()
+            .chain([
+                "AbstractController",
+                "ActionController",
+                "ActionController::Renderers",
+            ])
+            .collect();
+        let written = rbs(None, &declaring_kinds(&[super::API], &modules));
+        let includes: String = super::API_MODULES
+            .iter()
+            .map(|module| format!("  include {module}\n"))
+            .collect();
+        assert!(
+            written.contains(&format!(
+                "class ActionController::API\n  # Rails includes these in a loop over `MODULES`, \
+                 which is not read, so ya-lsp writes them out.\n{includes}"
+            )),
+            "{written}"
+        );
+        assert!(
+            crate::analysis::types::Types::new().harvest("file:///framework.rbs", &written),
+            "{written}"
+        );
+        // A Rails without one of them is one the list was not checked against.
+        let missing = rbs(None, &declaring_kinds(&[super::API], &modules[1..]));
+        assert!(!missing.contains("include"), "{missing}");
+    }
+
     fn rbs_of(every: &[&str], also: &str) -> String {
         let mut names = every.to_vec();
         names.push(also);
@@ -2245,19 +2518,35 @@ end
         assert_eq!(
             framework_constants(),
             vec![
+                "AbstractController",
+                "AbstractController::Callbacks",
+                "AbstractController::Rendering",
                 "ActionCable",
                 "ActionController",
                 "ActionController::API",
+                "ActionController::ApiRendering",
                 "ActionController::Base",
+                "ActionController::BasicImplicitRender",
+                "ActionController::Caching",
+                "ActionController::ConditionalGet",
                 "ActionController::Cookies",
+                "ActionController::DataStreaming",
+                "ActionController::DefaultHeaders",
                 "ActionController::ExpectedParameterMissing",
                 "ActionController::Flash",
                 "ActionController::Helpers",
                 "ActionController::Instrumentation",
+                "ActionController::Logging",
                 "ActionController::Metal",
                 "ActionController::Parameters",
+                "ActionController::ParamsWrapper",
+                "ActionController::RateLimiting",
                 "ActionController::Redirecting",
+                "ActionController::Renderers",
+                "ActionController::Renderers::All",
+                "ActionController::Rescue",
                 "ActionController::StrongParameters",
+                "ActionController::UrlFor",
                 "ActionDispatch",
                 "ActionDispatch::Cookies",
                 "ActionDispatch::Cookies::CookieJar",
@@ -2289,11 +2578,13 @@ end
                 "ActiveJob::Base",
                 "ActiveModel",
                 "ActiveModel::Attributes",
+                "ActiveModel::Dirty",
                 "ActiveModel::Errors",
                 "ActiveModel::Name",
                 "ActiveModel::Naming",
                 "ActiveRecord",
                 "ActiveRecord::AttributeMethods",
+                "ActiveRecord::AttributeMethods::Dirty",
                 "ActiveRecord::Base",
                 "ActiveRecord::ConnectionAdapters",
                 "ActiveRecord::ConnectionAdapters::DatabaseStatements",
@@ -2317,6 +2608,7 @@ end
                 "ActiveSupport::Duration",
                 "ActiveSupport::EncryptedConfiguration",
                 "ActiveSupport::EnvironmentInquirer",
+                "ActiveSupport::HashWithIndifferentAccess",
                 "ActiveSupport::OrderedOptions",
                 "ActiveSupport::SafeBuffer",
                 "ActiveSupport::TimeWithZone",
@@ -2531,6 +2823,18 @@ class ActionController::Metal
   # `session` is a `ActionDispatch::Request::Session`. The framework ships no signature for it, so ya-lsp writes the return type; Rails makes the method with `delegate`, which is not read in a gem, so it has no line to go to. A controller test's harness stores a test session instead.
   def session: () -> ActionDispatch::Request::Session
 end
+class ActionController::Parameters
+  # What `permit` hands back holds what its filters let through: a key read off it is what the filter keeps of what the request carries there; the method itself is declared in the bundle.
+  def permit: (*untyped filters) -> ShapedByItsArguments
+  # What `[]` hands back is what the receiver holds: a key read straight off the request's own params is what a request can carry; the method itself is declared in the bundle.
+  def []: (untyped key) -> ReadOffItsReceiver
+  # What `dig` hands back is what the receiver holds: a key read straight off the request's own params is what a request can carry; the method itself is declared in the bundle.
+  def dig: (*untyped keys) -> ReadOffItsReceiver
+  # What `fetch` hands back is what the receiver holds: a key read straight off the request's own params is what a request can carry; the method itself is declared in the bundle.
+  def fetch: (untyped key, *untyped args) ?{ () -> untyped } -> ReadOffItsReceiver
+  # What `require` hands back is what the receiver holds: a key read straight off the request's own params is what a request can carry; the method itself is declared in the bundle.
+  def require: (untyped key) -> ReadOffItsReceiver
+end
 module ActionController::StrongParameters
   # `params` is a `ActionController::Parameters`. The framework ships no signature for it, so ya-lsp writes the return type; the method itself is declared in the bundle.
   def params: () -> ActionController::Parameters
@@ -2563,6 +2867,7 @@ end
                 "ActionController::Cookies",
                 "ActionController::Flash",
                 "ActionController::Metal",
+                "ActionController::Parameters",
                 "ActionController::StrongParameters",
                 "ActionView::Helpers::ControllerHelper",
             ]
@@ -2594,13 +2899,15 @@ end
                 .iter()
                 .any(|row| row.starts_with("def request"))
         );
+        // Nor do the reads off it, whose owner it is.
+        assert!(!without_return.iter().any(|row| row.starts_with("def dig")));
         // No `ActionController::Flash`: only the row on it goes.
         let without_owner = rows(&actionpack_without(&["ActionController::Flash"]));
-        assert_eq!(without_owner.len(), 10, "{without_owner:?}");
+        assert_eq!(without_owner.len(), 15, "{without_owner:?}");
         // No `ActionView::Helpers` above the view context: writing
         // `ActionView::Helpers::ControllerHelper` would invent it, so every row on it goes.
         let unspellable = rows(&actionpack_without(&["ActionView::Helpers"]));
-        assert_eq!(unspellable.len(), 6, "{unspellable:?}");
+        assert_eq!(unspellable.len(), 11, "{unspellable:?}");
     }
 
     /// The application class, with the nesting it is written in.
@@ -2708,8 +3015,8 @@ end
         let rbs = rendered(&declaring_kinds(&gated, &modules));
         assert!(
             rbs.contains(
-                "def expect: (**untyped) -> (ActionController::Parameters | Array[untyped]) | \
-                 (Symbol) -> untyped | (Symbol, Symbol, *untyped) -> untyped"
+                "def expect: (**untyped) -> ShapedByItsArguments | (Symbol) -> ReadOffItsReceiver \
+                 | (Symbol, Symbol, *untyped) -> untyped"
             ),
             "{rbs}"
         );

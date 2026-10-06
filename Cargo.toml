@@ -1,6 +1,6 @@
 [package]
 name = "ya-lsp"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -69,7 +69,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # allocators this ships against, so Linux should gain less and Windows more. rust-analyzer ships
 # mimalloc on Windows and the system allocator elsewhere: the same trade from the other end.
 # The `#[global_allocator]` is in `main.rs`, not `lib.rs`, so it binds the shipped server and not
-# the test binaries.
+# the test binaries. prism's C allocates through it too, on macOS and Linux (`.cargo/config.toml`).
 mimalloc = "0.1"
 
 [dev-dependencies]

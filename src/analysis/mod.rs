@@ -216,6 +216,14 @@ const MAX_SUBTYPES: usize = 2048;
 ///   latency, fails.
 const MAX_INCOMING_CALLS: usize = 2048;
 
+/// How many `inlayHint` requests wait for an edit's settle at once (see [`Analysis::hold`]).
+///
+/// A sanity guard, not a tuning: VS Code cancels its last ask before it sends the next, and a
+/// client that does not sends the same range again, which replaces the one held. So one per
+/// visible editor is what typing leaves here. Past the cap the oldest is answered at once, the way
+/// every hint request was before holding.
+const MAX_HELD_HINTS: usize = 16;
+
 /// The `$/progress` token for the gem index. Fixed, since only one runs at a time.
 const GEM_PROGRESS_TOKEN: &str = "ya-lsp/index-gems";
 
@@ -514,6 +522,11 @@ impl Cancellations {
         self.lock().remove(id)
     }
 
+    /// Whether `id` is cancelled, leaving the cancellation for `serve` to consume.
+    fn contains(&self, id: &RequestId) -> bool {
+        self.lock().contains(id)
+    }
+
     /// A request that completed normally leaves no cancellation behind.
     fn forget(&self, id: &RequestId) {
         self.lock().remove(id);
@@ -780,6 +793,9 @@ struct Analysis {
     /// pass would. Nothing a reopening may skip can change them: it runs only where nothing but
     /// reopened documents moved.
     shared: crate::knowledge::Declared,
+    /// Which own documents write a `def` of the names a routes file calls, held by each
+    /// document's text ([`synthesize::Defining`]).
+    defining: std::cell::RefCell<synthesize::Defining>,
     /// The projection [`Analysis::synthesize`] last ran the generators on, for the pass gate.
     ///
     /// `None` until the first pass, the honest answer to "would it write the same thing again":
@@ -851,6 +867,10 @@ struct Analysis {
     /// The half of the pass gate needing no notification: the pass claims its answer is a function
     /// of the disk, so the gate looks at the disk.
     stamps: Vec<(std::path::PathBuf, Option<(std::time::SystemTime, u64)>)>,
+    /// Every document a generator read through `Declaring::text` in the last pass, no list naming
+    /// it: a routes file's helper, a file a `draw` names, a module a controller includes. One of
+    /// them touched runs the pass, as a listed file does ([`Analysis::declaring`]).
+    declared_from: std::cell::RefCell<HashSet<String>>,
     /// Whether something was indexed without reporting a document.
     ///
     /// Every bulk route sets it (the workspace walk, a gem batch, the file watcher, a rebuild),
@@ -918,6 +938,10 @@ struct Analysis {
     /// - **An eager drain at the next idle moment is worse than either**: it leaves the graph
     ///   holding a class with no members, not a stale one.
     pending_index: Vec<DocUri>,
+    /// `inlayHint` requests set aside until the edit in `pending_index` settles, oldest first.
+    ///
+    /// Only the run loop holds one ([`Self::hold`]); `handle` serves every request it is given.
+    held_hints: Vec<Request>,
     /// Where the cold start has got to. See [`Stage`]: one stage at a time, each naming the next.
     stage: Stage,
     /// How many of the user's own files the index holds, against `index.max_files`.
@@ -1094,6 +1118,7 @@ impl Analysis {
             unbuffered: HashSet::new(),
             shared: crate::knowledge::Declared::new(),
             generated_from: None,
+            defining: std::cell::RefCell::default(),
             walks: 0,
             reopenings: 0,
             placings: 0,
@@ -1106,6 +1131,7 @@ impl Analysis {
             reopened: HashSet::new(),
             passes: 0,
             stamps: Vec::new(),
+            declared_from: std::cell::RefCell::default(),
             touched_all: true,
             open: HashMap::new(),
             encoding,
@@ -1123,6 +1149,7 @@ impl Analysis {
             load_prefixes: Vec::new(),
             resolve_at: None,
             pending_index: Vec::new(),
+            held_hints: Vec::new(),
             stage: Stage::Workspace,
             workspace_files: 0,
             skipped: HashSet::new(),
@@ -1271,6 +1298,9 @@ impl Analysis {
             // the queue. Reversing the order would cost a resolve per debounce of typing.
             // `threaded_tests::push_diagnostics_for_an_edit_wait_for_the_background_index` pins the
             // current choice.
+            if receiver.is_empty() && self.answer_held_hint() {
+                continue;
+            }
             if receiver.is_empty() && self.step_pipeline() {
                 continue;
             }
@@ -1296,7 +1326,10 @@ impl Analysis {
                 },
             };
 
-            self.handle(task);
+            match task {
+                Task::Request(request) if self.holds(&request) => self.hold(request),
+                task => self.handle(task),
+            }
         }
 
         // Drain pending resolution so a shutdown does not leave the graph half-linked. A future
@@ -1304,6 +1337,72 @@ impl Analysis {
         if self.dirty {
             self.settle();
         }
+        // Every request is answered, the held ones too, against the graph just settled.
+        for request in std::mem::take(&mut self.held_hints) {
+            self.serve(request);
+        }
+    }
+
+    /// Whether `request` waits for the edit's settle instead of forcing it.
+    ///
+    /// **Why `inlayHint`.** VS Code asks for the margin again once typing pauses for as long as the
+    /// last few answers took, which on a mid-size app is shorter than the gap between two keys. A
+    /// hint request reads the graph, so each one settled the edit and then labelled about 200
+    /// lines, and the next keystroke's completion queued behind both. A held request costs nothing
+    /// while the user types, and is answered right after the settle `RESOLVE_DEBOUNCE` runs anyway.
+    ///
+    /// - **Held, not answered empty or with an error.** VS Code clears the margin for any answer
+    ///   that is not hints, so the labels would blink off while typing. A request still waiting
+    ///   leaves them drawn, and VS Code cancels it itself when it asks again.
+    /// - **Only while an edit waits for the timer.** `pending_index` is fed by `didChange` alone,
+    ///   so an open, a gem batch or a watched file is answered as before: nothing would settle
+    ///   them on a timer, and a held request would wait forever.
+    /// - **Not during a cold start**, where `serve`'s drain rung decides.
+    fn holds(&self, request: &Request) -> bool {
+        request.method == "textDocument/inlayHint"
+            && !self.pending_index.is_empty()
+            && self.resolve_at.is_some()
+            && self.stage.is_ready()
+    }
+
+    /// Set `request` aside until the edit settles.
+    ///
+    /// A held request the client has since cancelled, or one for exactly the same document and
+    /// range, is answered now: VS Code cancels the last ask before it sends the next, and a client
+    /// that does not would otherwise have every keystroke's margin computed after the pause, where
+    /// only the last one is read.
+    fn hold(&mut self, request: Request) {
+        let (replaced, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_hints)
+            .into_iter()
+            .partition(|held| {
+                held.params == request.params || self.cancellations.contains(&held.id)
+            });
+        self.held_hints = kept;
+        for held in replaced {
+            self.supersede(held);
+        }
+        if self.held_hints.len() >= MAX_HELD_HINTS {
+            let oldest = self.held_hints.remove(0);
+            self.serve(oldest);
+        }
+        let held = self.held_hints.len() + 1;
+        tracing::debug!(method = request.method, id = %request.id, held, "held until the edit settles");
+        self.held_hints.push(request);
+    }
+
+    /// Answer the oldest held hint request once its edit has settled. True if one was answered.
+    ///
+    /// One per turn of the loop, and only with the queue empty, so a completion typed meanwhile
+    /// goes first. `pending_index` empties only in `settle` (or a rebuild, which drops the edit's
+    /// index along with the graph), so whatever settled it, the timer or a request that needed the
+    /// graph, the answer reads the edit.
+    fn answer_held_hint(&mut self) -> bool {
+        if self.held_hints.is_empty() || !self.pending_index.is_empty() {
+            return false;
+        }
+        let request = self.held_hints.remove(0);
+        self.serve(request);
+        true
     }
 
     fn handle(&mut self, task: Task) {
@@ -1328,7 +1427,7 @@ impl Analysis {
         match task {
             Task::DidOpen { uri, text, version } => {
                 // The buffer answers for it now, not a text held while it was closed.
-                self.exits.forget_texts();
+                self.exits.forget_text(uri.as_str());
                 self.open.insert(
                     uri.clone(),
                     OpenDocument {
@@ -1347,6 +1446,8 @@ impl Analysis {
                 changes,
                 version,
             } => {
+                // A caller's text may have changed what it passes (`types::Callers`).
+                self.graph.callers.forget_buffers();
                 if !self.open.contains_key(&uri) {
                     // A change for a buffer never opened. Clients occasionally do this, and
                     // dropping the edit strands the file on stale content, but an incremental range
@@ -1369,7 +1470,7 @@ impl Analysis {
                         return;
                     }
                     tracing::warn!("didChange for un-opened {uri}; treating it as an open");
-                    self.exits.forget_texts();
+                    self.exits.forget_text(uri.as_str());
                     self.open.insert(
                         uri.clone(),
                         OpenDocument {
@@ -1738,6 +1839,9 @@ impl Analysis {
         );
         let started = Instant::now();
         self.settle();
+        // Before the refresh, which reads callers: the one pass over every call is paid here, while
+        // the stream says answers are not final, not by the first hint or hover.
+        self.graph.index_every_call();
         // The hints, which have no timer. This is the one moment an already-answered request's
         // answer changes without the document changing: a file opened before signatures arrived has
         // an empty margin, and nothing else would ask again.
@@ -2038,7 +2142,7 @@ impl Analysis {
         if indexer::index_source(self.graph.graph_mut(), uri.as_str(), source, language) {
             self.unskip(uri);
             let spelled = indexer::spells(source, &self.spelling);
-            self.note_spelled(&[(uri.clone(), spelled)]);
+            self.note_spelled(&[(uri.clone(), spelled, indexer::named(source, language))]);
             return true;
         }
         self.record_skip(uri);
@@ -2046,9 +2150,18 @@ impl Analysis {
     }
 
     /// Record which texts each of these just-indexed documents spells ([`Self::spelled`]).
-    fn note_spelled(&mut self, indexed: &[(DocUri, u64)]) {
-        for (uri, spelled) in indexed {
+    fn note_spelled(&mut self, indexed: &[(DocUri, u64, indexer::Named)]) {
+        for (uri, spelled, named) in indexed {
             let id = UriId::from(uri.as_str());
+            // The callers rung asks only about the project's own documents; a gem's names are not
+            // kept.
+            if self.is_own_code(uri.as_str()) {
+                self.graph.callers.note_names(id, named);
+            } else {
+                self.graph
+                    .callers
+                    .note_names(id, &indexer::Named::default());
+            }
             if *spelled == 0 {
                 self.spelled.remove(&id);
             } else {
@@ -2113,8 +2226,9 @@ impl Analysis {
     /// Throw the graph away and build it again: the workspace, the open buffers, the gems.
     ///
     /// Shared by `ReloadConfig` (the configuration decides what belongs in the index, so nothing
-    /// computed under the old one can be trusted) and by the recovery in [`Analysis::resolve`] (the
-    /// graph is in an unknown state, and starting over is the only honest answer).
+    /// computed under the old one can be trusted), by [`Analysis::rebundle`] (the lockfile decides
+    /// the rest of it) and by the recovery in [`Analysis::resolve`] (the graph is in an unknown
+    /// state, and starting over is the only honest answer).
     fn rebuild(&mut self) {
         self.graph = indexed::Indexed::default();
         // The table is keyed by declarations this graph no longer has, and every signature file is
@@ -2134,6 +2248,7 @@ impl Analysis {
         // Every entry describes offsets into the graph being thrown away.
         self.indexed_text.clear();
         self.spelled.clear();
+        self.graph.callers.forget_names();
         // Every module keeps its own parse memo. It is keyed by URI with the file's own freshness,
         // so it would survive a rebuild correctly, but a rebuild is a config change that can move
         // the workspace root and so every provenance line. Rebuilding the registry drops them
@@ -2181,6 +2296,20 @@ impl Analysis {
         // followed by one more generator stage, instead of blocking the analysis thread for the
         // length of a bundle.
         self.queue_background_indexing();
+    }
+
+    /// The bundle a lockfile locks changed on disk: re-index everything, as a `ya-lsp.toml` reload
+    /// does, with the configuration left as it is.
+    ///
+    /// **Everything, not the gems that moved.** The lockfile also decides the `auto` switches and
+    /// which Ruby's library is indexed, and both reach past the gems: RSpec's words in every spec,
+    /// Ruby's library under every `require`.
+    fn rebundle(&mut self, lockfile: &Path) {
+        self.workspace.forget_bundle();
+        self.workspace.say_which_way_rails_went();
+        let lockfile = lockfile.display();
+        tracing::info!("{lockfile} changed the bundle; re-indexing workspace");
+        self.rebuild();
     }
 
     /// Replace an open buffer with what is on disk, where the rule in [`Watched`] allows it.
@@ -2256,7 +2385,30 @@ impl Analysis {
     /// never reach rubydex, which would parse SQL as Ruby. So its branch invalidates and indexes
     /// nothing, and sits **above** the `Workspace::indexes` gate, which is `index.include` (Ruby
     /// shapes) and would always say no.
+    ///
+    /// **A lockfile is none of the three.** When the bundle it locks changed, the batch ends in
+    /// [`Analysis::rebundle`].
     fn refresh(&mut self, uris: Vec<DocUri>, watched: Watched) {
+        // **A lockfile goes first, and a changed bundle ends the batch.** Gem discovery runs once
+        // per session, so without this a `bundle install` adds gems nothing ever indexes. The
+        // rebuild re-reads everything from disk, which covers the rest of the batch, as a reload
+        // does for `ya-lsp.toml`.
+        let lockfiles = self.workspace.lockfiles();
+        if let Some(lockfile) = uris
+            .iter()
+            .filter_map(DocUri::to_file_path)
+            .find(|path| lockfiles.contains(path))
+        {
+            if self.workspace.bundle_changed() {
+                self.rebundle(&lockfile);
+                return;
+            }
+            tracing::debug!(
+                "{} changed, but the bundle it locks did not",
+                lockfile.display()
+            );
+        }
+
         let started = Instant::now();
         let max_files = self.workspace.config().index.max_files;
         let (mut indexed, mut forgotten, mut full) = (0_usize, 0_usize, false);
@@ -2398,6 +2550,9 @@ impl Analysis {
         // The map describes offsets into a document that no longer exists.
         self.indexed_text.remove(uri);
         self.spelled.remove(&UriId::from(uri.as_str()));
+        self.graph
+            .callers
+            .note_names(UriId::from(uri.as_str()), &indexer::Named::default());
         // Whatever this file *implied* goes with it. A generated declaration left behind would
         // outlive the only thing that could refresh it: nothing re-reads a deleted file, so a
         // deleted `db/schema.rb`'s columns would answer forever.
@@ -2562,10 +2717,13 @@ impl Analysis {
         let rewritten = self.synthesize();
         self.resolve();
         self.place_generated_members(rewritten.as_ref());
-        // **One more step that needs the resolve first**, for a similar reason:
+        // **Two more steps that need the resolve first**, for a similar reason:
         // `alias_method :blank?, :empty?` is written in ActiveSupport and `empty?` declared in
         // `vendor/rbs`, so the row a Ruby alias copies exists only once every signature is
-        // harvested. See [`Types::adopt_aliases`](types::Types::adopt_aliases).
+        // harvested. See [`Types::adopt_aliases`](types::Types::adopt_aliases). A stand-in's rows
+        // go first, since an alias may rename a method only a stand-in types
+        // ([`Types::adopt_stand_ins`](types::Types::adopt_stand_ins)).
+        self.types.adopt_stand_ins(&self.graph);
         self.types.adopt_aliases(&self.graph);
     }
 
@@ -5208,6 +5366,81 @@ end
             !harness.definition_at(&uri, source, "Megaphone").is_null(),
             "gem intelligence must survive a config reload"
         );
+    }
+
+    #[test]
+    fn a_gem_installed_after_startup_is_indexed_once_the_lockfile_says_so() {
+        // Gem discovery runs once per session. Before this, a `bundle install` added gems nothing
+        // ever indexed, until a restart or a `ya-lsp.toml` save.
+        let (dir, gem_home, env) =
+            project_with_gem("module Shouty\n  class Megaphone\n  end\nend\n");
+        let lockfile = dir.path().join("Gemfile.lock");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        let source = "Shouty::Megaphone.new\nHushed::Whisper.new\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        harness.index_gems();
+        assert!(harness.definition_at(&uri, source, "Whisper").is_null());
+
+        // What `bundle add hushed` leaves behind: the gem installed, then the lockfile written.
+        let gem = gem_home.path().join("gems/hushed-0.1.0/lib");
+        std::fs::create_dir_all(&gem).unwrap();
+        std::fs::write(
+            gem.join("hushed.rb"),
+            "module Hushed\n  class Whisper\n  end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            gem_home.path().join("specifications/hushed-0.1.0.gemspec"),
+            "Gem::Specification.new do |s|\n  s.require_paths = [\"lib\".freeze]\nend\n",
+        )
+        .unwrap();
+        let locked = std::fs::read_to_string(&lockfile).unwrap();
+        std::fs::write(&lockfile, format!("{locked}    hushed (0.1.0)\n")).unwrap();
+
+        let changed = DocUri::from_path(&lockfile).expect("an absolute path");
+        let (_, logged) =
+            crate::testing::captured_logs(tracing::Level::INFO, || harness.watch(&[&changed]));
+        assert!(
+            logged.contains("Gemfile.lock changed the bundle"),
+            "{logged}"
+        );
+        while harness.analysis.step_pipeline() {}
+        harness.analysis.settle();
+
+        assert!(
+            !harness.definition_at(&uri, source, "Whisper").is_null(),
+            "the new gem is indexed"
+        );
+        assert!(
+            !harness.definition_at(&uri, source, "Megaphone").is_null(),
+            "and the gem that was already there survives the rebuild"
+        );
+    }
+
+    #[test]
+    fn a_lockfile_written_again_with_the_same_bundle_re_indexes_nothing() {
+        // Bundler touches an unchanged lockfile at the end of every `bundle install`. Rebuilding
+        // for it would cost seconds of answers from a half-built index, for nothing.
+        let (dir, _gem_home, env) =
+            project_with_gem("module Shouty\n  class Megaphone\n  end\nend\n");
+        let lockfile = dir.path().join("Gemfile.lock");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        harness.write("app/main.rb", "Shouty::Megaphone.new\n");
+        harness.index();
+        harness.index_gems();
+
+        let locked = std::fs::read_to_string(&lockfile).unwrap();
+        std::fs::write(&lockfile, locked).unwrap();
+        let changed = DocUri::from_path(&lockfile).expect("an absolute path");
+        let (_, logged) =
+            crate::testing::captured_logs(tracing::Level::DEBUG, || harness.watch(&[&changed]));
+
+        assert!(
+            logged.contains("Gemfile.lock changed, but the bundle it locks did not"),
+            "{logged}"
+        );
+        assert!(!logged.contains("re-indexing workspace"), "{logged}");
     }
 
     // -----------------------------------------------------------------------

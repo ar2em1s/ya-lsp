@@ -1,5 +1,4 @@
-//! Locale files: the keys `I18n.t` looks up in the project's main locale, and what each holds
-//! (backlog 46).
+//! Locale files: the keys `I18n.t` looks up in the project's main locale, and what each holds.
 //!
 //! # One locale
 //!

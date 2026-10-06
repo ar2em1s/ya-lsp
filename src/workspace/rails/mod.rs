@@ -33,6 +33,8 @@
 //!   recognised by superclass or mixin and read from a `def`.
 //! - [`routes`]: `config/routes.rb`: which helpers Rails names, the one module they go in, and
 //!   every class that `include`s it.
+//! - [`request`]: what a key read straight off a controller's `params` can be, and what the
+//!   application's writes, its routes' defaults and a parser of its own change of it.
 //! - [`framework`]: what the framework's own singletons return, and the rows left out. The one
 //!   generator with almost no input: it reads a class name from `config/application.rb` and takes
 //!   the rest from a table.
@@ -51,6 +53,7 @@
 //! wrongly about the file the user is looking at, and one reaching nothing looks exactly like a
 //! project that does not follow it.
 
+mod actions;
 mod adapters;
 mod associations;
 mod attributes;
@@ -69,19 +72,22 @@ mod migrations;
 mod models;
 mod relations;
 mod renders;
+mod request;
 mod routes;
 mod schema;
 mod structure;
 mod syntax;
 mod tail;
+mod targets;
 
+pub use actions::{Controllers, Written as ControllerWritten, read_controllers};
 pub use adapters::{
     Connection, DatabaseConfig, Registered, Resolver, adapter_constants, connection_rows,
     is_database_config, read_database_config, read_registered,
 };
 pub use callbacks::{
-    Actions as CallbackActions, Before, Callbacks, Skip as CallbackSkip,
-    absorb as absorb_callbacks, runs_before,
+    Actions as CallbackActions, Before, Callbacks, NameUse, Skip as CallbackSkip,
+    absorb as absorb_callbacks, runs_before, spelled_use,
 };
 pub use concerns::{
     CLASS_METHODS, ClassMethod as ConcernMethod, From as ConcernSource,
@@ -94,7 +100,8 @@ pub use conventions::{
 };
 pub use current::{BASE as CURRENT_ATTRIBUTES, CurrentAttribute};
 pub use entrypoints::{
-    Entrypoints, MESSAGE_DELIVERY, TemplatePath, convention_of, is_mailer, read_entrypoints,
+    Entrypoints, FromTheClass, MESSAGE_DELIVERY, TemplatePath, called_by_rails, convention_of,
+    is_mailer, keyed_by_a_class_call, passes_to_the_class, read_entrypoints, run_from_the_class,
 };
 pub use framework::{
     RAILTIE_CONFIGURATION, application_class, config_facts, framework_constants,
@@ -111,12 +118,21 @@ pub use renders::{
     Default, JBUILDER, Local, Locals, Name, RENDER_CALLS, Render, StrictLocals, Value, partial_of,
     read_renders, strict_locals,
 };
+pub use request::{
+    Asked as RequestAsked, Filter as PermitFilter, KeyReads, Permitted, Requests,
+    Spelled as PermitSpelled, Touched as RequestTouched, expected as expected_by,
+    filters as permit_filters, read_request_settings, read_request_writes, read_route_values,
+};
 pub use routes::{
     Engine, EngineName, ROUTES_PROXY, Routes, Whose, hosts_routes, mixins, mounted_helper, proxies,
     read_engines, read_routes,
 };
 pub use schema::{Picked, Schema, TableNames, engine_prefix, read_schema, read_table_names};
 pub use structure::read_structure;
+pub use targets::{
+    Macro as RouteMacro, Reach, RouteContext, RouteSource, RouteTable, Target, Unreadable,
+    called_in, read_isolated, read_route_macros, read_targets,
+};
 
 pub use associations::COLLECTION_PROXY;
 use associations::Kind;
@@ -466,6 +482,61 @@ const LONG_TAIL: [(&str, Installs); 29] = [
     ("helper_method", Installs::Elsewhere),
     ("normalizes", Installs::Nothing),
 ];
+
+/// The namespaces of Rails' own frameworks, whose class sides declare its macros.
+const FRAMEWORKS: [&str; 10] = [
+    "ActiveRecord::",
+    "ActiveModel::",
+    "ActiveSupport::",
+    "ActiveJob::",
+    "ActiveStorage::",
+    "ActionController::",
+    "AbstractController::",
+    "ActionView::",
+    "ActionMailer::",
+    "ActionText::",
+];
+
+/// What a controller calls to answer its request, as its own methods: the action's value, which
+/// Rails ignores. `render_to_string` is read, and a view's `render` (ActionView's) is its HTML.
+const RESPONSES: [&str; 8] = [
+    "render",
+    "redirect_to",
+    "redirect_back",
+    "redirect_back_or_to",
+    "head",
+    "respond_to",
+    "send_data",
+    "send_file",
+];
+
+/// Whether a call reaching `owner`'s `method` hands back a value nothing reads: Rails' macros,
+/// called for what they declare, and a controller's response, never for what they return.
+///
+/// - **A class body's macro**: an association, `scope`, an attribute or store macro, a callback, a
+///   validation ([`MACROS`], [`LONG_TAIL`], `validates…`), where it is declared on the class side
+///   of one of Rails' own classes (a singleton or a `ClassMethods` module), or on `Module` and
+///   `Class`, where ActiveSupport writes `delegate` and the `mattr_` family. The same name on an
+///   object (a policy's `scope`, a logger's `store`) is that object's method, and its value is read.
+/// - **A controller's response** ([`RESPONSES`]), as ActionController's or AbstractController's
+///   own method: an action's last line, whose value is the action's.
+/// - **A migration's schema command, and its table block's columns** ([`migrations`]).
+#[must_use]
+pub fn discards_value(owner: &str, method: &str) -> bool {
+    let class_side = matches!(owner, "Module" | "Class")
+        || ((owner.contains("::<") || owner.ends_with("ClassMethods"))
+            && FRAMEWORKS
+                .iter()
+                .any(|framework| owner.starts_with(framework)));
+    let macro_named = MACROS.contains(&method)
+        || LONG_TAIL.iter().any(|(name, _)| *name == method)
+        || callbacks::names_a_callback(method)
+        || method.starts_with("validates");
+    let responds = (owner.starts_with("ActionController::")
+        || owner.starts_with("AbstractController::"))
+        && RESPONSES.contains(&method);
+    (class_side && macro_named) || responds || migrations::discards_value(owner, method)
+}
 
 /// Every class a generated row names that a **gem** declares, not this application.
 ///
@@ -1092,5 +1163,55 @@ mod tests {
             !harness.has("Story#title()"),
             "and the table its name implies was read as well"
         );
+    }
+
+    #[test]
+    fn a_macro_s_value_is_unread_and_a_method_of_the_same_name_on_an_object_is_not() {
+        for (owner, method) in [
+            ("ActiveRecord::Base::<Base>", "belongs_to"),
+            ("ActiveRecord::Associations::ClassMethods", "has_many"),
+            (
+                "ActiveModel::Validations::ClassMethods",
+                "validates_presence_of",
+            ),
+            ("ActiveRecord::Base::<Base>", "store"),
+            ("ActionController::Base::<Base>", "before_action"),
+            ("ActiveRecord::Base::<Base>", "after_commit"),
+            ("Module", "delegate"),
+            ("Class", "class_attribute"),
+            ("ActiveRecord::Migration", "add_column"),
+            ("ActiveRecord::Migration", "create_table"),
+            (
+                "ActiveRecord::ConnectionAdapters::TableDefinition",
+                "timestamps",
+            ),
+            ("ActiveRecord::ConnectionAdapters::Table", "remove"),
+            ("ActiveRecord::ConnectionAdapters::ColumnMethods", "string"),
+            ("ActionController::Instrumentation", "render"),
+            ("ActionController::Redirecting", "redirect_to"),
+            ("ActionController::Head", "head"),
+            ("ActionController::MimeResponds", "respond_to"),
+            ("AbstractController::Rendering", "render"),
+        ] {
+            assert!(discards_value(owner, method), "{owner}#{method}");
+        }
+        for (owner, method) in [
+            // A policy's reader and a logger's store are read.
+            ("ApplicationPolicy", "scope"),
+            ("Logster::Logger", "store"),
+            // A class side outside Rails' own frameworks is the application's.
+            ("Shelf::<Shelf>", "belongs_to"),
+            // Not a macro on Rails' class side.
+            ("ActiveRecord::Base::<Base>", "find_by"),
+            // A question, and a statement whose result a migration reads.
+            ("ActiveRecord::Migration", "table_exists?"),
+            ("ActiveRecord::Migration", "execute"),
+            ("ActiveRecord::Migration", "select_value"),
+            // A controller's string, and a view's HTML.
+            ("AbstractController::Rendering", "render_to_string"),
+            ("ActionView::Helpers::RenderingHelper", "render"),
+        ] {
+            assert!(!discards_value(owner, method), "{owner}#{method}");
+        }
     }
 }

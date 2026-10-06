@@ -2,13 +2,14 @@
 
 use rubydex::model::{
     declaration::Declaration,
-    definitions::Definition,
+    definitions::{Definition, Parameter, Signatures},
     graph::Graph,
     ids::{DeclarationId, StringId, UriId},
     visibility::Visibility,
 };
 
 use super::{
+    cursor::ParameterSlot,
     locator::{self, Resolution},
     render,
     synthesized::{self, Synthesized},
@@ -118,6 +119,24 @@ pub fn variable(
         None => name,
     };
     Some(compose(&answer, &notes, documentation.as_deref()))
+}
+
+/// The card on a local, a block's parameter or a method's parameter: `name: T`, as an instance
+/// variable's card spells it, with the guess line where only a name typed it. A method's
+/// parameter itself says `| untyped` where a call that passes it something was left out
+/// ([`spell_parameter`]); a value computed from it does not.
+#[must_use]
+pub fn local(graph: &Graph, name: &str, typed: &types::Typed, parameter: bool) -> Option<String> {
+    let spelled = if parameter {
+        spell_parameter(graph, typed)?
+    } else {
+        render::typed(graph, typed)?
+    };
+    let mut notes = Vec::new();
+    if typed.derivation.tier() == types::Tier::Guessed {
+        notes.push(GUESSED.to_owned());
+    }
+    Some(compose(&format!("{name}: {spelled}"), &notes, None))
 }
 
 /// The card on a literal key a member looks up: what the main locale holds under it,
@@ -307,9 +326,9 @@ fn signature(
             let parameters = aliased(graph, declaration_id, declaration, definitions)
                 .and_then(|target| {
                     let renamed = locator::definitions_of(graph, target);
-                    parameters(sources, &renamed, &[])
+                    parameters(sources, target, &renamed, &[])
                 })
-                .or_else(|| parameters(sources, definitions, places))
+                .or_else(|| parameters(sources, declaration_id, definitions, places))
                 .unwrap_or_default();
             let visibility = match method.map(|method| method.visibility()) {
                 Some(Visibility::Public) | None => String::new(),
@@ -335,23 +354,80 @@ fn signature(
 
 /// A method's parameters as its card prints them: the names and defaults a person wrote, where a
 /// Ruby `def` says them ([`written_def`]); an RBS signature's own otherwise, where rubydex calls an
-/// unnamed one `arg0`. `None` where no definition is a method's.
+/// unnamed one `arg0`. Each with its type before it where ya-lsp has one ([`parameter_types`]).
+/// `None` where no definition is a method's.
 fn parameters(
     sources: &types::Sources<'_>,
+    method: DeclarationId,
     definitions: &[&Definition],
     places: &[locator::Site],
 ) -> Option<String> {
     let graph: &Graph = sources.graph;
     if let Some((written, Definition::Method(ruby))) = written_def(graph, definitions, places) {
-        return Some(render::parameter_list(
+        return Some(render::typed_parameter_list(
             graph,
             ruby.signatures(),
             &types::written_defaults(sources, written, ruby.offset().start(), ruby.offset().end()),
+            &parameter_types(sources, method, ruby.signatures()),
         ));
     }
     definitions.iter().find_map(|definition| match definition {
-        Definition::Method(method) => Some(render::parameter_list(graph, method.signatures(), &[])),
+        Definition::Method(signed) => Some(render::typed_parameter_list(
+            graph,
+            signed.signatures(),
+            &[],
+            &parameter_types(sources, method, signed.signatures()),
+        )),
         _ => None,
+    })
+}
+
+/// What each of a method's parameters holds, spelled, where ya-lsp knows
+/// ([`types::parameter_type`]): `| untyped` after the classes where a call that passes it
+/// something was left out, nothing types what ([`types::Derivation::left_out`]).
+fn parameter_types(
+    sources: &types::Sources<'_>,
+    method: DeclarationId,
+    signatures: &Signatures,
+) -> Vec<(ParameterSlot, String)> {
+    let graph: &Graph = sources.graph;
+    let Some(signature) = signatures.as_slice().first() else {
+        return Vec::new();
+    };
+    let mut positional = 0;
+    let mut typed = Vec::new();
+    for parameter in signature {
+        let slot = match parameter {
+            Parameter::RequiredPositional(_) | Parameter::OptionalPositional(_) => {
+                positional += 1;
+                ParameterSlot::Positional(positional - 1)
+            }
+            Parameter::RequiredKeyword(named) | Parameter::OptionalKeyword(named) => {
+                let Some(name) = graph.strings().get(named.str()) else {
+                    continue;
+                };
+                ParameterSlot::Keyword(name.as_str().to_owned())
+            }
+            _ => continue,
+        };
+        if let Some(spelled) = types::parameter_type(sources, method, &slot)
+            .and_then(|held| spell_parameter(graph, &held))
+        {
+            typed.push((slot, spelled));
+        }
+    }
+    typed
+}
+
+/// A parameter's type as its card says it: the classes, then `| untyped` where a call was left
+/// out ([`types::Derivation::left_out`]).
+#[must_use]
+pub fn spell_parameter(graph: &Graph, typed: &types::Typed) -> Option<String> {
+    let spelled = render::typed(graph, typed)?;
+    Some(if typed.derivation.left_out {
+        format!("{spelled} | untyped")
+    } else {
+        spelled
     })
 }
 
@@ -1124,7 +1200,7 @@ anything.hop(1)
         // reader's question.
         assert_eq!(
             card(&mut harness, &uri, source, "build("),
-            "```ruby\nPerson.build(name) -> Person\n```\n\n---\n\nBuild one."
+            "```ruby\nPerson.build(String name) -> Person\n```\n\n---\n\nBuild one."
         );
 
         // Reopened, and a class: no count.
@@ -1188,6 +1264,75 @@ anything.hop(1)
         assert!(
             !markdown.contains('('),
             "no parameter list to render: {markdown}"
+        );
+    }
+
+    /// A parameter's card is what its callers pass, `| untyped` where one passes what nothing
+    /// types; a read nothing has written since is the parameter's own card. A local is what it
+    /// holds, and says nothing of what its value was computed from. The method's card writes each
+    /// parameter's type before it.
+    #[test]
+    fn a_parameter_and_a_local_say_what_they_hold() {
+        let source = "\
+class Greeter
+  def greet(name, times = 2, loud: false)
+    copy = name
+    shout = name.upcase
+    [1].each { |n| n }
+    found = minted
+    name
+  end
+
+  def tidy(word)
+    word = word.upcase
+    word
+  end
+end
+
+class Probe
+  def one
+    Greeter.new.greet(\"x\")
+    Greeter.new.tidy(\"y\")
+  end
+
+  def two(other)
+    Greeter.new.greet(other, 3, loud: true)
+  end
+end
+";
+        let (mut harness, uri) = with_types(source);
+        let shown = |harness: &mut Harness, needle: &str| {
+            harness.hover_at(&uri, source, needle)["contents"]["value"]
+                .as_str()
+                .unwrap_or("null")
+                .to_owned()
+        };
+        for (needle, said) in [
+            ("name, times", "name: String | untyped"),
+            ("times = 2", "times: Integer"),
+            ("loud: false", "loud: bool"),
+            ("name\n    shout", "name: String | untyped"),
+            ("copy = name", "copy: String"),
+            ("shout = name", "shout: String"),
+            ("n| n }", "n: Integer"),
+            // A parameter written since is a local like any other.
+            ("word\n  end", "word: String"),
+        ] {
+            let card = shown(&mut harness, needle);
+            assert_eq!(card, format!("```ruby\n{said}\n```"), "{needle}");
+        }
+        let found = shown(&mut harness, "found = minted");
+        assert_eq!(
+            found,
+            format!("```ruby\nfound: Minted\n```\n\n*{GUESSED}*"),
+            "a guessed local says so"
+        );
+        let method = shown(&mut harness, "greet(\"x\")");
+        assert!(
+            method.contains(
+                "Greeter#greet(String | untyped name, Integer times = 2, bool loud: false) -> String"
+            ),
+            "{method}"
         );
     }
 }

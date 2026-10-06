@@ -12,7 +12,7 @@ server is never involved.
 
 ## Must
 
-1. **The question is the typing probe's** (`tmp/bench/callsites.py`): `cursor::type_of` →
+1. **The question is the one a hover asks:** `cursor::type_of` →
    `types::method_receiver`, Resolved or Derived and spellable, one fresh `Memo` per call, as one
    hover request would ask. A second meaning of *typed* would make the number disagree with the
    probe and with the margin.
@@ -22,6 +22,16 @@ server is never involved.
 3. **`used_calls` is Ruby's reading of where a value goes**, pinned by
    `a_call_counts_where_ruby_reads_its_value`. It knows no framework either: a controller action's
    last statement counts, which the probe's `typedefs_defs.rb` left out.
+   - **A sampled call that reaches a framework's macro leaves the share** (`types::discarded`,
+     `Knowledge::discards_value`, decided 2026-10-02): a model's `belongs_to`, a callback, a
+     migration's `add_column` and its table's columns, a controller's `render`, `redirect_to` or
+     `head` (an action's value, which Rails ignores), by the declaration the call reaches, never
+     by its name (a policy's `scope` and a view's `render` are read). Left out after the draw, so a run asks the same
+     calls; the result line counts the calls left and the population in proportion
+     (`Coverage::standing`).
+   - **Ruby's own `raise` and `fail` are typed, as `bot`** (`cursor::never_returns`): they never
+     return, and their method's `!` says so. Both rules are the probe's too (its graft prints
+     `CALLTYPE Resolved bot` and `CALLTYPE Discarded`).
 4. **The draw is seeded and ours** (`sample`, SplitMix64): two runs over one tree ask the same
    calls. No `rand` dependency, so a bump cannot move it.
 5. **The error is Agresti–Coull with the finite-population correction, at 95%**
@@ -30,11 +40,11 @@ server is never involved.
    whose stdout is not an LSP transport, and it runs only when the first argument is `coverage`.
    Logs only where `YA_LSP_LOG` asks. A terminal gets counters rewritten in place; anything else
    gets one line per phase, so a CI log stays short.
-7. **A panic in one call is that call untyped** (`typed_at`), as `Analysis::serve` contains a
+7. **A panic in one call is that call untyped** (`counted_at`), as `Analysis::serve` contains a
    request's.
 
 ## Measured (2026-09-30, on battery)
 
 The sample against a census build (every call asked) over the six corpora: every sample within its
 error, the widest at 45.6% ± 2.1% against 47.3%. A whole run, bundle indexing included, took
-2.1–6.0 s and 0.46–1.19 GB; the largest corpus's census 44 s (`tmp/bench/v070/coverage-cmd/`).
+2.1–6.0 s and 0.46–1.19 GB; the largest corpus's census 44 s.

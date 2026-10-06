@@ -37,6 +37,19 @@ paths:
 - **`source_files` takes `.rb` and `.rbs` only.**
 - **Count unresolved gems per name, not per platform spec.**
 
+## When the bundle changes under a running server
+
+- **Discovery runs once per session; a lockfile change is the only trigger to run it again.**
+  `gems::lockfiles` is every lockfile Bundler could use, existing or not. The client registration
+  (`capabilities::watched_files`) and `Analysis::refresh` both read that one list.
+- **Re-index only when the bundle really changed** (`Workspace::bundle_changed`): the discovered
+  `Gems` differ, or an `auto` switch flips. Bundler touches an unchanged lockfile at the end of
+  every `bundle install`, and a yes costs a whole re-index.
+- **A changed bundle re-indexes everything** (`Analysis::rebundle` → `rebuild`), not the gems that
+  moved. The lockfile also decides the `auto` switches and Ruby's version.
+- **Known limit:** a frozen bundle (`BUNDLE_FROZEN`, deployment) never touches its lockfile, so a
+  gem installed into one is missed until a restart.
+
 ## Background indexing
 
 - **Gem chunks set `dirty` but never arm `resolve_at`.** Arming it per chunk delays the user's own

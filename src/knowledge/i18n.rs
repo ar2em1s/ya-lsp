@@ -1,5 +1,5 @@
 //! The project's translations: which key a `t("…")` call names, what it holds in the main locale,
-//! and where it is written (backlog 46).
+//! and where it is written.
 //!
 //! The reading is `workspace::i18n`'s; this finds the locale files, reads each once per version of
 //! its text, merges them in i18n's load order, and answers the key hooks the analysis asks

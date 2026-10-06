@@ -12,6 +12,10 @@
 //! - [`licenses`]: what `--licenses` prints, and why the binary must carry it.
 //! - [`messages`]: every sentence the server says to a user, and the rule they are written to.
 
+// prism's C allocates through mimalloc where `.cargo/config.toml` builds it so, in every binary
+// that parses: the test binaries too, which keep the system allocator for Rust (`main.rs`).
+use mimalloc as _;
+
 pub mod analysis;
 pub mod generated;
 pub mod knowledge;

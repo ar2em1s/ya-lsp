@@ -59,6 +59,9 @@ paths:
   `hints_answer_for_the_range_they_were_asked_about`) instead of timing, because timing flakes.
 - **Push a refresh once, when the background index finishes** (`workspace/inlayHint/refresh`,
   gated on `ClientSupport::hint_refresh`). Otherwise the next keystroke fixes it.
+- **While an edit waits for its settle, a hint request waits with it** (`concurrency.md`,
+  Keystrokes 6). The run loop answers it right after the settle, so the margin never costs a
+  keystroke, and the labels stay drawn meanwhile because the request is still pending.
 
 ## Templates
 

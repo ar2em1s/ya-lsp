@@ -103,12 +103,20 @@ parses again: hover once parsed its buffer up to six times, a third of its time.
 3. **The type is beside the name.** A method's `-> T` is what its signature declares, else its body
    read, else this call's type (`locator::call_type`). A variable's or constant's `: T`
    is what it holds (`types::constant_type`). A typed instance variable's card is the variable
-   (`hover::variable`, `Owner#@name: T`), never the card of the class it holds.
+   (`hover::variable`, `Owner#@name: T`), never the card of the class it holds. **A local, a
+   block's parameter and a method's parameter get `name: T`** (`hover::local`,
+   `locator::local_type`, `cursor::local_at`): at its binding, a read, or the `def`'s header. A
+   method's parameter itself (the header, or a read no write reaches) says `| untyped` after its
+   classes where a call that passes it something was left out (`types::Derivation::left_out`); a
+   local holding something computed from it does not.
 4. **A list card counts and does not list** (`hover::listed`): `**N definitions**` for an exact
    answer per class, `**N possible definitions**` and the guess line for the name rung, counted as
    spelled. `definition` at the same cursor shows the places.
 5. **Parameters are what a person wrote** (`hover::written_def`): the method's own Ruby `def`, else
-   the `def` at one of a generated declaration's places. Defaults as written where they fit on the
+   the `def` at one of a generated declaration's places. **Each parameter's type goes before it**
+   where ya-lsp has one (`hover::parameter_types`, `types::parameter_type`: the signature's, else
+   what its callers pass), RBS's order kept for every kind: `greet(String | untyped name, Integer
+   times = 2, bool loud: false)`. Signature help keeps the bare names. Defaults as written where they fit on the
    line (`types::written_defaults`, `render::LONGEST_DEFAULT`, one line). An RBS signature's unnamed
    parameter keeps rubydex's `argN`; a generator names a writer's `value` (`synthesized.md`).
    - **An alias has the parameters of the method it renames** (`hover::aliased`, decided
@@ -234,6 +242,10 @@ Held by `an_extend_is_read_wherever_it_is_written` and
   every one has it** (`locator::on_each`, shared with `rebound_call`; precise, one declaration per
   class), else the name rung whole with nothing said about the receiver. `Mod.x` written out is
   untouched, and a plain `each` block in a module body keeps the module.
+- **A name a module's `self` lacks is each running class's own member** (`types::self_runners`,
+  `types.md`), where `self` is the receiver (bare or `self.`): the classes that have it, through
+  `on_each`, before the name rung. Where the module has the name, or no running class has it, the
+  rungs below decide as before.
 - **A precise answer can be several declarations** (`on_each`, and a call on a union through
   `on_a_typed_receiver`): the card counts them as **N definitions** (`hover::listed`); only the
   name rung's list says *possible definitions* and guesses.
@@ -267,6 +279,9 @@ Held by `an_extend_is_read_wherever_it_is_written` and
   - One `def` written as its own body keeps the whole declaration.
   - The check applies on three roads: the root arm, `constructor`, and the typed rung.
   - Withdraw the claim, not the `def`: it stays in `workspace/symbol` and in the name list.
+  - **The walk goes on past it** (`locator::past_the_root`, `types::member_past_the_root`), as
+    Ruby's does: `Object` never had the member, so `Foo.new.freeze` is `Kernel#freeze` however many
+    blocks write a `freeze`. Stopping there dropped the class from a union, a wrong type.
 - **Nothing else precise is filtered.** `references` is never filtered: its fence has the tree
   gate off, so the walk is rubydex's own.
 

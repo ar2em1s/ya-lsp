@@ -30,8 +30,7 @@
 //! **Read out of the bundle's own files, not written down here**, because the list moves with the
 //! Rails version (`add_unique_constraint`, `create_virtual_table` and `enable_index` are all recent)
 //! and the bundle has the list that is true for it. Measured over the six corpora's 4,388
-//! migrations: 9,633 of 11,542 receiverless calls land in these three modules (`tmp/bench/
-//! migrations/`).
+//! migrations: 9,633 of 11,542 receiverless calls land in these three modules.
 //!
 //! **Not forwarded:** the adapter class's own methods (`enable_extension`, `create_enum`,
 //! `adapter_name`), because `AbstractAdapter` also overrides `Object`'s (`inspect`), and one
@@ -101,6 +100,23 @@ const YIELDS: [(&str, &str); 4] = [
     ("drop_table", TABLE_DEFINITION),
     ("change_table", TABLE),
 ];
+
+/// How a schema command forwarded onto a migration begins: what a migration writes for the change
+/// it makes, never for a value.
+const COMMANDS: [&str; 6] = ["add_", "remove_", "change_", "create_", "drop_", "rename_"];
+
+/// Whether a call reaching `owner`'s `method` hands back a value nothing reads: a schema command
+/// forwarded onto a migration (`add_column`, `create_table`; not a question like `table_exists?`,
+/// nor `execute` or `select_value`, whose result a migration may read), and any method of the
+/// table a command's block is handed (`t.string`, `t.timestamps`).
+pub(super) fn discards_value(owner: &str, method: &str) -> bool {
+    if owner == TABLE_DEFINITION || owner == TABLE || COLUMN_METHODS.contains(&owner) {
+        return true;
+    }
+    owner == MIGRATION
+        && !method.ends_with('?')
+        && COMMANDS.iter().any(|verb| method.starts_with(verb))
+}
 
 /// The one method name Ruby makes private wherever it is written, and the three statement modules
 /// write it.

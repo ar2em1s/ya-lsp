@@ -1,4 +1,4 @@
-//! `ActiveSupport::CurrentAttributes` (backlog 63): each `attribute :x` makes a reader and a writer
+//! `ActiveSupport::CurrentAttributes`: each `attribute :x` makes a reader and a writer
 //! on the class's one per-thread instance, and the same pair on the class object, which hands them
 //! to that instance. rubydex sees none of them (`generated_attribute_methods` and `delegate`), so
 //! they are declared here.

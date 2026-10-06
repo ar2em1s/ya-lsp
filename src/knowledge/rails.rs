@@ -14,7 +14,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use super::{Context, Counted, Declared, Declaring, Fresh, ListId, Reading, Seen, Sources, Wants};
+use super::{
+    Context, Counted, Declared, Declaring, Fresh, FromTheClass, ListId, NameUse, Reading, Seen,
+    Sources, Spelled, Wants,
+};
 use crate::analysis::views::Views;
 use crate::generated::{At, Facts, Owner, candidates};
 use crate::workspace::{DocUri, Features, rails};
@@ -81,8 +84,87 @@ pub const ADAPTERS: ListId = ListId("rails.adapters");
 /// (`Rails.configuration.dispatcher = …`): [`rails::read_config_writes`].
 pub const CONFIGURED: ListId = ListId("rails.configured");
 
-/// The eleven lists, one row each.
-static WANTS: [Wants; 11] = [
+/// Documents that may write into the request's `params`, or hand them on: every file spelling
+/// them. Read only, for what a key read off them is ([`rails::read_request_writes`]).
+pub const REQUESTS: ListId = ListId("rails.requests");
+
+/// Documents that may give the request a parser of their own, or turn on `parse_json_times`
+/// ([`rails::read_request_settings`]). Membership alone is not the fact: actionpack's own file
+/// spells the default.
+pub const PARSERS: ListId = ListId("rails.parsers");
+
+/// Documents that write a route set's blocks outside a routes file: a plugin's
+/// `routes.append do`, an engine's `routes.draw do` in its own file. Read only, for the values a
+/// route gives a key ([`rails::read_route_values`]).
+pub const ROUTE_BLOCKS: ListId = ListId("rails.route_blocks");
+
+/// Controller files, for which actions each `def` runs under ([`rails::read_controllers`]).
+pub const CONTROLLERS: ListId = ListId("rails.controllers");
+
+/// The fifteen lists, one row each.
+static WANTS: [Wants; 15] = [
+    Wants {
+        list: CONTROLLERS,
+        calls: &[],
+        constants: &[],
+        modules: &[],
+        defines: &[],
+        path: Some("_controller.rb"),
+        spells: &[],
+        tags: false,
+        inherits: false,
+        engines: true,
+        gems: false,
+        reads_only: true,
+        buffers: false,
+    },
+    Wants {
+        list: REQUESTS,
+        calls: &[],
+        constants: &[],
+        modules: &[],
+        defines: &[],
+        path: None,
+        spells: &["params", "parameters"],
+        tags: false,
+        inherits: false,
+        // an engine's controllers serve the application's requests
+        engines: true,
+        gems: false,
+        reads_only: true,
+        buffers: false,
+    },
+    Wants {
+        list: PARSERS,
+        calls: &[],
+        constants: &[],
+        modules: &[],
+        defines: &[],
+        path: None,
+        spells: &["parameter_parsers", "parse_json_times"],
+        tags: false,
+        inherits: false,
+        engines: true,
+        // a gem registering a parser does it for the application that loads it
+        gems: true,
+        reads_only: true,
+        buffers: false,
+    },
+    Wants {
+        list: ROUTE_BLOCKS,
+        calls: &[],
+        constants: &[],
+        modules: &[],
+        defines: &[],
+        path: None,
+        spells: &["routes.draw", "routes.append", "routes.prepend"],
+        tags: false,
+        inherits: false,
+        engines: true,
+        gems: false,
+        reads_only: true,
+        buffers: false,
+    },
     Wants {
         list: CONFIGURED,
         calls: &["config", "configuration"],
@@ -297,6 +379,12 @@ struct Wanted {
     database: bool,
     /// A file that may assign a setting of the project's own.
     configured: bool,
+    /// A file that may write into the request's params, or hand them on.
+    request: bool,
+    /// A file that may give the request a parser of its own.
+    parsers: bool,
+    /// A controller file.
+    controllers: bool,
 }
 
 /// One source file as this module's readers last saw it, and the evidence it has not changed.
@@ -316,6 +404,13 @@ pub struct Source {
     pub database: Option<Arc<rails::DatabaseConfig>>,
     /// The settings it assigns ([`rails::read_config_writes`]).
     pub configured: Option<Arc<Vec<(String, At)>>>,
+    /// What it does to the request's params, by the class or module each write sits in
+    /// ([`rails::read_request_writes`]).
+    pub request: Option<Arc<BTreeMap<Vec<String>, rails::RequestTouched>>>,
+    /// Whether it gives the request a parser of its own ([`rails::read_request_settings`]).
+    pub parsers: Option<bool>,
+    /// Its controller bodies, `def`s, callbacks and calls ([`rails::read_controllers`]).
+    pub controllers: Option<Arc<rails::ControllerWritten>>,
 }
 
 impl Source {
@@ -348,9 +443,37 @@ impl Source {
             configured: wanted
                 .configured
                 .then(|| Arc::new(rails::read_config_writes(source))),
+            request: wanted
+                .request
+                .then(|| Arc::new(rails::read_request_writes(source))),
+            parsers: wanted.parsers.then(|| rails::read_request_settings(source)),
+            controllers: wanted
+                .controllers
+                .then(|| Arc::new(rails::read_controllers(source))),
         }
     }
 }
+
+/// The class or module a body nested in others names, as Ruby's constant lookup resolves each level
+/// in the one around it: the first candidate something declares ([`candidates`]), or the names
+/// joined where nothing does.
+fn resolved(namespaces: &crate::generated::Namespaces, nesting: &[String]) -> String {
+    let mut owner = String::new();
+    for written in nesting {
+        owner = if owner.is_empty() {
+            written.clone()
+        } else {
+            candidates(&owner, written)
+                .into_iter()
+                .find(|candidate| namespaces.declares(candidate))
+                .unwrap_or_else(|| format!("{owner}::{written}"))
+        };
+    }
+    owner
+}
+
+/// The member that hands a controller its request's params, as rubydex names its declaration.
+const REQUEST_PARAMS: &str = "ActionController::StrongParameters#params()";
 
 /// Rails.
 #[derive(Debug, Default)]
@@ -367,6 +490,28 @@ pub struct Rails {
     /// Kept here as well as on the projection, because the pass gate asks for them before the
     /// projection exists: a dump that appeared or vanished is a change nothing else would notice.
     found: Vec<DocUri>,
+    /// What the project does to the request's params, as the last pass read it: `None` where a
+    /// read off them is left to Rails' own body ([`Self::request_gates`]).
+    request: Option<rails::Requests>,
+    /// The routes and the controllers, as the last pass read them, for which keys a route proves
+    /// ([`Self::route_proofs`]).
+    proofs: Option<Proofs>,
+    /// What each project file that writes a method a routes file calls says it does
+    /// ([`rails::read_route_macros`]), by the file and its text's hash: parsed again only when the
+    /// text moves. Every pass asks, and the files rarely change: re-parsing them was half of what
+    /// a pass after an edit spent proving routes on the largest corpus.
+    macros: BTreeMap<DocUri, (u64, Arc<BTreeMap<String, rails::RouteMacro>>)>,
+    /// How many files [`Self::macros`] parsed, for a test that asserts an unchanged one is not.
+    pub macro_reads: u64,
+}
+
+/// What a read's route proof is asked against.
+#[derive(Debug, Default)]
+struct Proofs {
+    routes: rails::RouteTable,
+    controllers: rails::Controllers,
+    /// The calls a routes file makes that the project writes a `def` of.
+    defined: BTreeSet<String>,
 }
 
 impl Rails {
@@ -393,6 +538,230 @@ impl Rails {
             super::add(into, &document, rails::config_facts(writes, &source.name));
         }
         settings
+    }
+
+    /// What the project does to the request's params: its own writes, what its routes give a key,
+    /// and whether anything gives the request a parser of its own.
+    ///
+    /// `None` where a read off them must be left to Rails' own body: the project turned routes off,
+    /// so what a route gives a key is not read, or something can hand back any class.
+    fn request_gates(&self, declaring: &Declaring<'_>) -> Option<rails::Requests> {
+        if !declaring.features.routes {
+            return None;
+        }
+        let parsed = |uri: &String| self.sources.get(uri);
+        if declaring
+            .context
+            .documents(PARSERS)
+            .iter()
+            .any(|uri| parsed(uri).and_then(|source| source.parsers) != Some(false))
+        {
+            return None;
+        }
+        let loaded =
+            |uri: &String| DocUri::from_graph_uri(uri).is_none_or(|uri| (declaring.loaded)(&uri));
+        let mut requests = rails::Requests::default();
+        for uri in declaring.context.documents(REQUESTS) {
+            // A spec writing a controller's params runs in the suite, not in the application.
+            if !loaded(uri) {
+                continue;
+            }
+            requests.absorb_writes(
+                parsed(uri).and_then(|source| source.request.as_deref())?,
+                &|nesting| resolved(&declaring.context.namespaces, nesting),
+            );
+        }
+        // Every routes file whole, and each file it draws; then every route block written
+        // elsewhere. A file both list is read whole, once.
+        let mut whole: BTreeSet<DocUri> = BTreeSet::new();
+        for uri in declaring.context.documents(ROUTES) {
+            let Some(uri) = DocUri::from_graph_uri(uri).filter(|uri| {
+                uri.to_file_path()
+                    .is_some_and(|path| rails::is_routes(&path))
+            }) else {
+                continue;
+            };
+            let source = (declaring.text)(&uri)?;
+            let routes = rails::read_routes(&source, &[], Self::whose(declaring, &uri));
+            for draw in routes.draws() {
+                if let Some(drawn) = Self::drawn(&uri, &draw.name)
+                    && whole.insert(drawn.clone())
+                {
+                    requests
+                        .absorb_routes(&rails::read_route_values(&(declaring.text)(&drawn)?, true));
+                }
+            }
+            if whole.insert(uri) {
+                requests.absorb_routes(&rails::read_route_values(&source, true));
+            }
+        }
+        for uri in declaring.context.documents(ROUTE_BLOCKS) {
+            let Some(uri) = DocUri::from_graph_uri(uri)
+                .filter(|uri| !whole.contains(uri) && (declaring.loaded)(uri))
+            else {
+                continue;
+            };
+            requests.absorb_routes(&rails::read_route_values(&(declaring.text)(&uri)?, false));
+        }
+        Some(requests)
+    }
+
+    /// Every route the project draws and every controller it writes, read for which keys a route
+    /// proves (`rails::Controllers::proven`). `None` with routes off.
+    ///
+    /// - **Routes**: each routes file's and route block's (`ROUTE_BLOCKS`), the files a `draw`
+    ///   names beside the application's routes file, each engine's `isolate_namespace`, and what each
+    ///   project method a routes file calls does (`read_route_macros`, through `Declaring::methods`).
+    /// - **Controllers**: every controller file the application loads, and every module one
+    ///   `include`s that the project writes, to a fixpoint: a module's callback or bare call runs in
+    ///   the class that includes it, and one not read could reach any action.
+    fn route_proofs(&mut self, declaring: &Declaring<'_>) -> Option<Proofs> {
+        if !declaring.features.routes {
+            return None;
+        }
+        let loaded = |uri: &DocUri| (declaring.loaded)(uri);
+        let mut mains: Vec<DocUri> = declaring
+            .context
+            .documents(ROUTES)
+            .iter()
+            .filter_map(|uri| DocUri::from_graph_uri(uri))
+            .filter(|uri| {
+                (declaring.own)(uri.as_str())
+                    && loaded(uri)
+                    && uri
+                        .to_file_path()
+                        .is_some_and(|path| rails::is_routes(&path))
+            })
+            .collect();
+        mains.sort();
+        // The project's own routes: a gem engine's are read as unreadable under its namespace,
+        // where it is mounted, since which module its controllers are in is the gem's.
+        let mut files: Vec<DocUri> = mains.clone();
+        for uri in declaring.context.documents(ROUTE_BLOCKS) {
+            if let Some(uri) = DocUri::from_graph_uri(uri)
+                && (declaring.own)(uri.as_str())
+                && loaded(&uri)
+                && !files.contains(&uri)
+            {
+                files.push(uri);
+            }
+        }
+        let texts: Vec<String> = files
+            .iter()
+            .map(|uri| (declaring.text)(uri))
+            .collect::<Option<_>>()?;
+        let drawn = |name: &str| {
+            mains
+                .iter()
+                .filter_map(|main| Self::drawn(main, name))
+                .find_map(|drawn| (declaring.text)(&drawn))
+        };
+        let mut isolated = BTreeMap::new();
+        for uri in declaring.context.documents(ENGINES) {
+            if let Some(text) = DocUri::from_graph_uri(uri).and_then(|uri| (declaring.text)(&uri)) {
+                isolated.extend(rails::read_isolated(&text));
+            }
+        }
+        // Every method a routes file calls bare that the project writes, and what each does.
+        let mut called = BTreeSet::new();
+        for text in &texts {
+            called.extend(rails::called_in(text));
+        }
+        let writers = (declaring.methods)(&called);
+        let mut macros = BTreeMap::new();
+        let read: BTreeSet<&DocUri> = writers.values().flatten().collect();
+        self.macros.retain(|uri, _| read.contains(uri));
+        for uri in read {
+            if let Some(text) = (declaring.text)(uri) {
+                macros.extend(
+                    self.route_macros(uri, &text)
+                        .iter()
+                        .filter(|(name, _)| writers.contains_key(*name))
+                        .map(|(name, does)| (name.clone(), *does)),
+                );
+            }
+        }
+        let sources: Vec<rails::RouteSource<'_>> = texts
+            .iter()
+            .map(|text| rails::RouteSource { text, whole: false })
+            .collect();
+        let routes = rails::read_targets(
+            &sources,
+            &rails::RouteContext {
+                drawn: &drawn,
+                isolated: &isolated,
+                macros: &macros,
+            },
+        );
+        let namespaces = &declaring.context.namespaces;
+        let resolve = |nesting: &[String]| resolved(namespaces, nesting);
+        let superclass = |outer: &[String], written: &str| {
+            let outer = resolved(namespaces, outer);
+            if outer.is_empty() || written.starts_with("::") {
+                return written.trim_start_matches("::").to_owned();
+            }
+            candidates(&outer, written)
+                .into_iter()
+                .find(|candidate| namespaces.declares(candidate))
+                .unwrap_or_else(|| written.to_owned())
+        };
+        let mut controllers = rails::Controllers::default();
+        let mut read: BTreeSet<DocUri> = BTreeSet::new();
+        let mut pending: Vec<(DocUri, Option<Arc<rails::ControllerWritten>>)> = Vec::new();
+        for uri in declaring.context.documents(CONTROLLERS) {
+            if let Some(doc) = DocUri::from_graph_uri(uri)
+                && loaded(&doc)
+            {
+                let held = self
+                    .sources
+                    .get(uri)
+                    .and_then(|source| source.controllers.clone());
+                pending.push((doc, Some(held?)));
+            }
+        }
+        while let Some((uri, held)) = pending.pop() {
+            if !read.insert(uri.clone()) {
+                continue;
+            }
+            let written = match held {
+                Some(written) => written,
+                None => Arc::new(rails::read_controllers(&(declaring.text)(&uri)?)),
+            };
+            controllers.absorb(&written, &resolve, &superclass);
+            let included: BTreeSet<String> = written
+                .includes
+                .iter()
+                .map(|(outer, module)| superclass(outer, module))
+                .collect();
+            for (_, declarer) in (declaring.declares)(&included) {
+                if (declaring.own)(declarer.as_str()) && !read.contains(&declarer) {
+                    pending.push((declarer, None));
+                }
+            }
+        }
+        Some(Proofs {
+            routes,
+            controllers,
+            defined: writers.into_keys().collect(),
+        })
+    }
+
+    /// [`rails::read_route_macros`] of one file, held by its text's hash ([`Self::macros`]).
+    fn route_macros(
+        &mut self,
+        uri: &DocUri,
+        text: &str,
+    ) -> Arc<BTreeMap<String, rails::RouteMacro>> {
+        let hash = xxhash_rust::xxh3::xxh3_64(text.as_bytes());
+        if let Some((held, parsed)) = self.macros.get(uri)
+            && *held == hash
+        {
+            return Arc::clone(parsed);
+        }
+        self.macro_reads += 1;
+        let parsed = Arc::new(rails::read_route_macros(text));
+        self.macros.insert(uri.clone(), (hash, Arc::clone(&parsed)));
+        parsed
     }
 
     /// What this module last parsed of one document, or nothing.
@@ -1731,9 +2100,9 @@ impl super::Knowledge for Rails {
         match list {
             SCHEMAS | RENAMED | ZONES => features.schema,
             MODELS | CONCERNS => features.models,
-            ROUTES | ENGINES => features.routes,
+            ROUTES | ENGINES | CONTROLLERS => features.routes,
             ENTRYPOINTS => features.entrypoints,
-            FRAMEWORK | ADAPTERS | CONFIGURED => features.rails,
+            FRAMEWORK | ADAPTERS | CONFIGURED | REQUESTS | PARSERS | ROUTE_BLOCKS => features.rails,
             _ => false,
         }
     }
@@ -1991,6 +2360,8 @@ impl super::Knowledge for Rails {
         let installed = self.class_method_declarations(declaring, &concerns, into);
         let extended = self.concern_declarations(declaring, &concerns, into);
         let settings = self.setting_declarations(declaring, into);
+        self.request = self.request_gates(declaring);
+        self.proofs = self.route_proofs(declaring);
         vec![
             ("settings a project assigns", settings),
             ("columns", schemas),
@@ -2062,6 +2433,15 @@ impl super::Knowledge for Rails {
         for uri in context.documents(CONFIGURED) {
             wants.entry(uri.clone()).or_default().configured = true;
         }
+        for uri in context.documents(REQUESTS) {
+            wants.entry(uri.clone()).or_default().request = true;
+        }
+        for uri in context.documents(PARSERS) {
+            wants.entry(uri.clone()).or_default().parsers = true;
+        }
+        for uri in context.documents(CONTROLLERS) {
+            wants.entry(uri.clone()).or_default().controllers = true;
+        }
 
         // A file that left every list keeps nothing here. Not an optimisation: the memo is keyed by
         // URI, and a file deleted and written again is a different file, so an entry nothing asks
@@ -2093,12 +2473,238 @@ impl super::Knowledge for Rails {
         }
     }
 
+    /// A key read straight off the request's `params` (`rails::Requests::value`): only where the
+    /// receiver is `ActionController::StrongParameters#params`, a controller's, in the project's own
+    /// code, whose writes and routes the pass read.
+    fn read_type(&self, read: &super::Read<'_>) -> Option<String> {
+        if read.reader != REQUEST_PARAMS || !read.own {
+            return None;
+        }
+        let method = read
+            .member
+            .strip_prefix("ActionController::Parameters#")?
+            .strip_suffix("()")?;
+        let keys: Vec<Option<String>> = without_default(method, read.arguments)
+            .iter()
+            .map(|argument| match argument {
+                super::Written::Text(text) | super::Written::Symbol(text) => Some(text.clone()),
+                super::Written::List(_) | super::Written::Pairs(_) | super::Written::Other => None,
+            })
+            .collect();
+        let proven = match (&self.proofs, read.ancestors.first(), read.def, keys.first()) {
+            (Some(proofs), Some(owner), Some(def), Some(Some(key)))
+                if matches!(method, "[]" | "fetch" | "require" | "expect" | "dig")
+                    && keys.len() == 1 =>
+            {
+                proofs
+                    .controllers
+                    .proven(&proofs.routes, owner, def, key, &|call| {
+                        proofs.defined.contains(call)
+                    })
+            }
+            _ => None,
+        };
+        self.request.as_ref()?.value(
+            &rails::RequestAsked {
+                method,
+                keys: &keys,
+                block: read.block,
+                proven: proven.as_deref(),
+            },
+            read.ancestors,
+        )
+    }
+
+    /// What `permit` and `expect` hand back (`rails::permit_filters`, `rails::expected_by`), and
+    /// what a read of each key they let through hands back where they filter the request's own
+    /// `params` in the project's own code (`rails::Requests::permitted`): the receiver read off
+    /// `ActionController::StrongParameters#params` by literal keys alone (`[]`, `require`,
+    /// `fetch`, `dig`).
+    fn shaped_type(&self, shaping: &super::Shaping<'_>) -> Option<super::Shape> {
+        let method = shaping
+            .member
+            .strip_prefix("ActionController::Parameters#")?
+            .strip_suffix("()")?;
+        let explicit = match method {
+            "permit" => false,
+            "expect" | "expect!" => true,
+            _ => return None,
+        };
+        let filters = written_filters(shaping.arguments, shaping.keywords);
+        let (type_, filtered) = match (explicit, &filters) {
+            (false, Some(filters)) => (
+                "ActionController::Parameters",
+                Some((None, filters.as_slice())),
+            ),
+            // Whatever its filters, `permit` hands back a `Parameters`.
+            (false, None) => ("ActionController::Parameters", None),
+            (true, Some(filters)) => {
+                let (type_, inner) = rails::expected_by(filters)?;
+                (type_, inner.map(|(key, inner)| (Some(key), inner)))
+            }
+            // Keywords it cannot read: one key's array or hash, or several keys' values.
+            (true, None) if shaping.keywords.is_none_or(|keywords| !keywords.is_empty()) => {
+                ("ActionController::Parameters | Array[untyped]", None)
+            }
+            (true, None) => return None,
+        };
+        let mut reads = BTreeMap::new();
+        if let (Some((key, filters)), Some((REQUEST_PARAMS, links)), true, Some(request)) =
+            (filtered, shaping.chain, shaping.own, self.request.as_ref())
+            && let Some(mut path) = read_path(links)
+        {
+            path.extend(key.map(str::to_owned));
+            let permitted = rails::Permitted {
+                path: &path,
+                filters,
+                explicit,
+            };
+            for read in request.permitted(&permitted, shaping.ancestors) {
+                for (member, spelled) in [
+                    ("[]", &read.read),
+                    ("dig", &read.read),
+                    ("fetch", &read.fetched),
+                    ("require", &read.required),
+                ] {
+                    reads.insert(
+                        (
+                            format!("ActionController::Parameters#{member}()"),
+                            read.key.clone(),
+                        ),
+                        spelled.clone(),
+                    );
+                }
+            }
+        }
+        Some(super::Shape {
+            spelled: type_.to_owned(),
+            reads,
+        })
+    }
+
+    /// A Sidekiq worker's `perform` and a channel's actions ([`rails::called_by_rails`]).
+    fn called_by_a_framework(&self, method: &str, ancestors: &[&str]) -> bool {
+        rails::called_by_rails(method, ancestors)
+    }
+
+    /// A job's `perform_later` and a mailer's action on the class ([`rails::run_from_the_class`]).
+    fn run_from_the_class(&self, method: &str, ancestors: &[&str]) -> Option<FromTheClass> {
+        rails::run_from_the_class(method, ancestors).map(|from| FromTheClass {
+            names: from.names,
+            unwritten: from.unwritten,
+        })
+    }
+
+    /// A mailer's `with` and a job's `set` ([`rails::passes_to_the_class`]).
+    fn passes_to_the_class(&self, method: &str, ancestors: &[&str]) -> bool {
+        rails::passes_to_the_class(method, ancestors)
+    }
+
+    /// A mailer's `params` ([`rails::keyed_by_a_class_call`]).
+    fn keyed_by_a_class_call(&self, reader: &str) -> Option<&'static str> {
+        rails::keyed_by_a_class_call(reader)
+    }
+
+    /// Rails' macros, whose value nothing reads ([`rails::discards_value`]).
+    fn discards_value(&self, owner: &str, method: &str) -> bool {
+        rails::discards_value(owner, method)
+    }
+
+    /// What Rails does with a name one of its macros is passed ([`rails::spelled_use`]).
+    fn spelled_use(&self, spelled: &Spelled<'_>) -> Option<NameUse> {
+        let routes = spelled.path.is_some_and(rails::is_routes);
+        rails::spelled_use(spelled.call, spelled.key, routes).map(|named| match named {
+            rails::NameUse::Named => NameUse::Named,
+            rails::NameUse::CalledBare => NameUse::CalledBare,
+        })
+    }
+
     /// The two entry-point conventions, asked once for both callers. It is the same
     /// [`rails::convention_of`] the reader asks, so which documents are opened and which classes
     /// are read cannot disagree.
     fn claims_by_ancestry(&self, superclass: Option<&str>, mixins: &[String]) -> bool {
         rails::convention_of(superclass, mixins).is_some()
     }
+}
+
+/// The filters a call writes, as `permit` reads its arguments and keywords, or `None` where some
+/// part is no literal or the keywords cannot be read.
+fn written_filters(
+    arguments: &[super::Written],
+    keywords: Option<&[(String, super::Written)]>,
+) -> Option<Vec<(String, rails::PermitFilter)>> {
+    let mut written = arguments.iter().map(spelled).collect::<Option<Vec<_>>>()?;
+    let keywords = keywords?;
+    if !keywords.is_empty() {
+        written.push(rails::PermitSpelled::Pairs(
+            keywords
+                .iter()
+                .map(|(key, value)| Some((key.clone(), spelled(value)?)))
+                .collect::<Option<_>>()?,
+        ));
+    }
+    Some(rails::permit_filters(&written))
+}
+
+/// A filter as `permit` reads it, or `None` where some part is no literal.
+fn spelled(written: &super::Written) -> Option<rails::PermitSpelled> {
+    Some(match written {
+        super::Written::Text(name) | super::Written::Symbol(name) => {
+            rails::PermitSpelled::Name(name.clone())
+        }
+        super::Written::List(inner) => {
+            rails::PermitSpelled::List(inner.iter().map(spelled).collect::<Option<_>>()?)
+        }
+        super::Written::Pairs(pairs) => rails::PermitSpelled::Pairs(
+            pairs
+                .iter()
+                .map(|(key, value)| Some((key.clone(), spelled(value)?)))
+                .collect::<Option<_>>()?,
+        ),
+        super::Written::Other => return None,
+    })
+}
+
+/// A read's arguments with `fetch`'s default left out where it is an empty hash: `fetch(key, {})`
+/// hands back what `fetch(key)` does, or the default converted, an empty `Parameters`, which the
+/// request's union holds and whose every key is absent.
+fn without_default<'w>(method: &str, arguments: &'w [super::Written]) -> &'w [super::Written] {
+    match (method, arguments) {
+        ("fetch", [key, super::Written::Pairs(pairs)]) if pairs.is_empty() => {
+            std::slice::from_ref(key)
+        }
+        _ => arguments,
+    }
+}
+
+/// The keys a chain of reads off the request's params reads, each a `Parameters` read of literal
+/// keys: `[]`, `require` and `fetch` of one (with an empty hash for a default, or none), `dig` of
+/// several. `None` for anything else.
+fn read_path(links: &[super::Link]) -> Option<Vec<String>> {
+    let mut path = Vec::new();
+    for link in links {
+        let method = link
+            .member
+            .strip_prefix("ActionController::Parameters#")?
+            .strip_suffix("()")?;
+        let key = |written: &super::Written| match written {
+            super::Written::Text(key) | super::Written::Symbol(key) => Some(key.clone()),
+            _ => None,
+        };
+        if link.more {
+            return None;
+        }
+        match (method, without_default(method, &link.arguments)) {
+            ("[]" | "require" | "fetch", [only]) => path.push(key(only)?),
+            ("dig", keys) if !keys.is_empty() => {
+                for written in keys {
+                    path.push(key(written)?);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(path)
 }
 
 /// What one document contributes to [`Projection`].
@@ -2375,6 +2981,220 @@ mod tests {
         assert_eq!(base("Widget"), "Widget");
         // And the cycle is bounded here too.
         assert_eq!(base("Loop"), "Loop");
+    }
+
+    /// `permit` and `expect` are answered from their literal filters on any receiver, and carry
+    /// what a read of each key hands back only off the request's own `params` in own code, read
+    /// by literal keys alone.
+    #[test]
+    fn a_shaping_call_reads_its_filters_and_its_receiver_s_chain() {
+        use crate::knowledge::{Knowledge, Link, Shaping, Written};
+        let rails = Rails {
+            request: Some(rails::Requests::default()),
+            ..Rails::default()
+        };
+        let symbol = |name: &str| Written::Symbol(name.to_owned());
+        let link = |member: &str, arguments: Vec<Written>, more: bool| Link {
+            member: format!("ActionController::Parameters#{member}()"),
+            arguments,
+            more,
+        };
+        let required = [link("require", vec![symbol("post")], false)];
+        let shaping = Shaping {
+            member: "ActionController::Parameters#permit()",
+            arguments: &[symbol("title")],
+            keywords: Some(&[]),
+            chain: Some((REQUEST_PARAMS, &required)),
+            own: true,
+            ancestors: &["PostsController"],
+        };
+        let shaped = |shaping: Shaping<'_>| rails.shaped_type(&shaping);
+        let keys = |shaping: Shaping<'_>| {
+            shaped(shaping).map(|shape| {
+                (
+                    shape.spelled,
+                    shape
+                        .reads
+                        .into_keys()
+                        .map(|(member, key)| format!("{member} {key}"))
+                        .collect::<Vec<_>>(),
+                )
+            })
+        };
+        let all_four = |key: &str| {
+            ["[]", "dig", "fetch", "require"]
+                .iter()
+                .map(|member| format!("ActionController::Parameters#{member}() {key}"))
+                .collect::<Vec<_>>()
+        };
+        let parameters = "ActionController::Parameters".to_owned();
+        assert_eq!(keys(shaping), Some((parameters.clone(), all_four("title"))));
+        // The receiver's chain, read by literal keys alone.
+        let other_reader = Shaping {
+            chain: Some(("ActionController::Metal#params()", &required)),
+            ..shaping
+        };
+        for refused in [
+            other_reader,
+            Shaping {
+                chain: None,
+                ..shaping
+            },
+            Shaping {
+                own: false,
+                ..shaping
+            },
+        ] {
+            assert_eq!(keys(refused), Some((parameters.clone(), Vec::new())));
+        }
+        let no_request = Rails::default();
+        assert_eq!(
+            no_request
+                .shaped_type(&shaping)
+                .map(|shape| shape.reads.len()),
+            Some(0)
+        );
+        for links in [
+            vec![link("dig", vec![symbol("a"), symbol("b")], false)],
+            vec![link("fetch", vec![symbol("post")], false)],
+            vec![link(
+                "fetch",
+                vec![symbol("post"), Written::Pairs(Vec::new())],
+                false,
+            )],
+            vec![link("[]", vec![Written::Text("post".to_owned())], false)],
+        ] {
+            let chained = Shaping {
+                chain: Some((REQUEST_PARAMS, &links)),
+                ..shaping
+            };
+            assert_eq!(keys(chained), Some((parameters.clone(), all_four("title"))));
+        }
+        for links in [
+            vec![link("dig", Vec::new(), false)],
+            vec![link("require", vec![symbol("post")], true)],
+            vec![link("require", vec![Written::Other], false)],
+            vec![link("fetch", vec![symbol("post"), Written::Other], false)],
+            vec![link(
+                "fetch",
+                vec![
+                    symbol("post"),
+                    Written::Pairs(vec![("title".to_owned(), symbol("x"))]),
+                ],
+                false,
+            )],
+            vec![link(
+                "require",
+                vec![symbol("post"), Written::Pairs(Vec::new())],
+                false,
+            )],
+            vec![link("merge", vec![symbol("post")], false)],
+            vec![Link {
+                member: "Hash#[]()".to_owned(),
+                arguments: vec![symbol("post")],
+                more: false,
+            }],
+        ] {
+            let chained = Shaping {
+                chain: Some((REQUEST_PARAMS, &links)),
+                ..shaping
+            };
+            assert_eq!(
+                keys(chained),
+                Some((parameters.clone(), Vec::new())),
+                "{links:?}"
+            );
+        }
+        // What the call writes.
+        let nested = [(
+            "post".to_owned(),
+            Written::List(vec![
+                symbol("title"),
+                Written::Pairs(vec![("tags".to_owned(), Written::List(Vec::new()))]),
+            ]),
+        )];
+        let expect = Shaping {
+            member: "ActionController::Parameters#expect()",
+            arguments: &[],
+            keywords: Some(&nested),
+            chain: Some((REQUEST_PARAMS, &[])),
+            ..shaping
+        };
+        let mut both = all_four("tags");
+        both.extend(all_four("title"));
+        both.sort();
+        assert_eq!(keys(expect), Some((parameters.clone(), both)));
+        assert_eq!(
+            keys(Shaping {
+                member: "ActionController::Parameters#expect!()",
+                arguments: &[symbol("id")],
+                keywords: Some(&[]),
+                ..shaping
+            }),
+            None
+        );
+        assert_eq!(
+            keys(Shaping {
+                member: "ActionController::Parameters#expect()",
+                keywords: None,
+                ..shaping
+            }),
+            Some((
+                "ActionController::Parameters | Array[untyped]".to_owned(),
+                Vec::new()
+            ))
+        );
+        // Filters it cannot read: `permit` is still a `Parameters`, `expect` with keywords one
+        // key's array or hash or several keys' values, and without them its arms'.
+        let unread = [("post".to_owned(), Written::Other)];
+        for unreadable in [
+            Shaping {
+                keywords: None,
+                ..shaping
+            },
+            Shaping {
+                arguments: &[Written::Other],
+                ..shaping
+            },
+            Shaping {
+                keywords: Some(&unread),
+                ..shaping
+            },
+        ] {
+            assert_eq!(keys(unreadable), Some((parameters.clone(), Vec::new())));
+            let expect = Shaping {
+                member: "ActionController::Parameters#expect()",
+                ..unreadable
+            };
+            let either = "ActionController::Parameters | Array[untyped]".to_owned();
+            let answer = (unreadable.keywords != Some(&[])).then(|| (either, Vec::new()));
+            assert_eq!(keys(expect), answer);
+        }
+        for refused in [
+            Shaping {
+                member: "ActionController::Parameters#to_h()",
+                ..shaping
+            },
+            Shaping {
+                member: "Hash#permit()",
+                ..shaping
+            },
+            Shaping {
+                member: "ActionController::Parameters#permit",
+                ..shaping
+            },
+        ] {
+            assert_eq!(keys(refused), None);
+        }
+        // A list inside a filter reads as its elements.
+        let listed = [Written::List(vec![symbol("title")])];
+        assert_eq!(
+            keys(Shaping {
+                arguments: &listed,
+                ..shaping
+            }),
+            Some((parameters, all_four("title")))
+        );
     }
 
     #[test]

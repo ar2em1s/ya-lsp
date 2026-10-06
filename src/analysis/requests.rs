@@ -44,43 +44,11 @@ use crate::workspace::DocUri;
 
 impl Analysis {
     pub(super) fn serve(&mut self, request: Request) {
-        // **The one line saying a request arrived.** Without it, "hover does nothing in this file"
-        // is indistinguishable from "the client never sent a hover", which is what a document
-        // selector one folder too narrow actually does.
-        //
-        // Written here, not per method, because `serve` is the one door every method goes through.
-        // Fields, not prose: grepping `method=textDocument/hover` gives the pair.
         let arrived = Instant::now();
-        let (document, position) = asked_about(&request.params);
-        tracing::debug!(
-            method = request.method,
-            id = %request.id,
-            document,
-            position,
-            dirty = self.dirty,
-            "request"
-        );
+        self.arrived(&request);
 
         if self.cancellations.take(&request.id) {
-            // Logged in the same shape as every other outcome: following one id through the log
-            // always gives the same two lines, and `cancelled` is a normal thing for a client to
-            // do.
-            let elapsed = format!("{:.2?}", arrived.elapsed());
-            tracing::debug!(
-                method = request.method,
-                id = %request.id,
-                outcome = "cancelled",
-                settled = false,
-                retried = false,
-                drained = false,
-                elapsed,
-                "answered"
-            );
-            self.respond(Response::new_err(
-                request.id,
-                ErrorCode::RequestCanceled as i32,
-                "request cancelled by the client".to_owned(),
-            ));
+            self.cancelled(request, arrived);
             return;
         }
 
@@ -226,6 +194,76 @@ impl Analysis {
         );
 
         self.cancellations.forget(&id);
+        self.respond(response);
+    }
+
+    /// A held `inlayHint` that a newer one for the same range replaced, or that the client
+    /// cancelled while it waited (`Analysis::hold`). Answered without being computed, through the
+    /// same two log lines as every other request.
+    ///
+    /// `ContentModified` is the protocol's word for an answer a later state made worthless, and
+    /// clients drop it without showing an error.
+    pub(super) fn supersede(&mut self, request: Request) {
+        let arrived = Instant::now();
+        self.arrived(&request);
+        if self.cancellations.take(&request.id) {
+            self.cancelled(request, arrived);
+            return;
+        }
+        self.refuse(
+            request,
+            arrived,
+            ErrorCode::ContentModified,
+            "a newer request for the same range replaced this one",
+        );
+    }
+
+    /// **The one line saying a request arrived.** Without it, "hover does nothing in this file" is
+    /// indistinguishable from "the client never sent a hover", which is what a document selector
+    /// one folder too narrow actually does.
+    ///
+    /// Written by the two doors a request leaves through, not per method. Fields, not prose:
+    /// grepping `method=textDocument/hover` gives the pair.
+    fn arrived(&self, request: &Request) {
+        let (document, position) = asked_about(&request.params);
+        tracing::debug!(
+            method = request.method,
+            id = %request.id,
+            document,
+            position,
+            dirty = self.dirty,
+            "request"
+        );
+    }
+
+    /// Answer a request the client cancelled. `cancelled` is a normal thing for a client to do.
+    fn cancelled(&mut self, request: Request, arrived: Instant) {
+        self.refuse(
+            request,
+            arrived,
+            ErrorCode::RequestCanceled,
+            "request cancelled by the client",
+        );
+    }
+
+    /// Answer `request` with an error without computing it.
+    ///
+    /// Logged in the same shape as every other outcome: following one id through the log always
+    /// gives the same two lines.
+    fn refuse(&mut self, request: Request, arrived: Instant, code: ErrorCode, message: &str) {
+        let response = Response::new_err(request.id, code as i32, message.to_owned());
+        let outcome = outcome(&response);
+        let elapsed = format!("{:.2?}", arrived.elapsed());
+        tracing::debug!(
+            method = request.method,
+            id = %response.id,
+            outcome,
+            settled = false,
+            retried = false,
+            drained = false,
+            elapsed,
+            "answered"
+        );
         self.respond(response);
     }
 
@@ -379,6 +417,20 @@ impl Analysis {
                 )
             {
                 return Some(answer(markdown, local.span));
+            }
+            // A local, a block's parameter or a method's parameter: what it holds.
+            if let Some(((start, end), typed, parameter)) =
+                locator::local_type(&sources, uri_id, &parsed, offset, at, &rebase)
+                && let Some(markdown) = hover::local(
+                    sources.graph,
+                    text.text()
+                        .get(start as usize..end as usize)
+                        .unwrap_or_default(),
+                    &typed,
+                    parameter,
+                )
+            {
+                return Some(answer(markdown, (start, end)));
             }
             // What the call under the cursor returns, for a method that declares nothing of its own
             //. `None` off a call's name.
@@ -3006,11 +3058,13 @@ const fn jumpable(tier: types::Tier) -> bool {
 ///
 /// **`nothing` and `empty` differ** and the log keeps them apart: `null` is a cursor the server
 /// could make nothing of, empty `items` a list that matched nothing, and they are fixed in
-/// different modules. `cancelled` is the client changing its mind, not a defect; `failed` is an
-/// error response, which apart from a crash means a method this build does not answer.
+/// different modules. `cancelled` is the client changing its mind, not a defect; `superseded` a
+/// held hint request a newer one replaced; `failed` is an error response, which apart from a crash
+/// means a method this build does not answer.
 fn outcome(response: &Response) -> &'static str {
     match &response.response_result {
         Err(error) if error.code == ErrorCode::RequestCanceled as i32 => "cancelled",
+        Err(error) if error.code == ErrorCode::ContentModified as i32 => "superseded",
         Err(_) => "failed",
         Ok(serde_json::Value::Null) => "nothing",
         Ok(_) if answered_nothing(response) => "empty",

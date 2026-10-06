@@ -334,6 +334,23 @@ fn declare_all(
     into
 }
 
+/// [`Analysis::defining_documents`]' memo: each of the project's own documents' `def`s of the names
+/// last asked, by the document and its text's hash, and what decided which documents are the
+/// project's.
+///
+/// Every pass asks (a routes file's bare calls), and a pass after an edit re-indexes one document:
+/// reading every document's definitions again was a quarter of what that pass spent proving routes
+/// on the largest corpus. A document whose hash moved is read again, one gone is let go, and other
+/// names or another layout start over.
+#[derive(Default)]
+pub(super) struct Defining {
+    wanted: BTreeSet<String>,
+    layout: u64,
+    documents: HashMap<UriId, (u64, Vec<String>)>,
+    /// How many documents were read, for a test that asserts an unchanged one is not.
+    pub(super) reads: usize,
+}
+
 /// Which classes each concern's macros really land on, resolved and then closed over.
 ///
 /// 1. **Resolve.** An `include` names a constant, resolved against the nesting of the body that
@@ -591,6 +608,8 @@ impl Analysis {
         // ([`Analysis::reopened_only`]) and get what this pass would have.
         let mut knowledge = std::mem::take(&mut self.knowledge);
         let mut counted: knowledge::Counted = Vec::new();
+        // What this pass reads replaces what the last one did; a reopening only adds to it.
+        self.declared_from.borrow_mut().clear();
         let (mut generated, buffered) = self.declaring(&context, |declaring| {
             (
                 declare_all(&mut knowledge, declaring, &mut counted, false),
@@ -644,7 +663,12 @@ impl Analysis {
         declare(&knowledge::Declaring {
             context,
             features: self.workspace.features(),
-            text: &|uri| self.with_text(uri, |text| text.text().to_owned()),
+            text: &|uri| {
+                self.declared_from
+                    .borrow_mut()
+                    .insert(uri.as_str().to_owned());
+                self.with_text(uri, |text| text.text().to_owned())
+            },
             caption: &|uri| self.workspace_relative(uri),
             own: &|uri| self.is_own_code(uri),
             declares: &|wanted| {
@@ -654,7 +678,79 @@ impl Analysis {
                 self.declared_kinds(declarers.get_or_init(|| self.declarers()), wanted)
             },
             loaded: &|uri| !environment::Fence::at(None, self.layout()).unloadable(uri.as_str()),
+            methods: &|wanted| self.defining_documents(wanted),
         })
+    }
+
+    /// Which of the project's own documents write a `def` of each of these names.
+    ///
+    /// Read from the definitions, as every question the pass asks is (the declarations are one
+    /// settle behind), and only the user's own documents', which are few beside the bundle's.
+    /// **Each document's answer is held by its text's hash** ([`Defining`]): a pass after an edit
+    /// reads the one document that moved, not every document's definitions.
+    fn defining_documents(&self, wanted: &BTreeSet<String>) -> BTreeMap<String, Vec<DocUri>> {
+        // Which documents are the project's own is decided by these three, and only by them.
+        let layout = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (
+                &self.workspace_prefix,
+                &self.own_prefixes,
+                &self.foreign_prefixes,
+            )
+                .hash(&mut hasher);
+            hasher.finish()
+        };
+        let mut memo = self.defining.borrow_mut();
+        if memo.wanted != *wanted || memo.layout != layout {
+            memo.wanted = wanted.clone();
+            memo.layout = layout;
+            memo.documents.clear();
+        }
+        // A method definition's name carries its parentheses, as its declaration's does.
+        let names: HashMap<StringId, &String> = wanted
+            .iter()
+            .map(|name| (StringId::from(format!("{name}()").as_str()), name))
+            .collect();
+        let mut seen: HashSet<UriId> = HashSet::new();
+        let mut found: BTreeMap<String, Vec<DocUri>> = BTreeMap::new();
+        for (id, document) in self.graph.documents() {
+            if document.uri().starts_with(synthesized::GENERATED_SCHEME)
+                || !self.is_own_code(document.uri())
+            {
+                continue;
+            }
+            seen.insert(*id);
+            let hash = document.content_hash();
+            if memo.documents.get(id).is_none_or(|(held, _)| *held != hash) {
+                let mut writes: Vec<String> = document
+                    .definitions()
+                    .iter()
+                    .filter_map(|id| match self.graph.definitions().get(id) {
+                        Some(Definition::Method(method)) => {
+                            names.get(method.str_id()).map(|name| (*name).clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                writes.sort();
+                writes.dedup();
+                memo.reads += 1;
+                memo.documents.insert(*id, (hash, writes));
+            }
+            let writes: &Vec<String> = &memo.documents[id].1;
+            if writes.is_empty() {
+                continue;
+            }
+            let Some(uri) = DocUri::from_graph_uri(document.uri()) else {
+                continue;
+            };
+            for name in writes {
+                found.entry(name.clone()).or_default().push(uri.clone());
+            }
+        }
+        memo.documents.retain(|id, _| seen.contains(id));
+        found
     }
 
     /// A settle whose only news is that the editor opened or closed files that modules read only
@@ -838,19 +934,22 @@ impl Analysis {
     /// Whether nothing a generator *reads* has changed: the half of the gate about files, not the
     /// projection. Its own function because both gates ask it.
     ///
-    /// 1. **Was a listed file touched?** A `Context` says which documents a generator opens, never
-    ///    what is in them, so touching the file is the whole answer.
+    /// 1. **Was a listed file touched, or one a generator read through `Declaring::text`?** A
+    ///    `Context` says which documents a generator opens, never what is in them, so touching the
+    ///    file is the whole answer. A routes file's helper, a file a `draw` names and a module a
+    ///    controller includes are on no list; what the last pass read of them is
+    ///    (`Analysis::declared_from`), or an edit to one alone ran no pass and left the proofs
+    ///    stale.
     /// 2. **Is every file it read still there, unchanged?** Not belt and braces: the pass claims
     ///    its answer is a function of what is on disk, so a `git checkout` deleting `db/schema.rb`
     ///    must stop the columns answering at the next settle, before any watcher notification
     ///    arrives. One `stat` per file read buys that back, and the parse memo rests on the same
     ///    `stat`.
     fn generators_would_repeat_themselves(&self, previous: &Context) -> bool {
-        if self
-            .touched
-            .iter()
-            .any(|uri| previous.read_by_a_generator().any(|read| read == uri))
-        {
+        let declared_from = self.declared_from.borrow();
+        if self.touched.iter().any(|uri| {
+            declared_from.contains(uri) || previous.read_by_a_generator().any(|read| read == uri)
+        }) {
             return false;
         }
         self.stamps.iter().all(|(path, was)| stamp_of(path) == *was)
@@ -2886,7 +2985,7 @@ q = Adapter.new.select_all(\"SELECT 1\", async: true)
              j: bool? = ActiveSupport::Cache::Store.new.write(\"k\", 1)\n\
              k: bool? = Story.new.save\nl: true? = Story.new.save!\n\
              m: bool? = Story.new.update(title: \"x\")\n\
-             n: ActionController::Parameters | Array = ActionController::Parameters.new.expect(story: [:title])\n\
+             n: ActionController::Parameters = ActionController::Parameters.new.expect(story: [:title])\n\
              p: ActiveRecord::Result = Adapter.new.select_all(\"SELECT 1\")"
         );
     }
@@ -3434,6 +3533,77 @@ end
             .to_owned();
         assert!(card.contains("User#label"), "{card}");
         assert!(!card.contains("Guessed from name alone"), "{card}");
+    }
+
+    /// A callback's block is handed what its factory builds, and what every factory inheriting it
+    /// builds, and runs on a `SyntaxRunner`; an attribute's block runs on the evaluator, and the
+    /// factory's own on its definition's proxy.
+    #[test]
+    fn a_factory_s_callback_is_handed_what_the_factory_builds() {
+        let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
+        harness.write(
+            "lib/factory_bot.rb",
+            "module FactoryBot\n  module Syntax\n    module Methods\n    end\n  end\n\n  \
+             class DefinitionProxy\n    def association(name) = 1\n  end\n\n  \
+             class SyntaxRunner\n    include Syntax::Methods\n  end\n\n  \
+             class Evaluator\n    def association(name) = \"x\"\n  end\n\n  \
+             def self.define\n  end\nend\n",
+        );
+        for model in ["User", "Admin", "Post"] {
+            harness.write(
+                &format!("app/models/{}.rb", model.to_lowercase()),
+                &format!("class {model}\n  def self.table = 1\n\n  def label = 1\nend\n"),
+            );
+        }
+        let source = "\
+FactoryBot.define do
+  factory :user do
+    a = association(:user)
+    name { b = association(:user) }
+    after(:create) do |user, evaluator|
+      c = user
+      d = create(:post)
+      e = evaluator
+    end
+    trait :named do
+      after(:build) { |named| f = named }
+    end
+    before(:build, :create) { |maybe| g = maybe }
+    factory :admin, class: \"Admin\" do
+      after(:stub) { |admin| h = admin }
+    end
+  end
+
+  factory :post do
+    after(:all) { |any| i = any }
+    sequence(:title) { |n| j = association(:x) }
+  end
+
+  factory :odd, class: \"Post\" do
+    after(:create) { |one, two, three| k = one }
+  end
+end
+";
+        let uri = harness.write("spec/factories/users.rb", source);
+        harness.index();
+        harness.index_gems();
+        // `admin` inherits `user`'s callbacks and traits, so they are handed either. `before(:build)`
+        // is handed `nil`. The evaluator, `after(:all)` (a `Hash` for `attributes_for`), a
+        // `sequence`'s block and a block taking three are not read.
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "    a: Integer = association(:user)
+    name { b: String = association(:user) }
+    after(:create) do |user: Admin | User, evaluator|
+      c: Admin | User = user
+      d: Post = create(:post)
+      after(:build) { |named: Admin | User| f = named }
+      after(:build) { |named| f: Admin | User = named }
+    before(:build, :create) { |maybe: Admin? | User| g = maybe }
+    before(:build, :create) { |maybe| g: Admin? | User = maybe }
+      after(:stub) { |admin: Admin| h = admin }
+      after(:stub) { |admin| h: Admin = admin }"
+        );
     }
 
     /// With `[types] factories = false`, no strategy is declared and nothing is typed.
@@ -6624,6 +6794,636 @@ end
         }
     }
 
+    /// An API controller's `params` is `StrongParameters`', as a `Base` controller's is, though
+    /// `ActionController::API` includes its modules in a loop over `MODULES` and `Metal` writes a
+    /// `params` of its own behind them.
+    #[test]
+    fn an_api_controller_s_params_is_strong_parameters_like_a_base_controller_s() {
+        let source = "\
+class PostsController < ActionController::API
+  def create
+    params.permit(:title)
+  end
+end
+";
+        let (mut harness, _schema, _uri) = rails_project("");
+        harness.write("lib/bundle.rb", BUNDLE);
+        harness.write("lib/actionpack.rb", ACTIONPACK);
+        harness.write(
+            "lib/api.rb",
+            "module AbstractController\n  module Rendering\n  end\n  module Callbacks\n  end\nend\n\
+             module ActionController\n  \
+             module UrlFor\n  end\n  module Redirecting\n  end\n  module ApiRendering\n  end\n  \
+             module Renderers\n    module All\n    end\n  end\n  module ConditionalGet\n  end\n  \
+             module BasicImplicitRender\n  end\n  module RateLimiting\n  end\n  \
+             module Caching\n  end\n  module DataStreaming\n  end\n  module DefaultHeaders\n  end\n  \
+             module Logging\n  end\n  module Rescue\n  end\n  module Instrumentation\n  end\n  \
+             module ParamsWrapper\n  end\n\n  \
+             class Metal\n    def params; end\n  end\n\n  \
+             class API < Metal\n    MODULES = [StrongParameters, Rescue]\n\n    \
+             MODULES.each do |mod|\n      include mod\n    end\n  end\nend\n",
+        );
+        let uri = harness.write("app/controllers/posts_controller.rb", source);
+        harness.index();
+        let card = card(&mut harness, &uri, source, "permit");
+        assert!(
+            card.contains("ActionController::Parameters#permit"),
+            "{card}"
+        );
+        assert!(!card.contains("Guessed from name alone"), "{card}");
+    }
+
+    /// A key read straight off a controller's `params` is what a parsed request can carry, `nil`
+    /// where it may be absent, joined with what the project writes there and what a route gives
+    /// it. `params[:locale] = :en` adds `Symbol` to `locale`, and `defaults: { format: :json }` to
+    /// `format`. `fetch` with an empty hash for a default reads as `fetch`: the default comes back
+    /// an empty `Parameters`, which the union holds. Any other default, a `Parameters` the code
+    /// built, or a local holding `params`, answers as before.
+    #[test]
+    fn a_key_read_off_the_request_is_what_a_request_can_carry() {
+        let source = "\
+class PostsController < ActionController::Base
+  def show
+    id = params[:id]
+    post = params.require(:post)
+    page = params.fetch(:page)
+    emptied = params.fetch(:page, {})
+    routed = params.fetch(:id, {})
+    defaulted = params.fetch(:page, 1)
+    deep = params.dig(:a, :b)
+    format = params[:format]
+    locale = params[:locale]
+    upcased = params[:name].upcase
+    other = ActionController::Parameters.new[:id]
+    held = params
+    through = held[:id]
+    nil
+  end
+
+  def set_locale
+    params[:locale] = :en
+  end
+end
+";
+        let drawn = |routes: &str, extra: &str| {
+            let (mut harness, _schema, _uri) = rails_project("");
+            harness.write("lib/bundle.rb", BUNDLE);
+            harness.write(
+                "lib/actionpack.rb",
+                &format!(
+                    "{ACTIONPACK}module ActionDispatch\n  module Http\n    class UploadedFile\n    \
+                     end\n  end\nend\nclass Symbol\nend\n{extra}"
+                ),
+            );
+            harness.write("config/routes.rb", routes);
+            let uri = harness.write("app/controllers/posts_controller.rb", source);
+            harness.index();
+            drawn_hints(source, &harness.hints_in(&uri))
+        };
+        // `true` and `false` are put back after the other classes (`Sides`), so `bool` comes last.
+        let union = "Integer | Float | Array | ActionController::Parameters | \
+                     ActionDispatch::Http::UploadedFile";
+        let routes = "Rails.application.routes.draw do\n  resources :posts, defaults: { format: :json }\nend\n";
+        assert_eq!(
+            drawn(routes, ""),
+            format!(
+                "  def show -> nil
+    id: String = params[:id]
+    post: String | {union} | bool = params.require(:post)
+    page: String? | {union} | bool = params.fetch(:page)
+    emptied: String? | {union} | bool = params.fetch(:page, {{}})
+    routed: String = params.fetch(:id, {{}})
+    deep: String? | {union} | bool = params.dig(:a, :b)
+    format: Symbol | String = params[:format]
+    locale: String? | {union} | Symbol | bool = params[:locale]
+    upcased: String = params[:name].upcase
+    held: ActionController::Parameters = params
+  def set_locale -> Symbol"
+            )
+        );
+        // A parser of the project's own can hand back anything, so every key is left to Rails.
+        let parsed = drawn(
+            routes,
+            "ActionDispatch::Request.parameter_parsers[:xml] = ->(raw) { raw }\n",
+        );
+        assert!(!parsed.contains("id:"), "{parsed}");
+        assert!(
+            parsed.contains("held: ActionController::Parameters"),
+            "{parsed}"
+        );
+    }
+
+    /// A key read off what `permit` or `expect` hands back, from the request's own `params`, is
+    /// what its filter lets through of what the request carries there: `title` a scalar, `tags: []`
+    /// an array, `meta: {}` a hash, `address: [:street]` a hash or an array of them, `nil` where
+    /// the key never came (`fetch` raises there instead, `require` on a blank value). Kept through
+    /// a `def` that hands it back and a local nothing writes into or hands on. A local written
+    /// into or handed on, an instance variable, a key the filter does not name, a filter that is
+    /// no literal and a `Parameters` the code built answer as before.
+    #[test]
+    fn a_permitted_key_is_what_its_filter_lets_through() {
+        let source = "\
+class PostsController < ActionController::Base
+  def show
+    title = post_params[:title]
+    fetched = post_params.fetch(:title)
+    required = post_params.require(:title)
+    dug = post_params.dig(:title)
+    named = post_params[\"title\"]
+    tags = post_params[:tags]
+    listed = post_params.fetch(:tags)
+    meta = post_params[:meta]
+    address = post_params[:address]
+    unnamed = post_params[:other]
+    kept = params.permit(:q)
+    q = kept[:q]
+    written = params.permit(:q)
+    written[:q] = 1
+    lost = written[:q]
+    handed = params.permit(:q)
+    use(handed)
+    gone = handed[:q]
+    @held = params.permit(:q)
+    ivar = @held[:q]
+    fields = [:q]
+    dynamic = params.permit(fields)[:q]
+    built = ActionController::Parameters.new.permit(:q)[:q]
+    expected = params.expect(post: [:title, tags: []])
+    expected_title = expected[:title]
+    expected_tags = expected[:tags]
+    several = params.expect(:id, post: [:title])
+    listed_out = params.expect(tags: [])
+    one = params.expect(:id)
+    options = {}
+    spread = params.expect(**options)
+    unread = params.expect(post: fields)
+    splat = params.permit(*fields)
+    other_key = kept[fields]
+    two = kept.fetch(:q, 1)
+    helped = helper(:x).permit(:q)[:q]
+    nil
+  end
+
+  private
+
+  def helper(key) = params
+
+  def post_params
+    params.require(:post).permit(:title, tags: [], meta: {}, address: [:street])
+  end
+end
+";
+        let (mut harness, _schema, _uri) = rails_project("");
+        harness.write("lib/bundle.rb", BUNDLE);
+        harness.write(
+            "lib/actionpack.rb",
+            &format!(
+                "{ACTIONPACK}module ActionController\n  class Parameters\n    \
+                 def expect(*filters); end\n  end\n  class ExpectedParameterMissing\n  end\nend\n\
+                 module ActionDispatch\n  module Http\n    class UploadedFile\n    end\n  end\nend\n\
+                 class Symbol\nend\n"
+            ),
+        );
+        let uri = harness.write("app/controllers/posts_controller.rb", source);
+        harness.index();
+        let scalar = "String | Integer | Float | ActionDispatch::Http::UploadedFile | bool";
+        let maybe = "String? | Integer | Float | ActionDispatch::Http::UploadedFile | bool";
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            format!(
+                "  def show -> nil
+    title: {maybe} = post_params[:title]
+    fetched: {maybe} = post_params.fetch(:title)
+    required: {scalar} = post_params.require(:title)
+    dug: {maybe} = post_params.dig(:title)
+    named: {maybe} = post_params[\"title\"]
+    tags: Array? = post_params[:tags]
+    listed: Array = post_params.fetch(:tags)
+    meta: ActionController::Parameters? = post_params[:meta]
+    address: Array? | ActionController::Parameters = post_params[:address]
+    kept: ActionController::Parameters = params.permit(:q)
+    q: {maybe} = kept[:q]
+    written: ActionController::Parameters = params.permit(:q)
+    handed: ActionController::Parameters = params.permit(:q)
+    expected: ActionController::Parameters = params.expect(post: [:title, tags: []])
+    expected_title: {maybe} = expected[:title]
+    expected_tags: Array? = expected[:tags]
+    several: Array = params.expect(:id, post: [:title])
+    listed_out: Array = params.expect(tags: [])
+    one: {scalar} = params.expect(:id)
+    spread: ActionController::Parameters | Array = params.expect(**options)
+    unread: ActionController::Parameters | Array = params.expect(post: fields)
+    splat: ActionController::Parameters = params.permit(*fields)
+  def helper(key) -> ActionController::Parameters = params
+  def post_params -> ActionController::Parameters"
+            )
+        );
+    }
+
+    /// What could have changed a permitted value before the read refuses it: a write into the
+    /// local the `def` hands back, a memoized instance variable any method may write into, a
+    /// `tap` whose block may, a second name an assignment read as a value gives the object, and a
+    /// write into the request under the key the filter reads below.
+    /// A write of a scalar under a key `permit` reads at the top joins its class. The receiver is
+    /// read off the params by literal keys alone: `fetch`, `[]` and `dig` count, and so does an
+    /// empty hash for `fetch`'s default, which holds no key; any other default does not.
+    #[test]
+    fn a_permitted_key_refuses_what_may_have_been_written_since() {
+        let source = "\
+class PostsController < ActionController::Base
+  def show
+    local = written_params[:title]
+    memo = memo_params[:title]
+    tapped = params.permit(:q).tap { |held| held[:q] = 1 }[:q]
+    nested = params.require(:post).permit(:title)[:title]
+    locale = params.permit(:locale)[:locale]
+    chained = (aliased = params.permit(:q))[:q]
+    first = second = params.permit(:q)
+    first_q = first[:q]
+    second_q = second[:q]
+    stored = stored_params[:q]
+    nil
+  end
+
+  private
+
+  def written_params
+    held = params.require(:item).permit(:title)
+    held[:title] = 1
+    held
+  end
+
+  def memo_params
+    @memo_params ||= params.require(:item).permit(:title)
+  end
+
+  def stored_params
+    @stored_params = params.permit(:q)
+  end
+
+  def set_post
+    params[:post] = { title: 1 }
+    params[:locale] = :en
+  end
+end
+
+class ItemsController < ActionController::Base
+  def show
+    fetched = params.fetch(:item).permit(:title)[:title]
+    indexed = params[:item].permit(:title)[:title]
+    dug = params.dig(:item, :inner).permit(:title)[:title]
+    defaulted = params.fetch(:item, other).permit(:title)[:title]
+    emptied = params.fetch(:item, {}).permit(:title)[:title]
+    nil
+  end
+end
+";
+        let (mut harness, _schema, _uri) = rails_project("");
+        harness.write("lib/bundle.rb", BUNDLE);
+        harness.write(
+            "lib/actionpack.rb",
+            &format!(
+                "{ACTIONPACK}module ActionDispatch\n  module Http\n    class UploadedFile\n    \
+                 end\n  end\nend\nclass Symbol\nend\n"
+            ),
+        );
+        let uri = harness.write("app/controllers/posts_controller.rb", source);
+        harness.index();
+        let maybe = "String? | Integer | Float | ActionDispatch::Http::UploadedFile | bool";
+        let symbol =
+            "String? | Integer | Float | ActionDispatch::Http::UploadedFile | Symbol | bool";
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            format!(
+                "  def show -> nil
+    tapped = params.permit(:q).tap {{ |held: ActionController::Parameters| held[:q] = 1 }}[:q]
+    locale: {symbol} = params.permit(:locale)[:locale]
+    chained = (aliased: ActionController::Parameters = params.permit(:q))[:q]
+    first: ActionController::Parameters = second = params.permit(:q)
+    first = second: ActionController::Parameters = params.permit(:q)
+  def written_params -> ActionController::Parameters
+    held: ActionController::Parameters = params.require(:item).permit(:title)
+  def memo_params -> ActionController::Parameters
+  def stored_params -> ActionController::Parameters
+  def set_post -> Symbol
+  def show -> nil
+    fetched: {maybe} = params.fetch(:item).permit(:title)[:title]
+    indexed: {maybe} = params[:item].permit(:title)[:title]
+    dug: {maybe} = params.dig(:item, :inner).permit(:title)[:title]
+    emptied: {maybe} = params.fetch(:item, {{}}).permit(:title)[:title]"
+            )
+        );
+    }
+
+    /// A filter held in a constant is the list its one assignment writes, frozen as written:
+    /// written plainly, under a path, nested, or as a keyword's value, and still where a call on it
+    /// elsewhere made rubydex take it for a namespace (`FIELDS.map`). A list left unfrozen, one
+    /// written again with an operator anywhere, a constant assigned twice and a list with
+    /// anything but names in it answer as a filter that is no literal does.
+    #[test]
+    fn a_filter_held_in_a_frozen_constant_is_read_as_written() {
+        let source = "\
+class PostsController < ActionController::Base
+  FIELDS = %i[title body].freeze
+  NESTED = [:title, { tags: [] }].freeze
+  LOOSE = %i[title]
+  GROWN = %i[title].freeze
+  TWICE = %i[title].freeze
+  MIXED = [:title, :body.to_s].freeze
+
+  def show
+    title = params.permit(FIELDS)[:title]
+    body = params.require(:post).permit(FIELDS).fetch(:body)
+    tags = params.permit(NESTED)[:tags]
+    pathed = params.permit(Admin::Keys::NAMES)[:name]
+    expected = params.expect(post: FIELDS)
+    expected_title = expected[:title]
+    nested = params.permit(post: NESTED)
+    loose = params.permit(LOOSE)[:title]
+    grown = params.permit(GROWN)[:title]
+    twice = params.permit(TWICE)[:title]
+    mixed = params.permit(MIXED)[:title]
+    nil
+  end
+end
+
+class PostsController
+  TWICE = %i[body].freeze
+end
+";
+        let (mut harness, _schema, _uri) = rails_project("");
+        harness.write("lib/bundle.rb", BUNDLE);
+        harness.write(
+            "lib/actionpack.rb",
+            &format!(
+                "{ACTIONPACK}module ActionController\n  class Parameters\n    \
+                 def expect(*filters); end\n  end\n  class ExpectedParameterMissing\n  end\nend\n\
+                 module ActionDispatch\n  module Http\n    class UploadedFile\n    end\n  end\nend\n\
+                 class Symbol\nend\n"
+            ),
+        );
+        harness.write(
+            "app/models/admin/keys.rb",
+            "module Admin\n  module Keys\n    NAMES = %i[name].freeze\n  end\nend\n",
+        );
+        harness.write(
+            "config/initializers/grown.rb",
+            "PostsController::GROWN += [{ title: [] }]\nPostsController::FIELDS.map(&:to_s)\n",
+        );
+        let uri = harness.write("app/controllers/posts_controller.rb", source);
+        harness.index();
+        let scalar = "String | Integer | Float | ActionDispatch::Http::UploadedFile | bool";
+        let maybe = "String? | Integer | Float | ActionDispatch::Http::UploadedFile | bool";
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            format!(
+                "  def show -> nil
+    title: {maybe} = params.permit(FIELDS)[:title]
+    body: {maybe} = params.require(:post).permit(FIELDS).fetch(:body)
+    tags: Array? = params.permit(NESTED)[:tags]
+    pathed: {maybe} = params.permit(Admin::Keys::NAMES)[:name]
+    expected: ActionController::Parameters = params.expect(post: FIELDS)
+    expected_title: {maybe} = expected[:title]
+    nested: ActionController::Parameters = params.permit(post: NESTED)"
+            )
+        );
+        let _ = scalar;
+    }
+
+    /// Every pass asks which project files write a method a routes file calls, and what each says it
+    /// does. Both are held: a pass after an edit reads only the document that moved, and the
+    /// macro's file is parsed again only when its own text does. What they answer still follows
+    /// the files.
+    #[test]
+    fn a_routes_macro_is_read_again_only_when_its_file_moves() {
+        let (mut harness, _schema, _uri) = rails_project("");
+        harness.write("lib/bundle.rb", BUNDLE);
+        let drawn = "Rails.application.routes.draw do\n  admin_resources :posts\nend\n";
+        let routes = harness.write("config/routes.rb", drawn);
+        let written = "def admin_resources(name)\n  resources name\nend\n";
+        let helpers = harness.write("config/route_helpers.rb", written);
+        harness.index();
+        let reads = |harness: &Harness| {
+            let rails = harness
+                .analysis
+                .knowledge
+                .of::<crate::knowledge::rails::Rails>()
+                .expect("the Rails body is registered");
+            (rails.macro_reads, harness.analysis.defining.borrow().reads)
+        };
+        let wanted = std::collections::BTreeSet::from(["admin_resources".to_owned()]);
+        let (macros, defining) = reads(&harness);
+        assert_eq!(macros, 1, "the one file writing the macro");
+        assert!(defining > 1, "every own document, once");
+        assert_eq!(
+            harness.analysis.defining_documents(&wanted)["admin_resources"],
+            std::slice::from_ref(&helpers)
+        );
+
+        // The routes file moves: one document read again, the macro's file not parsed.
+        harness.open(&routes, drawn);
+        let (macros, defining) = reads(&harness);
+        harness.change(
+            &routes,
+            "Rails.application.routes.draw do\n  admin_resources :posts\n  admin_resources :tags\nend\n",
+        );
+        assert_eq!(reads(&harness), (macros, defining + 1));
+
+        // The macro's file moves alone, on no list: the pass runs, parses it again and reads it
+        // alone.
+        harness.open(&helpers, written);
+        let (macros, defining) = reads(&harness);
+        harness.change(&helpers, &format!("# Routing helpers.\n{written}"));
+        assert_eq!(reads(&harness), (macros + 1, defining + 1));
+
+        // Its `def` gone, nothing writes the name any more.
+        harness.change(&helpers, "# Routing helpers.\n");
+        assert!(harness.analysis.defining_documents(&wanted).is_empty());
+    }
+
+    /// What a project helper a routes file calls does bounds the route it draws: a helper handing
+    /// its argument to `resources` may reach only that resource's controller, so `comments`' own
+    /// route still proves `:id`. An edit to the helper's file alone, which no list names, moves
+    /// that at the next settle: a helper that is no macro may reach any controller.
+    #[test]
+    fn an_edit_to_a_routes_helper_alone_moves_the_proof() {
+        let source = "\
+class CommentsController < ActionController::Base
+  def show
+    id = params[:id]
+  end
+end
+";
+        let (mut harness, _schema, _uri) = rails_project("");
+        harness.write("lib/bundle.rb", BUNDLE);
+        harness.write(
+            "lib/actionpack.rb",
+            &format!(
+                "{ACTIONPACK}module ActionDispatch\n  module Http\n    class UploadedFile\n    \
+                 end\n  end\nend\nclass Symbol\nend\n"
+            ),
+        );
+        harness.write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :comments, only: :show\n  \
+             admin_resources :posts\nend\n",
+        );
+        let written = "def admin_resources(name)\n  resources name\nend\n";
+        let helpers = harness.write("config/route_helpers.rb", written);
+        let uri = harness.write("app/controllers/comments_controller.rb", source);
+        harness.index();
+        let proven = "    id: String = params[:id]";
+        let before = drawn_hints(source, &harness.hints_in(&uri));
+        assert!(before.contains(proven), "{before}");
+
+        harness.open(&helpers, written);
+        harness.change(&helpers, "def admin_resources(name)\n  get name\nend\n");
+        let after = drawn_hints(source, &harness.hints_in(&uri));
+        assert!(!after.contains(proven), "{after}");
+    }
+
+    /// A key every route reaching the read requires is a `String`, and one a route's default gives
+    /// is that default's class: `show` runs only under `/posts/:id`, `feed` under a default
+    /// `id: :latest`. `index` has no `:id`, and neither has a helper `index` calls.
+    #[test]
+    fn a_required_route_segment_is_a_string() {
+        let source = "\
+class PostsController < ActionController::Base
+  before_action :load, only: :show
+
+  def show
+    id = params[:id]
+    required = params.require(:id)
+    other = params[:page]
+  end
+
+  def feed
+    latest = params[:id]
+  end
+
+  def index
+    helper
+  end
+
+  private
+
+  def load
+    loaded = params[:id]
+  end
+
+  def helper
+    unproven = params[:id]
+  end
+end
+";
+        let (mut harness, _schema, _uri) = rails_project("");
+        harness.write("lib/bundle.rb", BUNDLE);
+        harness.write(
+            "lib/actionpack.rb",
+            &format!(
+                "{ACTIONPACK}module ActionDispatch\n  module Http\n    class UploadedFile\n    \
+                 end\n  end\nend\nclass Symbol\nend\n"
+            ),
+        );
+        harness.write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :posts, only: %i[index show]\n  \
+             get \"feed\", to: \"posts#feed\", id: :latest\nend\n",
+        );
+        let uri = harness.write("app/controllers/posts_controller.rb", source);
+        harness.index();
+        let union = "String? | Integer | Float | Array | ActionController::Parameters | \
+                     ActionDispatch::Http::UploadedFile | bool";
+        let defaulted = "String? | Integer | Float | Array | ActionController::Parameters | \
+                         ActionDispatch::Http::UploadedFile | Symbol | bool";
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            // A key nothing proves is the union with every class a route's default gives it.
+            format!(
+                "  def show -> {union}
+    id: String = params[:id]
+    required: String = params.require(:id)
+    other: {union} = params[:page]
+  def feed -> Symbol
+    latest: Symbol = params[:id]
+  def index -> {defaulted}
+  def load -> String
+    loaded: String = params[:id]
+  def helper -> {defaulted}
+    unproven: {defaulted} = params[:id]"
+            )
+        );
+    }
+
+    /// What can give a key something else is read only from files the application loads (a
+    /// spec's write is the suite's), a module's write counts in the controllers that include it,
+    /// and routes are read through the files a `draw` names and the project's own routing
+    /// macros. With routes off nothing a route gives a key is read, so nothing answers.
+    #[test]
+    fn the_request_gates_read_what_the_application_loads() {
+        let source = "\
+module Admin
+  class PostsController < ApplicationController
+    include Loading
+
+    def show
+      id = params[:id]
+      kind = params[:kind]
+    end
+  end
+end
+";
+        let drawn = |config: &str| {
+            let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], config);
+            harness.write("lib/bundle.rb", BUNDLE);
+            harness.write(
+                "lib/actionpack.rb",
+                &format!(
+                    "{ACTIONPACK}module ActionDispatch\n  module Http\n    class UploadedFile\n    \
+                     end\n  end\nend\nclass Symbol\nend\n"
+                ),
+            );
+            harness.write(
+                "config/routes.rb",
+                "Rails.application.routes.draw do\n  draw :admin\n  listed :reports\nend\n",
+            );
+            harness.write(
+                "config/routes/admin.rb",
+                "namespace :admin do\n  resources :posts, only: :show\nend\n",
+            );
+            harness.write(
+                "lib/routing.rb",
+                "module Routing\n  def listed(name)\n    resources name, only: :index\n  end\nend\n",
+            );
+            harness.write(
+                "app/controllers/concerns/loading.rb",
+                "module Loading\n  def load_it\n    params[:kind] = :loaded\n  end\nend\n",
+            );
+            harness.write(
+                "spec/controllers/posts_spec.rb",
+                "class Admin::PostsController\n  def tweak\n    params[:id] = :x\n  end\nend\n",
+            );
+            harness.write(
+                "app/controllers/application_controller.rb",
+                "class ApplicationController < ActionController::Base\nend\n",
+            );
+            let uri = harness.write("app/controllers/admin/posts_controller.rb", source);
+            harness.index();
+            drawn_hints(source, &harness.hints_in(&uri))
+        };
+        let union = "String? | Integer | Float | Array | ActionController::Parameters | \
+                     ActionDispatch::Http::UploadedFile | Symbol | bool";
+        assert_eq!(
+            drawn(""),
+            format!(
+                "    def show -> {union}
+      id: String = params[:id]
+      kind: {union} = params[:kind]"
+            )
+        );
+        assert_eq!(drawn("[rails]\nroutes = false\n"), "null");
+    }
+
     /// A controller's `cookies` is private in actionpack, and its signature says so, so it stays
     /// private whichever definition rubydex reads its visibility from.
     /// A controller's `helpers`, and its class object's, reach the application's helper modules
@@ -6635,7 +7435,7 @@ end
         harness.write(
             "lib/helpers.rb",
             "module ActionView\n  module Helpers\n    module SanitizeHelper\n      \
-             def strip_tags(html)\n        html.to_s\n      end\n    end\n    \
+             def strip_tags(html)\n        html\n      end\n    end\n    \
              include SanitizeHelper\n  end\n\n  class Base\n    include Helpers\n  end\nend\n\n\
              module ActionController\n  module Helpers\n    def helpers\n      \
              @_helper_proxy ||= view_context\n    end\n  end\n\n  class Base\n    \
@@ -6664,10 +7464,12 @@ stripped = ActionController::Base.helpers.strip_tags(\"<b>x</b>\")
             drawn_hints(source, &harness.hints_in(&uri)),
             "\
 proxy: ActionView::Base = ApplicationController.helpers
-cover: String = ApplicationController.helpers.cover_url(1)"
+cover: String = ApplicationController.helpers.cover_url(1)
+stripped: String = ActionController::Base.helpers.strip_tags(\"<b>x</b>\")"
         );
-        // The framework's own helper, through `ActionView::Base`. Its body hands back what its
-        // literal argument is, which the margin leaves to the line; the card says it.
+        // The framework's own helper, through `ActionView::Base`. Its body hands back what the
+        // call passes. Its one caller names neither `ActionView::Base` nor the helper, so the card
+        // types no parameter.
         let stripped = card(&mut harness, &uri, source, "strip_tags");
         assert!(
             stripped.contains("ActionView::Helpers::SanitizeHelper#strip_tags(html) -> String"),
@@ -6682,6 +7484,48 @@ cover: String = ApplicationController.helpers.cover_url(1)"
         assert!(
             definition.to_string().contains("lib/helpers.rb"),
             "{definition}"
+        );
+    }
+
+    /// A Sidekiq worker's `perform` runs with what JSON hands back and a channel's actions with
+    /// what a client sends, so their callers say nothing about their parameters; a helper beside
+    /// them is what its callers pass.
+    #[test]
+    fn a_method_a_framework_calls_is_not_typed_by_its_callers() {
+        let (mut harness, _schema, _uri) = rails_project("");
+        harness.write(
+            "lib/frameworks.rb",
+            "module Sidekiq\n  module Job\n  end\nend\n\n\
+             module ActionCable\n  module Channel\n    class Base\n    end\n  end\nend\n",
+        );
+        let source = "\
+class HardJob
+  include Sidekiq::Job
+
+  def perform(count)
+    count
+  end
+
+  def helper(count)
+    count
+  end
+end
+
+class ChatChannel < ActionCable::Channel::Base
+  def speak(data)
+    data
+  end
+end
+
+HardJob.new.perform(1)
+HardJob.new.helper(1)
+ChatChannel.new.speak(1)
+";
+        let uri = harness.write("app/jobs/hard_job.rb", source);
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def helper(count) -> Integer"
         );
     }
 

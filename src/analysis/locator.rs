@@ -745,6 +745,30 @@ pub fn type_of(
     Some(((start, end), class_of(sources.graph, &typed)?))
 }
 
+/// The local, block parameter or method parameter under the cursor ([`cursor::local_at`]): its
+/// span, what it holds, and whether it is the parameter itself (in its `def`'s header, or a read
+/// nothing has written since), whose card says what its callers left out.
+#[must_use]
+pub fn local_type(
+    sources: &types::Sources<'_>,
+    uri_id: UriId,
+    text: &cursor::Parsed<'_>,
+    offset: u32,
+    scope_at: u32,
+    rebase: &Rebase,
+) -> Option<((u32, u32), types::Typed, bool)> {
+    let (start, end, receiver, local) = cursor::local_at(text, offset)?;
+    let receiver = receiver.rebased(rebase)?;
+    let scope = types::Scope::at(sources.graph, uri_id, scope_at);
+    let typed = types::method_receiver(sources, uri_id, &receiver, &scope)?;
+    let parameter = match local {
+        cursor::Local::Parameter => true,
+        cursor::Local::Read => types::reads_a_parameter(sources, uri_id, &receiver),
+        cursor::Local::Binding => false,
+    };
+    Some(((start, end), typed, parameter))
+}
+
 /// What the call under the cursor returns, for a card whose method declares nothing.
 ///
 /// - **Only a call**, and only with the cursor in its message name ([`cursor::type_of`]'s rule):
@@ -1270,7 +1294,16 @@ fn typed(
                         .unwrap_or_else(|| by_name(graph, &member, ClassObject::No, privacy)),
                 );
             }
-            _ => {}
+            Some(Some(_)) => {}
+            // **A name a module's instance method calls on `self` that the module lacks** is each
+            // running class's own member ([`types::self_runners`]), as the call's type reads it.
+            None => {
+                if let Some(answer) = types::self_runners(sources, uri_id, located.start, &member)
+                    .and_then(|typed| on_each(sources, uri_id, &typed, &member))
+                {
+                    return Some(answer);
+                }
+            }
         }
     }
     Some(match &context {
@@ -1343,7 +1376,7 @@ fn on_a_typed_receiver(
     };
     let mut declarations = Vec::new();
     for on in classes {
-        match types::member_of(sources, uri_id, on, StringId::from(member)) {
+        match types::member_past_the_root(sources, uri_id, on, StringId::from(member)) {
             // **Gated like the resolved rung above.** This is where upstream's looseness lands:
             // `Vault.new.secret` types the receiver from the constructor, then asks for a
             // member the interpreter refuses. A *Derived* card still claims the code can make
@@ -1356,14 +1389,12 @@ fn on_a_typed_receiver(
             // declaration the arm never saw, reaches the same `def`, and answers `precise`,
             // which `resolve_typed` does not fence. Example: `Widget` with
             // `String.class_eval { def self.configure }` in the workspace would answer
-            // *Resolved* `Object#configure`.
+            // *Resolved* `Object#configure`. The walk goes on past such a member instead
+            // (`types::member_past_the_root`), so `Widget.new.freeze` is still `Kernel#freeze`.
             //
             // **One class failing a gate leaves the name rung**, so the answer never rests on
             // some of a union's classes.
-            Some(found)
-                if declared_on_the_root(graph, Some(&sources.memo.blocks), found)
-                    && privacy.admits(graph, found) =>
-            {
+            Some(found) if privacy.admits(graph, found) => {
                 if !declarations.contains(&found) {
                     declarations.push(found);
                 }
@@ -1424,13 +1455,9 @@ fn on_each(
     typed: &types::Typed,
     member: &str,
 ) -> Option<Resolution> {
-    let graph = sources.graph;
     let mut declarations = Vec::new();
     for &on in typed.classes() {
-        let found = types::member_of(sources, uri_id, on, StringId::from(member))?;
-        if !declared_on_the_root(graph, Some(&sources.memo.blocks), found) {
-            return None;
-        }
+        let found = types::member_past_the_root(sources, uri_id, on, StringId::from(member))?;
         if !declarations.contains(&found) {
             declarations.push(found);
         }
@@ -2901,7 +2928,7 @@ impl<'a> Blocks<'a> {
     }
 
     /// Whether this one `def` has a block between it and the body it is filed on.
-    fn written_in_a_block(&self, graph: &Graph, definition: &Definition) -> bool {
+    pub(super) fn written_in_a_block(&self, graph: &Graph, definition: &Definition) -> bool {
         let mut inside = self.inside.borrow_mut();
         let found = inside
             .entry(*definition.uri_id())
@@ -3013,6 +3040,56 @@ pub(super) fn declared_on_the_root(
     blocks.is_none_or(|blocks| !blocks.only_in_blocks(graph, answer))
 }
 
+/// The member Ruby really finds where [`declared_on_the_root`] withdrew `withdrawn`: `owner`'s
+/// walk, resumed past the root that holds it.
+///
+/// - **A `def` written in a block is not on the root at all.** rubydex files it on `Object`, but
+///   Ruby defines it on whatever the block runs on (`Struct.new(:x) { def freeze; end }` is the
+///   struct's), so `Object` lacks it and the lookup goes on to `Kernel`. `Foo.new.freeze` is
+///   `Kernel#freeze`, whatever a gem writes in such a block.
+/// - **Past every member the walk would step over too**: another block-written one, and one only
+///   the suite loads ([`loaded_member_in`]'s fence).
+/// - **A module's walk is `Object`'s** once its own ancestors lack the root ([`find_member`]).
+/// - `None` where nothing past the root has the member, or the walk never reached it.
+pub(crate) fn past_the_root(
+    graph: &Graph,
+    fence: environment::Fence<'_>,
+    blocks: &Blocks<'_>,
+    owner: DeclarationId,
+    member: StringId,
+    withdrawn: DeclarationId,
+) -> Option<DeclarationId> {
+    let root = *graph.declarations().get(&withdrawn)?.owner_id();
+    let walk = |of: DeclarationId| -> Option<Vec<DeclarationId>> {
+        let namespace = graph.declarations().get(&of)?.as_namespace()?;
+        Some(
+            namespace
+                .ancestors()
+                .iter()
+                .filter_map(|ancestor| match ancestor {
+                    Ancestor::Complete(id) => Some(*id),
+                    Ancestor::Partial(_) => None,
+                })
+                .collect(),
+        )
+    };
+    let mut ancestors = walk(owner)?;
+    if !ancestors.contains(&root) && is_module(graph, owner) {
+        ancestors = walk(DeclarationId::from(ROOTS[0]))?;
+    }
+    let at = ancestors.iter().position(|id| *id == root)?;
+    ancestors[at + 1..].iter().find_map(|id| {
+        let found = *graph
+            .declarations()
+            .get(id)?
+            .as_namespace()?
+            .members()
+            .get(&member)?;
+        let loaded = !fence.on_trees() || fence.loadable(graph, found);
+        (loaded && declared_on_the_root(graph, Some(blocks), found)).then_some(found)
+    })
+}
+
 fn resolve_call(
     graph: &Indexed,
     reference: &MethodRef,
@@ -3081,7 +3158,16 @@ fn resolve_call(
                 // gem's real `ActiveRecord::Migration#execute`, and `resolve_typed` fences the
                 // spec's copy out again, so the reader gets a *Guessed* card naming the right
                 // method instead of a *Resolved* card naming the wrong one.
-                if fence.loadable_on_a_root(graph, answer)
+                // A member only blocks write is not on the root at all: Ruby's walk goes on past it
+                // ([`past_the_root`]), and the answer found there passes the same gates.
+                let answer = match blocks {
+                    Some(blocks) if !declared_on_the_root(graph, Some(blocks), answer) => {
+                        past_the_root(graph, fence, blocks, owner, member_id, answer)
+                    }
+                    _ => Some(answer),
+                };
+                if let Some(answer) = answer
+                    && fence.loadable_on_a_root(graph, answer)
                     && declared_on_the_root(graph, blocks, answer)
                     && privacy.admits(graph, answer)
                 {

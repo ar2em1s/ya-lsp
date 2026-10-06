@@ -1,4 +1,4 @@
-//! What a controller surely runs before an action (backlog 60): the `before_action`s each body
+//! What a controller surely runs before an action: the `before_action`s each body
 //! writes, less the `skip_before_action`s that may take one back, read from each class's and
 //! module's own statements.
 //!
@@ -19,6 +19,9 @@
 //!
 //! **An action that is itself a callback's method** (any `*_action` naming it) may run as one,
 //! before the others, so nothing runs surely before it.
+//!
+//! Also what a callback, a validation or another macro does with a method's name it is passed
+//! ([`spelled_use`]), which the types table asks to read a spelled name as a caller or as none.
 
 use std::collections::BTreeSet;
 
@@ -292,6 +295,149 @@ pub fn runs_before(chain: &[Option<&Callbacks>], loose: &Callbacks, action: &str
     methods
 }
 
+/// What Rails does with a method's name one of its macros is passed ([`spelled_use`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameUse {
+    /// It reads, filters or defines by the name, and calls nothing by it.
+    Named,
+    /// It calls the method with no arguments on an object of the class whose body writes the
+    /// macro: ActiveSupport's callbacks `send` a symbol with nothing, and so do their `if:` and
+    /// `unless:`, and a validation reads each attribute it names.
+    CalledBare,
+}
+
+/// The macros that add a callback around an action, or a record's or a model's own.
+const CALLED_BARE: [&str; 33] = [
+    "before_action",
+    "prepend_before_action",
+    "append_before_action",
+    "after_action",
+    "prepend_after_action",
+    "append_after_action",
+    "around_action",
+    "prepend_around_action",
+    "append_around_action",
+    "before_validation",
+    "after_validation",
+    "before_save",
+    "around_save",
+    "after_save",
+    "before_create",
+    "around_create",
+    "after_create",
+    "before_update",
+    "around_update",
+    "after_update",
+    "before_destroy",
+    "around_destroy",
+    "after_destroy",
+    "after_commit",
+    "after_rollback",
+    "after_create_commit",
+    "after_update_commit",
+    "after_destroy_commit",
+    "after_save_commit",
+    "after_initialize",
+    "after_find",
+    "after_touch",
+    "validate",
+];
+
+/// The macros that take a callback back by its name.
+const UNCALLED_SKIPS: [&str; 4] = [
+    "skip_before_action",
+    "skip_after_action",
+    "skip_around_action",
+    "skip_callback",
+];
+
+/// Whether `method` is a callback macro (a controller's, a model's, `validate`) or one that takes a
+/// callback back: written for what it registers, never for what it returns.
+pub(super) fn names_a_callback(method: &str) -> bool {
+    CALLED_BARE.contains(&method) || UNCALLED_SKIPS.contains(&method)
+}
+
+/// The macros that define a method by each name they are passed, or name an association, a
+/// template or an action: Rails calls nothing by any name written in them.
+const NAMING: [&str; 25] = [
+    "belongs_to",
+    "has_many",
+    "has_one",
+    "has_and_belongs_to_many",
+    "scope",
+    "enum",
+    "attribute",
+    "store",
+    "store_accessor",
+    "serialize",
+    "has_secure_password",
+    "has_one_attached",
+    "has_many_attached",
+    "has_rich_text",
+    "accepts_nested_attributes_for",
+    "attr_readonly",
+    "encrypts",
+    "normalizes",
+    "delegated_type",
+    "define_attribute_methods",
+    "render",
+    "redirect_to",
+    "url_for",
+    "protect_from_forgery",
+    "skip_forgery_protection",
+];
+
+/// What Rails does with a method's name `call` is passed, as a positional (`key` `None`) or under
+/// `key`; `routes` says the call is in a file the router draws, whose every name is a route's,
+/// an action's or a controller's. `None` where this does not say.
+///
+/// - **A callback** (an action's, a record's, `validate`) and its `if:` and `unless:` call the
+///   method with nothing; `only:`, `except:` and `on:` name actions or contexts.
+/// - **A validation** reads each attribute it names with nothing; a `scope:` is read as a column
+///   or an association.
+/// - **A skip** names a callback; **an association, a scope, an enum, an attribute** define methods
+///   by their names; **`render` and `redirect_to`** name templates and actions. Their `if:` and
+///   `unless:` are still callbacks; an association's `dependent:` is called on another object,
+///   which this does not say.
+#[must_use]
+pub fn spelled_use(call: &str, key: Option<&str>, routes: bool) -> Option<NameUse> {
+    if routes {
+        return Some(NameUse::Named);
+    }
+    let validation = call == "validates" || call == "validates_each" || {
+        call.starts_with("validates_") && call.ends_with("_of")
+    };
+    let condition = matches!(key, Some("if" | "unless"));
+    if condition && (CALLED_BARE.contains(&call) || UNCALLED_SKIPS.contains(&call) || validation) {
+        return Some(NameUse::CalledBare);
+    }
+    if CALLED_BARE.contains(&call) {
+        return match key {
+            None => Some(NameUse::CalledBare),
+            Some("only" | "except" | "on" | "prepend") => Some(NameUse::Named),
+            Some(_) => None,
+        };
+    }
+    if validation {
+        return match key {
+            None => Some(NameUse::CalledBare),
+            Some("on" | "message" | "in" | "within" | "scope") => Some(NameUse::Named),
+            Some(_) => None,
+        };
+    }
+    if UNCALLED_SKIPS.contains(&call) {
+        return Some(NameUse::Named);
+    }
+    if NAMING.contains(&call) {
+        return match key {
+            Some("dependent") => None,
+            Some("if" | "unless") => Some(NameUse::CalledBare),
+            _ => Some(NameUse::Named),
+        };
+    }
+    None
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
@@ -494,5 +640,36 @@ end
         );
         absorb(&mut joined, &named);
         assert!(runs_before(&[Some(&parent)], &joined, "index").is_empty());
+    }
+
+    #[test]
+    fn a_name_a_macro_is_passed_is_called_with_nothing_named_or_not_said() {
+        use NameUse::{CalledBare, Named};
+        for (call, key, routes, said) in [
+            ("before_action", None, false, Some(CalledBare)),
+            ("around_action", Some("if"), false, Some(CalledBare)),
+            ("after_save", Some("unless"), false, Some(CalledBare)),
+            ("validate", None, false, Some(CalledBare)),
+            ("before_action", Some("only"), false, Some(Named)),
+            ("after_commit", Some("on"), false, Some(Named)),
+            ("before_action", Some("with"), false, None),
+            ("validates", None, false, Some(CalledBare)),
+            ("validates_presence_of", None, false, Some(CalledBare)),
+            ("validates_each", Some("if"), false, Some(CalledBare)),
+            ("validates", Some("scope"), false, Some(Named)),
+            ("validates", Some("inclusion"), false, None),
+            ("skip_before_action", None, false, Some(Named)),
+            ("skip_before_action", Some("if"), false, Some(CalledBare)),
+            ("has_many", Some("through"), false, Some(Named)),
+            ("has_many", Some("dependent"), false, None),
+            ("scope", Some("if"), false, Some(CalledBare)),
+            ("render", None, false, Some(Named)),
+            ("resources", Some("only"), true, Some(Named)),
+            ("get", None, true, Some(Named)),
+            ("get", None, false, None),
+            ("delegate", None, false, None),
+        ] {
+            assert_eq!(spelled_use(call, key, routes), said, "{call} {key:?}");
+        }
     }
 }

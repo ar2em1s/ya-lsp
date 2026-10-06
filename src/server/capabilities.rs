@@ -4,7 +4,7 @@
 //! editor show an empty result instead of falling back to its own heuristics, which is worse than
 //! not advertising at all.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use lsp_types::{
     CallHierarchyServerCapability, ClientCapabilities, CodeActionKind, CodeActionOptions,
@@ -350,7 +350,7 @@ const LOCALES_GLOB: &str = "**/config/locales/**/*.yml";
 /// later unregisters it must name the same one.
 const WATCHED_FILES_ID: &str = "ya-lsp-watched-files";
 
-/// Ask the client to watch the project's `ya-lsp.toml` and the files it indexes.
+/// Ask the client to watch the project's `ya-lsp.toml`, the files it indexes and its lockfile.
 ///
 /// The protocol has no static form for file watching (`initialize` cannot announce it), so
 /// `client/registerCapability` is the only way, and `None` here means the client did not say it
@@ -368,10 +368,17 @@ const WATCHED_FILES_ID: &str = "ya-lsp-watched-files";
 /// are read beside the graph, are not Ruby, and must never reach rubydex. Being constants makes
 /// them safe: this registration is made once, at `initialize`, so anything derived from reloadable
 /// configuration would be stale for the life of the process.
+///
+/// **The lockfiles come last, one watcher each** (`Workspace::lockfiles`): every lockfile Bundler
+/// could use, existing or not, since a fresh clone has none until `bundle install` writes it. They
+/// are as safe as the constants: the list follows `BUNDLE_GEMFILE`, which is read once, never the
+/// configuration. Each is watched from its own directory, so a `BUNDLE_GEMFILE` outside the project
+/// is watched too.
 #[must_use]
 pub fn watched_files(
     root: &Path,
     index: &IndexConfig,
+    lockfiles: &[PathBuf],
     capabilities: &ClientCapabilities,
 ) -> Option<Registration> {
     let watched = capabilities
@@ -383,24 +390,34 @@ pub fn watched_files(
         return None;
     }
     let relative = watched.relative_pattern_support == Some(true);
+    let project = [
+        CONFIG_FILE_NAME,
+        SCHEMA_DUMP_GLOB,
+        DATABASE_CONFIG_GLOB,
+        LOCALES_GLOB,
+    ]
+    .into_iter()
+    .chain(index.include.iter().map(String::as_str))
+    .map(|pattern| watch_glob(root, pattern, relative));
+    let lockfiles = lockfiles.iter().map(|lockfile| {
+        // Both fall back only for a path no lockfile list holds: `gems::lockfiles` joins a file
+        // name onto a directory.
+        let directory = lockfile.parent().unwrap_or(root);
+        let name = lockfile.file_name().unwrap_or_default().to_string_lossy();
+        watch_glob(directory, &name, relative)
+    });
     let options = DidChangeWatchedFilesRegistrationOptions {
-        watchers: [
-            CONFIG_FILE_NAME,
-            SCHEMA_DUMP_GLOB,
-            DATABASE_CONFIG_GLOB,
-            LOCALES_GLOB,
-        ]
-        .into_iter()
-        .chain(index.include.iter().map(String::as_str))
-        .map(|pattern| FileSystemWatcher {
-            glob_pattern: watch_glob(root, pattern, relative),
-            // All three kinds, which is what omitting `kind` means. A deleted `ya-lsp.toml` is
-            // a configuration change (back to defaults), and so is one written for the first
-            // time; a deleted `.rb` is the one case the index cannot learn any other way, since
-            // nothing else says a declaration has gone.
-            kind: None,
-        })
-        .collect(),
+        watchers: project
+            .chain(lockfiles)
+            .map(|glob_pattern| FileSystemWatcher {
+                glob_pattern,
+                // All three kinds, which is what omitting `kind` means. A deleted `ya-lsp.toml` is
+                // a configuration change (back to defaults), and so is one written for the first
+                // time; a deleted `.rb` is the one case the index cannot learn any other way, since
+                // nothing else says a declaration has gone.
+                kind: None,
+            })
+            .collect(),
     };
     Some(Registration {
         id: WATCHED_FILES_ID.to_owned(),
@@ -1001,7 +1018,7 @@ mod tests {
             include: vec!["**/*.rb".to_owned(), "sig/**/*.rbs".to_owned()],
             ..IndexConfig::default()
         };
-        let registration = watched_files(root, &index, &watching(Some(true), None))
+        let registration = watched_files(root, &index, &[], &watching(Some(true), None))
             .expect("a watcher is registered");
         assert_eq!(registration.method, "workspace/didChangeWatchedFiles");
         assert_eq!(registration.id, WATCHED_FILES_ID);
@@ -1053,6 +1070,7 @@ mod tests {
         let registration = watched_files(
             root,
             &IndexConfig::default(),
+            &[],
             &watching(Some(true), Some(true)),
         )
         .expect("a watcher is registered");
@@ -1093,12 +1111,65 @@ mod tests {
         let registration = watched_files(
             Path::new("."),
             &IndexConfig::default(),
+            &[],
             &watching(Some(true), Some(true)),
         )
         .expect("a watcher is registered");
         assert_eq!(
             watchers(&registration)[0].glob_pattern,
             GlobPattern::String("./ya-lsp.toml".to_owned())
+        );
+    }
+
+    #[test]
+    fn every_lockfile_is_watched_from_its_own_directory() {
+        // Without these, a `bundle install` adds gems nothing ever indexes: gem discovery runs once
+        // per session. Every lockfile Bundler could use, after everything else, and each from its
+        // own directory, because `BUNDLE_GEMFILE` may name one outside the project.
+        let root = Path::new("/tmp/ya-lsp-watch/project");
+        let elsewhere = Path::new("/tmp/ya-lsp-watch/shared");
+        let lockfiles = [
+            elsewhere.join("Gemfile.ci.lock"),
+            root.join("Gemfile.lock"),
+            root.join("gems.locked"),
+        ];
+        let tail = |capabilities: &ClientCapabilities| -> Vec<GlobPattern> {
+            let registration =
+                watched_files(root, &IndexConfig::default(), &lockfiles, capabilities)
+                    .expect("a watcher is registered");
+            let watchers = watchers(&registration);
+            watchers[watchers.len() - lockfiles.len()..]
+                .iter()
+                .map(|watcher| watcher.glob_pattern.clone())
+                .collect()
+        };
+
+        assert_eq!(
+            tail(&watching(Some(true), None)),
+            vec![
+                GlobPattern::String("/tmp/ya-lsp-watch/shared/Gemfile.ci.lock".to_owned()),
+                GlobPattern::String("/tmp/ya-lsp-watch/project/Gemfile.lock".to_owned()),
+                GlobPattern::String("/tmp/ya-lsp-watch/project/gems.locked".to_owned()),
+            ]
+        );
+        let relative = |base: &Path, pattern: &str| {
+            GlobPattern::Relative(RelativePattern {
+                base_uri: OneOf::Right(
+                    DocUri::from_path(base)
+                        .expect("an absolute directory")
+                        .to_lsp()
+                        .expect("a uri"),
+                ),
+                pattern: pattern.to_owned(),
+            })
+        };
+        assert_eq!(
+            tail(&watching(Some(true), Some(true))),
+            vec![
+                relative(elsewhere, "Gemfile.ci.lock"),
+                relative(root, "Gemfile.lock"),
+                relative(root, "gems.locked"),
+            ]
         );
     }
 
@@ -1110,11 +1181,12 @@ mod tests {
         // branches and seeing nothing happen.
         let root = Path::new("/tmp/ya-lsp-watch/project");
         let index = IndexConfig::default();
-        assert!(watched_files(root, &index, &ClientCapabilities::default()).is_none());
+        assert!(watched_files(root, &index, &[], &ClientCapabilities::default()).is_none());
         assert!(
             watched_files(
                 root,
                 &index,
+                &[],
                 &ClientCapabilities {
                     workspace: Some(lsp_types::WorkspaceClientCapabilities::default()),
                     ..ClientCapabilities::default()
@@ -1123,9 +1195,9 @@ mod tests {
             .is_none(),
             "a workspace section that says nothing about watched files is still a no"
         );
-        assert!(watched_files(root, &index, &watching(Some(false), None)).is_none());
+        assert!(watched_files(root, &index, &[], &watching(Some(false), None)).is_none());
         assert!(
-            watched_files(root, &index, &watching(None, Some(true))).is_none(),
+            watched_files(root, &index, &[], &watching(None, Some(true))).is_none(),
             "relative patterns without dynamic registration are not an offer to watch"
         );
     }

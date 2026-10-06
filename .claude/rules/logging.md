@@ -23,7 +23,8 @@ lines are product, and `captured_logs` asserts them.
 
 ## Every request writes two lines
 
-Both are written in `Analysis::serve`, the one door every method goes through:
+Both are written in `Analysis::serve`, the one door every method goes through, or in
+`Analysis::supersede`, the door a held hint request leaves by without being computed:
 
 1. **`request`:** method, id, document, position, and whether the graph was behind the buffer.
 2. **`answered`:** method, id, outcome, `settled`, `retried`, `drained`, `elapsed`.
@@ -31,7 +32,12 @@ Both are written in `Analysis::serve`, the one door every method goes through:
    - `drained` means a cold server indexed the queued bundle first.
    - Keep the outcomes `nothing` (`null`) and `empty` (an empty list) distinct. They are fixed in
      different modules.
-   - A cancelled request uses the same shape.
+   - A cancelled request uses the same shape, and so does `superseded` (a held hint request a newer
+     one for the same range replaced).
+
+**A held `inlayHint` writes one line more**, `held until the edit settles`, when the run loop sets it
+aside (`Analysis::hold`). Its pair is written when it is answered, so without that line the wait
+before the pair is invisible.
 
 `every_method_says_it_arrived_and_says_what_it_answered` reads the method list out of `dispatch`
 itself. Never copy the list into the test.

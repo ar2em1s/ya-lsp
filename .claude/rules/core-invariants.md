@@ -12,8 +12,8 @@ paths:
 1. **Only `analysis/` may name a rubydex type.** rubydex's API churns, and this keeps the blast
    radius to one directory.
 2. **`analysis/mod.rs` is the thread, and `analysis/requests.rs` is the request layer.** Sibling files
-   see each other's private items. Only `Analysis::serve`, `own_documents` and `file_name` are
-   `pub(super)`.
+   see each other's private items. Only `Analysis::serve`, `Analysis::supersede` (a held hint
+   request answered without being computed), `own_documents` and `file_name` are `pub(super)`.
 3. **A test lives next to the code whose invariant it would break.** `analysis/testing.rs`'s
    `Harness` exposes only plain values (`has`, `declarations_of`, `generated_for`,
    `document_count`). A test that needs more is a test of the analysis thread, and belongs in

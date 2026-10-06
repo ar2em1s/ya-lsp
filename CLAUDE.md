@@ -113,14 +113,15 @@ src/
     i18n.rs          i18n's words and the locale files' reader: what each key holds, and where
     rails/           every Rails word in the crate: schema, structure.sql, models,
                      associations, relations, concerns, enums, attributes, delegates,
-                     the tail of 17 macro families, routes, entrypoints, framework,
+                     the tail of 17 macro families, routes, request params, entrypoints, framework,
                      migrations, layouts, conventions, renders (partials and their locals),
-                     callbacks (a controller's before_action), current attributes,
-                     connection adapters, blocks, inflector
+                     callbacks (a controller's before_action, what a macro does with a
+                     method's name), current attributes, connection adapters, blocks, inflector
 scripts/             coverage.sh, canary.py, corpora.py + corpora.toml, audit/
 audit/               committed audit ledger and baseline (integers, paths, hashes only)
 vendor/rbs/          Ruby's RBS signatures, embedded by build.rs
 tests/               lifecycle.rs, vscode_manifest.rs, claude_plugin.rs
+.cargo/              config.toml + prism/: prism's C allocates through mimalloc on macOS and Linux
 editors/vscode/      the VS Code extension (TypeScript)
 editors/claude-code/ the Claude Code plugin (three JSON files and a setup skill)
 .claude-plugin/      the repository's own plugin marketplace
@@ -204,7 +205,7 @@ make ext-install / ext-test / ext-lint   # the VS Code extension
 Three facts about these targets:
 
 1. **Coverage gates** are 95% of lines and branches project-wide, 90% of lines per file, and 100%
-   in 53 named modules. `coverage.md` has the details.
+   in 56 named modules. `coverage.md` has the details.
 2. **No corpus source text is ever committed.** `make canary`, `make corpora` and `make audit`
    read corpora under `tmp/corpora/`, which is gitignored (`corpora.md`).
 3. **The extension's `contract.test.ts` skips itself when no built `ya-lsp` exists**, so build the

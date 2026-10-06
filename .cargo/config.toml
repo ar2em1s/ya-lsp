@@ -1,0 +1,18 @@
+# **prism allocates through mimalloc where the C compiler is Clang or GCC**
+# (`prism/prism_xallocator.h` says why). prism reads its allocator from that header when
+# `PRISM_XALLOCATOR` is defined; the include path finds it.
+#
+# - **Per target, and only the four built with Clang or GCC.** `cc` adds `CFLAGS_<target>` to that
+#   target's C builds alone, so the Windows targets (MSVC) build prism on the system allocator as
+#   before, and so does any target not listed. Only the speed differs.
+# - **Every C library in the build gets the define and the path**: prism alone reads either
+#   (`libprism.a` calls `mi_*`; `librbs.a` and `libmimalloc.a` call what they did).
+# - **Forced**: a `C_INCLUDE_PATH` set in the environment is replaced inside cargo's builds, or
+#   prism would fail to find the header. None of the C here needs one.
+
+[env]
+C_INCLUDE_PATH = { value = ".cargo/prism", relative = true, force = true }
+CFLAGS_aarch64_apple_darwin = "-DPRISM_XALLOCATOR"
+CFLAGS_x86_64_apple_darwin = "-DPRISM_XALLOCATOR"
+CFLAGS_x86_64_unknown_linux_gnu = "-DPRISM_XALLOCATOR"
+CFLAGS_aarch64_unknown_linux_gnu = "-DPRISM_XALLOCATOR"

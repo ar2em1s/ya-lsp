@@ -21,7 +21,7 @@ migration trees**.
 
 | Key | Gates | Seam |
 | --- | --- | --- |
-| `rails.enabled` | all the rails keys below, plus the framework singletons, the controller context, the framework's block rows and `config`, what a migration sends to its connection, the connection adapter (`config/database.yml`), and file-move renames | registered-row filter |
+| `rails.enabled` | all the rails keys below, plus the framework singletons, the controller context, the framework's block rows and `config`, what a migration sends to its connection, the connection adapter (`config/database.yml`), a read off the request's `params` (also needs `rails.routes`), and file-move renames | registered-row filter |
 | `rails.schema` | `db/*schema.rb`, `db/*structure.sql`, `table_name` | `Schemas` + `Renamed` |
 | `rails.models` | associations, `enum`, `attribute`, `delegate`, the 17 tail macros, the query interface, concern class methods | `Models` + `Concerns` |
 | `rails.routes` | `config/routes.rb` and the helper module | `Routes` |

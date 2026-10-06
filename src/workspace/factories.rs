@@ -21,14 +21,33 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ruby_prism::{BlockNode, CallNode, ClassNode, DefNode, ModuleNode, Node, Visit, parse};
 
-use crate::generated::{At, Declared, Facts, Namespaces, Owner, Source, candidates};
+use crate::generated::{At, Declared, Facts, Namespaces, Owner, Runs, Source, candidates};
 use crate::workspace::rails::camelize;
 
 /// The module FactoryBot's strategy methods are defined on, which a project includes.
 pub const SYNTAX: &str = "FactoryBot::Syntax::Methods";
 
+/// The class whose instance runs a factory's block, a trait's and a `transient`'s.
+pub const PROXY: &str = "FactoryBot::DefinitionProxy";
+
+/// The class whose instance runs a callback's block.
+pub const RUNNER: &str = "FactoryBot::SyntaxRunner";
+
+/// The class whose instance (a subclass of it, made per factory) runs an attribute's block.
+pub const EVALUATOR: &str = "FactoryBot::Evaluator";
+
+/// The namespace of the class made for each factory's block ([`proxies`]).
+pub const FACTORIES: &str = "FactoryBot::Factories";
+
 /// Every constant this module names, for the pass to ask the bundle about.
-pub const CONSTANTS: [&str; 3] = ["FactoryBot", "FactoryBot::Syntax", SYNTAX];
+pub const CONSTANTS: [&str; 6] = [
+    "FactoryBot",
+    "FactoryBot::Syntax",
+    SYNTAX,
+    PROXY,
+    RUNNER,
+    EVALUATOR,
+];
 
 /// FactoryBot's strategies, `(name, the strategy it runs, what one built object is wrapped in)`:
 /// `create_list` runs `create` and hands back an `Array` of what it built.
@@ -73,6 +92,10 @@ pub struct Read {
     pub otherwise: bool,
     /// The strategies `FactoryBot.register_strategy` replaces, which build what the project says.
     pub registered: BTreeSet<String>,
+    /// For each factory whose name is not a literal, the factory it inherits from (the one it is
+    /// written in, or its literal `parent:`), or `None` where a `parent:` names one only Ruby
+    /// knows: its callbacks' objects may be any of that factory's.
+    pub unnamed: Vec<Option<String>>,
     /// The file it was read from, which the caller fills in: where a factory is written
     /// ([`Classes::places`]).
     pub uri: String,
@@ -91,6 +114,8 @@ pub struct Factory {
     pub class: Option<Named>,
     /// `parent:`, by name.
     pub parent: Option<String>,
+    /// Whether a `parent:` is written that is not a literal: whose child it is, only Ruby knows.
+    pub parent_unknown: bool,
     /// The factory it is written in, by index into [`Read::factories`]: its parent too.
     pub within: Option<usize>,
     /// Whether an `initialize_with` in its block, a trait's included, builds anything but
@@ -100,6 +125,40 @@ pub struct Factory {
     pub nesting: String,
     /// The whole `factory` call, and its name.
     pub at: At,
+    /// Where each call starts whose block its definition runs (its own `trait`s and
+    /// `transient`s included), and what runs it.
+    pub blocks: Vec<(u32, Ran)>,
+    /// Whether a block in it is handed to `send`, which may call a callback no [`Ran::Callback`]
+    /// lists.
+    pub sends: bool,
+}
+
+/// What runs a block written in a factory's definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ran {
+    /// A `trait` or a `transient`: the definition's proxy, as the factory's own block.
+    Proxy,
+    /// An `after`, a `before` or a `callback`: an object of the syntax runner, handed what was
+    /// built.
+    Callback(Callback),
+    /// An attribute's: the factory's evaluator.
+    Attribute,
+    /// Anything else (`sequence`, `initialize_with`, `to_create`, …): what runs it differs between
+    /// FactoryBot's releases, or is not one class.
+    Other,
+}
+
+/// One callback: which of the three it is written with, and what its block takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Callback {
+    /// `after`, `before` or `callback`.
+    pub method: String,
+    /// The names it is registered under (`after_create`), or `None` where one is not a literal.
+    pub names: Option<Vec<String>>,
+    /// Whether its block's parameters are at most two plain ones, which FactoryBot hands the object
+    /// and the evaluator. Anything else (a third, an optional, a `*rest`) changes what FactoryBot
+    /// hands it, by the block's arity.
+    pub plain: bool,
 }
 
 /// A class an option names.
@@ -123,6 +182,7 @@ pub fn read_factories(source: &str) -> Read {
         nesting: Vec::new(),
         defining: None,
         within: None,
+        proxied: None,
     };
     reader.visit(&result.node());
     reader.read
@@ -146,6 +206,9 @@ struct Reader<'s> {
     defining: Option<Defining>,
     /// The factory whose block the walk is in.
     within: Option<usize>,
+    /// The factory whose definition's proxy is `self` where the walk is: in its block, a trait's or
+    /// a `transient`'s, and not inside a block one of their calls is handed.
+    proxied: Option<usize>,
 }
 
 impl<'pr> Visit<'pr> for Reader<'_> {
@@ -180,10 +243,29 @@ impl<'pr> Visit<'pr> for Reader<'_> {
         }
         if bare && name == b"initialize_with" {
             self.constructor(node);
+            self.ran(node, Ran::Other);
             return;
         }
         if bare && name == b"factory" && self.defining.is_some() {
             self.factory(node);
+            return;
+        }
+        if bare
+            && let Some(index) = self.proxied
+            && let Some(ran) = self.dsl(node, index)
+        {
+            let proxied = ran == Ran::Proxy;
+            self.ran(node, ran);
+            let (defining, within) = (self.defining, self.within);
+            self.visit_arguments(node);
+            // Inside a block another object runs, a `factory` or an `initialize_with` is not
+            // FactoryBot's.
+            let (inner, proxy) = if proxied {
+                (defining, Some(index))
+            } else {
+                (None, None)
+            };
+            self.walk_as(node, inner, within, proxy);
             return;
         }
         ruby_prism::visit_call_node(self, node);
@@ -201,6 +283,18 @@ impl Reader<'_> {
 
     /// Walk a call's block as the given definition's.
     fn walk(&mut self, node: &CallNode<'_>, defining: Option<Defining>, within: Option<usize>) {
+        let proxied = within.filter(|_| defining == Some(Defining::Define));
+        self.walk_as(node, defining, within, proxied);
+    }
+
+    /// Walk a call's block as the given definition's, with the proxy as `self` or not.
+    fn walk_as(
+        &mut self,
+        node: &CallNode<'_>,
+        defining: Option<Defining>,
+        within: Option<usize>,
+        proxied: Option<usize>,
+    ) {
         let Some(body) = node
             .block()
             .and_then(|block| block.as_block_node())
@@ -208,10 +302,95 @@ impl Reader<'_> {
         else {
             return;
         };
-        let outer = (self.defining, self.within);
-        (self.defining, self.within) = (defining, within);
+        let outer = (self.defining, self.within, self.proxied);
+        (self.defining, self.within, self.proxied) = (defining, within, proxied);
         self.visit(&body);
-        (self.defining, self.within) = outer;
+        (self.defining, self.within, self.proxied) = outer;
+    }
+
+    /// A call's arguments, walked as where the call is written.
+    fn visit_arguments(&mut self, node: &CallNode<'_>) {
+        if let Some(arguments) = node.arguments() {
+            self.visit(&arguments.as_node());
+        }
+    }
+
+    /// What runs the block a call with no receiver hands, where the definition's proxy is `self`:
+    /// `None` for a call with no block written.
+    ///
+    /// The proxy undefines every method but a dozen, so any other name is an attribute's
+    /// (`method_missing`), whose block the evaluator runs.
+    fn dsl(&mut self, node: &CallNode<'_>, index: usize) -> Option<Ran> {
+        let block = node.block()?.as_block_node()?;
+        let name = node.name();
+        Some(match name.as_slice() {
+            b"trait" | b"transient" => Ran::Proxy,
+            b"after" | b"before" | b"callback" => Ran::Callback(Callback {
+                method: String::from_utf8_lossy(name.as_slice()).into_owned(),
+                names: self.callback_names(node),
+                plain: plain_parameters(&block),
+            }),
+            b"add_attribute" => Ran::Attribute,
+            b"send" | b"__send__" | b"public_send" => {
+                self.read.factories[index].sends = true;
+                Ran::Other
+            }
+            b"sequence"
+            | b"to_create"
+            | b"association"
+            | b"skip_create"
+            | b"traits_for_enum"
+            | b"ignore"
+            | b"method_missing"
+            | b"singleton_method_added"
+            | b"child_factories"
+            | b"__id__"
+            | b"nil?"
+            | b"object_id"
+            | b"extend"
+            | b"instance_eval"
+            | b"instance_exec"
+            | b"initialize"
+            | b"block_given?"
+            | b"raise"
+            | b"caller"
+            | b"method" => Ran::Other,
+            _ => Ran::Attribute,
+        })
+    }
+
+    /// The names a callback registers its block under: `after(:create)` is `after_create`,
+    /// `callback(:after_stub)` as written.
+    fn callback_names(&self, node: &CallNode<'_>) -> Option<Vec<String>> {
+        let prefix = match node.name().as_slice() {
+            b"after" => "after_",
+            b"before" => "before_",
+            _ => "",
+        };
+        let arguments = arguments_of(node);
+        if arguments.is_empty() {
+            return None;
+        }
+        arguments
+            .iter()
+            .map(|argument| self.literal(argument).map(|name| format!("{prefix}{name}")))
+            .collect()
+    }
+
+    /// Record where a call whose block the definition runs starts.
+    fn ran(&mut self, node: &CallNode<'_>, ran: Ran) {
+        let Some(index) = self.proxied else {
+            return;
+        };
+        if node
+            .block()
+            .and_then(|block| block.as_block_node())
+            .is_some()
+        {
+            self.read.factories[index]
+                .blocks
+                .push((node.location().start_offset() as u32, ran));
+        }
     }
 
     /// One `factory :name, …` and the factories written in its block. In a `modify` it defines
@@ -222,10 +401,22 @@ impl Reader<'_> {
             return;
         }
         let arguments = arguments_of(node);
+        let options = self.options(&arguments);
         let Some(name) = arguments.first().and_then(|first| self.literal(first)) else {
+            // A factory only Ruby names is no answer of its own, but it may inherit callbacks, so
+            // the factory above it must not be read as having every child it has.
+            let parent = match options.get("parent") {
+                Some(value) => self.literal(value),
+                None => self
+                    .within
+                    .map(|index| self.read.factories[index].name.clone()),
+            };
+            if options.contains_key("parent") || self.within.is_some() {
+                self.read.unnamed.push(parent);
+            }
+            self.walk_as(node, self.defining, self.within, self.proxied);
             return;
         };
-        let options = self.options(&arguments);
         let whole = node.location();
         let named = arguments[0].location();
         // A Symbol's name without its colon, a String's without its quotes.
@@ -247,9 +438,14 @@ impl Reader<'_> {
             aliases: self.aliases(&options),
             class: options.get("class").map(|value| self.named(value)),
             parent: options.get("parent").and_then(|value| self.literal(value)),
+            parent_unknown: options
+                .get("parent")
+                .is_some_and(|value| self.literal(value).is_none()),
             within: self.within,
             otherwise: false,
             nesting: self.nesting.join("::"),
+            blocks: Vec::new(),
+            sends: false,
         });
         let index = self.read.factories.len() - 1;
         self.walk(node, self.defining, Some(index));
@@ -366,6 +562,38 @@ fn is_constant(node: &Node<'_>) -> bool {
     node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some()
 }
 
+/// Whether a callback's block takes at most two plain parameters, which FactoryBot hands the object
+/// and the evaluator by the block's arity (`Callback#run`): one is the object, two the object and
+/// the evaluator. `_1`, `_2` and `it` count as written.
+fn plain_parameters(block: &BlockNode<'_>) -> bool {
+    let Some(parameters) = block.parameters() else {
+        return true;
+    };
+    if let Some(numbered) = parameters.as_numbered_parameters_node() {
+        return numbered.maximum() <= 2;
+    }
+    if parameters.as_it_parameters_node().is_some() {
+        return true;
+    }
+    let Some(written) = parameters
+        .as_block_parameters_node()
+        .and_then(|written| written.parameters())
+    else {
+        return true;
+    };
+    written.requireds().iter().count() <= 2
+        && written
+            .requireds()
+            .iter()
+            .all(|required| required.as_required_parameter_node().is_some())
+        && written.optionals().iter().next().is_none()
+        // A parameter after a rest or an optional is past one of them already.
+        && written.rest().is_none()
+        && written.keywords().iter().next().is_none()
+        && written.keyword_rest().is_none()
+        && written.block().is_none()
+}
+
 /// Whether a constructor block ends in `new(…)`, sent to nothing: the factory's class.
 fn returns_new(block: &BlockNode<'_>) -> bool {
     let last = block
@@ -405,6 +633,12 @@ pub struct Classes {
     /// Where each factory (aliases included) is written: the file and the `factory` call. Not a
     /// name two definitions write.
     pub places: BTreeMap<String, (String, At)>,
+    /// Each factory's parent (aliases included), by name: the one it is written in, or its
+    /// `parent:`.
+    pub parents: BTreeMap<String, String>,
+    /// Which read and which of its factories each name is (aliases included). Not a name two
+    /// definitions write, nor a gem's the project writes too.
+    pub defined: BTreeMap<String, (usize, usize)>,
 }
 
 /// What every file's definitions build. `resolve` looks a constant written inside a nesting up,
@@ -423,6 +657,7 @@ pub struct Classes {
 pub fn classes(reads: &[Read], resolve: &dyn Fn(&str, &str) -> Option<String>) -> Classes {
     let otherwise = reads.iter().any(|read| read.otherwise);
     let mut factories: BTreeMap<String, &Factory> = BTreeMap::new();
+    let mut defined: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let mut twice: BTreeSet<String> = BTreeSet::new();
     let mut places: BTreeMap<String, (String, At)> = BTreeMap::new();
     // Each factory's parent, by every name it has.
@@ -436,8 +671,8 @@ pub fn classes(reads: &[Read], resolve: &dyn Fn(&str, &str) -> Option<String>) -
                 .flat_map(|factory| std::iter::once(&factory.name).chain(&factory.aliases))
         })
         .collect();
-    for read in reads {
-        for factory in &read.factories {
+    for (read_at, read) in reads.iter().enumerate() {
+        for (factory_at, factory) in read.factories.iter().enumerate() {
             let parent = factory.parent.clone().or_else(|| {
                 factory
                     .within
@@ -450,6 +685,7 @@ pub fn classes(reads: &[Read], resolve: &dyn Fn(&str, &str) -> Option<String>) -
                 if factories.insert(name.clone(), factory).is_some() {
                     twice.insert(name.clone());
                 }
+                defined.insert(name.clone(), (read_at, factory_at));
                 places.insert(name.clone(), (read.uri.clone(), factory.at));
                 if let Some(parent) = &parent {
                     parents.insert(name.clone(), parent.clone());
@@ -466,6 +702,9 @@ pub fn classes(reads: &[Read], resolve: &dyn Fn(&str, &str) -> Option<String>) -
     };
     classes.places = places;
     classes.places.retain(|name, _| !twice.contains(name));
+    defined.retain(|name, _| !twice.contains(name));
+    classes.defined = defined;
+    classes.parents = parents.clone();
     for name in factories.keys() {
         let answer = if otherwise {
             None
@@ -495,7 +734,8 @@ fn factory_class(
             return None;
         }
         let factory = *factories.get(current)?;
-        if factory.otherwise {
+        // A `parent:` only Ruby names may hold the `class:` that decides.
+        if factory.otherwise || factory.parent_unknown {
             return None;
         }
         chain.push(factory);
@@ -595,6 +835,214 @@ pub fn rows(built: &Classes, namespaces: &Namespaces) -> Vec<(&'static str, Fact
         hosted.push((SYNTAX, facts));
     }
     hosted
+}
+
+/// What each factory's blocks run as, and what its callbacks are handed: per definition file, by
+/// its index in `reads`, the facts written beside it.
+///
+/// - **A factory's block, its `trait`s' and its `transient`s' run on its definition's proxy**:
+///   one class per factory, `FactoryBot::Factories::<Name>`, below FactoryBot's
+///   `DefinitionProxy`, so a callback there can say what that factory builds.
+/// - **A callback's block runs on a `SyntaxRunner`, an attribute's on the evaluator**; any other
+///   block (`sequence`, `initialize_with`, `to_create`) is refused: what runs it differs between
+///   releases. A factory this pass does not answer for (a name two definitions write, a gem's the
+///   project writes too) is left as it was.
+/// - **`after`, `before` and `callback` hand their block what was built** ([`callback_row`]):
+///   every class the factory and each factory inheriting from it build, since a child runs its
+///   parent's callbacks and traits. Refused where any of those is not known, where a factory only
+///   Ruby names may inherit it, where a block is handed to `send`, or where a project registers a
+///   strategy of its own, which may hand a callback anything.
+#[must_use]
+pub fn proxies(reads: &[Read], built: &Classes, namespaces: &Namespaces) -> Vec<(usize, Facts)> {
+    if !namespaces.declares(PROXY) {
+        return Vec::new();
+    }
+    // Any factory may be the parent of one whose `parent:` only Ruby names.
+    let anyone_s = reads.iter().any(|read| {
+        read.unnamed.iter().any(Option::is_none)
+            || read.factories.iter().any(|factory| factory.parent_unknown)
+    }) || !built.registered.is_empty();
+    // A factory only Ruby names inherits from these, and from everything above them.
+    let mut adopting: BTreeSet<&str> = BTreeSet::new();
+    for parent in reads.iter().flat_map(|read| read.unnamed.iter().flatten()) {
+        let mut at = Some(parent.as_str());
+        while let Some(name) = at {
+            if !adopting.insert(name) {
+                break;
+            }
+            at = built.parents.get(name).map(String::as_str);
+        }
+    }
+    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (child, parent) in &built.parents {
+        children
+            .entry(parent.as_str())
+            .or_default()
+            .push(child.as_str());
+    }
+    let ran = |declared: &str| {
+        if namespaces.declares(declared) {
+            Runs::Instance(declared.to_owned())
+        } else {
+            Runs::Refused
+        }
+    };
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+    let mut out = Vec::new();
+    for (read_at, read) in reads.iter().enumerate() {
+        let mut facts = Facts::default();
+        facts.whole();
+        for (factory_at, factory) in read.factories.iter().enumerate() {
+            if built.defined.get(&factory.name) != Some(&(read_at, factory_at)) {
+                continue;
+            }
+            let Some(segment) = segment_of(&factory.name, &mut taken) else {
+                continue;
+            };
+            let class = format!("{FACTORIES}::{segment}");
+            let owner = Owner::Instance(class.clone());
+            facts.namespace(Owner::Module(FACTORIES.to_owned()), None);
+            facts.inherits(owner.clone(), format!("::{PROXY}"));
+            facts.runs(owner.clone(), factory.at.0.0, Runs::Instance(class.clone()));
+            for (call, block) in &factory.blocks {
+                let runs = match block {
+                    Ran::Proxy => Runs::Instance(class.clone()),
+                    Ran::Callback(_) => ran(RUNNER),
+                    Ran::Attribute => ran(EVALUATOR),
+                    Ran::Other => Runs::Refused,
+                };
+                facts.runs(owner.clone(), *call, runs);
+            }
+            let refused = anyone_s
+                || factory.sends
+                || std::iter::once(&factory.name)
+                    .chain(&factory.aliases)
+                    .any(|name| adopting.contains(name.as_str()));
+            let objects = if refused {
+                None
+            } else {
+                objects_of(factory, built, &children)
+            };
+            for method in ["after", "before", "callback"] {
+                if let Some(row) = objects
+                    .as_ref()
+                    .and_then(|objects| callback_row(&owner, method, objects, &factory.blocks))
+                {
+                    facts.declare(row);
+                }
+            }
+        }
+        if !facts.is_empty() {
+            out.push((read_at, facts));
+        }
+    }
+    out
+}
+
+/// The constant a factory's class is named by below [`FACTORIES`]: its name camelized, suffixed
+/// as RSpec suffixes a group where two names camelize alike. `None` for a name that is no bare
+/// RBS symbol.
+fn segment_of(name: &str, taken: &mut BTreeSet<String>) -> Option<String> {
+    if !symbol_spelled(name) {
+        return None;
+    }
+    let base =
+        camelize(name).filter(|base| base.starts_with(|first: char| first.is_ascii_uppercase()))?;
+    let mut segment = base.clone();
+    let mut next = 2;
+    while !taken.insert(segment.clone()) {
+        segment = format!("{base}_{next}");
+        next += 1;
+    }
+    Some(segment)
+}
+
+/// Every class a factory's callbacks may be handed an object of: its own and that of each
+/// factory inheriting from it, by `parent:` or by being written in it, sorted. `None` where any
+/// of them is not known.
+fn objects_of(
+    factory: &Factory,
+    built: &Classes,
+    children: &BTreeMap<&str, Vec<&str>>,
+) -> Option<Vec<String>> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut next: Vec<&str> = std::iter::once(&factory.name)
+        .chain(&factory.aliases)
+        .map(String::as_str)
+        .collect();
+    let mut objects: BTreeSet<String> = BTreeSet::new();
+    while let Some(name) = next.pop() {
+        if !seen.insert(name) {
+            continue;
+        }
+        objects.insert(built.factories.get(name)?.clone()?);
+        next.extend(children.get(name).into_iter().flatten());
+    }
+    Some(objects.into_iter().collect())
+}
+
+/// The row that says what a callback's block is handed, from every callback of that method the
+/// factory's definition writes: `after(:build)`, `after(:create)`, `after(:stub)` and
+/// `before(:create)` the object built, `before(:build)` and `before(:all)` a `nil` (FactoryBot
+/// 6.6 notifies them before there is one; earlier releases never run them). `None` where one is
+/// registered under another name (`after(:all)` is handed what the strategy returns, a `Hash` for
+/// `attributes_for`), its names are not literals, or its block's parameters are not plain.
+fn callback_row(
+    owner: &Owner,
+    method: &str,
+    objects: &[String],
+    blocks: &[(u32, Ran)],
+) -> Option<Declared> {
+    let (mut object, mut nil) = (false, false);
+    let mut written = false;
+    for (_, block) in blocks {
+        let Ran::Callback(callback) = block else {
+            continue;
+        };
+        if callback.method != method {
+            continue;
+        }
+        written = true;
+        if !callback.plain {
+            return None;
+        }
+        for name in callback.names.as_ref()? {
+            match name.as_str() {
+                "after_build" | "after_create" | "after_stub" | "before_create" => object = true,
+                "before_build" | "before_all" => nil = true,
+                _ => return None,
+            }
+        }
+    }
+    if !written {
+        return None;
+    }
+    let union = objects
+        .iter()
+        .map(|class| format!("::{class}"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let handed = match (object, nil) {
+        (true, false) => union,
+        (true, true) if objects.len() == 1 => format!("{union}?"),
+        (true, true) => format!("({union})?"),
+        // A block handed only `nil` says nothing a reader needs.
+        (false, _) => return None,
+    };
+    Some(Declared {
+        owner: owner.clone(),
+        name: method.to_owned(),
+        returns: "untyped".to_owned(),
+        parameters: format!("(*untyped names) {{ ({handed} object, untyped evaluator) -> void }}"),
+        because: format!(
+            "FactoryBot's `{method}`: its block is handed what this factory builds, then the \
+             evaluator."
+        ),
+        at: None,
+        from: Source::Interface,
+        overloads: Vec::new(),
+        private: false,
+    })
 }
 
 /// One strategy with an arm per factory that says its class, in name order, then a catch-all.
@@ -771,6 +1219,339 @@ initialize_with { outside }
             "an `initialize_with` outside FactoryBot is none of its"
         );
         assert!(read.registered.is_empty());
+    }
+
+    #[test]
+    fn a_definition_s_blocks_are_filed_with_what_runs_them() {
+        let source = r#"
+FactoryBot.define do
+  trait :global do
+    after(:create) { |x| x }
+  end
+  factory :user do
+    name { "x" }
+    add_attribute(:email) { "e" }
+    loop do end
+    sequence(:n) { |i| i }
+    initialize_with { new }
+    to_create(&:save!)
+    association :team
+    send(:after, :create) { |x| x }
+    [1].each { trait :inner do end }
+    trait :admin do
+      after(:build, :create) { |user, evaluator| user }
+      transient do
+        count { 1 }
+      end
+    end
+    before(name) { |user| user }
+    callback(:after_stub) { _1 }
+    after(:create) { it }
+    after(:create) { |a, b, c| a }
+    after(:create) { |(a, b)| a }
+    after(:create) { |a = 1| a }
+    after(:create) { |*a| a }
+    after(:create) { |a, *b, c| a }
+    after(:create) { |a, k:| a }
+    after(:create) { |a, **k| a }
+    after(:create) { |a, &b| a }
+    after(:create) { |;local| local }
+    after(:create) { _3 }
+    after { |x| x }
+    after(:create) do
+      factory :not_one
+      initialize_with { other }
+    end
+  end
+end
+"#;
+        let read = read_factories(source);
+        let names: Vec<&str> = read
+            .factories
+            .iter()
+            .map(|factory| factory.name.as_str())
+            .collect();
+        assert_eq!(names, ["user"], "a callback's block defines no factory");
+        assert!(
+            !read.otherwise,
+            "a callback's `initialize_with` is not FactoryBot's"
+        );
+        let user = &read.factories[0];
+        assert!(user.sends);
+        let filed: Vec<String> = user
+            .blocks
+            .iter()
+            .map(|(at, ran)| {
+                let line = source[*at as usize..].lines().next().unwrap_or_default();
+                let ran = match ran {
+                    Ran::Callback(callback) => format!(
+                        "{} {:?} {}",
+                        callback.method,
+                        callback.names,
+                        if callback.plain { "plain" } else { "-" }
+                    ),
+                    other => format!("{other:?}"),
+                };
+                format!("{line} => {ran}")
+            })
+            .collect();
+        assert_eq!(
+            filed,
+            [
+                r#"name { "x" } => Attribute"#,
+                r#"add_attribute(:email) { "e" } => Attribute"#,
+                "loop do end => Attribute",
+                "sequence(:n) { |i| i } => Other",
+                "initialize_with { new } => Other",
+                "send(:after, :create) { |x| x } => Other",
+                "trait :inner do end } => Proxy",
+                "trait :admin do => Proxy",
+                r#"after(:build, :create) { |user, evaluator| user } => after Some(["after_build", "after_create"]) plain"#,
+                "transient do => Proxy",
+                "count { 1 } => Attribute",
+                "before(name) { |user| user } => before None plain",
+                r#"callback(:after_stub) { _1 } => callback Some(["after_stub"]) plain"#,
+                r#"after(:create) { it } => after Some(["after_create"]) plain"#,
+                r#"after(:create) { |a, b, c| a } => after Some(["after_create"]) -"#,
+                r#"after(:create) { |(a, b)| a } => after Some(["after_create"]) -"#,
+                r#"after(:create) { |a = 1| a } => after Some(["after_create"]) -"#,
+                r#"after(:create) { |*a| a } => after Some(["after_create"]) -"#,
+                r#"after(:create) { |a, *b, c| a } => after Some(["after_create"]) -"#,
+                r#"after(:create) { |a, k:| a } => after Some(["after_create"]) -"#,
+                r#"after(:create) { |a, **k| a } => after Some(["after_create"]) -"#,
+                r#"after(:create) { |a, &b| a } => after Some(["after_create"]) -"#,
+                r#"after(:create) { |;local| local } => after Some(["after_create"]) plain"#,
+                r#"after(:create) { _3 } => after Some(["after_create"]) -"#,
+                "after { |x| x } => after None plain",
+                r#"after(:create) do => after Some(["after_create"]) plain"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_factory_only_ruby_names_is_filed_under_the_one_it_inherits_from() {
+        let read = read_factories(
+            "FactoryBot.define do\n  factory :user do\n    factory name_of(:x) do\n      \
+             after(:create) { |x| x }\n    end\n  end\n  factory dynamic, parent: :post\n  \
+             factory dynamic, parent: other\n  factory dynamic\n  factory :child, parent: someone\nend\n",
+        );
+        assert_eq!(
+            read.unnamed,
+            [Some("user".to_owned()), Some("post".to_owned()), None]
+        );
+        let user = &read.factories[0];
+        assert_eq!(user.blocks.len(), 1, "its callback is filed under `user`");
+        let child = &read.factories[1];
+        assert!(child.parent_unknown);
+        assert_eq!(child.parent, None);
+        // Whose child it is decides its class, so none is said.
+        assert_eq!(built(&[read], &["Child"]), ["child=-", "user=-"]);
+    }
+
+    /// What [`proxies`] writes for `reads`, as RBS and the blocks' runs by their call's first line.
+    fn proxied(reads: &[Read], names: &'static [&'static str], bundle: &Namespaces) -> String {
+        let built = classes(reads, &declared(names));
+        proxies(reads, &built, bundle)
+            .iter()
+            .map(|(index, facts)| {
+                let rendered = facts.render(bundle);
+                let source = &reads[*index].uri;
+                let runs: Vec<String> = rendered
+                    .ran
+                    .iter()
+                    .map(|(at, runs)| {
+                        let line = source[*at as usize..].lines().next().unwrap_or_default();
+                        format!("{line} => {runs:?}\n")
+                    })
+                    .collect();
+                format!("{}{}", rendered.rbs, runs.concat())
+            })
+            .collect()
+    }
+
+    /// A definition file read with its text kept where its URI would be, for [`proxied`].
+    fn kept(source: &str) -> Read {
+        let mut read = read_factories(source);
+        read.uri = source.to_owned();
+        read
+    }
+
+    #[test]
+    fn each_factory_s_blocks_run_on_its_own_proxy_and_its_callbacks_are_handed_what_it_builds() {
+        let source = "\
+FactoryBot.define do
+  factory :user do
+    name { 1 }
+    sequence(:n) { |i| i }
+    after(:create) { |user, evaluator| user }
+    trait :admin do
+      after(:build) { |user| user }
+    end
+    before(:build, :create) { |user| user }
+    callback(:after_stub) { |user| user }
+    factory :admin, class: Admin
+  end
+  factory :post do
+    before(:create) { |post| post }
+  end
+  factory :a_b, class: Post
+  factory :aB, class: Post
+  factory :\"odd name\", class: Post
+end
+";
+        let bundle = declaring(&["FactoryBot", PROXY, RUNNER, EVALUATOR]);
+        let rbs = proxied(&[kept(source)], &["User", "Admin", "Post"], &bundle);
+        for expected in [
+            "module FactoryBot\nmodule Factories\nend\nend\n",
+            "class FactoryBot::Factories::User < ::FactoryBot::DefinitionProxy\n",
+            "def after: (*untyped names) { (::Admin | ::User object, untyped evaluator) -> void } \
+             -> untyped\n",
+            "def before: (*untyped names) { ((::Admin | ::User)? object, untyped evaluator) -> void } \
+             -> untyped\n",
+            "def callback: (*untyped names) { (::Admin | ::User object, untyped evaluator) -> void } \
+             -> untyped\n",
+            "class FactoryBot::Factories::Admin < ::FactoryBot::DefinitionProxy\n",
+            "def before: (*untyped names) { (::Post object, untyped evaluator) -> void } -> untyped\n",
+            // Two names that camelize alike, the second suffixed.
+            "class FactoryBot::Factories::AB < ::FactoryBot::DefinitionProxy\n",
+            "class FactoryBot::Factories::AB_2 < ::FactoryBot::DefinitionProxy\n",
+            // The factory's own block, a trait's, a callback's, an attribute's, and the rest.
+            "factory :user do => Instance(\"FactoryBot::Factories::User\")\n",
+            "trait :admin do => Instance(\"FactoryBot::Factories::User\")\n",
+            "after(:create) { |user, evaluator| user } => Instance(\"FactoryBot::SyntaxRunner\")\n",
+            "name { 1 } => Instance(\"FactoryBot::Evaluator\")\n",
+            "sequence(:n) { |i| i } => Refused\n",
+        ] {
+            assert!(rbs.contains(expected), "{expected}\n---\n{rbs}");
+        }
+        assert!(!rbs.contains("odd name") && !rbs.contains("Odd"), "{rbs}");
+        // `admin` writes no callback of its own.
+        let admin = rbs
+            .split("class FactoryBot::Factories::Admin")
+            .nth(1)
+            .and_then(|rest| rest.split("\nend\n").next())
+            .unwrap_or_default();
+        assert!(!admin.contains("def "), "{admin}");
+        // Without the runner and the evaluator, their blocks are refused.
+        let bare = declaring(&["FactoryBot", PROXY]);
+        let rbs = proxied(&[kept(source)], &["User", "Admin", "Post"], &bare);
+        assert!(rbs.contains("name { 1 } => Refused\n"), "{rbs}");
+        assert!(
+            rbs.contains("after(:create) { |user, evaluator| user } => Refused\n"),
+            "{rbs}"
+        );
+        // Without the proxy, nothing.
+        assert_eq!(
+            proxied(
+                &[kept(source)],
+                &["User"],
+                &declaring(&["FactoryBot", RUNNER])
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_callback_is_handed_nothing_said_where_what_runs_it_may_be_anything() {
+        let bundle = declaring(&["FactoryBot", PROXY, RUNNER, EVALUATOR]);
+        let typed = |sources: &[&str]| {
+            let reads: Vec<Read> = sources.iter().map(|source| kept(source)).collect();
+            let rbs = proxied(&reads, &["User", "Admin", "Post"], &bundle);
+            ["after", "before", "callback"]
+                .into_iter()
+                .filter(|method| rbs.contains(&format!("def {method}:")))
+                .collect::<Vec<_>>()
+        };
+        let user = "FactoryBot.define do\n  factory :user do\n    after(:create) { |user| user }\n  end\nend\n";
+        assert_eq!(typed(&[user]), ["after"]);
+        // A child only Ruby names, below `user` or anywhere.
+        for other in [
+            "FactoryBot.define do\n  factory dynamic, parent: :user\n  factory again, parent: :user\nend\n",
+            "FactoryBot.define do\n  factory dynamic, parent: anyone\nend\n",
+            "FactoryBot.define do\n  factory :admin, parent: anyone\nend\n",
+            "FactoryBot.register_strategy(:json, Json)\n",
+        ] {
+            assert!(typed(&[user, other]).is_empty(), "{other}");
+        }
+        // A child whose class is not known, and one below a sibling: only the first refuses.
+        assert!(
+            typed(&[
+                user,
+                "FactoryBot.define do\n  factory :admin, parent: :user, class: klass\nend\n"
+            ])
+            .is_empty()
+        );
+        assert_eq!(
+            typed(&[
+                user,
+                "FactoryBot.define do\n  factory :post\n  factory dynamic, parent: :post\nend\n"
+            ]),
+            ["after"]
+        );
+        // A block handed to `send`, parameters FactoryBot reads by arity, a name it registers the
+        // block under that hands something else, or none written as a literal.
+        for written in [
+            "send(:after, :create) { |user| user }",
+            "after(:create) { |a, b, c| a }",
+            "after(:all) { |result| result }",
+            "after(name) { |user| user }",
+        ] {
+            let source = format!(
+                "FactoryBot.define do\n  factory :user do\n    after(:create) {{ |user| user }}\n    \
+                 {written}\n  end\nend\n"
+            );
+            assert!(typed(&[&source]).is_empty(), "{written}");
+        }
+        // One class or `nil`.
+        let rbs = proxied(
+            &[kept(
+                "FactoryBot.define do\n  factory :post do\n    before(:build, :create) { |x| x }\n  \
+                 end\nend\n",
+            )],
+            &["Post"],
+            &bundle,
+        );
+        assert!(
+            rbs.contains("{ (::Post? object, untyped evaluator) -> void }"),
+            "{rbs}"
+        );
+        // Only ever handed `nil`, which says nothing.
+        assert!(
+            typed(&["FactoryBot.define do\n  factory :user do\n    before(:build) { |x| x }\n  end\nend\n"])
+                .is_empty()
+        );
+        // A name two definitions write, and a gem's the project writes too, are left as they were.
+        let twin =
+            "FactoryBot.define do\n  factory :user do\n    after(:create) { |u| u }\n  end\nend\n";
+        let reads = [kept(twin), kept(&format!("{twin}\n"))];
+        assert_eq!(proxied(&reads, &["User"], &bundle), "");
+        let mut gem = kept(&format!("{twin}\n\n"));
+        gem.gem = true;
+        let rbs = proxied(&[kept(twin), gem], &["User"], &bundle);
+        assert_eq!(
+            rbs.matches("class FactoryBot::Factories::User ").count(),
+            1,
+            "{rbs}"
+        );
+    }
+
+    #[test]
+    fn a_loop_of_parents_is_walked_once() {
+        // `classes` answers no class anywhere in a loop, so this never meets one; the walk still
+        // ends.
+        let read = read_factories("FactoryBot.define do\n  factory :a, parent: :b\nend\n");
+        let built = Classes {
+            factories: BTreeMap::from([
+                ("a".to_owned(), Some("A".to_owned())),
+                ("b".to_owned(), Some("B".to_owned())),
+            ]),
+            ..Classes::default()
+        };
+        let children = BTreeMap::from([("a", vec!["b"]), ("b", vec!["a"])]);
+        assert_eq!(
+            objects_of(&read.factories[0], &built, &children),
+            Some(vec!["A".to_owned(), "B".to_owned()])
+        );
     }
 
     #[test]

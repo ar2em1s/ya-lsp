@@ -1433,8 +1433,8 @@ MIT License
 -------------------------------------------------------------------------------
 
 Used by:
-  ya-lsp 1.0.0 — https://github.com/ar2em1s/ya-lsp
-  ya-lsp 1.0.0 — https://github.com/ar2em1s/ya-lsp
+  ya-lsp 1.1.0 — https://github.com/ar2em1s/ya-lsp
+  ya-lsp 1.1.0 — https://github.com/ar2em1s/ya-lsp
 
 The MIT License (MIT)
 

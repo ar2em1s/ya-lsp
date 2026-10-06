@@ -24,8 +24,9 @@ use std::rc::Rc;
 
 use ruby_prism::{
     AssocNode, BlockNode, CallAndWriteNode, CallNode, CallOperatorWriteNode, CallOrWriteNode,
-    ClassNode, ConstantOrWriteNode, ConstantPathNode, ConstantPathOrWriteNode,
-    ConstantPathWriteNode, ConstantReadNode, ConstantWriteNode, DefNode,
+    ClassNode, ConstantAndWriteNode, ConstantOperatorWriteNode, ConstantOrWriteNode,
+    ConstantPathAndWriteNode, ConstantPathNode, ConstantPathOperatorWriteNode,
+    ConstantPathOrWriteNode, ConstantPathWriteNode, ConstantReadNode, ConstantWriteNode, DefNode,
     InstanceVariableAndWriteNode, InstanceVariableOrWriteNode, InstanceVariableWriteNode,
     ItLocalVariableReadNode, LambdaNode, LocalVariableAndWriteNode, LocalVariableOperatorWriteNode,
     LocalVariableOrWriteNode, LocalVariableReadNode, LocalVariableTargetNode,
@@ -283,6 +284,7 @@ impl Receiver {
                 given: *given,
                 value: Box::new(value.rebased(rebase)?),
             },
+            Receiver::Stored(value) => Receiver::Stored(Box::new(value.rebased(rebase)?)),
             // The offset moves for [`Receiver::SelfObject`]'s reason: the body it falls in says
             // what `super` means, and both halves (which class, which method) are read from the
             // graph at this position.
@@ -321,6 +323,7 @@ impl Receiver {
             arguments: Vec::new(),
             symbol: None,
             text: Text::default(),
+            names: Literals::default(),
         }
     }
 
@@ -329,7 +332,7 @@ impl Receiver {
     #[must_use]
     pub fn unguarded(&self) -> &Self {
         match self {
-            Self::BlockGiven { value, .. } => value.unguarded(),
+            Self::BlockGiven { value, .. } | Self::Stored(value) => value.unguarded(),
             other => other,
         }
     }
@@ -342,7 +345,7 @@ impl Receiver {
 ///   whatever was declared at position one.
 /// - **A parameter after a `*rest` gets no slot**, for [`Receiver::Destructured`]'s reason: its
 ///   position depends on how many arguments the call wrote, which nothing can know.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ParameterSlot {
     /// Counted from the left, over required then optional positionals.
     Positional(usize),
@@ -362,6 +365,82 @@ impl PartialEq for Text {
 }
 
 impl Eq for Text {}
+
+/// What an array or a hash literal spells, where every element is a name or one more such literal
+/// (`[:title, { tags: [] }]`), for [`Receiver::Literal`]: a list of names written as data, which a
+/// knowledge module reads as a filter (`types`' `shaped`). No comparison of two receivers reads it,
+/// as for [`Text`].
+#[derive(Debug, Clone, Default)]
+pub struct Literals(pub Option<Rc<Names>>);
+
+impl PartialEq for Literals {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Literals {}
+
+/// One level of [`Literals`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Names {
+    /// A symbol's name.
+    Symbol(Box<str>),
+    /// A plain string's text.
+    Text(Box<str>),
+    /// An array literal, a braceless hash in it included as a [`Names::Pairs`].
+    List(Box<[Names]>),
+    /// A hash literal whose every key is a symbol or a plain string, by the key's text.
+    Pairs(Box<[(Box<str>, Names)]>),
+}
+
+/// How deep [`Names`] reads a literal: a guard against a stack overflow on a pathological one, far
+/// above any filter written by hand.
+const NAMES_DEEP: usize = 16;
+
+impl Names {
+    /// What a literal spells, or `None` where some element is anything else.
+    fn of(node: &Node<'_>, depth: usize) -> Option<Self> {
+        if depth > NAMES_DEEP {
+            return None;
+        }
+        if let Some(symbol) = node.as_symbol_node() {
+            return Some(Self::Symbol(
+                String::from_utf8_lossy(symbol.unescaped()).into(),
+            ));
+        }
+        if let Some(string) = node.as_string_node() {
+            return Some(Self::Text(
+                String::from_utf8_lossy(string.unescaped()).into(),
+            ));
+        }
+        if let Some(array) = node.as_array_node() {
+            return array
+                .elements()
+                .iter()
+                .map(|element| Self::of(&element, depth + 1))
+                .collect::<Option<Box<[Self]>>>()
+                .map(Self::List);
+        }
+        let elements = match (node.as_hash_node(), node.as_keyword_hash_node()) {
+            (Some(hash), _) => hash.elements(),
+            (None, Some(hash)) => hash.elements(),
+            (None, None) => return None,
+        };
+        elements
+            .iter()
+            .map(|element| {
+                let pair = element.as_assoc_node()?;
+                let key = match Self::of(&pair.key(), depth + 1)? {
+                    Self::Symbol(key) | Self::Text(key) => key,
+                    Self::List(_) | Self::Pairs(_) => return None,
+                };
+                Some((key, Self::of(&pair.value(), depth + 1)?))
+            })
+            .collect::<Option<Box<[(Box<str>, Self)]>>>()
+            .map(Self::Pairs)
+    }
+}
 
 /// The thing to the left of the `.` or the `::`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,6 +503,10 @@ pub enum Receiver {
         /// and for an interpolated string, whose text only running Ruby knows. What a key a
         /// knowledge module keeps names (`generated::KEYED`) is read off it.
         text: Text,
+        /// **What an array or a hash literal spells** ([`Literals`]), where it is names alone:
+        /// `[:title, tags: []]`. A filter a knowledge module reads is written that way
+        /// (`generated::SHAPED`). `None` for every other literal.
+        names: Literals,
     },
     /// A literal `self`, or the implicit one a receiverless call has, **and where it was written**.
     ///
@@ -656,6 +739,13 @@ pub enum Receiver {
         /// not be read.
         arguments: Vec<Receiver>,
     },
+    /// The value of an assignment read as a value (`x = (@y = v)`, a `def` whose last statement is
+    /// `@y = v`): `v`'s, and also held by what it was written to.
+    ///
+    /// - **Its type is `v`'s**, which [`types`](super::types) answers as for `v`.
+    /// - **What the object held when it was made is not kept** (`types`' `Typed::shaped`): code may
+    ///   write into it through the other name before the read.
+    Stored(Box<Receiver>),
     /// A value only one kind of call reaches: one that passed the enclosing `def` a block, or one
     /// that passed none. The `def` asked, with `block_given?` or a read of its own
     /// `&block`, and this value is on one side of the answer: an exit, or a conditional's branch.
@@ -1092,6 +1182,291 @@ pub fn constant_assignment(source: &str, name: (u32, u32)) -> Option<Receiver> {
     (!matches!(receiver, Receiver::Unknown)).then_some(receiver)
 }
 
+/// What one text writes into its constants, as a list of names held in one ([`frozen_constants`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FrozenConstants {
+    /// Each constant assigned a literal of names frozen as written (`KEYS = %i[a b].freeze`), by
+    /// the span of its name's last segment, where rubydex files its `Definition::Constant`.
+    pub frozen: HashMap<(u32, u32), Rc<Names>>,
+    /// Each constant written again with an operator (`KEYS += [:c]`, `KEYS &&= x`), by the same
+    /// span: rubydex records these as a reference to the constant, not as a definition of it.
+    pub rewritten: HashSet<(u32, u32)>,
+}
+
+/// Every constant written as a value in one text, by its name's span (a path's last segment, where
+/// rubydex places the reference): a class handed to code that may build it where nothing here
+/// shows (`mount_uploader :cover, CoverUploader`, `serializer: AccountSerializer`, `FOO = Bar`).
+///
+/// **Not a value:** a call's receiver (`Bar.new`), a path's namespace (`Bar::Baz`), a class or
+/// module's name and a superclass, a `rescue`'s classes, a `when`'s, and what `is_a?`, `kind_of?`,
+/// `instance_of?`, `include`, `extend` and `prepend` are given: each asks about the class or mixes
+/// it in, and builds nothing. **Nor is a constant whose value only ever becomes a receiver**:
+/// through parentheses, a conditional's branches or `||` (`(a ? Foo : Bar).new`), or held in a
+/// local of one `def` every read of which is a call's receiver (`klass = Foo; klass.new`).
+#[must_use]
+pub fn constants_handed_on(source: &str) -> HashSet<(u32, u32)> {
+    const ASKING: [&[u8]; 6] = [
+        b"is_a?",
+        b"kind_of?",
+        b"instance_of?",
+        b"include",
+        b"extend",
+        b"prepend",
+    ];
+    // A constant's name span: the node's for a name, the last segment's for a path.
+    fn named(node: &Node<'_>) -> Option<(u32, u32)> {
+        if let Some(read) = node.as_constant_read_node() {
+            return Some(span_of(&read.as_node()));
+        }
+        let path = node.as_constant_path_node()?;
+        let name = path.name_loc();
+        Some((name.start_offset() as u32, name.end_offset() as u32))
+    }
+    // What a value can be, through parentheses, a conditional's branches and `||`/`&&`.
+    fn flowing<'pr>(node: Node<'pr>, out: &mut Vec<Node<'pr>>) {
+        if let Some(parentheses) = node.as_parentheses_node() {
+            if let Some(body) = parentheses.body() {
+                flowing(body, out);
+            }
+        } else if let Some(statements) = node.as_statements_node() {
+            if let Some(last) = statements.body().iter().last() {
+                flowing(last, out);
+            }
+        } else if let Some(branch) = node.as_if_node() {
+            if let Some(statements) = branch.statements() {
+                flowing(statements.as_node(), out);
+            }
+            if let Some(other) = branch.subsequent() {
+                flowing(other, out);
+            }
+        } else if let Some(other) = node.as_else_node() {
+            if let Some(statements) = other.statements() {
+                flowing(statements.as_node(), out);
+            }
+        } else if let Some(either) = node.as_or_node() {
+            flowing(either.left(), out);
+            flowing(either.right(), out);
+        } else if let Some(both) = node.as_and_node() {
+            flowing(both.left(), out);
+            flowing(both.right(), out);
+        } else {
+            out.push(node);
+        }
+    }
+    /// The constants written to one local, and whether a read of it is anything but a receiver.
+    type Local = (Vec<(u32, u32)>, bool);
+    struct Walk {
+        all: Vec<(u32, u32)>,
+        not: HashSet<(u32, u32)>,
+        /// Where each enclosing `def` starts, innermost last: a local's scope.
+        defs: Vec<u32>,
+        /// Where each local read that is a call's receiver starts.
+        receiving: HashSet<u32>,
+        /// Each local, by its `def` and name: the constants written to it, and whether any read
+        /// of it is something other than a receiver.
+        locals: HashMap<(u32, Vec<u8>), Local>,
+    }
+    impl Walk {
+        fn not(&mut self, node: &Node<'_>) {
+            if let Some(span) = named(node) {
+                self.not.insert(span);
+            }
+        }
+        fn local(&mut self, name: &[u8]) -> &mut Local {
+            let scope = self.defs.last().copied().unwrap_or(u32::MAX);
+            self.locals.entry((scope, name.to_vec())).or_default()
+        }
+        fn written(&mut self, name: &[u8], value: Node<'_>) {
+            let mut leaves = Vec::new();
+            flowing(value, &mut leaves);
+            let constants: Vec<(u32, u32)> = leaves.iter().filter_map(named).collect();
+            if !constants.is_empty() {
+                self.local(name).0.extend(constants);
+            }
+        }
+    }
+    impl<'pr> Visit<'pr> for Walk {
+        fn visit_constant_read_node(&mut self, node: &ConstantReadNode<'pr>) {
+            self.all.extend(named(&node.as_node()));
+        }
+        fn visit_def_node(&mut self, node: &DefNode<'pr>) {
+            self.defs.push(node.location().start_offset() as u32);
+            ruby_prism::visit_def_node(self, node);
+            self.defs.pop();
+        }
+        fn visit_local_variable_write_node(&mut self, node: &LocalVariableWriteNode<'pr>) {
+            self.written(node.name().as_slice(), node.value());
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &LocalVariableOrWriteNode<'pr>) {
+            self.written(node.name().as_slice(), node.value());
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_read_node(&mut self, node: &LocalVariableReadNode<'pr>) {
+            if !self
+                .receiving
+                .contains(&(node.location().start_offset() as u32))
+            {
+                self.local(node.name().as_slice()).1 = true;
+            }
+        }
+        fn visit_constant_path_node(&mut self, node: &ConstantPathNode<'pr>) {
+            self.all.extend(named(&node.as_node()));
+            if let Some(parent) = node.parent() {
+                self.not(&parent);
+            }
+            ruby_prism::visit_constant_path_node(self, node);
+        }
+        fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+            if let Some(receiver) = node.receiver() {
+                let mut leaves = Vec::new();
+                flowing(receiver, &mut leaves);
+                for leaf in &leaves {
+                    self.not(leaf);
+                    if let Some(read) = leaf.as_local_variable_read_node() {
+                        self.receiving.insert(read.location().start_offset() as u32);
+                    }
+                }
+            }
+            if ASKING.contains(&node.name().as_slice())
+                && let Some(arguments) = node.arguments()
+            {
+                for argument in arguments.arguments().iter() {
+                    self.not(&argument);
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_class_node(&mut self, node: &ClassNode<'pr>) {
+            self.not(&node.constant_path());
+            if let Some(superclass) = node.superclass() {
+                self.not(&superclass);
+            }
+            ruby_prism::visit_class_node(self, node);
+        }
+        fn visit_module_node(&mut self, node: &ModuleNode<'pr>) {
+            self.not(&node.constant_path());
+            ruby_prism::visit_module_node(self, node);
+        }
+        fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
+            for exception in node.exceptions().iter() {
+                self.not(&exception);
+            }
+            ruby_prism::visit_rescue_node(self, node);
+        }
+        fn visit_when_node(&mut self, node: &ruby_prism::WhenNode<'pr>) {
+            for condition in node.conditions().iter() {
+                self.not(&condition);
+            }
+            ruby_prism::visit_when_node(self, node);
+        }
+    }
+    let result = parse(source);
+    let mut walk = Walk {
+        all: Vec::new(),
+        not: HashSet::new(),
+        defs: Vec::new(),
+        receiving: HashSet::new(),
+        locals: HashMap::new(),
+    };
+    walk.visit(&result.node());
+    for (constants, read_otherwise) in walk.locals.into_values() {
+        if !read_otherwise {
+            walk.not.extend(constants);
+        }
+    }
+    walk.all
+        .into_iter()
+        .filter(|span| !walk.not.contains(span))
+        .collect()
+}
+
+/// [`FrozenConstants`] for one text, from one parse.
+///
+/// - **Frozen as written, nothing less.** `.freeze` with no argument and no block on an array or a
+///   hash literal of names ([`Names`]): an unfrozen list changes under any `KEYS << :x`, anywhere.
+///   What `.freeze` leaves open is a literal nested inside, which only code reaching into the
+///   constant by index changes.
+/// - **The four definitions rubydex files** (`=` and `||=`, on a name or a path), and the two
+///   operator writes it does not (`op=` and `&&=`), whose value is a new object under the old name.
+#[must_use]
+pub fn frozen_constants(source: &str) -> FrozenConstants {
+    struct Walk(FrozenConstants);
+    fn span_of_location(location: &Location<'_>) -> (u32, u32) {
+        (location.start_offset() as u32, location.end_offset() as u32)
+    }
+    impl Walk {
+        fn assigned(&mut self, name: &Location<'_>, value: &Node<'_>) {
+            let frozen = value.as_call_node().filter(|call| {
+                call.name().as_slice() == b"freeze"
+                    && call.arguments().is_none()
+                    && call.block().is_none()
+            });
+            if let Some(names) = frozen
+                .and_then(|call| call.receiver())
+                .filter(|literal| {
+                    literal.as_array_node().is_some() || literal.as_hash_node().is_some()
+                })
+                .and_then(|literal| Names::of(&literal, 0))
+            {
+                self.0.frozen.insert(span_of_location(name), Rc::new(names));
+            }
+        }
+    }
+    impl<'pr> Visit<'pr> for Walk {
+        fn visit_constant_write_node(&mut self, node: &ConstantWriteNode<'pr>) {
+            self.assigned(&node.name_loc(), &node.value());
+            ruby_prism::visit_constant_write_node(self, node);
+        }
+
+        fn visit_constant_or_write_node(&mut self, node: &ConstantOrWriteNode<'pr>) {
+            self.assigned(&node.name_loc(), &node.value());
+            ruby_prism::visit_constant_or_write_node(self, node);
+        }
+
+        fn visit_constant_path_write_node(&mut self, node: &ConstantPathWriteNode<'pr>) {
+            self.assigned(&node.target().name_loc(), &node.value());
+            ruby_prism::visit_constant_path_write_node(self, node);
+        }
+
+        fn visit_constant_path_or_write_node(&mut self, node: &ConstantPathOrWriteNode<'pr>) {
+            self.assigned(&node.target().name_loc(), &node.value());
+            ruby_prism::visit_constant_path_or_write_node(self, node);
+        }
+
+        fn visit_constant_operator_write_node(&mut self, node: &ConstantOperatorWriteNode<'pr>) {
+            self.0.rewritten.insert(span_of_location(&node.name_loc()));
+            ruby_prism::visit_constant_operator_write_node(self, node);
+        }
+
+        fn visit_constant_and_write_node(&mut self, node: &ConstantAndWriteNode<'pr>) {
+            self.0.rewritten.insert(span_of_location(&node.name_loc()));
+            ruby_prism::visit_constant_and_write_node(self, node);
+        }
+
+        fn visit_constant_path_operator_write_node(
+            &mut self,
+            node: &ConstantPathOperatorWriteNode<'pr>,
+        ) {
+            self.0
+                .rewritten
+                .insert(span_of_location(&node.target().name_loc()));
+            ruby_prism::visit_constant_path_operator_write_node(self, node);
+        }
+
+        fn visit_constant_path_and_write_node(&mut self, node: &ConstantPathAndWriteNode<'pr>) {
+            self.0
+                .rewritten
+                .insert(span_of_location(&node.target().name_loc()));
+            ruby_prism::visit_constant_path_and_write_node(self, node);
+        }
+    }
+    let result = parse(source);
+    let mut walk = Walk(FrozenConstants::default());
+    walk.visit(&result.node());
+    walk.0
+}
+
 /// The instance variable spanned by `span`, as a shape a type can be looked up from.
 ///
 /// - **[`at`] reaches an instance variable only as the thing left of a `.`.** This asks about the
@@ -1311,6 +1686,607 @@ pub struct BlockSite {
     pub body: (u32, u32),
 }
 
+/// One name a sending call builds ([`sent_patterns`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SentPattern {
+    /// The literal start and end of every name it can build.
+    pub head: String,
+    pub tail: String,
+    /// How many positional arguments it passes after the name: `None` where any.
+    pub passed: Option<u8>,
+    /// Where the call starts, where it is sent to `self`.
+    pub on_self: Option<u32>,
+}
+
+/// Every name a call of one of `senders` builds around an interpolation in its
+/// first argument (`send("handle_#{event}", payload)`, `try(:"#{name}_was")`), as the literal head
+/// and tail it keeps, and how many positional arguments it passes after the name: `None` where a
+/// splat or a keyword could pass any. A name with no literal part is left out: it could be any
+/// name.
+#[must_use]
+pub fn sent_patterns(source: &str, senders: &[&str]) -> Vec<SentPattern> {
+    struct Walk<'s> {
+        senders: &'s [&'s str],
+        found: Vec<SentPattern>,
+    }
+    impl<'pr> Visit<'pr> for Walk<'_> {
+        fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+            let name = String::from_utf8_lossy(node.name().as_slice());
+            if self.senders.contains(&name.as_ref())
+                && let Some(written) = node.arguments()
+                && let Some(first) = written.arguments().iter().next()
+                && let scopes::Spelled::Like { head, tail } = scopes::spelled_by(&first)
+                && (!head.is_empty() || !tail.is_empty())
+            {
+                let rest: Vec<Node<'_>> = written.arguments().iter().skip(1).collect();
+                let plain = rest.iter().all(|argument| {
+                    argument.as_splat_node().is_none()
+                        && argument.as_keyword_hash_node().is_none()
+                        && argument.as_forwarding_arguments_node().is_none()
+                });
+                // A `Method` looked up by name is called later, with whatever its caller passes.
+                let looked_up = name.ends_with("method");
+                let passed = (plain && !looked_up)
+                    .then(|| u8::try_from(rest.len()).ok())
+                    .flatten();
+                // Sent to `self` (no receiver, or `self.`): only `self`'s own methods can answer.
+                let on_self = node
+                    .receiver()
+                    .is_none_or(|receiver| receiver.as_self_node().is_some());
+                self.found.push(SentPattern {
+                    head,
+                    tail,
+                    passed,
+                    on_self: on_self.then_some(node.location().start_offset() as u32),
+                });
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let result = parse(source);
+    let mut walk = Walk {
+        senders,
+        found: Vec::new(),
+    };
+    walk.visit(&result.node());
+    walk.found.sort();
+    walk.found.dedup();
+    walk.found
+}
+
+/// One literal that spells a method's name, and where it is written ([`spelled_uses`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpelledUse {
+    /// Where the literal starts.
+    pub at: u32,
+    /// A string, not a symbol.
+    pub text: bool,
+    pub how: Spelling,
+}
+
+/// Where a literal spelling a method's name is written. What that does with the name is
+/// [`types`](super::types)' question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Spelling {
+    /// An argument of a call written with a name: a positional, a hash's value under `key`, or an
+    /// element of an array that is one. `first` is where the call's name starts, where the literal
+    /// is the call's first positional itself (`send(:greet, x)`).
+    Argument {
+        call: String,
+        key: Option<String>,
+        first: Option<u32>,
+    },
+    /// Passed as the block: `map(&:greet)`.
+    BlockPass,
+    /// Compared or named, never sent: a `when` condition, a hash's key, an `alias` or `undef`.
+    Compared,
+    /// Anywhere else: assigned, returned, a receiver, an element of a collection held.
+    Held,
+}
+
+/// Every symbol, `%i[]` word and one-word string in one text that spells a method's name, by the
+/// name, and where each is written, from one parse: what the callers rung reads in a document the
+/// indexer saw spell a name ([`super::indexer::named`]). A part of an interpolation is no literal.
+#[must_use]
+pub fn spelled_uses(source: &str) -> HashMap<String, Vec<SpelledUse>> {
+    #[derive(Default)]
+    struct Walk {
+        found: HashMap<String, Vec<SpelledUse>>,
+        claimed: HashSet<u32>,
+    }
+    impl Walk {
+        fn note(&mut self, node: &Node<'_>, how: impl FnOnce() -> Spelling) {
+            let at = node.location().start_offset() as u32;
+            let Some(name) = spelled_name(node) else {
+                return;
+            };
+            if self.claimed.insert(at) {
+                let text = node.as_string_node().is_some();
+                self.found.entry(name).or_default().push(SpelledUse {
+                    at,
+                    text,
+                    how: how(),
+                });
+            }
+        }
+
+        fn claim(&mut self, node: &Node<'_>) {
+            self.claimed.insert(node.location().start_offset() as u32);
+        }
+
+        fn argument(&mut self, node: &Node<'_>, call: &str, key: Option<&str>, first: Option<u32>) {
+            if let Some(array) = node.as_array_node() {
+                for element in array.elements().iter() {
+                    self.argument(&element, call, key, None);
+                }
+            } else if let Some(hash) = node.as_hash_node() {
+                self.pairs(hash.elements().iter(), call);
+            } else {
+                self.note(node, || Spelling::Argument {
+                    call: call.to_owned(),
+                    key: key.map(str::to_owned),
+                    first,
+                });
+            }
+        }
+
+        fn pairs<'pr>(&mut self, elements: impl Iterator<Item = Node<'pr>>, call: &str) {
+            for element in elements {
+                let Some(pair) = element.as_assoc_node() else {
+                    continue;
+                };
+                let key = pair.key();
+                self.note(&key, || Spelling::Compared);
+                let key = key
+                    .as_symbol_node()
+                    .map(|symbol| String::from_utf8_lossy(symbol.unescaped()).into_owned());
+                self.argument(&pair.value(), call, key.as_deref(), None);
+            }
+        }
+
+        fn parts<'pr>(&mut self, parts: impl Iterator<Item = Node<'pr>>) {
+            for part in parts.filter(|part| part.as_string_node().is_some()) {
+                self.claim(&part);
+            }
+        }
+    }
+    impl<'pr> Visit<'pr> for Walk {
+        fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+            let call = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+            let first = node.message_loc().map(|name| name.start_offset() as u32);
+            if let Some(arguments) = node.arguments() {
+                for (index, argument) in arguments.arguments().iter().enumerate() {
+                    if let Some(hash) = argument.as_keyword_hash_node() {
+                        self.pairs(hash.elements().iter(), &call);
+                    } else {
+                        self.argument(&argument, &call, None, first.filter(|_| index == 0));
+                    }
+                }
+            }
+            if let Some(passed) = node
+                .block()
+                .and_then(|block| block.as_block_argument_node())
+                && let Some(expression) = passed.expression()
+            {
+                self.note(&expression, || Spelling::BlockPass);
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+
+        fn visit_when_node(&mut self, node: &ruby_prism::WhenNode<'pr>) {
+            for condition in node.conditions().iter() {
+                self.note(&condition, || Spelling::Compared);
+            }
+            ruby_prism::visit_when_node(self, node);
+        }
+
+        fn visit_assoc_node(&mut self, node: &AssocNode<'pr>) {
+            self.note(&node.key(), || Spelling::Compared);
+            ruby_prism::visit_assoc_node(self, node);
+        }
+
+        fn visit_alias_method_node(&mut self, node: &ruby_prism::AliasMethodNode<'pr>) {
+            self.note(&node.new_name(), || Spelling::Compared);
+            self.note(&node.old_name(), || Spelling::Compared);
+            ruby_prism::visit_alias_method_node(self, node);
+        }
+
+        fn visit_undef_node(&mut self, node: &ruby_prism::UndefNode<'pr>) {
+            for name in node.names().iter() {
+                self.note(&name, || Spelling::Compared);
+            }
+            ruby_prism::visit_undef_node(self, node);
+        }
+
+        fn visit_interpolated_string_node(
+            &mut self,
+            node: &ruby_prism::InterpolatedStringNode<'pr>,
+        ) {
+            self.parts(node.parts().iter());
+            ruby_prism::visit_interpolated_string_node(self, node);
+        }
+
+        fn visit_interpolated_symbol_node(
+            &mut self,
+            node: &ruby_prism::InterpolatedSymbolNode<'pr>,
+        ) {
+            self.parts(node.parts().iter());
+            ruby_prism::visit_interpolated_symbol_node(self, node);
+        }
+
+        fn visit_interpolated_x_string_node(
+            &mut self,
+            node: &ruby_prism::InterpolatedXStringNode<'pr>,
+        ) {
+            self.parts(node.parts().iter());
+            ruby_prism::visit_interpolated_x_string_node(self, node);
+        }
+
+        fn visit_interpolated_regular_expression_node(
+            &mut self,
+            node: &ruby_prism::InterpolatedRegularExpressionNode<'pr>,
+        ) {
+            self.parts(node.parts().iter());
+            ruby_prism::visit_interpolated_regular_expression_node(self, node);
+        }
+
+        fn visit_symbol_node(&mut self, node: &SymbolNode<'pr>) {
+            self.note(&node.as_node(), || Spelling::Held);
+        }
+
+        fn visit_string_node(&mut self, node: &StringNode<'pr>) {
+            self.note(&node.as_node(), || Spelling::Held);
+        }
+    }
+    let result = parse(source);
+    let mut walk = Walk::default();
+    walk.visit(&result.node());
+    walk.found
+}
+
+/// The method name a symbol or a plain string literal spells: a word, with an optional `?`, `!`
+/// or `=` at its end, as the indexer's scan reads one.
+fn spelled_name(node: &Node<'_>) -> Option<String> {
+    let text: Vec<u8> = if let Some(symbol) = node.as_symbol_node() {
+        symbol.unescaped().to_vec()
+    } else {
+        node.as_string_node()?.unescaped().to_vec()
+    };
+    let (&head, rest) = text.split_first()?;
+    let body = match rest.last() {
+        Some(b'?' | b'!' | b'=') => &rest[..rest.len() - 1],
+        _ => rest,
+    };
+    let word = (head.is_ascii_alphabetic() || head == b'_')
+        && body
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+    word.then(|| String::from_utf8_lossy(&text).into_owned())
+}
+
+/// A module a hook mixes into what it is handed ([`hook_mixins`]):
+/// `def self.included(base) = base.extend(ClassMethods)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookMixin {
+    /// Where the hook's `def` starts.
+    pub hook_at: u32,
+    /// `included`, `extended` or `prepended`.
+    pub hook: String,
+    /// `include`, `prepend` or `extend`.
+    pub mixer: String,
+    /// The constant mixed in, by where its path ends, as [`Receiver::Constant`] places one; `None`
+    /// for `self`, the hook's own module.
+    pub mixed: Option<u32>,
+}
+
+/// Every module a hook mixes into what it is handed, in one text, from one parse: in a
+/// `def self.included(base)`, `self.extended(base)` or `self.prepended(base)` with that one
+/// parameter, outside a nested `def`, a call of `include`, `prepend` or `extend` on the parameter
+/// (or of a sender whose first argument spells one), one row per constant or `self` it is handed.
+#[must_use]
+pub fn hook_mixins(source: &str) -> Vec<HookMixin> {
+    struct Walk {
+        found: Vec<HookMixin>,
+        /// The hook being walked: where its `def` starts, its name and its parameter's.
+        hook: Option<(u32, String, Vec<u8>)>,
+    }
+    fn only_parameter(node: &DefNode<'_>) -> Option<Vec<u8>> {
+        let parameters = node.parameters()?;
+        let others = parameters.optionals().iter().next().is_some()
+            || parameters.rest().is_some()
+            || parameters.posts().iter().next().is_some()
+            || parameters.keywords().iter().next().is_some()
+            || parameters.keyword_rest().is_some();
+        let mut requireds = parameters.requireds().iter();
+        let one = requireds.next()?;
+        if others || requireds.next().is_some() {
+            return None;
+        }
+        Some(one.as_required_parameter_node()?.name().as_slice().to_vec())
+    }
+    impl<'pr> Visit<'pr> for Walk {
+        fn visit_def_node(&mut self, node: &DefNode<'pr>) {
+            let name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+            let hook = node
+                .receiver()
+                .is_some_and(|receiver| receiver.as_self_node().is_some())
+                && matches!(name.as_str(), "included" | "extended" | "prepended");
+            let inner = hook
+                .then(|| only_parameter(node))
+                .flatten()
+                .map(|parameter| (node.location().start_offset() as u32, name, parameter));
+            let outer = std::mem::replace(&mut self.hook, inner);
+            ruby_prism::visit_def_node(self, node);
+            self.hook = outer;
+        }
+
+        fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+            if let Some((at, hook, parameter)) = &self.hook
+                && node
+                    .receiver()
+                    .and_then(|receiver| receiver.as_local_variable_read_node())
+                    .is_some_and(|read| read.name().as_slice() == parameter.as_slice())
+            {
+                let name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+                let arguments: Vec<Node<'pr>> = node
+                    .arguments()
+                    .map(|arguments| arguments.arguments().iter().collect())
+                    .unwrap_or_default();
+                let mixer = match name.as_str() {
+                    "include" | "prepend" | "extend" => Some((name, 0)),
+                    "send" | "public_send" | "__send__" => arguments
+                        .first()
+                        .and_then(spelled_name)
+                        .filter(|named| matches!(named.as_str(), "include" | "prepend" | "extend"))
+                        .map(|named| (named, 1)),
+                    _ => None,
+                };
+                if let Some((mixer, skip)) = mixer {
+                    for argument in arguments.iter().skip(skip) {
+                        let mixed = if argument.as_self_node().is_some() {
+                            None
+                        } else if argument.as_constant_read_node().is_some()
+                            || argument.as_constant_path_node().is_some()
+                        {
+                            Some(argument.location().end_offset() as u32)
+                        } else {
+                            continue;
+                        };
+                        self.found.push(HookMixin {
+                            hook_at: *at,
+                            hook: hook.clone(),
+                            mixer: mixer.clone(),
+                            mixed,
+                        });
+                    }
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let result = parse(source);
+    let mut walk = Walk {
+        found: Vec::new(),
+        hook: None,
+    };
+    walk.visit(&result.node());
+    walk.found
+}
+
+/// Every call with a written name in one text, as its shape, by where the name starts, from one
+/// parse: what the callers rung reads a caller document for.
+#[must_use]
+pub fn every_call(source: &str) -> HashMap<u32, Receiver> {
+    let result = parse(source);
+    let mut finder = Finder::new(source, u32::MAX);
+    finder.visit(&result.node());
+    calls_of(&result.node(), &finder)
+}
+
+/// One `super` written in a `def`: the call it makes of the method above ([`supers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuperSite {
+    /// Where the keyword starts: the scope its arguments are read in.
+    pub at: u32,
+    /// The enclosing `def`'s span.
+    pub def: (u32, u32),
+    /// What it passes, counted as a call's arguments are ([`Arity`]).
+    pub arity: Arity,
+    /// Each positional it passes, as [`Receiver::Returned`]'s `arguments`.
+    pub arguments: Vec<Receiver>,
+    /// The keywords it passes by name, as [`Receiver::Returned`]'s `keywords`.
+    pub keywords: Option<Vec<(String, Receiver)>>,
+}
+
+/// Every `super` written in a `def` of one text, as the call it makes, from one parse: what an
+/// object's `initialize` above an override is handed.
+///
+/// - **`super(a, b)` passes what it writes**, read as a call's arguments are.
+/// - **A bare `super` passes the `def`'s parameters as they are where it runs**, in the `def`'s
+///   own shape: each required and optional positional in order, each keyword by name, as
+///   [`Receiver::Parameter`]. A parameter the `def` writes anywhere may hold something else by
+///   then, so it passes [`Receiver::Unknown`]. A `*rest`, a positional after it, a `**rest`, `...`
+///   or a destructured parameter passes a count nothing knows ([`Arity::Unknown`]).
+/// - **A `super` in a nested `def` is that `def`'s**, and one in a block the `def`'s around it.
+///   One outside every `def` (a `define_method` block) is left out: its name is the macro's.
+#[must_use]
+pub fn supers(source: &str) -> Vec<SuperSite> {
+    // The `def`s by index, the ones open around the walk, and each `super` with its `def`'s.
+    struct Walk<'pr> {
+        defs: Vec<Node<'pr>>,
+        open: Vec<usize>,
+        found: Vec<(Node<'pr>, usize)>,
+    }
+    impl<'pr> Visit<'pr> for Walk<'pr> {
+        fn visit_def_node(&mut self, node: &DefNode<'pr>) {
+            self.open.push(self.defs.len());
+            self.defs.push(node.as_node());
+            ruby_prism::visit_def_node(self, node);
+            self.open.pop();
+        }
+        fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
+            if let Some(def) = self.open.last() {
+                self.found.push((node.as_node(), *def));
+            }
+            ruby_prism::visit_super_node(self, node);
+        }
+        fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
+            if let Some(def) = self.open.last() {
+                self.found.push((node.as_node(), *def));
+            }
+            ruby_prism::visit_forwarding_super_node(self, node);
+        }
+    }
+    let result = parse(source);
+    let mut finder = Finder::new(source, u32::MAX);
+    finder.visit(&result.node());
+    let mut walk = Walk {
+        defs: Vec::new(),
+        open: Vec::new(),
+        found: Vec::new(),
+    };
+    walk.visit(&result.node());
+    walk.found
+        .iter()
+        .filter_map(|(node, def)| {
+            let def = walk.defs.get(*def)?.as_def_node()?;
+            let span = span_of(&def.as_node());
+            let at = node.location().start_offset() as u32;
+            if let Some(written) = node.as_super_node() {
+                let arguments = written.arguments();
+                return Some(SuperSite {
+                    at,
+                    def: span,
+                    arity: written_arity(arguments.as_ref()),
+                    arguments: finder.listed_arguments(arguments.as_ref(), Budget::default()),
+                    keywords: finder.listed_keywords(arguments.as_ref(), Budget::default()),
+                });
+            }
+            let (arity, arguments, keywords) = forwarded_by(&finder, &def, span);
+            Some(SuperSite {
+                at,
+                def: span,
+                arity,
+                arguments,
+                keywords,
+            })
+        })
+        .collect()
+}
+
+/// What a bare `super` in `def` passes: its parameters, as [`supers`] reads them.
+type Forwarded = (Arity, Vec<Receiver>, Option<Vec<(String, Receiver)>>);
+
+fn forwarded_by(finder: &Finder<'_, '_>, def: &DefNode<'_>, span: (u32, u32)) -> Forwarded {
+    let unknown = (Arity::Unknown, Vec::new(), None);
+    let Some(parameters) = def.parameters() else {
+        return (Arity::Exactly(0), Vec::new(), Some(Vec::new()));
+    };
+    // A positional after a rest comes with the rest; `...` is a keyword rest.
+    if parameters.rest().is_some() || parameters.keyword_rest().is_some() {
+        return unknown;
+    }
+    let name = String::from_utf8_lossy(def.name().as_slice()).into_owned();
+    let held = |slot: ParameterSlot, spelled: &[u8]| {
+        let spelled = String::from_utf8_lossy(spelled);
+        let written = finder
+            .defs
+            .iter()
+            .find(|found| found.span == span)
+            .is_none_or(|found| finder.written_in(found, &spelled));
+        if written {
+            Receiver::Unknown
+        } else {
+            Receiver::Parameter {
+                at: span.0,
+                method: name.clone(),
+                slot,
+            }
+        }
+    };
+    let mut arguments = Vec::new();
+    for (index, parameter) in parameters
+        .requireds()
+        .iter()
+        .chain(parameters.optionals().iter())
+        .enumerate()
+    {
+        let spelled = match (
+            parameter.as_required_parameter_node(),
+            parameter.as_optional_parameter_node(),
+        ) {
+            (Some(required), _) => required.name(),
+            (_, Some(optional)) => optional.name(),
+            // `def f((a, b))`: the destructured value is passed whole, which nothing names.
+            _ => return unknown,
+        };
+        arguments.push(held(ParameterSlot::Positional(index), spelled.as_slice()));
+    }
+    // A keyword parameter is required or optional; a `**rest` was turned away above.
+    let keywords: Vec<(String, Receiver)> = parameters
+        .keywords()
+        .iter()
+        .filter_map(|parameter| {
+            parameter
+                .as_required_keyword_parameter_node()
+                .map(|required| required.name())
+                .or_else(|| {
+                    parameter
+                        .as_optional_keyword_parameter_node()
+                        .map(|optional| optional.name())
+                })
+        })
+        .map(|spelled| {
+            let key = String::from_utf8_lossy(spelled.as_slice()).into_owned();
+            let value = held(ParameterSlot::Keyword(key.clone()), spelled.as_slice());
+            (key, value)
+        })
+        .collect();
+    let count = arguments.len() as u32;
+    let arity = if keywords.is_empty() {
+        Arity::Exactly(count)
+    } else {
+        Arity::Keyed(count)
+    };
+    (arity, arguments, Some(keywords))
+}
+
+/// [`every_call`] of a tree and a cursor-less [`Finder`] walk of it.
+fn calls_of(node: &Node<'_>, finder: &Finder<'_, '_>) -> HashMap<u32, Receiver> {
+    struct Found<'pr> {
+        calls: Vec<(u32, Node<'pr>)>,
+    }
+    impl<'pr> Visit<'pr> for Found<'pr> {
+        fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+            if let Some(message) = node.message_loc() {
+                self.calls
+                    .push((message.start_offset() as u32, node.as_node()));
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut found = Found { calls: Vec::new() };
+    found.visit(node);
+    found
+        .calls
+        .into_iter()
+        .map(|(at, node)| (at, finder.receiver_of(Some(&node), Budget::default())))
+        .collect()
+}
+
+/// [`every_call`] and [`shapes`] from one parse and one [`Finder`] walk: a document the callers
+/// rung reads call shapes from is mostly one whose receivers and arguments it reads next.
+#[must_use]
+pub fn every_call_and_shapes(source: &str) -> (HashMap<u32, Receiver>, Shapes) {
+    let result = parse(source);
+    let mut finder = Finder::new(source, u32::MAX);
+    finder.visit(&result.node());
+    (
+        calls_of(&result.node(), &finder),
+        shapes_of(source, &result.node(), &finder),
+    )
+}
+
 /// [`Shapes`] for one text.
 #[must_use]
 pub fn shapes(source: &str) -> Shapes {
@@ -1388,6 +2364,15 @@ pub fn blocks_handed_back(source: &str) -> HashMap<u32, Box<[Receiver]>> {
     blocks.found
 }
 
+/// The one proc literal a call is passed as a positional argument ([`lambdas_handed_back`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandedLambda {
+    /// Where the literal starts, as [`Receiver::ProcParameter`] names it.
+    pub at: u32,
+    /// What it hands back.
+    pub exits: Box<[Receiver]>,
+}
+
 /// What the one proc literal each call is passed as a positional argument hands back, by where
 /// the call starts: the body of a member a call defines from its lambda, as
 /// `scope :recent, -> { … }` does.
@@ -1396,10 +2381,10 @@ pub fn blocks_handed_back(source: &str) -> HashMap<u32, Box<[Receiver]>> {
 ///   `break` and `return`. A proc whose `return` or `break` leaves the method is unreadable.
 /// - **Only a call passed exactly one**, since two leave which one is meant to the method.
 #[must_use]
-pub fn lambdas_handed_back(source: &str) -> HashMap<u32, Box<[Receiver]>> {
+pub fn lambdas_handed_back(source: &str) -> HashMap<u32, HandedLambda> {
     struct Lambdas<'f, 'a, 'b> {
         finder: &'f Finder<'a, 'b>,
-        found: HashMap<u32, Box<[Receiver]>>,
+        found: HashMap<u32, HandedLambda>,
     }
     impl<'pr> Visit<'pr> for Lambdas<'_, '_, '_> {
         fn visit_call_node(&mut self, node: &CallNode<'pr>) {
@@ -1413,10 +2398,15 @@ pub fn lambdas_handed_back(source: &str) -> HashMap<u32, Box<[Receiver]>> {
                         .collect()
                 })
                 .unwrap_or_default();
-            if let [literal] = literals.as_slice() {
+            if let [literal] = literals.as_slice()
+                && let Some(at) = proc_literal(literal)
+            {
                 self.found.insert(
                     node.location().start_offset() as u32,
-                    self.finder.proc_shape(literal).exits.into_boxed_slice(),
+                    HandedLambda {
+                        at,
+                        exits: self.finder.proc_shape(literal).exits.into_boxed_slice(),
+                    },
                 );
             }
             ruby_prism::visit_call_node(self, node);
@@ -1578,10 +2568,19 @@ fn shapes_of(source: &str, node: &Node<'_>, finder: &Finder<'_, '_>) -> Shapes {
             )
         })
         .collect();
-    let mut defaults = Defaults {
-        found: HashMap::new(),
-    };
-    defaults.visit(node);
+    let mut gathered = Gathered::new(node);
+    gathered.visit(node);
+    let Gathered {
+        defaults,
+        raising,
+        sites,
+        yields: yield_sites,
+        writers,
+        procs: literals,
+        uses,
+        mut ends,
+    } = gathered;
+    ends.ends.sort_unstable();
     let written_defaults = defaults
         .found
         .iter()
@@ -1604,15 +2603,6 @@ fn shapes_of(source: &str, node: &Node<'_>, finder: &Finder<'_, '_>) -> Shapes {
             (span, held)
         })
         .collect();
-    let mut raising = Raising(HashSet::new());
-    raising.visit(node);
-    let mut sites = Sites {
-        bodies: vec![span_of(node)],
-
-        open: vec![span_of(node)],
-        found: Vec::new(),
-    };
-    sites.visit(node);
     let blocks = sites
         .found
         .into_iter()
@@ -1629,8 +2619,6 @@ fn shapes_of(source: &str, node: &Node<'_>, finder: &Finder<'_, '_>) -> Shapes {
             body: found.body,
         })
         .collect();
-    let mut yield_sites = YieldSites::default();
-    yield_sites.visit(node);
     let yields = yield_sites
         .found
         .into_iter()
@@ -1652,8 +2640,6 @@ fn shapes_of(source: &str, node: &Node<'_>, finder: &Finder<'_, '_>) -> Shapes {
             (span, handed)
         })
         .collect();
-    let mut writers = Writers::default();
-    writers.visit(node);
     let setters = writers
         .found
         .into_iter()
@@ -1677,8 +2663,6 @@ fn shapes_of(source: &str, node: &Node<'_>, finder: &Finder<'_, '_>) -> Shapes {
             }),
         })
         .collect();
-    let mut literals = ProcLiterals::default();
-    literals.visit(node);
     let procs = literals
         .found
         .iter()
@@ -1691,7 +2675,7 @@ fn shapes_of(source: &str, node: &Node<'_>, finder: &Finder<'_, '_>) -> Shapes {
         .collect();
     Shapes {
         returns,
-        variables: finder.variables(&call_ends(node), &uses(node)),
+        variables: finder.variables(&ends, &uses.0, &uses.1),
         defaults,
         written_defaults,
         raising: raising.0,
@@ -1712,9 +2696,13 @@ fn shapes_of(source: &str, node: &Node<'_>, finder: &Finder<'_, '_>) -> Shapes {
 struct Writers<'pr> {
     found: Vec<Written<'pr>>,
     sends: Vec<(u32, Sending, Option<Node<'pr>>)>,
-    /// The locals each `def` being walked writes, innermost last ([`LocalNames`]).
-    locals: Vec<HashMap<Vec<u8>, scopes::Spelled>>,
+    /// Each `def` being walked, innermost last: its body, and the locals it writes
+    /// ([`LocalNames`]), read the first time a sending call in it names one by a local.
+    locals: Vec<(Option<Node<'pr>>, Option<LocalSpellings>)>,
 }
+
+/// What each local one `def` writes can spell ([`LocalNames`]).
+type LocalSpellings = HashMap<Vec<u8>, scopes::Spelled>;
 
 /// What [`Writers::sent`] reads of one sending call: the names, and how many values follow.
 type Sending = (scopes::Spelled, Option<usize>);
@@ -1773,7 +2761,7 @@ impl<'pr> Writers<'pr> {
     /// The names a sending call can send, and how many arguments it passes after the name (`None`
     /// where a splat or `...` can be any number, and one first can be any name). `None` for a call
     /// with no argument, which raises.
-    fn sent(&self, call: &CallNode<'_>) -> Option<Sending> {
+    fn sent(&mut self, call: &CallNode<'_>) -> Option<Sending> {
         let arguments: Vec<Node<'_>> = call
             .arguments()
             .map(|written| written.arguments().iter().collect())
@@ -1788,8 +2776,7 @@ impl<'pr> Writers<'pr> {
         let values = (!values.iter().any(spreads)).then_some(values.len());
         let spelled = match name.as_local_variable_read_node() {
             Some(local) => self
-                .locals
-                .last()
+                .locals_here()
                 .and_then(|written| written.get(local.name().as_slice()))
                 .cloned()
                 .unwrap_or_else(scopes::Spelled::everything),
@@ -1797,20 +2784,32 @@ impl<'pr> Writers<'pr> {
         };
         Some((spelled, values))
     }
-}
 
-impl<'pr> Visit<'pr> for Writers<'pr> {
-    fn visit_def_node(&mut self, node: &DefNode<'pr>) {
-        let mut locals = LocalNames::default();
-        if let Some(body) = node.body() {
-            locals.visit(&body);
-        }
-        self.locals.push(locals.found);
-        ruby_prism::visit_def_node(self, node);
+    /// The locals the innermost `def` being walked writes, read on first use: most `def`s send
+    /// nothing by a local, and reading every one's was a walk of most of the text.
+    fn locals_here(&mut self) -> Option<&LocalSpellings> {
+        let (body, held) = self.locals.last_mut()?;
+        Some(held.get_or_insert_with(|| {
+            let mut locals = LocalNames::default();
+            if let Some(body) = body {
+                locals.visit(body);
+            }
+            locals.found
+        }))
+    }
+
+    /// A `def` opens: its locals are its own.
+    fn enter_def(&mut self, node: &DefNode<'pr>) {
+        self.locals.push((node.body(), None));
+    }
+
+    /// The innermost `def` closes.
+    fn leave_def(&mut self) {
         self.locals.pop();
     }
 
-    fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+    /// A call: a sending one, a `set(name: value)` on a receiver, or a writer's.
+    fn call(&mut self, node: &CallNode<'pr>) {
         if SENDERS
             .iter()
             .any(|sender| sender.as_bytes() == node.name().as_slice())
@@ -1837,39 +2836,6 @@ impl<'pr> Visit<'pr> for Writers<'pr> {
                 value,
             );
         }
-        ruby_prism::visit_call_node(self, node);
-    }
-
-    fn visit_call_or_write_node(&mut self, node: &CallOrWriteNode<'pr>) {
-        self.push(
-            node.location().start_offset() as u32,
-            node.write_name().as_slice(),
-            node.receiver(),
-            node.value(),
-        );
-        ruby_prism::visit_call_or_write_node(self, node);
-    }
-
-    fn visit_call_and_write_node(&mut self, node: &CallAndWriteNode<'pr>) {
-        self.push(
-            node.location().start_offset() as u32,
-            node.write_name().as_slice(),
-            node.receiver(),
-            node.value(),
-        );
-        ruby_prism::visit_call_and_write_node(self, node);
-    }
-
-    // `Current.count += 1` writes what `+` answers, which is not the value written: nothing here
-    // reads it, and the accessor it writes answers nothing.
-    fn visit_call_operator_write_node(&mut self, node: &CallOperatorWriteNode<'pr>) {
-        self.push(
-            node.location().start_offset() as u32,
-            node.write_name().as_slice(),
-            node.receiver(),
-            node.as_node(),
-        );
-        ruby_prism::visit_call_operator_write_node(self, node);
     }
 }
 
@@ -1972,102 +2938,116 @@ fn empty_container(node: &Node<'_>) -> Option<&'static str> {
     }
 }
 
-/// Every local read's [`Use`], by where it starts.
-fn uses<'pr>(node: &Node<'pr>) -> HashMap<u32, Use<'pr>> {
-    #[derive(Default)]
-    struct Uses<'pr>(HashMap<u32, Use<'pr>>);
-    impl<'pr> Uses<'pr> {
-        fn local(node: Option<Node<'pr>>) -> Option<u32> {
-            let node = node?;
-            let node = unparenthesised(&node).unwrap_or(node);
-            Some(
-                node.as_local_variable_read_node()?
-                    .location()
-                    .start_offset() as u32,
-            )
-        }
+/// Every local read's [`Use`], by where it starts: the first use the walk meets is the read's.
+/// Beside them, every local write whose value nothing takes, by where it starts: a statement of a
+/// list that is not its last ([`Reaching::kept`]).
+#[derive(Default)]
+struct Uses<'pr>(HashMap<u32, Use<'pr>>, HashSet<u32>);
 
-        /// What a statement-level call on a local adds to it ([`Use::Adds`]).
-        fn added(call: &CallNode<'pr>) -> Option<(Vec<Node<'pr>>, bool)> {
-            let arguments: Vec<Node<'pr>> = call
-                .arguments()
-                .map(|written| written.arguments().iter().collect())
-                .unwrap_or_default();
-            let added = match call.name().as_slice() {
-                b"<<" | b"push" | b"append" | b"unshift" | b"prepend" => (arguments, false),
-                b"insert" => (arguments.into_iter().skip(1).collect(), false),
-                b"[]=" | b"store" if arguments.len() == 2 => (arguments, true),
-                _ => return None,
-            };
-            (call.block().is_none()).then_some(added)
-        }
-
-        fn note(&mut self, at: u32, used: Use<'pr>) {
-            self.0.entry(at).or_insert(used);
-        }
+impl<'pr> Uses<'pr> {
+    fn local(node: Option<Node<'pr>>) -> Option<u32> {
+        let node = node?;
+        let node = unparenthesised(&node).unwrap_or(node);
+        Some(
+            node.as_local_variable_read_node()?
+                .location()
+                .start_offset() as u32,
+        )
     }
-    impl<'pr> Visit<'pr> for Uses<'pr> {
-        fn visit_statements_node(&mut self, node: &StatementsNode<'pr>) {
-            for statement in node.body().iter() {
-                let Some(call) = statement.as_call_node() else {
-                    continue;
-                };
-                let Some(at) = Self::local(call.receiver()) else {
-                    continue;
-                };
-                if let Some((values, keyed)) = Self::added(&call) {
-                    self.note(at, Use::Adds(values, keyed));
-                } else if SELF_RETURNING
-                    .iter()
-                    .any(|name| name.as_bytes() == call.name().as_slice())
-                {
-                    self.note(at, Use::Reads);
-                }
-            }
-            ruby_prism::visit_statements_node(self, node);
-        }
 
-        fn visit_call_node(&mut self, node: &CallNode<'pr>) {
-            if let Some(at) = Self::local(node.receiver()) {
-                let reads = READS
-                    .iter()
-                    .any(|name| name.as_bytes() == node.name().as_slice());
-                self.note(at, if reads { Use::Reads } else { Use::Escapes });
-            }
-            ruby_prism::visit_call_node(self, node);
-        }
+    /// What a statement-level call on a local adds to it ([`Use::Adds`]).
+    fn added(call: &CallNode<'pr>) -> Option<(Vec<Node<'pr>>, bool)> {
+        let arguments: Vec<Node<'pr>> = call
+            .arguments()
+            .map(|written| written.arguments().iter().collect())
+            .unwrap_or_default();
+        let added = match call.name().as_slice() {
+            b"<<" | b"push" | b"append" | b"unshift" | b"prepend" => (arguments, false),
+            b"insert" => (arguments.into_iter().skip(1).collect(), false),
+            b"[]=" | b"store" if arguments.len() == 2 => (arguments, true),
+            _ => return None,
+        };
+        (call.block().is_none()).then_some(added)
+    }
 
-        fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
-            let mut arguments = node
-                .arguments()
-                .into_iter()
-                .flat_map(|written| written.arguments().iter());
-            if let (Some(only), None) = (arguments.next(), arguments.next())
-                && let Some(at) = Self::local(Some(only))
+    fn note(&mut self, at: u32, used: Use<'pr>) {
+        self.0.entry(at).or_insert(used);
+    }
+
+    /// A statement list, before its statements: each call on a local written as a statement, and
+    /// each local write whose value the list drops.
+    fn statements(&mut self, node: &StatementsNode<'pr>) {
+        let body = node.body();
+        for statement in body.iter().take(body.len().saturating_sub(1)) {
+            if let Some(write) = statement.as_local_variable_write_node() {
+                self.1.insert(write.location().start_offset() as u32);
+            }
+        }
+        for statement in node.body().iter() {
+            let Some(call) = statement.as_call_node() else {
+                continue;
+            };
+            let Some(at) = Self::local(call.receiver()) else {
+                continue;
+            };
+            if let Some((values, keyed)) = Self::added(&call) {
+                self.note(at, Use::Adds(values, keyed));
+            } else if SELF_RETURNING
+                .iter()
+                .any(|name| name.as_bytes() == call.name().as_slice())
             {
                 self.note(at, Use::Reads);
             }
-            ruby_prism::visit_return_node(self, node);
-        }
-
-        fn visit_def_node(&mut self, node: &DefNode<'pr>) {
-            let last = node
-                .body()
-                .and_then(|body| body.as_statements_node())
-                .and_then(|statements| statements.body().iter().last());
-            if let Some(at) = Self::local(last) {
-                self.note(at, Use::Reads);
-            }
-            ruby_prism::visit_def_node(self, node);
-        }
-
-        fn visit_local_variable_read_node(&mut self, node: &LocalVariableReadNode<'pr>) {
-            self.note(node.location().start_offset() as u32, Use::Escapes);
         }
     }
-    let mut found = Uses::default();
-    found.visit(node);
-    found.0
+
+    /// A call, before its receiver: a member called on a local.
+    fn call(&mut self, node: &CallNode<'pr>) {
+        if let Some(at) = Self::local(node.receiver()) {
+            let reads = READS
+                .iter()
+                .any(|name| name.as_bytes() == node.name().as_slice());
+            self.note(at, if reads { Use::Reads } else { Use::Escapes });
+        }
+    }
+
+    /// A `return` of one local.
+    fn returned(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+        let mut arguments = node
+            .arguments()
+            .into_iter()
+            .flat_map(|written| written.arguments().iter());
+        if let (Some(only), None) = (arguments.next(), arguments.next())
+            && let Some(at) = Self::local(Some(only))
+        {
+            self.note(at, Use::Reads);
+        }
+    }
+
+    /// A `def`, before its body: a local its last statement reads.
+    fn def(&mut self, node: &DefNode<'pr>) {
+        let last = node
+            .body()
+            .and_then(|body| body.as_statements_node())
+            .and_then(|statements| statements.body().iter().last());
+        if let Some(at) = Self::local(last) {
+            self.note(at, Use::Reads);
+        }
+    }
+
+    /// Any other read of a local.
+    fn read(&mut self, node: &LocalVariableReadNode<'pr>) {
+        self.note(node.location().start_offset() as u32, Use::Escapes);
+    }
+}
+
+/// One text's [`CallEnds`], from the walk [`shapes_of`] makes ([`Gathered`]).
+#[cfg(test)]
+fn call_ends(node: &Node<'_>) -> CallEnds {
+    let mut gathered = Gathered::new(node);
+    gathered.visit(node);
+    gathered.ends.ends.sort_unstable();
+    gathered.ends
 }
 
 /// Where every construct in a text that may run a method ends, sorted: the moment it runs is at
@@ -2081,127 +3061,31 @@ fn uses<'pr>(node: &Node<'pr>) -> HashMap<u32, Use<'pr>> {
 /// is read though it is written after, and in `touch if @label.upcase` `touch` runs after the read
 /// though it is written before. So [`CallEnds::modifiers`] holds every modifier `if`, `unless`,
 /// `while` and `until`'s body and condition, for [`CallEnds::between`] to put in order.
-fn call_ends(node: &Node<'_>) -> CallEnds {
-    #[derive(Default)]
-    struct Ends(CallEnds);
-    impl Ends {
-        fn end(&mut self, location: &Location<'_>) {
-            self.0.ends.push(location.end_offset() as u32);
-        }
-
-        /// A conditional or loop whose `statements` are written before its `predicate`.
-        fn modifier<'pr>(
-            &mut self,
-            predicate: &Node<'pr>,
-            statements: Option<StatementsNode<'pr>>,
-        ) -> bool {
-            let Some(statements) = statements.filter(|statements| {
-                statements.location().start_offset() < predicate.location().start_offset()
-            }) else {
-                return false;
-            };
-            self.0
-                .modifiers
-                .push((span_of(&statements.as_node()), span_of(predicate)));
-            self.visit(predicate);
-            self.visit_statements_node(&statements);
-            true
-        }
-    }
-    macro_rules! ends {
-        ($($visit:ident, $walk:ident, $node:ident;)*) => {
-            impl<'pr> Visit<'pr> for Ends {
-                $(
-                    fn $visit(&mut self, node: &ruby_prism::$node<'pr>) {
-                        self.end(&node.location());
-                        ruby_prism::$walk(self, node);
-                    }
-                )*
-
-                fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
-                    if !self.modifier(&node.predicate(), node.statements()) {
-                        ruby_prism::visit_if_node(self, node);
-                    }
-                }
-
-                fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
-                    if !self.modifier(&node.predicate(), node.statements()) {
-                        ruby_prism::visit_unless_node(self, node);
-                    }
-                }
-
-                fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
-                    if !self.modifier(&node.predicate(), node.statements()) {
-                        ruby_prism::visit_while_node(self, node);
-                    }
-                }
-
-                fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
-                    if !self.modifier(&node.predicate(), node.statements()) {
-                        ruby_prism::visit_until_node(self, node);
-                    }
-                }
-            }
-        };
-    }
-    ends! {
-        visit_call_node, visit_call_node, CallNode;
-        visit_call_operator_write_node, visit_call_operator_write_node, CallOperatorWriteNode;
-        visit_call_and_write_node, visit_call_and_write_node, CallAndWriteNode;
-        visit_call_or_write_node, visit_call_or_write_node, CallOrWriteNode;
-        visit_index_operator_write_node, visit_index_operator_write_node, IndexOperatorWriteNode;
-        visit_index_and_write_node, visit_index_and_write_node, IndexAndWriteNode;
-        visit_index_or_write_node, visit_index_or_write_node, IndexOrWriteNode;
-        visit_instance_variable_operator_write_node, visit_instance_variable_operator_write_node, InstanceVariableOperatorWriteNode;
-        visit_local_variable_operator_write_node, visit_local_variable_operator_write_node, LocalVariableOperatorWriteNode;
-        visit_class_variable_operator_write_node, visit_class_variable_operator_write_node, ClassVariableOperatorWriteNode;
-        visit_global_variable_operator_write_node, visit_global_variable_operator_write_node, GlobalVariableOperatorWriteNode;
-        visit_constant_operator_write_node, visit_constant_operator_write_node, ConstantOperatorWriteNode;
-        visit_constant_path_operator_write_node, visit_constant_path_operator_write_node, ConstantPathOperatorWriteNode;
-        visit_super_node, visit_super_node, SuperNode;
-        visit_forwarding_super_node, visit_forwarding_super_node, ForwardingSuperNode;
-        visit_yield_node, visit_yield_node, YieldNode;
-        visit_interpolated_string_node, visit_interpolated_string_node, InterpolatedStringNode;
-        visit_interpolated_symbol_node, visit_interpolated_symbol_node, InterpolatedSymbolNode;
-        visit_interpolated_regular_expression_node, visit_interpolated_regular_expression_node, InterpolatedRegularExpressionNode;
-        visit_interpolated_x_string_node, visit_interpolated_x_string_node, InterpolatedXStringNode;
-        visit_x_string_node, visit_x_string_node, XStringNode;
-        visit_match_write_node, visit_match_write_node, MatchWriteNode;
-        visit_match_predicate_node, visit_match_predicate_node, MatchPredicateNode;
-        visit_match_required_node, visit_match_required_node, MatchRequiredNode;
-        visit_case_node, visit_case_node, CaseNode;
-        visit_case_match_node, visit_case_match_node, CaseMatchNode;
-        visit_for_node, visit_for_node, ForNode;
-        visit_multi_write_node, visit_multi_write_node, MultiWriteNode;
-        visit_splat_node, visit_splat_node, SplatNode;
-        visit_assoc_splat_node, visit_assoc_splat_node, AssocSplatNode;
-        visit_block_argument_node, visit_block_argument_node, BlockArgumentNode;
-        visit_range_node, visit_range_node, RangeNode;
-        visit_def_node, visit_def_node, DefNode;
-        visit_alias_method_node, visit_alias_method_node, AliasMethodNode;
-        visit_undef_node, visit_undef_node, UndefNode;
-        visit_class_node, visit_class_node, ClassNode;
-        visit_module_node, visit_module_node, ModuleNode;
-        visit_singleton_class_node, visit_singleton_class_node, SingletonClassNode;
-        visit_constant_write_node, visit_constant_write_node, ConstantWriteNode;
-        visit_constant_path_write_node, visit_constant_path_write_node, ConstantPathWriteNode;
-    }
-    let mut ends = Ends::default();
-    ends.visit(node);
-    ends.0.ends.sort_unstable();
-    ends.0
-}
-
-/// [`call_ends`]'s answer.
 #[derive(Debug, Default)]
 struct CallEnds {
-    /// Where every construct that may run a method ends, sorted.
+    /// Where every construct that may run a method ends, sorted once the walk is done.
     ends: Vec<u32>,
     /// Every modifier's body and condition, the body written first and run last.
     modifiers: Vec<((u32, u32), (u32, u32))>,
 }
 
 impl CallEnds {
+    /// A construct that may run a method, ending where `location` does.
+    fn end(&mut self, location: &Location<'_>) {
+        self.ends.push(location.end_offset() as u32);
+    }
+
+    /// A conditional or loop, kept where its `statements` are written before its `predicate`: a
+    /// modifier.
+    fn modifier<'pr>(&mut self, predicate: &Node<'pr>, statements: Option<StatementsNode<'pr>>) {
+        if let Some(statements) = statements.filter(|statements| {
+            statements.location().start_offset() < predicate.location().start_offset()
+        }) {
+            self.modifiers
+                .push((span_of(&statements.as_node()), span_of(predicate)));
+        }
+    }
+
     /// Whether a construct that may run a method runs after the write that takes effect at
     /// `write` (its name at `name`) and before the read at `read`.
     ///
@@ -2318,17 +3202,16 @@ struct ProcLiterals<'pr> {
     found: Vec<Node<'pr>>,
 }
 
-impl<'pr> Visit<'pr> for ProcLiterals<'pr> {
-    fn visit_lambda_node(&mut self, node: &LambdaNode<'pr>) {
+impl<'pr> ProcLiterals<'pr> {
+    fn lambda(&mut self, node: &LambdaNode<'pr>) {
         self.found.push(node.as_node());
-        ruby_prism::visit_lambda_node(self, node);
     }
 
-    fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+    /// `proc {}`, `lambda {}` and `Proc.new {}`.
+    fn call(&mut self, node: &CallNode<'pr>) {
         if proc_literal(&node.as_node()).is_some() {
             self.found.push(node.as_node());
         }
-        ruby_prism::visit_call_node(self, node);
     }
 }
 
@@ -2414,10 +3297,9 @@ impl<'pr> YieldSites<'pr> {
             .or_default()
             .push(YieldSite { handed, called });
     }
-}
 
-impl<'pr> Visit<'pr> for YieldSites<'pr> {
-    fn visit_def_node(&mut self, node: &DefNode<'pr>) {
+    /// A `def` opens, with its `&block`'s name.
+    fn enter_def(&mut self, node: &DefNode<'pr>) {
         let span = span_of(&node.as_node());
         let block = node
             .parameters()
@@ -2426,16 +3308,19 @@ impl<'pr> Visit<'pr> for YieldSites<'pr> {
             .map(|name| name.as_slice().to_vec());
         self.found.entry(span).or_default();
         self.open.push((span, block));
-        ruby_prism::visit_def_node(self, node);
+    }
+
+    /// The innermost `def` closes.
+    fn leave_def(&mut self) {
         self.open.pop();
     }
 
-    fn visit_yield_node(&mut self, node: &ruby_prism::YieldNode<'pr>) {
+    fn yielded(&mut self, node: &ruby_prism::YieldNode<'pr>) {
         self.note(node.arguments(), false);
-        ruby_prism::visit_yield_node(self, node);
     }
 
-    fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+    /// A call of the innermost `def`'s own `&block`.
+    fn call(&mut self, node: &CallNode<'pr>) {
         let named = self.open.last().and_then(|(_, block)| block.as_deref());
         if let Some(block) = named
             && matches!(node.name().as_slice(), b"call" | b"yield" | b"[]")
@@ -2451,7 +3336,6 @@ impl<'pr> Visit<'pr> for YieldSites<'pr> {
                 self.note(node.arguments(), true);
             }
         }
-        ruby_prism::visit_call_node(self, node);
     }
 }
 
@@ -2477,10 +3361,14 @@ struct Site<'pr> {
 }
 
 impl<'pr> Sites<'pr> {
-    fn body(&mut self, span: (u32, u32), walk: impl FnOnce(&mut Self)) {
+    /// A body opens: a `def`, a class, a module, `class << self`, or a block that makes a class.
+    fn open(&mut self, span: (u32, u32)) {
         self.bodies.push(span);
         self.open.push(span);
-        walk(self);
+    }
+
+    /// The innermost body closes.
+    fn close(&mut self) {
         self.open.pop();
     }
 
@@ -2496,46 +3384,12 @@ impl<'pr> Sites<'pr> {
         }
         Some(span_of(&call.block()?.as_block_node()?.as_node()))
     }
-}
 
-impl<'pr> Visit<'pr> for Sites<'pr> {
-    fn visit_def_node(&mut self, node: &DefNode<'pr>) {
-        self.body(span_of(&node.as_node()), |walk| {
-            ruby_prism::visit_def_node(walk, node);
-        });
-    }
-
-    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
-        self.body(span_of(&node.as_node()), |walk| {
-            ruby_prism::visit_class_node(walk, node);
-        });
-    }
-
-    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
-        self.body(span_of(&node.as_node()), |walk| {
-            ruby_prism::visit_module_node(walk, node);
-        });
-    }
-
-    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
-        self.body(span_of(&node.as_node()), |walk| {
-            ruby_prism::visit_singleton_class_node(walk, node);
-        });
-    }
-
-    fn visit_call_node(&mut self, node: &CallNode<'pr>) {
-        let body = *self.open.last().expect("the file is always open");
-        let call = node.location().start_offset() as u32;
-        let method = String::from_utf8_lossy(node.name().as_slice()).into_owned();
-        let site = |span: (u32, u32), slot: BlockSlot| Site {
-            span,
-            receiver: node.receiver(),
-            method: method.clone(),
-            slot,
-            call,
-            body,
-        };
-        let mut found = Vec::new();
+    /// A call's blocks and lambda arguments, and the block it runs as a class's body, if any: the
+    /// walk opens that body around the block alone ([`Gathered::visit_call_node`]).
+    fn call(&mut self, node: &CallNode<'pr>) -> Option<BlockNode<'pr>> {
+        // Each site's span and slot; the rest is the call's, spelled only where it has one.
+        let mut found: Vec<((u32, u32), BlockSlot)> = Vec::new();
         // `proc { }` and `lambda { }` make a block into a value; they never run it against
         // anything, and where one is an argument it is filed as that argument, below.
         let literal =
@@ -2543,7 +3397,7 @@ impl<'pr> Visit<'pr> for Sites<'pr> {
         if let Some(block) = node.block().and_then(|block| block.as_block_node())
             && !literal
         {
-            found.push(site(span_of(&block.as_node()), BlockSlot::Block));
+            found.push((span_of(&block.as_node()), BlockSlot::Block));
         }
         let mut position = Some(0usize);
         for argument in node
@@ -2563,7 +3417,7 @@ impl<'pr> Visit<'pr> for Sites<'pr> {
                         continue;
                     };
                     let name = String::from_utf8_lossy(key.unescaped()).into_owned();
-                    found.push(site(span, BlockSlot::Keyword(name.into())));
+                    found.push((span, BlockSlot::Keyword(name.into())));
                 }
                 continue;
             }
@@ -2573,28 +3427,29 @@ impl<'pr> Visit<'pr> for Sites<'pr> {
                 continue;
             }
             if let (Some(index), Some(span)) = (position, Self::lambda_span(&argument)) {
-                found.push(site(span, BlockSlot::Positional(index)));
+                found.push((span, BlockSlot::Positional(index)));
             }
             position = position.map(|index| index + 1);
         }
-        self.found.extend(found);
+        if !found.is_empty() {
+            let body = *self.open.last().expect("the file is always open");
+            let call = node.location().start_offset() as u32;
+            let method = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+            self.found
+                .extend(found.into_iter().map(|(span, slot)| Site {
+                    span,
+                    receiver: node.receiver(),
+                    method: method.clone(),
+                    slot,
+                    call,
+                    body,
+                }));
+        }
         // **A block that makes a class is a body**, as rubydex records it (an anonymous class): its
         // `self` is that class, so no block around the call decides it, however that one rebinds.
-        if let Some(block) = node.block().and_then(|block| block.as_block_node())
-            && makes_a_class(node)
-        {
-            if let Some(receiver) = node.receiver() {
-                self.visit(&receiver);
-            }
-            if let Some(arguments) = node.arguments() {
-                self.visit_arguments_node(&arguments);
-            }
-            self.body(span_of(&block.as_node()), |walk| {
-                walk.visit_block_node(&block)
-            });
-            return;
-        }
-        ruby_prism::visit_call_node(self, node);
+        node.block()
+            .and_then(|block| block.as_block_node())
+            .filter(|_| makes_a_class(node))
     }
 }
 
@@ -2683,17 +3538,17 @@ impl<'pr> Visit<'pr> for Raises {
 }
 
 /// Every `def` in a text that [`raises_in`] says writes one, for [`Shapes::raising`].
+#[derive(Default)]
 struct Raising(HashSet<(u32, u32)>);
 
-impl<'pr> Visit<'pr> for Raising {
-    fn visit_def_node(&mut self, node: &DefNode<'pr>) {
+impl Raising {
+    fn def(&mut self, node: &DefNode<'_>) {
         if raises_in(node) {
             self.0.insert((
                 node.location().start_offset() as u32,
                 node.location().end_offset() as u32,
             ));
         }
-        ruby_prism::visit_def_node(self, node);
     }
 }
 
@@ -2701,12 +3556,13 @@ impl<'pr> Visit<'pr> for Raising {
 ///
 /// Slots as [`bound_by`] counts them: required and optional positionals in one sequence, and
 /// keywords by name.
+#[derive(Default)]
 struct Defaults<'pr> {
     found: HashMap<(u32, u32), Vec<(ParameterSlot, Node<'pr>)>>,
 }
 
-impl<'pr> Visit<'pr> for Defaults<'pr> {
-    fn visit_def_node(&mut self, node: &DefNode<'pr>) {
+impl<'pr> Defaults<'pr> {
+    fn def(&mut self, node: &DefNode<'pr>) {
         if let Some(written) = node.parameters() {
             let mut held = Vec::new();
             for (index, parameter) in written
@@ -2733,8 +3589,233 @@ impl<'pr> Visit<'pr> for Defaults<'pr> {
                 self.found.insert(here, held);
             }
         }
-        ruby_prism::visit_def_node(self, node);
     }
+}
+
+/// Every part of [`Shapes`] a plain walk of the whole tree reads, **from one walk**.
+///
+/// - **Why:** each part used to walk the tree on its own, eight walks a text. A walk costs about
+///   11 ns a node however little it reads, more than most parts' own work.
+/// - **Each part keeps its own state and hears what the walk meets in the order its own walk met
+///   it**: before a node's children where it acted on the way down, after them where it closed
+///   something (a `def`, a body). So nothing any part finds changes, and their order among
+///   themselves at one node does not matter.
+/// - **The walk is Prism's own order everywhere**, but around a block that makes a class
+///   ([`Sites::call`]), whose body is opened around the block alone.
+struct Gathered<'pr> {
+    defaults: Defaults<'pr>,
+    raising: Raising,
+    sites: Sites<'pr>,
+    yields: YieldSites<'pr>,
+    writers: Writers<'pr>,
+    procs: ProcLiterals<'pr>,
+    uses: Uses<'pr>,
+    ends: CallEnds,
+}
+
+impl<'pr> Gathered<'pr> {
+    /// Ready to walk `node`, a text's tree: its own body is open.
+    fn new(node: &Node<'_>) -> Self {
+        Self {
+            defaults: Defaults::default(),
+            raising: Raising::default(),
+            sites: Sites {
+                bodies: vec![span_of(node)],
+                open: vec![span_of(node)],
+                found: Vec::new(),
+            },
+            yields: YieldSites::default(),
+            writers: Writers::default(),
+            procs: ProcLiterals::default(),
+            uses: Uses::default(),
+            ends: CallEnds::default(),
+        }
+    }
+
+    /// A body that is not a `def`: a class, a module, `class << self`.
+    fn body(&mut self, node: &Node<'pr>, walk: impl FnOnce(&mut Self)) {
+        self.ends.end(&node.location());
+        self.sites.open(span_of(node));
+        walk(self);
+        self.sites.close();
+    }
+}
+
+/// Where a construct may run a method and nothing else here reads it ([`CallEnds`]).
+macro_rules! gathered_ends {
+    ($($visit:ident, $node:ident;)*) => {
+        impl<'pr> Visit<'pr> for Gathered<'pr> {
+            $(
+                fn $visit(&mut self, node: &ruby_prism::$node<'pr>) {
+                    self.ends.end(&node.location());
+                    ruby_prism::$visit(self, node);
+                }
+            )*
+
+            fn visit_def_node(&mut self, node: &DefNode<'pr>) {
+                self.ends.end(&node.location());
+                self.defaults.def(node);
+                self.raising.def(node);
+                self.uses.def(node);
+                self.yields.enter_def(node);
+                self.writers.enter_def(node);
+                self.sites.open(span_of(&node.as_node()));
+                ruby_prism::visit_def_node(self, node);
+                self.sites.close();
+                self.writers.leave_def();
+                self.yields.leave_def();
+            }
+
+            fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+                self.body(&node.as_node(), |walk| ruby_prism::visit_class_node(walk, node));
+            }
+
+            fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+                self.body(&node.as_node(), |walk| ruby_prism::visit_module_node(walk, node));
+            }
+
+            fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+                self.body(&node.as_node(), |walk| {
+                    ruby_prism::visit_singleton_class_node(walk, node);
+                });
+            }
+
+            fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+                self.ends.end(&node.location());
+                self.yields.call(node);
+                self.writers.call(node);
+                self.procs.call(node);
+                self.uses.call(node);
+                let Some(block) = self.sites.call(node) else {
+                    ruby_prism::visit_call_node(self, node);
+                    return;
+                };
+                if let Some(receiver) = node.receiver() {
+                    self.visit(&receiver);
+                }
+                if let Some(arguments) = node.arguments() {
+                    self.visit_arguments_node(&arguments);
+                }
+                self.sites.open(span_of(&block.as_node()));
+                self.visit_block_node(&block);
+                self.sites.close();
+            }
+
+            fn visit_call_or_write_node(&mut self, node: &CallOrWriteNode<'pr>) {
+                self.ends.end(&node.location());
+                self.writers.push(
+                    node.location().start_offset() as u32,
+                    node.write_name().as_slice(),
+                    node.receiver(),
+                    node.value(),
+                );
+                ruby_prism::visit_call_or_write_node(self, node);
+            }
+
+            fn visit_call_and_write_node(&mut self, node: &CallAndWriteNode<'pr>) {
+                self.ends.end(&node.location());
+                self.writers.push(
+                    node.location().start_offset() as u32,
+                    node.write_name().as_slice(),
+                    node.receiver(),
+                    node.value(),
+                );
+                ruby_prism::visit_call_and_write_node(self, node);
+            }
+
+            // `Current.count += 1` writes what `+` answers, which is not the value written: nothing
+            // here reads it, and the accessor it writes answers nothing.
+            fn visit_call_operator_write_node(&mut self, node: &CallOperatorWriteNode<'pr>) {
+                self.ends.end(&node.location());
+                self.writers.push(
+                    node.location().start_offset() as u32,
+                    node.write_name().as_slice(),
+                    node.receiver(),
+                    node.as_node(),
+                );
+                ruby_prism::visit_call_operator_write_node(self, node);
+            }
+
+            fn visit_yield_node(&mut self, node: &ruby_prism::YieldNode<'pr>) {
+                self.ends.end(&node.location());
+                self.yields.yielded(node);
+                ruby_prism::visit_yield_node(self, node);
+            }
+
+            fn visit_lambda_node(&mut self, node: &LambdaNode<'pr>) {
+                self.procs.lambda(node);
+                ruby_prism::visit_lambda_node(self, node);
+            }
+
+            fn visit_statements_node(&mut self, node: &StatementsNode<'pr>) {
+                self.uses.statements(node);
+                ruby_prism::visit_statements_node(self, node);
+            }
+
+            fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+                self.uses.returned(node);
+                ruby_prism::visit_return_node(self, node);
+            }
+
+            fn visit_local_variable_read_node(&mut self, node: &LocalVariableReadNode<'pr>) {
+                self.uses.read(node);
+            }
+
+            fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+                self.ends.modifier(&node.predicate(), node.statements());
+                ruby_prism::visit_if_node(self, node);
+            }
+
+            fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+                self.ends.modifier(&node.predicate(), node.statements());
+                ruby_prism::visit_unless_node(self, node);
+            }
+
+            fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+                self.ends.modifier(&node.predicate(), node.statements());
+                ruby_prism::visit_while_node(self, node);
+            }
+
+            fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+                self.ends.modifier(&node.predicate(), node.statements());
+                ruby_prism::visit_until_node(self, node);
+            }
+        }
+    };
+}
+
+gathered_ends! {
+    visit_index_operator_write_node, IndexOperatorWriteNode;
+    visit_index_and_write_node, IndexAndWriteNode;
+    visit_index_or_write_node, IndexOrWriteNode;
+    visit_instance_variable_operator_write_node, InstanceVariableOperatorWriteNode;
+    visit_local_variable_operator_write_node, LocalVariableOperatorWriteNode;
+    visit_class_variable_operator_write_node, ClassVariableOperatorWriteNode;
+    visit_global_variable_operator_write_node, GlobalVariableOperatorWriteNode;
+    visit_constant_operator_write_node, ConstantOperatorWriteNode;
+    visit_constant_path_operator_write_node, ConstantPathOperatorWriteNode;
+    visit_super_node, SuperNode;
+    visit_forwarding_super_node, ForwardingSuperNode;
+    visit_interpolated_string_node, InterpolatedStringNode;
+    visit_interpolated_symbol_node, InterpolatedSymbolNode;
+    visit_interpolated_regular_expression_node, InterpolatedRegularExpressionNode;
+    visit_interpolated_x_string_node, InterpolatedXStringNode;
+    visit_x_string_node, XStringNode;
+    visit_match_write_node, MatchWriteNode;
+    visit_match_predicate_node, MatchPredicateNode;
+    visit_match_required_node, MatchRequiredNode;
+    visit_case_node, CaseNode;
+    visit_case_match_node, CaseMatchNode;
+    visit_for_node, ForNode;
+    visit_multi_write_node, MultiWriteNode;
+    visit_splat_node, SplatNode;
+    visit_assoc_splat_node, AssocSplatNode;
+    visit_block_argument_node, BlockArgumentNode;
+    visit_range_node, RangeNode;
+    visit_alias_method_node, AliasMethodNode;
+    visit_undef_node, UndefNode;
+    visit_constant_write_node, ConstantWriteNode;
+    visit_constant_path_write_node, ConstantPathWriteNode;
 }
 
 /// Every variable read in one text, and what can reach each: the table [`Receiver::Variable`]
@@ -2912,6 +3993,12 @@ pub struct Reaching {
     /// What the checks around the read say about each value that reaches it. Empty
     /// for an instance variable: a call between the check and the read may write it.
     pub narrowed: Box<[Narrowing]>,
+    /// **Every read of the local leaves its object as it was and hands it nowhere** but out of its
+    /// method ([`Use::Reads`]): no write into it, no argument, no other variable, no block it may
+    /// be handed to. What the object held when it was made then still holds at the read
+    /// (`types`' `Typed::shaped`). `false` for an instance variable, which any method may write
+    /// into.
+    pub kept: bool,
 }
 
 /// A read of an instance variable, which any method of its object's classes can write.
@@ -3101,6 +4188,7 @@ fn reaching_local(
         bound: if open { bound.cloned() } else { None },
         instance: None,
         narrowed: Box::default(),
+        kept: false,
     }
 }
 
@@ -3843,6 +4931,11 @@ impl<'pr> Exits<'pr> {
         if node.as_return_node().is_some() {
             return;
         }
+        // `rescue … retry` runs the `begin` again, so the method leaves through that `begin`'s
+        // other exits, never through the `retry`.
+        if node.as_retry_node().is_some() {
+            return;
+        }
         self.push(Exit::Written(node));
     }
 
@@ -4288,6 +5381,68 @@ pub fn type_of(text: &Parsed<'_>, offset: u32) -> Option<(u32, u32, Receiver)> {
     // The same refusal as every entry point here: an unshapeable shape is no answer, and saying so
     // lets the caller tell it from a type it declined.
     (!matches!(receiver, Receiver::Unknown)).then_some((start, end, receiver))
+}
+
+/// Which kind of name a cursor on a local is on ([`local_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Local {
+    /// A name being bound: a local assigned, or a block's parameter.
+    Binding,
+    /// A read of a local, a block's parameter or a method's parameter.
+    Read,
+    /// A method's own parameter, in its `def`'s header.
+    Parameter,
+}
+
+/// The local, block parameter or method parameter under the cursor, and the shape that types it:
+/// for a card about the name itself. Calls, constants and instance variables are other cards'.
+#[must_use]
+pub fn local_at(text: &Parsed<'_>, offset: u32) -> Option<(u32, u32, Receiver, Local)> {
+    let (source, result) = (text.source(), text.result());
+    let mut finder = Finder::new(source, u32::MAX);
+    finder.visit(&result.node());
+    if let Some(bound) = finder
+        .bindings((offset, offset))
+        .into_iter()
+        .find(|bound| bound.name.0 <= offset && offset <= bound.name.1)
+    {
+        return Some((bound.name.0, bound.name.1, bound.was, Local::Binding));
+    }
+    // A parameter in its `def`'s header: only those a slot can name ([`Def::parameters`]).
+    let named = |at: u32| {
+        let end = source.as_bytes()[at as usize..]
+            .iter()
+            .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_' || *byte >= 0x80))
+            .map_or(source.len(), |length| at as usize + length);
+        u32::try_from(end).unwrap_or(u32::MAX)
+    };
+    for def in finder.defs.iter().rev() {
+        if let Some(parameter) = def
+            .parameters
+            .iter()
+            .find(|parameter| parameter.at <= offset && offset <= named(parameter.at))
+        {
+            return Some((
+                parameter.at,
+                named(parameter.at),
+                Finder::parameter_shape(def, parameter),
+                Local::Parameter,
+            ));
+        }
+    }
+    let mut pointed = Pointed {
+        offset,
+        found: None,
+    };
+    pointed.visit(&result.node());
+    let (start, end, node) = pointed.found?;
+    if node.as_local_variable_read_node().is_none()
+        && node.as_it_local_variable_read_node().is_none()
+    {
+        return None;
+    }
+    let receiver = finder.receiver_of(Some(&node), Budget::default());
+    (!matches!(receiver, Receiver::Unknown)).then_some((start, end, receiver, Local::Read))
 }
 
 /// The walk [`type_of`] runs: the innermost read around the cursor.
@@ -6622,15 +7777,25 @@ impl<'s, 'pr> Finder<'s, 'pr> {
         if let Some(inner) = unparenthesised(node) {
             return self.receiver_of(Some(&inner), budget.linked());
         }
-        // `x ||= v`, `x &&= v` and `x += v` combine the old value with the new one, so they are
-        // asked before the rule below, which would answer the new one alone.
-        if let Some(rewritten) = self.rewritten(node, budget) {
-            return rewritten;
+        // `@x ||= begin … end`: a `begin` that rescues nothing is its last statement, as parentheses
+        // are, and an empty one is `nil`. One that rescues is a conditional ([`Self::either`]).
+        if let Some(last) = unrescued(node) {
+            return match last {
+                Some(last) => self.receiver_of(Some(&last), budget.linked()),
+                None => Receiver::literal("NilClass"),
+            };
         }
-        // An assignment **is** its value, by Ruby's rule (see [`assigned_value`]). A link, not a
-        // spread: one question, asked once.
+        // `x ||= v`, `x &&= v` and `x += v` combine the old value with the new one, so they are
+        // asked before the rule below, which would answer the new one alone. What they hand back is
+        // also held by `x` ([`Receiver::Stored`]).
+        if let Some(rewritten) = self.rewritten(node, budget) {
+            return Receiver::Stored(Box::new(rewritten));
+        }
+        // An assignment **is** its value, by Ruby's rule (see [`assigned_value`]), now also held by
+        // what it was written to ([`Receiver::Stored`]). A link, not a spread: one question, asked
+        // once.
         if let Some(value) = assigned_value(node) {
-            return self.receiver_of(Some(&value), budget.linked());
+            return Receiver::Stored(Box::new(self.receiver_of(Some(&value), budget.linked())));
         }
         // `obj&.x = v` is the argument where the receiver is not `nil`, and `nil` where it is: a
         // union, which [`attribute_written`] leaves to this arm. Answering it here also
@@ -6640,14 +7805,18 @@ impl<'s, 'pr> Finder<'s, 'pr> {
                 .as_call_node()
                 .and_then(|call| call.arguments())
                 .and_then(|written| written.arguments().iter().last());
-            return Receiver::Either(vec![
+            return Receiver::Stored(Box::new(Receiver::Either(vec![
                 self.receiver_of(value.as_ref(), budget.spread()),
                 Receiver::literal("NilClass"),
-            ]);
+            ])));
         }
         // `defined?(x)` names what `x` is, or is `nil`: a keyword, so no method can answer
-        // otherwise.
-        if node.as_defined_node().is_some() {
+        // otherwise. `$1` and `$&` are a part of the last match, or `nil` where there is none:
+        // read off `$~`, which Ruby lets hold only a `MatchData` or `nil`.
+        if node.as_defined_node().is_some()
+            || node.as_numbered_reference_read_node().is_some()
+            || node.as_back_reference_read_node().is_some()
+        {
             return Receiver::Either(vec![
                 Receiver::literal("String"),
                 Receiver::literal("NilClass"),
@@ -6683,6 +7852,12 @@ impl<'s, 'pr> Finder<'s, 'pr> {
                 text: Text(
                     node.as_string_node()
                         .map(|string| String::from_utf8_lossy(string.unescaped()).into()),
+                ),
+                names: Literals(
+                    matches!(class, "Array" | "Hash")
+                        .then(|| Names::of(node, 0))
+                        .flatten()
+                        .map(Rc::new),
                 ),
             };
         }
@@ -7187,8 +8362,13 @@ impl<'s, 'pr> Finder<'s, 'pr> {
     }
 
     /// Every read in the text and what can reach it: the table [`Receiver::Variable`] points into.
-    /// `calls` is [`call_ends`]'s answer for the same text, `uses` [`uses`]'s map.
-    fn variables(&self, calls: &CallEnds, uses: &HashMap<u32, Use<'pr>>) -> Variables {
+    /// `calls` and `uses` are the same text's [`CallEnds`] and [`Uses`], from [`Gathered`].
+    fn variables(
+        &self,
+        calls: &CallEnds,
+        uses: &HashMap<u32, Use<'pr>>,
+        dropped: &HashSet<u32>,
+    ) -> Variables {
         let regions = Regions::new(self.regions.clone());
         let locals: HashMap<u32, &VariableWrite<'pr>> = self
             .local_writes
@@ -7218,7 +8398,13 @@ impl<'s, 'pr> Finder<'s, 'pr> {
                         .copied()
                         .collect();
                     self.reach_local(
-                        &mut table, &regions, &group, scope, &locals, &relevant, uses,
+                        &mut table,
+                        &regions,
+                        &group,
+                        scope,
+                        &locals,
+                        &relevant,
+                        (uses, dropped),
                     );
                 }
                 None => self.reach_instance(&mut table, &regions, &group, &instances, calls),
@@ -7292,7 +8478,7 @@ impl<'s, 'pr> Finder<'s, 'pr> {
         scope: (u32, u32),
         writes: &HashMap<u32, &VariableWrite<'pr>>,
         relevant: &[Held<'_>],
-        uses: &HashMap<u32, Use<'pr>>,
+        (uses, dropped): (&HashMap<u32, Use<'pr>>, &HashSet<u32>),
     ) {
         let mut written: Vec<Placed> = Vec::new();
         let mut bound: Option<Rc<Receiver>> = None;
@@ -7329,8 +8515,16 @@ impl<'s, 'pr> Finder<'s, 'pr> {
         if let ([only], Some(fill)) = (written.as_slice(), self.fill(group, writes, uses)) {
             table.fills.insert(only.id, fill);
         }
+        // An operator write's read (`x ||= v`) has no use noted, and counts as one that escapes. A
+        // write whose value something else takes (`x = y = v`, a list's last statement) gives the
+        // object another name.
+        let kept = reads
+            .iter()
+            .all(|read| matches!(uses.get(read), Some(Use::Reads)))
+            && written.iter().all(|write| dropped.contains(&write.name));
         for read in reads {
             let mut reaching = reaching_local(regions, scope, &written, bound.as_ref(), read);
+            reaching.kept = kept;
             if !relevant.is_empty() {
                 reaching.narrowed = narrowings(relevant, &written, &reaching, read);
             }
@@ -7474,6 +8668,7 @@ impl<'s, 'pr> Finder<'s, 'pr> {
                             decided: None,
                         })),
                         narrowed: Box::default(),
+                        kept: false,
                     },
                 );
                 continue;
@@ -7523,6 +8718,7 @@ impl<'s, 'pr> Finder<'s, 'pr> {
                         decided,
                     })),
                     narrowed: Box::default(),
+                    kept: false,
                 },
             );
         }
@@ -7620,7 +8816,16 @@ impl<'s, 'pr> Finder<'s, 'pr> {
     ///   be miscounted, and the consumer needs one shape per counted argument. See
     ///   [`Receiver::Returned`]'s `arguments`.
     fn written_arguments(&self, call: &CallNode<'_>, budget: Budget) -> Vec<Receiver> {
-        let Some(written) = call.arguments() else {
+        self.listed_arguments(call.arguments().as_ref(), budget)
+    }
+
+    /// [`Self::written_arguments`] of an argument list, which `super(a, b)` writes too.
+    fn listed_arguments(
+        &self,
+        written: Option<&ruby_prism::ArgumentsNode<'_>>,
+        budget: Budget,
+    ) -> Vec<Receiver> {
+        let Some(written) = written else {
             return Vec::new();
         };
         if budget.spent() {
@@ -7655,7 +8860,16 @@ impl<'s, 'pr> Finder<'s, 'pr> {
         call: &CallNode<'_>,
         budget: Budget,
     ) -> Option<Vec<(String, Receiver)>> {
-        let Some(written) = call.arguments() else {
+        self.listed_keywords(call.arguments().as_ref(), budget)
+    }
+
+    /// [`Self::written_keywords`] of an argument list, which `super(a, b)` writes too.
+    fn listed_keywords(
+        &self,
+        written: Option<&ruby_prism::ArgumentsNode<'_>>,
+        budget: Budget,
+    ) -> Option<Vec<(String, Receiver)>> {
+        let Some(written) = written else {
             return Some(Vec::new());
         };
         if budget.spent() {
@@ -7900,6 +9114,22 @@ fn unparenthesised<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
     // `(a; b)` evaluates to `b`, but no real code writes a receiver that way, and guessing at it is
     // how a classification goes wrong.
     statements.next().is_none().then_some(only)
+}
+
+/// The last statement of a `begin … end` that rescues nothing, `Some(None)` where it has none, or
+/// `None` for any other node. An `ensure` runs too, but its value is thrown away.
+///
+/// An `else` with no `rescue` is a syntax error Prism recovers from, so it is not read.
+fn unrescued<'pr>(node: &Node<'pr>) -> Option<Option<Node<'pr>>> {
+    let found = node.as_begin_node()?;
+    if found.rescue_clause().is_some() || found.else_clause().is_some() {
+        return None;
+    }
+    Some(
+        found
+            .statements()
+            .and_then(|statements| statements.body().iter().last()),
+    )
 }
 
 /// How many positional arguments a call wrote, as [`Arity`] spells it.
@@ -8578,11 +9808,11 @@ mod tests {
         // `&&=` as a value: the old value where it was falsy, the new one otherwise.
         assert_eq!(
             receiver("(x &&= \"s\").~"),
-            Receiver::Shortcut {
+            stored(Receiver::Shortcut {
                 left: Box::new(Receiver::Variable(1)),
                 right: Box::new(string()),
                 and: true,
-            }
+            })
         );
         // A block-local starts fresh on every call: the block around it is its scope, not a loop
         // over it.
@@ -8701,12 +9931,18 @@ mod tests {
                         arguments: Vec::new(),
                         symbol: Some("name".into()),
                         text: Text::default(),
+                        names: Literals::default(),
                     },
                     _ => Receiver::literal(class),
                 },
                 "classifying {source:?}"
             );
         }
+    }
+
+    /// An assignment's value read as a value ([`Receiver::Stored`]).
+    fn stored(value: Receiver) -> Receiver {
+        Receiver::Stored(Box::new(value))
     }
 
     /// A literal carrying what it holds, for tests about something else.
@@ -8716,7 +9952,131 @@ mod tests {
             arguments: arguments.to_vec(),
             symbol: None,
             text: Text::default(),
+            names: Literals::default(),
         }
+    }
+
+    /// An array or a hash literal of names, at every level, is read as the names it spells; one
+    /// element of anything else, a key that is no name, or a literal nested past the guard spells
+    /// nothing.
+    #[test]
+    fn a_literal_of_names_carries_what_it_spells() {
+        let spelled = |source: &str| match receiver(source) {
+            Receiver::Literal {
+                names: Literals(names),
+                ..
+            } => names.map(|names| (*names).clone()),
+            other => panic!("not a literal: {other:?}"),
+        };
+        let symbol = |name: &str| Names::Symbol(name.into());
+        assert_eq!(
+            spelled("[:title, \"body\", { tags: [] }, address: [:street]].~"),
+            Some(Names::List(
+                vec![
+                    symbol("title"),
+                    Names::Text("body".into()),
+                    Names::Pairs(vec![("tags".into(), Names::List(Box::default()))].into()),
+                    Names::Pairs(
+                        vec![("address".into(), Names::List(vec![symbol("street")].into()))].into()
+                    ),
+                ]
+                .into()
+            ))
+        );
+        assert_eq!(
+            spelled("{ \"meta\" => {} }.~"),
+            Some(Names::Pairs(
+                vec![("meta".into(), Names::Pairs(Box::default()))].into()
+            ))
+        );
+        assert_eq!(spelled("[:a, b].~"), None);
+        assert_eq!(spelled("{ key => 1 }.~"), None);
+        assert_eq!(spelled("{ [:a] => 1 }.~"), None);
+        assert_eq!(spelled("{ **rest }.~"), None);
+        let deep = format!(
+            "{}:a{}.~",
+            "[".repeat(NAMES_DEEP + 1),
+            "]".repeat(NAMES_DEEP + 1)
+        );
+        assert_eq!(spelled(&deep), None);
+        let shallow = format!("{}:a{}.~", "[".repeat(NAMES_DEEP), "]".repeat(NAMES_DEEP));
+        assert!(spelled(&shallow).is_some());
+        assert_eq!(spelled(":a.~"), None);
+    }
+
+    /// A constant assigned an array or a hash literal of names frozen as written holds those
+    /// names, by its name's last segment, whichever of the four forms rubydex files a definition
+    /// for; one left unfrozen, frozen with anything, or holding anything but names holds
+    /// nothing. An operator write is a constant written again, by the same span.
+    #[test]
+    fn a_constant_frozen_as_written_holds_its_names_and_an_operator_writes_it_again() {
+        let source = "\
+A = %i[a].freeze
+Outer::B = [:b, { c: [] }].freeze
+D ||= { d: {} }.freeze
+Outer::E ||= %i[e].freeze
+F = %i[f]
+G = [:g, h].freeze
+H = %i[h].freeze(true)
+I = %i[i].freeze { }
+J = \"j\".freeze
+K = %i[k].dup
+A += [:x]
+Outer::B &&= nil
+D -= []
+Outer::E |= []
+";
+        let span = |name: &str| {
+            let at = source.find(&format!("{name} ")).unwrap() as u32;
+            (at, at + name.len() as u32)
+        };
+        let segment = |path: &str, name: &str| {
+            let at = (source.find(path).unwrap() + path.len() - name.len()) as u32;
+            (at, at + name.len() as u32)
+        };
+        let last = |path: &str, name: &str| {
+            let at = (source.rfind(path).unwrap() + path.len() - name.len()) as u32;
+            (at, at + name.len() as u32)
+        };
+        let symbol = |name: &str| Names::Symbol(name.into());
+        let list = |names: Vec<Names>| Names::List(names.into());
+        let found = frozen_constants(source);
+        let frozen: HashMap<(u32, u32), Names> = found
+            .frozen
+            .iter()
+            .map(|(span, names)| (*span, (**names).clone()))
+            .collect();
+        assert_eq!(
+            frozen,
+            HashMap::from([
+                (span("A"), list(vec![symbol("a")])),
+                (
+                    segment("Outer::B", "B"),
+                    list(vec![
+                        symbol("b"),
+                        Names::Pairs(vec![("c".into(), list(Vec::new()))].into()),
+                    ]),
+                ),
+                (
+                    span("D"),
+                    Names::Pairs(vec![("d".into(), Names::Pairs(Box::default()))].into()),
+                ),
+                (segment("Outer::E", "E"), list(vec![symbol("e")])),
+            ])
+        );
+        let rewritten = |name: &str| {
+            let at = source.rfind(&format!("{name} ")).unwrap() as u32;
+            (at, at + name.len() as u32)
+        };
+        assert_eq!(
+            found.rewritten,
+            HashSet::from([
+                rewritten("A"),
+                last("Outer::B", "B"),
+                rewritten("D"),
+                last("Outer::E", "E"),
+            ])
+        );
     }
 
     /// A symbol literal's own name is read, and an interpolated one has none.
@@ -9503,6 +10863,275 @@ GUARD &&= Vault::Store.new
     }
 
     #[test]
+    fn a_constant_handed_on_is_one_written_as_a_value() {
+        let source = "\
+class Uploader < Base
+  include Helpers
+  mount_uploader :cover, CoverUploader
+  X = Admin::Thing
+  Other.new(1)
+  y.is_a?(Kind)
+  begin
+  rescue Oops => e
+  end
+  case z
+  when Shape then 1
+  end
+end
+render(obj, serializer: Ns::AccountSerializer)
+(a ? Picked : (b || Fallback)).new(1)
+
+def build
+  klass = Built
+  klass.new(1)
+  klass.name
+  passed = Passed
+  passed.new(1)
+  register(passed)
+  kept = Kept
+end
+
+def other
+  klass.call
+  register(klass)
+end
+";
+        let mut handed: Vec<&str> = constants_handed_on(source)
+            .into_iter()
+            .map(|(start, end)| &source[start as usize..end as usize])
+            .collect();
+        handed.sort_unstable();
+        assert_eq!(
+            handed,
+            ["AccountSerializer", "CoverUploader", "Passed", "Thing"]
+        );
+    }
+
+    #[test]
+    fn a_super_passes_what_it_writes_or_the_def_s_own_parameters() {
+        let source = "\
+class A
+  def initialize(object, opts = {}, key: 1, need:)
+    super
+  end
+
+  def b(x)
+    super(x.to_s, y: 2)
+  end
+
+  def c(x)
+    x = 1
+    super
+  end
+
+  def d(*rest)
+    super
+  end
+
+  def k(**opts)
+    super
+  end
+
+  def e
+    [1].each { super }
+    def inner(z) = super
+  end
+end
+define_method(:f) { super }
+define_method(:g) { super(1) }
+";
+        let at = |needle: &str| source.find(needle).expect(needle) as u32;
+        let parameter = |def: &str, slot: ParameterSlot| Receiver::Parameter {
+            at: at(&format!("def {def}")),
+            method: def.to_owned(),
+            slot,
+        };
+        type Passed = (u32, Arity, Vec<Receiver>, Option<Vec<(String, Receiver)>>);
+        let found: Vec<Passed> = supers(source)
+            .into_iter()
+            .map(|site| {
+                assert!(site.def.0 < site.at && site.at < site.def.1, "{site:?}");
+                (site.at, site.arity, site.arguments, site.keywords)
+            })
+            .collect();
+        let on_x = |shape: &Receiver| {
+            matches!(shape, Receiver::Returned { method, on, .. }
+                if method == "to_s"
+                    && matches!(&**on, Receiver::Spelled { was, .. }
+                        if matches!(**was, Receiver::Variable(_))))
+        };
+        assert_eq!(found.len(), 7, "{found:#?}");
+        // A bare `super` passes each parameter, positionals and keywords alike.
+        assert_eq!(
+            found[0],
+            (
+                at("super\n  end"),
+                Arity::Keyed(2),
+                vec![
+                    parameter("initialize", ParameterSlot::Positional(0)),
+                    parameter("initialize", ParameterSlot::Positional(1)),
+                ],
+                Some(vec![
+                    (
+                        "key".to_owned(),
+                        parameter("initialize", ParameterSlot::Keyword("key".to_owned()))
+                    ),
+                    (
+                        "need".to_owned(),
+                        parameter("initialize", ParameterSlot::Keyword("need".to_owned()))
+                    ),
+                ]),
+            )
+        );
+        // `super(…)` passes what it writes.
+        assert_eq!(found[1].1, Arity::Keyed(1));
+        assert!(on_x(&found[1].2[0]), "{:?}", found[1].2);
+        assert!(matches!(&found[1].3.as_deref(), Some([(key, _)]) if key == "y"));
+        // A parameter written before may hold anything; a rest passes a count nothing knows.
+        assert_eq!(found[2].1, Arity::Exactly(1));
+        assert_eq!(found[2].2, vec![Receiver::Unknown]);
+        assert_eq!((found[3].1, found[3].2.len()), (Arity::Unknown, 0));
+        assert_eq!((found[4].1, found[4].3.clone()), (Arity::Unknown, None));
+        // A block's `super` is the `def`'s around it; a nested `def`'s is its own; one outside
+        // every `def` is no site.
+        assert_eq!((found[5].1, found[5].2.len()), (Arity::Exactly(0), 0));
+        assert_eq!(
+            found[6].2,
+            vec![parameter("inner", ParameterSlot::Positional(0))]
+        );
+    }
+
+    #[test]
+    fn a_literal_spelling_a_name_is_read_where_it_is_written() {
+        // An argument names its call, the keyword it sits under and, as the first positional, where
+        // the call's name starts; an array's words and a hash's values are its arguments too. A
+        // `when`, a hash's key, an `alias` and an `undef` compare or name; a block pass is its own;
+        // anything else is held. A part of an interpolation, a sentence and a constant path are no
+        // names.
+        let source = "\
+send(:a, 'b')
+before_action :c, only: %i[d], if: { e: :f }
+items.map(&:g)
+case x
+when :h then 1
+end
+{ :i => :j }
+alias k l
+undef m
+HANDLERS = [:n, \"two words\", \"o#{p}\", :\"q?\"]
+call(**rest, r: :s, &)
+[:_t, \"9u\"]
+";
+        let uses = spelled_uses(source);
+        let how = |name: &str| -> Vec<Spelling> {
+            uses.get(name)
+                .map(|found| found.iter().map(|one| one.how.clone()).collect())
+                .unwrap_or_default()
+        };
+        let argument = |call: &str, key: Option<&str>, first: Option<u32>| Spelling::Argument {
+            call: call.to_owned(),
+            key: key.map(str::to_owned),
+            first,
+        };
+        assert_eq!(how("a"), [argument("send", None, Some(0))]);
+        assert_eq!(how("b"), [argument("send", None, None)]);
+        let before = source.find("before_action").unwrap() as u32;
+        assert_eq!(how("c"), [argument("before_action", None, Some(before))]);
+        assert_eq!(how("d"), [argument("before_action", Some("only"), None)]);
+        assert_eq!(how("e"), [Spelling::Compared]);
+        assert_eq!(how("f"), [argument("before_action", Some("e"), None)]);
+        assert_eq!(how("g"), [Spelling::BlockPass]);
+        assert_eq!(how("h"), [Spelling::Compared]);
+        assert_eq!(how("i"), [Spelling::Compared]);
+        assert_eq!(how("j"), [Spelling::Held]);
+        assert_eq!(how("k"), [Spelling::Compared]);
+        assert_eq!(how("l"), [Spelling::Compared]);
+        assert_eq!(how("m"), [Spelling::Compared]);
+        assert_eq!(how("n"), [Spelling::Held]);
+        assert_eq!(how("q?"), [Spelling::Held]);
+        assert!(how("o").is_empty() && how("p").is_empty());
+        assert_eq!(how("s"), [argument("call", Some("r"), None)]);
+        assert_eq!(how("_t"), [Spelling::Held]);
+        assert!(!uses.contains_key("9u"));
+        assert!(!uses.contains_key("two words"));
+        assert_eq!(uses.get("a").unwrap()[0].at, 5);
+        assert!(uses.get("b").unwrap()[0].text && !uses.get("a").unwrap()[0].text);
+    }
+
+    #[test]
+    fn a_hook_mixes_in_what_it_hands_its_one_parameter() {
+        // Only `self.included`, `self.extended` and `self.prepended` with one plain parameter, and
+        // only a mixin called on that parameter, directly or through a sender, outside a nested
+        // `def`. Each constant and `self` it is handed is one row; anything else is not read.
+        let source = "\
+module Hooked
+  def self.included(base)
+    base.extend(ClassMethods, self)
+    base.send(:include, Tools::Kit)
+    base.public_send(:define_method, :x) { }
+    base.include(mixin)
+    other.include(Elsewhere)
+    def helper(base) = base.include(Nested)
+  end
+
+  def self.extended(object) = object.prepend(Front)
+  def self.prepended(base, extra) = base.extend(Two)
+  def self.included(*bases) = bases.first.extend(Splat)
+  def self.extended(base = nil) = base.extend(Optional)
+  def self.included(base, *rest) = base.extend(Rest)
+  def self.included(base, after) = base.extend(Posts)
+  def self.included(base, key:) = base.extend(Keyword)
+  def self.included(base, **options) = base.extend(Options)
+  def self.included = extend(Bare)
+  def included(base) = base.extend(Instance)
+  def self.inherited(base) = base.extend(Other)
+end
+";
+        let found = hook_mixins(source);
+        let at = |needle: &str| source.find(needle).unwrap() as u32;
+        let end = |needle: &str| (source.find(needle).unwrap() + needle.len()) as u32;
+        let row = |hook: &str, mixer: &str, mixed: Option<u32>, def: &str| HookMixin {
+            hook_at: at(def),
+            hook: hook.to_owned(),
+            mixer: mixer.to_owned(),
+            mixed,
+        };
+        assert_eq!(
+            found,
+            [
+                row(
+                    "included",
+                    "extend",
+                    Some(end("ClassMethods")),
+                    "def self.included(base)"
+                ),
+                row("included", "extend", None, "def self.included(base)"),
+                row(
+                    "included",
+                    "include",
+                    Some(end("Tools::Kit")),
+                    "def self.included(base)"
+                ),
+                row(
+                    "extended",
+                    "prepend",
+                    Some(end("Front")),
+                    "def self.extended(object)"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_text_s_calls_and_walk_from_one_parse_are_what_each_reads_alone() {
+        let source = "class Shelf\n  def stack(books, by: :title)\n    sorted = books.sort_by { |b| b.public_send(by) }\n    @top = sorted.first&.title\n    yield sorted if block_given?\n    sorted\n  end\nend\nShelf.new.stack([], by: :year) { |s| s.size }\n";
+        let (calls, shapes) = every_call_and_shapes(source);
+        assert!(!calls.is_empty());
+        assert_eq!(calls, every_call(source));
+        assert_eq!(shapes, super::shapes(source));
+    }
+
+    #[test]
     fn every_call_that_sends_a_method_by_name_is_recorded() {
         // `send` and its kin, with the names each can send and how many values
         // follow. A local's name is what every write of it in its `def` spells; a `def` inside
@@ -9854,6 +11483,7 @@ end
                     decided: None,
                 })),
                 narrowed: Box::default(),
+                kept: false,
             })
         );
         // Assigned a receiverless call, which is `self.compute`, and every older rung is still
@@ -10921,6 +12551,13 @@ def l; raised = 1; raised; end
             exits(&format!("    \"x\"\n  rescue\n{rescue}")),
         );
         assert_eq!(exits(&format!("    \"x\"\n  rescue\n{rescue}")), strings(4));
+        // A `retry` runs the body again, so it is no exit of its own, on the `def` or a tail
+        // `begin`.
+        assert_eq!(exits("    \"x\"\n  rescue Timeout\n    retry"), strings(1));
+        assert_eq!(
+            exits("    begin\n      \"x\"\n    rescue\n      retry\n    end"),
+            strings(1)
+        );
         // The bound still holds where conditionals really nest, as a guard: four deep, the deepest
         // the reference corpora write, is read, and so is everything short of the bound. At the
         // bound the value is unreadable, which declines the method.
@@ -11004,7 +12641,7 @@ def l; raised = 1; raised; end
         ] {
             assert_eq!(
                 receiver(&format!("({written}).~")),
-                Receiver::literal("TrueClass"),
+                stored(Receiver::literal("TrueClass")),
                 "{written}"
             );
         }
@@ -11013,11 +12650,11 @@ def l; raised = 1; raised; end
         for written in ["@t ||= true", "t ||= true"] {
             assert_eq!(
                 receiver(&format!("({written}).~")),
-                Receiver::Shortcut {
+                stored(Receiver::Shortcut {
                     left: Box::new(Receiver::Variable(1)),
                     right: Box::new(Receiver::literal("TrueClass")),
                     and: false,
-                },
+                }),
                 "{written}"
             );
         }
@@ -11025,23 +12662,23 @@ def l; raised = 1; raised; end
         // like the same method without `@title_h1 =`.
         assert_eq!(
             exits("    @title_h1 = true"),
-            vec![Receiver::literal("TrueClass")]
+            vec![stored(Receiver::literal("TrueClass"))]
         );
         // The memoisation idiom: the cached value, or the one built now.
         let body = "    @periods ||= [\"1d\"]";
         assert_eq!(
             exits(body),
-            vec![Receiver::Shortcut {
+            vec![stored(Receiver::Shortcut {
                 left: Box::new(Receiver::Variable(at(body, "@periods"))),
                 right: Box::new(holding("Array", &[Some("String")])),
                 and: false,
-            }]
+            })]
         );
         // `+=` returns what the *operator* returned: the old value's `+`.
         let body = "    @count += 1";
         assert_eq!(
             exits(body),
-            vec![Receiver::Returned {
+            vec![stored(Receiver::Returned {
                 on: Box::new(Receiver::Variable(at(body, "@count"))),
                 method: "+".to_owned(),
                 block: Block::None,
@@ -11049,30 +12686,36 @@ def l; raised = 1; raised; end
                 arguments: vec![integer()],
                 keywords: Some(Vec::new()),
                 safe: false,
-            }]
+            })]
         );
         // `&&=` returns the old value where it is falsy, and the new one otherwise.
         let body = "    @title &&= \"x\"";
         assert_eq!(
             exits(body),
-            vec![Receiver::Shortcut {
+            vec![stored(Receiver::Shortcut {
                 left: Box::new(Receiver::Variable(at(body, "@title"))),
                 right: Box::new(Receiver::literal("String")),
                 and: true,
-            }]
+            })]
         );
         // Not a method-body rule: the same arm answers a chain on an assignment, and an assignment
         // as another's value.
-        assert_eq!(receiver("(@x = \"s\").~"), Receiver::literal("String"));
+        assert_eq!(
+            receiver("(@x = \"s\").~"),
+            stored(Receiver::literal("String"))
+        );
         assert_eq!(
             exits("    outer = inner = \"s\""),
-            vec![Receiver::literal("String")]
+            vec![stored(stored(Receiver::literal("String")))]
         );
         // Each branch is read through the assignment it ends in, so two that agree are an answer
         // and two that do not are declined.
         assert_eq!(
             exits("    if plain?\n      @a = \"x\"\n    else\n      @b = \"y\"\n    end"),
-            vec![Receiver::literal("String"), Receiver::literal("String")]
+            vec![
+                stored(Receiver::literal("String")),
+                stored(Receiver::literal("String"))
+            ]
         );
     }
 
@@ -11222,7 +12865,7 @@ def l; raised = 1; raised; end
             exits("    nil && @count += 1"),
             shortcut(
                 Receiver::literal("NilClass"),
-                Receiver::Returned {
+                stored(Receiver::Returned {
                     on: Box::new(Receiver::Variable(count)),
                     method: "+".to_owned(),
                     block: Block::None,
@@ -11230,7 +12873,7 @@ def l; raised = 1; raised; end
                     arguments: vec![integer()],
                     keywords: Some(Vec::new()),
                     safe: false,
-                },
+                }),
                 true
             )
         );
@@ -11247,11 +12890,11 @@ def l; raised = 1; raised; end
         );
         assert_eq!(
             exits("    held = \"a\" && 1"),
-            shortcut(
-                Receiver::literal("String"),
-                Receiver::literal("Integer"),
-                true
-            )
+            vec![stored(Receiver::Shortcut {
+                left: Box::new(Receiver::literal("String")),
+                right: Box::new(Receiver::literal("Integer")),
+                and: true,
+            })]
         );
         // They nest on the side Ruby nests them: `a && b && c` is `(a && b) && c`.
         assert_eq!(
@@ -11278,42 +12921,42 @@ def l; raised = 1; raised; end
         // Ruby discards `def name=`'s own return: `obj.name = "x"` evaluates to `"x"`.
         assert_eq!(
             exits("    story.name = \"x\""),
-            vec![Receiver::literal("String")]
+            vec![stored(Receiver::literal("String"))]
         );
         // The index spelling is the same node with the name `[]=`. `report[key] = v` evaluates to
         // `v` too; the subscripts are the arguments before it.
         assert_eq!(
             exits("    report[:a] = 1"),
-            vec![Receiver::literal("Integer")]
+            vec![stored(Receiver::literal("Integer"))]
         );
         assert_eq!(
             exits("    grid[1, 2] = [\"x\"]"),
-            vec![holding("Array", &[Some("String")])]
+            vec![stored(holding("Array", &[Some("String")]))]
         );
         // Assignment syntax either way, per Prism's own flag, not the name: `obj.x=(v)` is an
         // assignment and returns `v`.
         assert_eq!(
             receiver("(story.name=(\"x\")).~"),
-            Receiver::literal("String")
+            stored(Receiver::literal("String"))
         );
         // Not a method-body rule, like the assignments above: the same arm answers a chain on one,
         // and one as another's value.
         assert_eq!(
             receiver("(story.name = \"x\").~"),
-            Receiver::literal("String")
+            stored(Receiver::literal("String"))
         );
         assert_eq!(
             exits("    held = story.name = \"x\""),
-            vec![Receiver::literal("String")]
+            vec![stored(stored(Receiver::literal("String")))]
         );
         // **Safe navigation is a union**. `story&.name = "x"` returns `nil` where `story`
         // is `nil`, so it is `String | nil`.
         assert_eq!(
             exits("    story&.name = \"x\""),
-            vec![Receiver::Either(vec![
+            vec![stored(Receiver::Either(vec![
                 Receiver::literal("String"),
                 Receiver::literal("NilClass")
-            ])]
+            ]))]
         );
         // An ordinary call to the setter is not assignment syntax and really returns the body's
         // value, so it is left to the call rung.
@@ -11573,7 +13216,38 @@ def l; raised = 1; raised; end
             Receiver::Unknown
         );
         // A `begin` with nothing rescued is not a conditional.
-        assert_ne!(receiver("(begin\n  1\nend).~"), either(&[&int]));
+        assert_eq!(receiver("(begin\n  1\nend).~"), int);
+    }
+
+    #[test]
+    fn a_begin_that_rescues_nothing_is_its_last_statement() {
+        // One value, as parentheses are, whatever ran before it. An `ensure`'s value is thrown
+        // away, and an empty `begin` is `nil`.
+        assert_eq!(receiver("(begin\n  \"s\"\n  1\nend).~"), integer());
+        assert_eq!(receiver("(begin\n  1\nensure\n  \"s\"\nend).~"), integer());
+        assert_eq!(receiver("(begin\nend).~"), Receiver::literal("NilClass"));
+        assert_eq!(typed("x = begin\n  1\nend\nx.~"), integer());
+        // An `else` with no `rescue` is a syntax error, and is not read.
+        assert_eq!(
+            receiver("(begin\n  1\nelse\n  \"s\"\nend).~"),
+            Receiver::Unknown
+        );
+    }
+
+    #[test]
+    fn a_match_reference_is_a_string_or_nil() {
+        // A numbered group or a back reference reads the last match, which may not have happened.
+        let string_or_nil = Receiver::Either(vec![
+            Receiver::literal("String"),
+            Receiver::literal("NilClass"),
+        ]);
+        for spelled in ["$1", "$9", "$&", "$'", "$`", "$+"] {
+            assert_eq!(
+                receiver(&format!("{spelled}.~")),
+                string_or_nil,
+                "{spelled}"
+            );
+        }
     }
 
     #[test]

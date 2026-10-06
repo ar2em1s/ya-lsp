@@ -289,6 +289,9 @@ renders RBS text. That text is indexed like any other signature and harvested by
   column's type, a `Duration`.
 - **A `scope` is two declarations** (singleton + relation, one span). Relation copies are held and
   sorted by owner.
+- **A `scope` written again in one body replaces the earlier** (`Association::replaced_by`): Rails
+  defines the method once more, so the last lambda is the one that runs and its call is the place.
+  `Facts` keeps the first of two equal rows, so the earlier is dropped before declaring.
 
 ### Concerns
 
@@ -326,7 +329,7 @@ renders RBS text. That text is indexed like any other signature and harvested by
 | `delegate` | Always declares the member. Typed here where both hops are facts; otherwise `generated::FORWARDED["to", "name"]` for a method or constant `to:`, the two calls the types table makes at the call. `to:` an ivar or a non-literal is `untyped`. The prefix must be a plain identifier. In a concern it goes on the module |
 | Long tail (`LONG_TAIL`, 29 names / 17 families) | Affix shapes. `Installs::Nothing` and `Installs::Elsewhere` (`helper_method`) are in the table on purpose. `serialize` withdraws the column. Attachments are gated on `framework_classes`. `instance_*: false` only as a literal |
 | Callbacks | Rails' 23 names, unmapped, kept on abstract classes. The block is handed the record, and it and the `if:`/`unless:` lambdas run against it (`[self: instance]`) |
-| Mailers / jobs | Gate on superclass or include, never on `def perform`. Suffix list plus exact `ActionMailer::Base`. `ActionMailer::MessageDelivery` is written once and unmapped. `perform_later` is `instance \| false` (`enqueue`'s value). A class's own `perform_async` wins. `rails::convention_of` is shared |
+| Mailers / jobs | Gate on superclass or include, never on `def perform`. Suffix list plus exact `ActionMailer::Base`. `ActionMailer::MessageDelivery` is written once and unmapped. `perform_later` is `instance \| false` (`enqueue`'s value). A class's own `perform_async` wins. `rails::convention_of` is shared. The types table reads these rows' calls as `perform`'s and an action's callers (`rails::run_from_the_class`; Sidekiq's are not read) |
 | Route helpers | See below |
 
 - **`MACROS` and `ASSOCIATIONS` are one list written twice**
@@ -582,11 +585,31 @@ it); do not add it back.
   factory's or `parent:`), else the topmost factory's name. **A constant is looked up from where it is written; a String or Symbol from the top level**, as
   `constantize` does.
 - **Every doubt answers nothing, never a guess:** a name two definitions write, a parent nothing
-  defines, a loop, a `class:` only Ruby knows, and **any `initialize_with` that is not `new(…)`**
+  defines, a `parent:` only Ruby knows, a loop, a `class:` only Ruby knows, and **any `initialize_with` that is not `new(…)`**
   in the factory, a trait, an ancestor, the global one, or a `FactoryBot.modify` (which may be
   anyone's). A `class:` can name a service whose `initialize_with` returns a model.
 - **`FactoryBot.register_strategy` replacing a strategy** leaves it (and its `_list`/`_pair`)
   undeclared; a name not written as a literal is every strategy.
+- **Each factory's blocks run where FactoryBot runs them** (`factories::proxies`, written beside
+  the definition file, `Facts::whole`): the factory's own block, its `trait`s' and `transient`s'
+  on a class made for it, `FactoryBot::Factories::<Name> < FactoryBot::DefinitionProxy`
+  (`Runs::Instance`); an `after`/`before`/`callback` block on a `SyntaxRunner`, so `create(:x)`
+  there is typed; an attribute's on the `Evaluator` (the proxy undefines all but a dozen
+  methods, so any other name is an attribute); `sequence`, `initialize_with`, `to_create` and
+  the rest refused. A name two definitions write, or a gem's the project writes too, is left as
+  it was.
+- **A callback's block is handed what was built** (`callback_row`, a row on the made class): the
+  class of the factory and of every factory inheriting it, by nesting or `parent:`, since a
+  child runs its parent's callbacks and traits. `after(:build|:create|:stub)` and
+  `before(:create)` hand the object, `before(:build|:all)` `nil` (6.6; older releases never run
+  them). The evaluator stays `untyped`: it is a subclass made per factory and per call, whose
+  methods any attribute or override may replace. **No row** where a class in the union is not
+  known, a factory only Ruby names (or a `parent:` only Ruby names) may inherit it, a block is
+  handed to `send`, a strategy is registered (it may hand a callback anything), a callback's
+  name is not a literal or hands something else (`after(:all)` hands a strategy's result), or
+  its block takes more than two plain parameters (FactoryBot reads the arity).
+- **The last statement of a callback block was never a used call**: the `after` call is a
+  statement of the factory's block, which no one reads (`coverage::used_calls`).
 - **Go-to-definition on `create(:user)` goes to the `factory :user` call** (an alias's to its
   factory): a strategy has no place of its own, so `requests::literal_places` asks every module
   `Knowledge::literal_place` for the call's first Symbol, and `Factories` answers from
@@ -755,6 +778,109 @@ ancestors (its methods were name guesses, its instance variables had no writes).
   application file again: a third of a second on the largest corpus's cold open.
 - **Not read:** `send(:include, M)`, `class_eval { include M }`, `ActiveSupport.on_load` blocks.
 
+## A read off the request's `params`
+
+`workspace/rails/request.rs` reads (pure, floored at 100%), `knowledge/rails.rs` orchestrates
+(`request_gates`, `read_type`), gated on `rails.enabled`; with `rails.routes` off nothing answers,
+since what a route gives a key is then not read.
+
+- **The one RBS is which members read a key** (`framework::READS`, `generated::READ_OFF`): `[]`,
+  `dig`, `fetch` and `require` on `ActionController::Parameters`, and `expect`'s `(Symbol)` arm.
+  Every other receiver than the controller's own `params` (`StrongParameters#params`, written
+  bare) answers as before: a `Parameters` the code built holds whatever it was given.
+- **The union** (`request::VALUE`): `String | Integer | Float | bool | Array[untyped] |
+  ActionController::Parameters | ActionDispatch::Http::UploadedFile`, what Rack's, multipart's and
+  the JSON parser hand a `Parameters`; `nil` for `[]`, one-key `fetch` and `dig`, none for one-key
+  `require`. `expect(:id)` is the scalars (`SCALAR`). `fetch(key, {})` is `fetch(key)`: the
+  default comes back an empty `Parameters`, which the union holds (`without_default`). Any other
+  default, a block, `require` of a list and a dynamic `expect` are left to Rails' body.
+- **What can change it, each read from files the application loads** (`Declaring::loaded`):
+  - the code's writes (`read_request_writes`, list `rails.requests`, spelled `params` or
+    `parameters`, own and engines): `params[:k] = v`, `||=`, `store`, a merge's pairs, a local
+    or ivar holding `params`, `request.parameters` and its parts, `params.tap`/`each`'s block
+    parameters. A value the text names (a literal, a branch of each, a value off the params, a
+    conversion like `to_s`) joins its class to the key; any other refuses the key; a key it cannot
+    name joins every key, or refuses them all. **A write counts for reads under the class or module
+    it is written in** (`self`'s ancestors, the body's name resolved as Ruby's lookup does,
+    `resolved`); one outside any, for every read.
+  - a callee handed the params that writes into its parameter, matched by method name (`new` is
+    `initialize`), project-wide;
+  - what a route gives a key (`read_route_values`): every `key: value` in a routes file, each file
+    it draws, and every `routes.draw`/`append`/`prepend` block elsewhere (`rails.route_blocks`); a
+    `Regexp` is a constraint, a non-literal refuses the key, a `**` or a non-hash `defaults` refuses
+    them all;
+  - a parser of the project's or a gem's own, or `parse_json_times` (`read_request_settings`, list
+    `rails.parsers`, gems too): refuses every key, unless the parser is a lambda that only decodes
+    JSON (`decodes_json`).
+- **A key every route reaching the read gives is what those routes give it** (route proofs,
+  `request::Asked::proven`): `String` for a required segment, a default's class otherwise (and
+  `String` too where an optional segment writes the key, `(.:format)` always does), never `nil`
+  unless a default is. The routes reaching the read come from two pure readers:
+  - `targets.rs` (`read_targets`): every route's controller, action, path and defaults, from the
+    project's own routes files and route blocks (`ROUTE_BLOCKS`) and the files a `draw` names,
+    with Rails' scope rules (`namespace`, `scope`, `controller`, `with_options`, `defaults`,
+    `concern`/`concerns`, resources with `only`/`except`/`param`/`path`/`module`/`to`/`shallow`,
+    `member`/`collection`/`new`/`on:`, a loop over a literal array, engines under their mount
+    prefix and `isolate_namespace` module). Anything else is `Unreadable`: bounded to the
+    controller a `"c#a"` in its text names, a project macro's resource (`read_route_macros`, its
+    `def` found through `Declaring::methods`), a mounted gem engine's namespace, or any controller.
+    Checked route for route against the real routers of the six corpora (through the spike's
+    prototype): none missed silently.
+  - `actions.rs` (`Controllers::proven`): which `(class, action)` pairs a `def` runs under. A public
+    `def` is an action of its class and every subclass not writing its own; a callback's
+    `only:`/`except:`, or every routed action; a private helper its bare callers', to a fixpoint.
+    It reads every controller file the application loads (`rails.controllers`) and every own
+    module one includes, to a fixpoint. It refuses a module's `def`, a singleton `def`, a callback
+    a module names, a non-literal `only:`/`except:`, a name a symbol hands `send`, `try`, `method`,
+    `layout`, `respond_to?`, `with:`, `if:` or `unless:`, a `helper_method`, a caller it cannot
+    place, and no route at all. A route that may reach any controller refuses every proof, unless
+    it is a call no project `def` writes (a gem's routing macro, `devise_for`'s kin), which refuses
+    only the controllers descending from a class the project does not write.
+  - The read's class and `def` come from the types table (`Read::ancestors`, `Read::def`). What
+    `read_route_values` reads is left out of a proven read: its proof read every reaching route's
+    defaults.
+- **A key read off what `permit` or `expect` hands back is what its filter lets through**
+  (`framework::SHAPES`, `generated::SHAPED` on `permit` and `expect`'s `(**untyped)` arm;
+  `knowledge::rails::shaped_type`; the pure half in `request.rs`). Checked against 7.2's and
+  8.1's `strong_parameters.rb`.
+  - **The call's own type, any receiver, from the filter alone** (`request::filters`,
+    `expected`): `permit` is a `Parameters`; `expect` one key's value, required (`[]` an
+    `Array`, `{}` a `Parameters`, `[[…]]` an `Array` or a `Parameters` of hashes by index, a
+    filtered hash the `Parameters`), several keys' values an `Array`. A filter it cannot read
+    (`permit(*FIELDS)`, `expect(post: fields)`, `expect(**opts)`) still answers: `permit` a
+    `Parameters`, `expect` with keywords either; without keywords, and for one bare name, the
+    arms (`READ_OFF`). Answering nothing there lost 92 used calls: the row hides Rails' body.
+  - **A filter held in a constant is the list its one assignment writes** (`types::written_at`,
+    `constant_names`), as an argument or a keyword's value: a literal of names frozen as written
+    (`cursor::frozen_constants`), and no reference resolved to the constant writing it again with
+    an operator (`KEYS += [...]`, which rubydex files as a reference). An unfrozen list changes
+    under any `KEYS << :x`; what `.freeze` leaves open, a literal nested inside, only code reaching
+    into the constant by index changes. A `Todo` rubydex invented over that one assignment is
+    still the constant: rubydex takes a value written as a `.` call (`%i[a].freeze`) for a class
+    it may build, and promotes the constant once a method is called on it anywhere.
+  - **The reads, only off the controller's own `params` in own code**, read by literal keys
+    (`read_path`: `[]`, `require`, one-key `fetch` with or without `{}` for a default, `dig`):
+    each key's union is the request's
+    there (`request_value`, `[]` at the top, `dig` below a key, with the writes `Requests` reads
+    for `self`'s ancestors), kept by the filter (`let_through`): a scalar filter every class but an
+    array and a hash, `[]` the array, `{}` the hash, `[[…]]` either, a filtered hash the hash, or
+    under `permit` an array of them too. `[]` and `dig` add `nil`; `fetch` only for a scalar (JSON
+    can send `null`); `require` none. A key named twice is each. A key whose writes leave it open
+    is left out.
+  - **A hash or an array literal written under a key holds values the text writes** (`holds_values`,
+    any branch), so it is a nested write: a read through several keys, `dig`'s and a permitted
+    value's below that key, refuses. Before, `params[:post] = { title: date }` read as the union.
+  - Not read: a splatted filter (`permit(*FIELDS)`: `cursor` empties a splatted call's
+    arguments), a filter a method builds, a receiver held in a local or memoized in an instance
+    variable (one object every reader of both shares, a `before_action` and a view included), a
+    `slice` or any other link, nested hashes' own keys (`permit` reads `address: [:street]` under a
+    hash of hashes by index too), and permits off anything but the request's `params`: a
+    `Parameters` the code built lets through whatever answers `is_a?` for a permitted scalar class,
+    and `TimeWithZone` and `Duration` answer it for `Time` and `Numeric` without being either.
+- **Not read:** a middleware writing the Rack env; a gem that is not an engine (actionpack's own
+  `ParamsWrapper` nests the request's own values under a key, inside the union); a callee that
+  writes into what it was handed under another method's name.
+
 ## Framework singletons and the controller context
 
 | Chain | Return | Status |
@@ -766,7 +892,7 @@ ancestors (its methods were name guesses, its instance variables had no writes).
 | `Rails.logger` | `ActiveSupport::BroadcastLogger \| WrittenByItsWriter` | shipped: Rails' `initialize_logger` wraps every logger in one; what the application assigns after joins (`framework::ASSIGNED`, `types::written_beside`). Its `class_eval`'d `info`, `warn`, `error` and the rest are `framework::LOGGER_METHODS` |
 | `Rails.env`'s predicates, `TimeWithZone`, `Time.zone`'s builders, `Time.current`, a model's concern class methods | `framework::members` | shipped: `class_eval`, `method_missing` and `delegate`-made members are declared with the macro named |
 | controller `helpers`, both sides | `HelperProxy` | shipped: a generated `class HelperProxy < ActionView::Base` including every helper module the application writes (`framework::HELPER_PROXY`), hosted with `ActionView::Base`. Return-only rows on `ActionController::Helpers#helpers` and `ActionController::Base.helpers`, so the jump stays Rails'. `ActionView::Base` where the application writes no helper or declares the name. Over-inclusive for `ActionController::Base.helpers` itself and `include_all_helpers = false`: those calls raise in Ruby. `helper_method` and a gem's `helper` are not in it |
-| mailer `with` | — | **declined**: the call after it reaches a mailer action through `method_missing`. `with` itself answers `ActionMailer::Parameterized::Mailer` from its concern's body |
+| mailer `with` | — | `with` itself answers `ActionMailer::Parameterized::Mailer` from its concern's body. The call after it is the mailer's class's (`rails::passes_to_the_class`, `types.md`), and a mailer's `params[:key]` is what each `with(key: …)` passed (`rails::keyed_by_a_class_call`). A job's `set` hands on the same way |
 | `Rails.configuration` | `Rails::Application::Configuration` | read out of its body (`application.config`) since `config` is typed |
 | ActiveSupport's `try`, `try!` | `generated::SENT` | shipped: return-only rows on `ActiveSupport::Tryable`, which `Object` and `Delegator` include, so the types table makes the call the first argument names (`types.md`). `NilClass`'s own `try` answers `nil` from its body. The same in 7.2, 8.0 and 8.1 |
 | a mailbox's `mail`, `inbound_email` | `Mail::Message`, `ActionMailbox::InboundEmail` | shipped: `ActionMailbox::Base`'s `delegate` and `attr_reader` (`framework::FORWARDED`), the same in 7.2 to 8.1; only `receive(inbound_email)` builds a mailbox |
@@ -777,12 +903,28 @@ ancestors (its methods were name guesses, its instance variables had no writes).
 `update`, `update_column(s)`, the predicates, `destroy!`, `attributes`), `errors.full_messages`,
 `redirect_to` (`Integer`, on both modules), `credentials`, a mailer's `mail`, `MessageDelivery`'s
 deliveries, the cache store's `write`/`delete`/`exist?`/`fetch_multi`, `request.env`/`host`/
-`format`, `flash.now`, `strip_tags`, `Duration#to_i`, `exec_query`. **Where the call decides**, an
+`format`, `flash.now`, `strip_tags`, `Duration#to_i`, `exec_query`, a record's `changes`
+(`HashWithIndifferentAccess`) and `previous_changes`/`saved_changes` (that, or before any save an
+empty `Hash`). **Where the call decides**, an
 overload set: `Duration#since`/`ago` and aliases (by the time's class), `cache.fetch` (the block's
 `[T]`; a `raw:` arm joins `untyped`), `select_all` (an `async:` arm), `Arel.sql`, and
 `params.expect` (keywords: `Parameters | Array[untyped]`), which only exists where the bundle
 declares `ActionController::ExpectedParameterMissing` (8.0). `configure` is its block's value,
 `draw` is `nil`.
+
+**ActiveSupport's methods on Ruby's own classes** (`framework::CORE_EXTENSIONS`): `String#blank?`
+`bool`, `String#parameterize` `String`, `Array.wrap` `Array[untyped]`. Written only where the bundle
+declares `ActiveSupport`, since Ruby's classes are declared everywhere. **Never a row on `Object`,
+`BasicObject` or `Kernel`** (`Object#blank?` is left out): once such a generated document is edited
+or leaves the graph, rubydex's next resolve records `Kernel`'s reference a second time. A debug
+build, the test suite included, panics there and the seam re-indexes everything; a release build
+keeps the duplicate.
+
+**`ActionController::API`'s seventeen modules** (`framework::API_MODULES`) are written as `include`
+lines on it: Rails includes them in a loop over `MODULES`, which rubydex does not read, so an API
+controller's `params` was `Metal`'s. In Rails' order, the same in 7.2, 8.0 and 8.1, and only where
+the bundle declares every one. A table, not a reader of the loop: only actionpack writes that loop
+over a constant, and listing the gem files that might would read thousands for one class.
 
 `CONTEXT` is the same table for instance methods: what a controller calls on itself, and a template
 on its view context (`ActionView::Helpers::ControllerHelper`).
@@ -834,11 +976,19 @@ it through configuration, which `Rails.logger`'s rule (a call of the writer) doe
    contributions. The walk absorbs each held contribution **by reference**
    (`Context::absorb`), copying a name only where the set lacks it.
 3. **`generators_would_repeat_themselves`**: the files, checked by `stat` (never trust a
-   notification).
+   notification), and a touched document a generator read through `Declaring::text` in the last
+   pass though no list names it (`Analysis::declared_from`: a routes file's helper, a file a `draw`
+   names, a module a controller or model includes). Without it an edit to one of those alone ran
+   no pass, and route proofs stayed stale until some other edit did.
 4. **`record`'s text test**: re-index only documents whose RBS changed.
 
 - **The parse memo is keyed on text and on which readers ran.** `rails::MODELS` gains members after
   the walk. `Fresh::Disk` is `stamp_of`. Buffers are hashed. `rails::read_routes` is not memoised.
+  - **Route proofs hold what they read from files a routes file reaches:** a project macro's
+    `read_route_macros` by its file's text hash (`Rails::macros`), and which own documents write
+    each bare call a routes file makes by each document's content hash (`Analysis::defining_documents`,
+    `synthesize::Defining`; other names or another `is_own` layout start over). Re-reading both on
+    every pass was 50 of the 66 ms the largest corpus spent proving routes after an edit.
   - `defines` holds its parse (`read_defines`) and filters it by `spellable` at declare.
   - `structs` holds **facts**, because its reader asks `spellable` mid-parse: each file's facts are
     kept with every name it asked and the answer (`structs::read_asking`), and read again when

@@ -94,13 +94,14 @@
 //! - `cursor` refuses to let a bare name count as an assignment's answer.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 
 use ruby_rbs::node::{
-    AttrAccessorNode, AttrReaderNode, AttributeKind, ClassNode, MethodDefinitionKind,
-    MethodDefinitionNode, ModuleNode, Node, SymbolNode, Visit, parse,
+    AttrAccessorNode, AttrReaderNode, AttributeKind, ClassNode, ExtendNode, IncludeNode,
+    MethodDefinitionKind, MethodDefinitionNode, MethodTypeNode, ModuleNode, Node, SymbolNode,
+    Visit, parse,
 };
 use rubydex::model::{
     declaration::{Ancestor, Ancestors, Declaration, Namespace},
@@ -123,8 +124,8 @@ use super::{
     views,
 };
 use crate::generated::{
-    self, BLOCK, COLLECTION, DEFINED, ELEMENT, FORWARDED, HELD, KEYED, OWN_DEF, Runs, SCOPED, SENT,
-    SHARED, WRITTEN,
+    self, BLOCK, COLLECTION, DEFINED, ELEMENT, FORWARDED, HELD, KEYED, OWN_DEF, READ_OFF, Runs,
+    SCOPED, SENT, SHAPED, SHARED, WRITTEN,
 };
 use crate::knowledge;
 use crate::workspace::{DocUri, rails};
@@ -222,10 +223,27 @@ pub struct Types {
     /// ([`generated::KEYED`], [`keyed`]): what it names is a body of knowledge's table, asked at
     /// the call. A set for [`Self::blocked`]'s reason; its arm is no vote.
     keyed: HashSet<DeclarationId>,
+    /// The generated members whose value depends on the member that made their receiver
+    /// ([`generated::READ_OFF`], [`read_off`]), asked of the registry at the call. A set for
+    /// [`Self::blocked`]'s reason; its arm is no vote.
+    read_off: HashSet<DeclarationId>,
+    /// The generated members whose value is made from the literal arguments their call is
+    /// written with ([`generated::SHAPED`], [`shaped`]), asked of the registry at the call. A set
+    /// for [`Self::blocked`]'s reason; its arm is no vote.
+    shaped: HashSet<DeclarationId>,
     /// The methods every overload of whose signature returns `void`, or every one `bot`
     /// ([`Nothing`]): no value a reader could use, which the card says ([`Types::nothing`]).
     nothing: HashMap<DeclarationId, Nothing>,
+    /// Each body a signature mixes an `RBS::Unnamed` stand-in into, by document:
+    /// `(the body as rubydex names its methods' owner, the stand-in)`. Read by
+    /// [`Types::adopt_stand_ins`] once every signature is harvested.
+    stand_ins: HashMap<u64, Vec<(String, String)>>,
 }
+
+/// Where RBS puts a stand-in: a module or class holding the signatures of methods it cannot write
+/// on the namespace that has them, such as the formatting methods `Random` and its class object
+/// both answer.
+const STAND_INS: &str = "RBS::Unnamed::";
 
 /// What a method declared to hand back no value hands back: nothing a caller may use (`void`), or
 /// never returning at all (`bot`, and a `def` whose every path raises, [`never_returns`]).
@@ -630,17 +648,25 @@ impl Types {
         let Ok(signature) = parse(source) else {
             return false;
         };
+        let document = document_key(document);
         let mut walk = Harvest {
             nesting: Vec::new(),
             aliases: Vec::new(),
+            stand_ins: Vec::new(),
             source,
-            document: document_key(document),
+            document,
             types: self,
         };
         walk.visit(&signature.as_node());
         let aliases = std::mem::take(&mut walk.aliases);
+        let stand_ins = std::mem::take(&mut walk.stand_ins);
         for (wrote, means) in aliases {
             self.copy_rows(&wrote, &means);
+        }
+        if stand_ins.is_empty() {
+            self.stand_ins.remove(&document);
+        } else {
+            self.stand_ins.insert(document, stand_ins);
         }
         true
     }
@@ -752,6 +778,11 @@ impl Types {
         self.blocked.clear();
         self.bodied.clear();
         self.sent.clear();
+        self.keyed.clear();
+        self.read_off.clear();
+        self.shaped.clear();
+        self.nothing.clear();
+        self.stand_ins.clear();
     }
 
     /// The class a signature says this constant holds, if one does.
@@ -958,6 +989,51 @@ impl Types {
         }
     }
 
+    /// Give a Ruby `def` the rows of the signature RBS writes for it on a stand-in ([`STAND_INS`]).
+    ///
+    /// - **The case:** `SecureRandom.hex`. Ruby's `random/formatter.rb` writes `def hex` on
+    ///   `Random::Formatter`, and RBS writes `hex: (?Integer? n) -> String` on
+    ///   `RBS::Unnamed::Random_Formatter`, which its `module Random::Formatter` includes. The
+    ///   lookup finds the `def` first, as Ruby does, and its body types nothing; the signature one
+    ///   ancestor further was never asked.
+    /// - **A stand-in's signature is the body's own method's.** RBS writes a stand-in only for
+    ///   methods it cannot write on the namespace that has them, and mixes it into that namespace.
+    /// - **Only a body a signature mixes the stand-in into itself** (`include`, or `extend` for the
+    ///   class object). One that reaches it through another module may `def` a different method
+    ///   of the same name.
+    /// - **Only a member the graph declares on the body, and never over a row it has**, as
+    ///   [`Self::adopt_aliases`]: nothing is declared that Ruby did not write.
+    /// - **Before [`Self::adopt_aliases`]**, since Ruby's `alias uuid_v4 uuid` copies `uuid`'s
+    ///   row, which exists only once this has run.
+    pub fn adopt_stand_ins(&mut self, graph: &Graph) {
+        let mixed: Vec<(String, String)> = self.stand_ins.values().flatten().cloned().collect();
+        for (body, stand_in) in mixed {
+            let Some(namespace) = graph
+                .declarations()
+                .get(&DeclarationId::from(stand_in.as_str()))
+                .and_then(Declaration::as_namespace)
+            else {
+                continue;
+            };
+            for member in namespace.members().values() {
+                let Some(declared @ Declaration::Method(_)) = graph.declarations().get(member)
+                else {
+                    continue;
+                };
+                let means = declared.name();
+                let Some((_, method)) = means.rsplit_once('#') else {
+                    continue;
+                };
+                let wrote = format!("{body}#{method}");
+                let id = DeclarationId::from(wrote.as_str());
+                if self.returns.contains_key(&id) || graph.declarations().get(&id).is_none() {
+                    continue;
+                }
+                self.copy_rows(&wrote, means);
+            }
+        }
+    }
+
     /// Give every Ruby `alias` and `alias_method` the rows of the method it renames.
     ///
     /// - **The Ruby version of [`Self::copy_rows`].** `Array#blank?` is the case: ActiveSupport
@@ -1043,6 +1119,9 @@ struct Harvest<'t> {
     /// `def collect`. So the copy runs once the walk is done and every `def` has its rows. An alias
     /// whose target is in another document is not resolved; RBS writes an alias beside its method.
     aliases: Vec<(String, String)>,
+    /// `include RBS::Unnamed::Random_Formatter`, as [`Types::stand_ins`] keeps it, collected for
+    /// the same reason: the stand-in's methods are in another document.
+    stand_ins: Vec<(String, String)>,
     /// The document being read, for the one name the RBS tree gives only as a span.
     ///
     /// A keyword's name is a hash key whose node carries a location and nothing else, so `foo:` is
@@ -1285,6 +1364,17 @@ impl Visit for Harvest<'_> {
         ));
     }
 
+    /// `include RBS::Unnamed::Random_Formatter`: a body whose methods RBS writes on a stand-in
+    /// ([`Types::adopt_stand_ins`]).
+    fn visit_include_node(&mut self, node: &IncludeNode<'_>) {
+        self.stand_in(&type_name(&node.name()), false);
+    }
+
+    /// The class-object side of [`Self::visit_include_node`].
+    fn visit_extend_node(&mut self, node: &ExtendNode<'_>) {
+        self.stand_in(&type_name(&node.name()), true);
+    }
+
     /// Deliberately empty. **ya-lsp does not index RBS interfaces** (the same rule
     /// [`signatures`](super::signatures) enforces by editing the text), so their members have no
     /// declaration to key a row by. Harvesting them would file `_Rand#rand` under the enclosing
@@ -1406,6 +1496,18 @@ impl Visit for Harvest<'_> {
                     .keyed
                     .insert(DeclarationId::from(member.as_str()));
             }
+            // A member whose value the member that made its receiver decides, in any arm.
+            if method_types(node).any(|method_type| returns_the(&method_type, READ_OFF)) {
+                self.types
+                    .read_off
+                    .insert(DeclarationId::from(member.as_str()));
+            }
+            // A member whose value is made from its call's literal arguments, in any arm.
+            if method_types(node).any(|method_type| returns_the(&method_type, SHAPED)) {
+                self.types
+                    .shaped
+                    .insert(DeclarationId::from(member.as_str()));
+            }
             // A method whose every overload hands back `void`, or every one `bot`.
             if let Some(nothing) = declared_nothing(node) {
                 self.types
@@ -1461,6 +1563,23 @@ impl Harvest<'_> {
         };
         self.types
             .insert(self.document, &member, vec![arm], Vec::new());
+    }
+
+    /// Keep a mixin of a stand-in into the enclosing body. A stand-in mixed into another is RBS's
+    /// own arrangement and skipped: no Ruby writes a stand-in's methods.
+    fn stand_in(&mut self, written: &Written, extend: bool) {
+        let Some(owner) = self.nesting.last() else {
+            return;
+        };
+        if !written.path.starts_with(STAND_INS) || owner.name.starts_with(STAND_INS) {
+            return;
+        }
+        let body = if extend {
+            singleton_name(&owner.name)
+        } else {
+            owner.name.clone()
+        };
+        self.stand_ins.push((body, written.path.clone()));
     }
 
     /// A declaration's name, under whatever it is written inside.
@@ -1920,6 +2039,11 @@ fn declares(node: &MethodDefinitionNode<'_>, sentinel: &str) -> bool {
     let (Some(method_type), None) = (overloads.next(), overloads.next()) else {
         return false;
     };
+    returns_the(&method_type, sentinel)
+}
+
+/// Whether one arm hands back the sentinel itself, with no arguments.
+fn returns_the(method_type: &MethodTypeNode<'_>, sentinel: &str) -> bool {
     let Node::FunctionType(function) = method_type.type_() else {
         return false;
     };
@@ -2435,7 +2559,7 @@ fn class_of(node: &Node<'_>, owner: &Owner<'_>) -> Option<Returned> {
                 SCOPED => Some(Returned::plain(Return::Scoped)),
                 // Answered at the body seam from its own table, never as an arm: see
                 // [`Types::defined`].
-                DEFINED | BLOCK | OWN_DEF | SENT | KEYED => None,
+                DEFINED | BLOCK | OWN_DEF | SENT | KEYED | READ_OFF | SHAPED => None,
                 FORWARDED => forwarding(&class.args()).map(Returned::plain),
                 _ => Some(Returned::plain(Return::Class {
                     name: written.path.into(),
@@ -2971,7 +3095,8 @@ pub struct Sources<'a> {
     ///   self-call starts at the object's class and an override there wins.
     /// - **Set by [`from_body`], always**: a body read on a union or an unknown receiver hands
     ///   `None` down, never the class an outer body was read for. And by [`scoped_beside`], for the
-    ///   class a scope was called on.
+    ///   class a scope was called on, and by [`fold_objects`] and [`setter_values`] for a write an
+    ///   ancestor's body makes on the read's one object, where none was set.
     /// - **Part of every read's memo key** ([`Reads`]), since the same read answers differently
     ///   per object.
     pub object: Option<DeclarationId>,
@@ -3082,11 +3207,17 @@ struct Document {
     blocks: OnceCell<HashMap<u32, Box<[Receiver]>>>,
     /// What the one lambda each call is passed hands back, by where the call starts
     /// ([`cursor::lambdas_handed_back`]), for [`scoped_beside`], walked on first use.
-    lambdas: OnceCell<HashMap<u32, Box<[Receiver]>>>,
+    lambdas: OnceCell<HashMap<u32, cursor::HandedLambda>>,
     /// The render calls this text makes ([`rails::read_renders`]), with what each value they pass
     /// a partial is ([`cursor::values_at`]), for a partial's locals. Walked on first
     /// use; `view` is fixed by the path, so one reading is the only one.
     renders: OnceCell<Rc<Passing>>,
+    /// What this text writes into its constants ([`cursor::frozen_constants`]), for a filter held
+    /// in one ([`constant_names`]), walked on first use.
+    constants: OnceCell<cursor::FrozenConstants>,
+    /// The constants this text writes as values ([`cursor::constants_handed_on`]), for a class
+    /// handed to code that may build it ([`handed_on`]), walked on first use.
+    handed: OnceCell<HashSet<(u32, u32)>>,
 }
 
 /// One text's render calls, and each value they pass a partial as a shape, by its span.
@@ -3103,9 +3234,21 @@ impl Document {
     }
 
     /// [`Document::lambdas`], walked on first use.
-    fn lambdas(&self) -> &HashMap<u32, Box<[Receiver]>> {
+    fn lambdas(&self) -> &HashMap<u32, cursor::HandedLambda> {
         self.lambdas
             .get_or_init(|| cursor::lambdas_handed_back(&self.source))
+    }
+
+    /// [`Document::constants`], walked on first use.
+    fn constants(&self) -> &cursor::FrozenConstants {
+        self.constants
+            .get_or_init(|| cursor::frozen_constants(&self.source))
+    }
+
+    /// [`Document::handed`], walked on first use.
+    fn handed(&self) -> &HashSet<(u32, u32)> {
+        self.handed
+            .get_or_init(|| cursor::constants_handed_on(&self.source))
     }
 
     /// [`Document::renders`], read as a view or helper reads a call where `view`, on first use.
@@ -3234,6 +3377,8 @@ impl ReadBodies {
             blocks: OnceCell::new(),
             lambdas: OnceCell::new(),
             renders: OnceCell::new(),
+            constants: OnceCell::new(),
+            handed: OnceCell::new(),
         }))
     }
 
@@ -3250,25 +3395,35 @@ impl ReadBodies {
     }
 }
 
-/// How many documents' exits [`HeldExits`] keeps before it drops them all.
+/// How many bytes of text [`HeldExits`] keeps the walks of, the least recently used let go first:
+/// a walk weighs about eight and a half times its text, so up to about 70 MB.
 ///
-/// - **Above the widest single read, not a working size.** One [`instance_read`] walks every
-///   writer document of its object that spells the name, and a read wider than this bound empties
-///   the cache partway through and parses them all again on every request. One
-///   application's `shopify_api` has 889 resource classes under one base, each writing its class-level
-///   variables, which at 512 cost every hover there 190 ms. The bound is there so a *session*
-///   cannot grow without limit.
-/// - **Drop everything, not the oldest.** An eviction order is one more thing to get wrong. A
-///   dropped entry costs one re-parse, so being wrong here means a slow request, never a wrong
+/// - **Memory over a few re-walks (decided 2026-10-04).** A long session over the largest
+///   reference corpus (664 files, 29,000 requests, ten files open) ends 161 MB lower than at
+///   64 MB of text, for 5% more request time; hints and hovers over each corpus's 40 busiest
+///   files take 5% longer there (its walks reach 17.5 MB of distinct text) and no longer on the
+///   other five, whose walks fit. The full audit's servers take 8% more CPU, answering the same.
+/// - **Above the widest single read.** One [`instance_read`] walks every writer document of its
+///   object that spells the name: one application's `shopify_api` has 889 resource classes under
+///   one base, 5 MB of text.
+/// - **The oldest first, not everything at once.** A session moves on through its files, and
+///   letting all of them go re-walked the ones it was still reading (at 2,048 documents, the
+///   largest corpus's 5,907 texts 77,000 times). A walk let go costs one re-parse, never a wrong
 ///   answer.
+const HELD_WALK_BYTES: usize = 8 << 20;
+
+/// How many documents' escaped `def`s [`HeldExits::escapes`] keeps before it drops them all: the
+/// privacy gate asks every file declaring a private candidate, which is never close to this.
 const HELD_DOCUMENTS: usize = 2048;
 
-/// How many bytes of documents' text [`HeldExits::text`] keeps before it drops them all.
+/// How many bytes of closed documents' text [`HeldExits::text`] keeps, the least recently used let
+/// go first: twice [`HELD_WALK_BYTES`], since every walk reads its text first and more texts are
+/// read than walked (decided 2026-10-04, with it).
 ///
-/// The same headroom as [`HELD_DOCUMENTS`]: 889 `shopify_api` resource files are 5 MB. A full
-/// audit reads 52–61 MB of distinct text on the larger corpora, so this lets go during
-/// one, and a dropped text costs one read from disk.
-const HELD_TEXT_BYTES: usize = 32 << 20;
+/// At 32 MB, dropped whole and again on every `didOpen`, the hints and hovers over the largest
+/// corpus's busiest files read 214,285 files from disk; least recently used first, with `didOpen`
+/// dropping only the file it opens, 30,323 at 64 MB. A dropped text costs one read from disk.
+const HELD_TEXT_BYTES: usize = 16 << 20;
 
 /// Every document's exits, kept **across** requests and keyed by the text they were read from.
 ///
@@ -3284,7 +3439,8 @@ const HELD_TEXT_BYTES: usize = 32 << 20;
 ///    (`Analysis::graph_holds`). A file edited and edited back is the same text, and rightly hits.
 #[derive(Default)]
 pub struct HeldExits {
-    held: RefCell<HashMap<String, (u64, Rc<cursor::Shapes>)>>,
+    /// Each document's walk, by the text it was read from ([`HeldWalks`]).
+    walks: RefCell<HeldWalks>,
     /// The names each application document's reflective writes on another object can reach,
     /// by the content hash the graph holds for it ([`written_by_another`]). Read from that
     /// version of the text, so a request does not read every such file to learn nothing changed.
@@ -3310,11 +3466,110 @@ pub struct HeldExits {
     escapes: RefCell<HashMap<String, (u64, HeldEscapes)>>,
 }
 
-/// Closed documents' texts and their maps onto the graph, with the bytes they take.
-#[derive(Default)]
-struct HeldTexts {
-    held: HashMap<String, (u64, Rc<str>, Rebase)>,
+/// One value per document, by the text it was read from, the least recently used let go first once
+/// those texts pass the budget: [`HeldExits`]' walks and texts.
+struct Recent<V> {
+    held: HashMap<Rc<str>, RecentEntry<V>>,
+    /// Each held value's last use, oldest first.
+    order: BTreeMap<u64, Rc<str>>,
+    /// The last use counted.
+    tick: u64,
+    /// The bytes of text the held values were read from.
     bytes: usize,
+    budget: usize,
+}
+
+/// One document's value, and what [`Recent`] knows of it.
+struct RecentEntry<V> {
+    /// The content hash of the text it was read from.
+    hash: u64,
+    value: V,
+    /// The bytes of that text.
+    bytes: usize,
+    /// Its last use ([`Recent::order`]).
+    used: u64,
+}
+
+impl<V> Recent<V> {
+    /// An empty store that lets go of values past `budget` bytes of text.
+    fn within(budget: usize) -> Self {
+        Self {
+            held: HashMap::new(),
+            order: BTreeMap::new(),
+            tick: 0,
+            bytes: 0,
+            budget,
+        }
+    }
+
+    /// The value held for this version of `uri`, now the most recently used.
+    fn get(&mut self, uri: &str, hash: u64) -> Option<&V> {
+        let held = self.held.get_mut(uri).filter(|held| held.hash == hash)?;
+        let key = self
+            .order
+            .remove(&held.used)
+            .expect("every held value has its last use");
+        self.tick += 1;
+        held.used = self.tick;
+        self.order.insert(held.used, key);
+        Some(&held.value)
+    }
+
+    /// Hold this version's value in place of any other, then let the least recently used go until
+    /// the texts fit; never the value just held, so a text past the budget alone stays until the
+    /// next.
+    fn put(&mut self, uri: &str, hash: u64, bytes: usize, value: V) {
+        self.forget(uri);
+        self.tick += 1;
+        let key: Rc<str> = Rc::from(uri);
+        self.order.insert(self.tick, Rc::clone(&key));
+        self.held.insert(
+            key,
+            RecentEntry {
+                hash,
+                value,
+                bytes,
+                used: self.tick,
+            },
+        );
+        self.bytes += bytes;
+        while self.bytes > self.budget
+            && self.held.len() > 1
+            && let Some((_, oldest)) = self.order.pop_first()
+        {
+            let gone = self
+                .held
+                .remove(&oldest)
+                .expect("every last use is a held value's");
+            self.bytes -= gone.bytes;
+        }
+    }
+
+    /// Let go of what is held for `uri`, whatever its version.
+    fn forget(&mut self, uri: &str) {
+        if let Some(old) = self.held.remove(uri) {
+            self.order.remove(&old.used);
+            self.bytes -= old.bytes;
+        }
+    }
+}
+
+/// [`HeldExits`]' walks ([`HELD_WALK_BYTES`]).
+struct HeldWalks(Recent<Rc<cursor::Shapes>>);
+
+impl Default for HeldWalks {
+    fn default() -> Self {
+        Self(Recent::within(HELD_WALK_BYTES))
+    }
+}
+
+/// Closed documents' texts and their maps onto the graph ([`HELD_TEXT_BYTES`]).
+struct HeldTexts(Recent<(Rc<str>, Rebase)>);
+
+impl Default for HeldTexts {
+    fn default() -> Self {
+        Self(Recent::within(HELD_TEXT_BYTES))
+    }
 }
 
 /// One document's escaped `def`s ([`HeldExits::escapes`]), in its text's offsets.
@@ -3344,39 +3599,43 @@ impl HeldExits {
     /// The walk of `source`, done here or reused from a previous request.
     fn of(&self, uri: &str, source: &str) -> Rc<cursor::Shapes> {
         let hash = xxhash_rust::xxh3::xxh3_64(source.as_bytes());
-        if let Some((held, shapes)) = self.held.borrow().get(uri)
-            && *held == hash
-        {
-            return Rc::clone(shapes);
-        }
-        self.hold(uri, hash, cursor::shapes(source))
+        let held = self.walks.borrow_mut().0.get(uri, hash).cloned();
+        held.unwrap_or_else(|| self.hold(uri, hash, source.len(), cursor::shapes(source)))
     }
 
-    /// Keep one version's walk, dropping everything where the cache is full.
-    fn hold(&self, uri: &str, hash: u64, shapes: cursor::Shapes) -> Rc<cursor::Shapes> {
+    /// Keep one version's walk, letting the least recently used go where the cache is full.
+    fn hold(
+        &self,
+        uri: &str,
+        hash: u64,
+        bytes: usize,
+        shapes: cursor::Shapes,
+    ) -> Rc<cursor::Shapes> {
         let shapes = Rc::new(shapes);
-        let mut held = self.held.borrow_mut();
-        if held.len() >= HELD_DOCUMENTS {
-            held.clear();
-        }
-        held.insert(uri.to_owned(), (hash, Rc::clone(&shapes)));
+        self.walks
+            .borrow_mut()
+            .0
+            .put(uri, hash, bytes, Rc::clone(&shapes));
         shapes
     }
 
     /// Whether the walk of this version of `source` is held already, so a caller reading the text
-    /// for its own reasons need not make one ([`cursor::margin`]).
+    /// for its own reasons need not make one ([`cursor::margin`]): a use of it, since the type side
+    /// reads it next.
     #[must_use]
     pub fn holds(&self, uri: &str, source: &str) -> bool {
         let hash = xxhash_rust::xxh3::xxh3_64(source.as_bytes());
-        self.held
-            .borrow()
-            .get(uri)
-            .is_some_and(|(held, _)| *held == hash)
+        self.walks.borrow_mut().0.get(uri, hash).is_some()
     }
 
     /// Hold a walk of `source` a caller made from its own parse, as [`Self::of`] would have.
     pub fn keep(&self, uri: &str, source: &str, shapes: cursor::Shapes) {
-        self.hold(uri, xxhash_rust::xxh3::xxh3_64(source.as_bytes()), shapes);
+        self.hold(
+            uri,
+            xxhash_rust::xxh3::xxh3_64(source.as_bytes()),
+            source.len(),
+            shapes,
+        );
     }
 
     /// A closed document's text and its map, where it was read before at the version the graph
@@ -3389,34 +3648,26 @@ impl HeldExits {
     ///   every offset into that document is measured against. A file changed on disk and not yet
     ///   indexed answers with the text the graph still holds.
     /// - **An open buffer is never held**: it changes without the graph knowing. The caller
-    ///   forgets everything when one opens ([`Self::forget_texts`]).
+    ///   forgets a document's text when it opens ([`Self::forget_text`]).
     #[must_use]
     pub fn text(&self, uri: &str, hash: u64) -> Option<(Rc<str>, Rebase)> {
-        let texts = self.texts.borrow();
-        let (held, text, rebase) = texts.held.get(uri)?;
-        (*held == hash).then(|| (Rc::clone(text), *rebase))
-    }
-
-    /// Hold a closed document's text read at the version the graph holds, dropping everything
-    /// once [`HELD_TEXT_BYTES`] is reached.
-    pub fn keep_text(&self, uri: &str, hash: u64, text: &Rc<str>, rebase: Rebase) {
         let mut texts = self.texts.borrow_mut();
-        if texts.bytes + text.len() > HELD_TEXT_BYTES {
-            texts.held.clear();
-            texts.bytes = 0;
-        }
-        if let Some((_, old, _)) = texts
-            .held
-            .insert(uri.to_owned(), (hash, Rc::clone(text), rebase))
-        {
-            texts.bytes -= old.len();
-        }
-        texts.bytes += text.len();
+        let (text, rebase) = texts.0.get(uri, hash)?;
+        Some((Rc::clone(text), *rebase))
     }
 
-    /// Drop every held text: a document just opened, and its buffer now answers for it.
-    pub fn forget_texts(&self) {
-        *self.texts.borrow_mut() = HeldTexts::default();
+    /// Hold a closed document's text read at the version the graph holds, letting the least
+    /// recently used go past [`HELD_TEXT_BYTES`].
+    pub fn keep_text(&self, uri: &str, hash: u64, text: &Rc<str>, rebase: Rebase) {
+        self.texts
+            .borrow_mut()
+            .0
+            .put(uri, hash, text.len(), (Rc::clone(text), rebase));
+    }
+
+    /// Drop the text held for one document: it just opened, and its buffer now answers for it.
+    pub fn forget_text(&self, uri: &str) {
+        self.texts.borrow_mut().0.forget(uri);
     }
 
     /// [`locator::Modifiers`]' walk of `source`, done by `walk` or reused from a previous request.
@@ -3452,13 +3703,13 @@ impl HeldExits {
     /// How many documents are held. For tests; the cache has no other observable state.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.held.borrow().len()
+        self.walks.borrow().0.held.len()
     }
 
     /// Whether nothing is held.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.held.borrow().is_empty()
+        self.walks.borrow().0.held.is_empty()
     }
 }
 
@@ -3761,6 +4012,9 @@ fn reached(sources: &Sources<'_>, uri_id: UriId, at: u32) -> Option<Typed> {
             sources, uri_id, &document, variables, at, reaching, instance,
         );
     }
+    // **What an object held when it was made** ([`Typed::shaped`]) is kept by a local nothing writes
+    // into or hands on.
+    let kept = reaching.kept;
     let (typed, waiting, mut gone) =
         typed_members(sources, uri_id, &document, variables, at, reaching)?;
     // A check the read is under can rule out the `nil` no write hands over.
@@ -3796,7 +4050,12 @@ fn reached(sources: &Sources<'_>, uri_id: UriId, at: u32) -> Option<Typed> {
         reads.pending.set(waiting);
         return None;
     }
-    fold_reached(graph, typed, nil)
+    fold_kept(graph, typed, nil).map(|mut typed| {
+        if !kept {
+            typed.shaped = None;
+        }
+        typed
+    })
 }
 
 /// Whether `value` starts at a local read every value reaching which a check rules out:
@@ -4211,9 +4470,7 @@ fn fence_at<'s>(sources: &Sources<'s>, uri_id: UriId) -> environment::Fence<'s> 
 /// whether Ruby would run it, so no call rung applies one and forgets another.
 ///
 /// 1. **The test-suite fence** ([`member_of`]).
-/// 2. **The root gate** ([`locator::declared_on_the_root`]): a member found on `Object` only
-///    through `def`s written inside a block (`String.class_eval { def self.configure }`) is not
-///    every object's, and navigation refuses it too.
+/// 2. **The root gate** ([`member_past_the_root`]).
 /// 3. **Privacy**: a private member answers only a call written on `self`
 ///    ([`locator::is_private`], repair included). On any other receiver Ruby raises.
 ///
@@ -4225,15 +4482,37 @@ pub(crate) fn reach(
     member: StringId,
     on_self: bool,
 ) -> Option<DeclarationId> {
-    let graph = sources.graph;
-    let found = member_of(sources, uri_id, owner, member)?;
-    if !locator::declared_on_the_root(graph, Some(&sources.memo.blocks), found) {
-        return None;
-    }
-    if !on_self && locator::is_private(graph, &sources.memo.modifiers, found) {
+    let found = member_past_the_root(sources, uri_id, owner, member)?;
+    if !on_self && locator::is_private(sources.graph, &sources.memo.modifiers, found) {
         return None;
     }
     Some(found)
+}
+
+/// [`member_of`] behind the root gate ([`locator::declared_on_the_root`]): a member found on
+/// `Object` only through `def`s written inside a block (`String.class_eval { def self.configure }`)
+/// is not every object's, so the walk goes on past it, as Ruby's does
+/// ([`locator::past_the_root`]). `Foo.new.freeze` is `Kernel#freeze` however many blocks write a
+/// `freeze`. Navigation asks the same.
+pub(crate) fn member_past_the_root(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    owner: DeclarationId,
+    member: StringId,
+) -> Option<DeclarationId> {
+    let graph = sources.graph;
+    let found = member_of(sources, uri_id, owner, member)?;
+    if locator::declared_on_the_root(graph, Some(&sources.memo.blocks), found) {
+        return Some(found);
+    }
+    locator::past_the_root(
+        graph,
+        fence_at(sources, uri_id),
+        &sources.memo.blocks,
+        owner,
+        member,
+        found,
+    )
 }
 
 /// Whether `ancestor` is in `object`'s linearization: an instance of `object` runs its methods.
@@ -4968,7 +5247,25 @@ fn documents_of(hierarchies: &[Rc<Hierarchy>]) -> Vec<&(String, UriId)> {
 ///   for free, without a file and line that look like evidence.
 /// - **`nil` joins** unless the reading method has already written it, or every class the object can
 ///   be runs an `initialize` that does ([`initialized`]).
+/// - **What its object held when it was made is not kept** ([`Typed::shaped`]): any method may
+///   write into it between the write and the read.
 fn instance_read(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    document: &Document,
+    variables: &cursor::Variables,
+    at: u32,
+    reaching: &cursor::Reaching,
+    instance: &cursor::InstanceRead,
+) -> Option<Typed> {
+    instance_fold(sources, uri_id, document, variables, at, reaching, instance).map(|mut typed| {
+        typed.shaped = None;
+        typed
+    })
+}
+
+/// [`instance_read`] before what its object held when it was made is dropped.
+fn instance_fold(
     sources: &Sources<'_>,
     uri_id: UriId,
     document: &Document,
@@ -4991,6 +5288,7 @@ fn instance_read(
             bound: None,
             instance: None,
             narrowed: Box::default(),
+            kept: false,
         };
         let (typed, pending, _) = typed_members(sources, uri_id, document, variables, at, &only)?;
         if typed.is_empty() {
@@ -5083,6 +5381,18 @@ fn fold_objects(
         rendered,
     } = objects;
     let (mut typed, mut waiting) = own;
+    // **The one object the read is on**, where nothing narrowed it already: a write an ancestor's
+    // body makes runs on it, so it is typed for it ([`Sources::object`]). An `initialize`
+    // parameter that write reads is then what this object's constructions pass
+    // ([`from_constructions`]), not what every class running that `initialize` is built with.
+    let one_object = match bases.as_slice() {
+        [base] if sources.object.is_none() && !class_side && rendered.is_none() => Some(*base),
+        _ => None,
+    };
+    let for_object = Sources {
+        object: one_object,
+        ..*sources
+    };
     let hierarchies: Vec<Rc<Hierarchy>> = bases
         .iter()
         .map(|base| hierarchy(sources, uri_id, *base, class_side))
@@ -5148,8 +5458,11 @@ fn fold_objects(
                 }
                 continue;
             }
+            let inherited =
+                one_object.is_some_and(|base| owner != base && descends(graph, base, owner));
+            let typing = if inherited { &for_object } else { sources };
             match pending_aware(sources, || {
-                method_receiver(sources, *written_in, &shape, &scope)
+                method_receiver(typing, *written_in, &shape, &scope)
             }) {
                 Some(mut one) => {
                     if *written_in != uri_id {
@@ -5580,7 +5893,7 @@ fn read_partial_local(sources: &Sources<'_>, uri_id: UriId, name: &str) -> Local
     .contains(&name.to_owned());
     let fence = environment::Fence::at(Some(&cursor), sources.layout);
     let folds = Folds::of(graph);
-    let mut join = Join::default();
+    let mut join = Join::of_stores();
     let (mut passed, mut unpassed) = (false, false);
     // A call whose locals cannot be read, which may pass the name: that refuses only a name
     // something else says is a local.
@@ -6518,7 +6831,19 @@ fn read_initializer(
 /// Every value that can reach one place, as one type, by [`Join`]'s rule. Every assignment any
 /// value names is kept, so the card can name every line, and `nil` alone is `NilClass`, an answer:
 /// `x = nil` really holds it.
-fn fold_reached(graph: &Graph, mut typed: Vec<Typed>, nil: bool) -> Option<Typed> {
+///
+/// **What an object held when it was made is dropped** ([`Typed::shaped`]): a store any code may
+/// write into between the write and the read. [`fold_kept`] keeps it for a local nothing writes
+/// into.
+fn fold_reached(graph: &Graph, typed: Vec<Typed>, nil: bool) -> Option<Typed> {
+    fold_kept(graph, typed, nil).map(|mut typed| {
+        typed.shaped = None;
+        typed
+    })
+}
+
+/// [`fold_reached`], keeping what the object held when it was made where every value agrees.
+fn fold_kept(graph: &Graph, mut typed: Vec<Typed>, nil: bool) -> Option<Typed> {
     // One value and no `nil`: the answer is that value, untouched.
     if typed.len() == 1 && !nil {
         return typed.pop();
@@ -6671,6 +6996,18 @@ pub struct Typed {
     /// - **Read by a call of it and a block it is passed as** ([`called_method`], [`bound_return`]),
     ///   and drawn as `Method[Widget#shout]` (`render::typed`).
     bound: Option<Rc<Bound>>,
+    /// **What a read of one key of this value hands back** ([`knowledge::Shape::reads`]), as the
+    /// call that made it said from the literal arguments it was written with
+    /// ([`generated::SHAPED`]): `params.require(:post).permit(:title)` keeps `title`'s scalars.
+    ///
+    /// - **The object as it was made.** It holds while nothing can have written into it: the
+    ///   call's own value, a `def`'s that hands it back, and a local every read of which leaves it
+    ///   as it was ([`cursor::Reaching::kept`]). An instance variable, an argument bound into a
+    ///   body, what every caller passes, `self` in a body and anything a call answers anew drop
+    ///   it.
+    /// - **Every value must carry the same one**, as for [`Self::bound`] (`nil` aside).
+    /// - **Read by [`read_off`] alone**, and invisible to every label.
+    shaped: Option<Rc<knowledge::Shape>>,
 }
 
 /// The method a `Method` is bound to ([`Typed::bound`]): what `method(:shout)` looked up, on the
@@ -6713,6 +7050,7 @@ impl Typed {
             made: None,
             procs: None,
             bound: None,
+            shaped: None,
         }
     }
 
@@ -6759,6 +7097,7 @@ impl Typed {
             made: None,
             procs: None,
             bound: None,
+            shaped: None,
         })
     }
 
@@ -6970,6 +7309,15 @@ pub struct Derivation {
     ///
     /// Ruby's own rule, like `new`: it names which call answered, and adds no doubt to the tier.
     pub sent: Option<Sent>,
+    /// The method whose callers typed a parameter ([`from_callers`]): what every call that can
+    /// reach it passes at that slot, joined. Evidence about the project as it is written, so
+    /// derived: a call no text records (one built at run time) is outside it.
+    pub callers: Option<String>,
+    /// A call that may pass this parameter something was left out, because nothing types what it
+    /// passes: the classes are the readable calls' join, and Ruby's may be wider. Said only where
+    /// the parameter itself is shown (its card, its `def`'s card); **never carried by
+    /// [`Self::absorb`]**, so nothing computed from the parameter says it (decided 2026-10-02).
+    pub left_out: bool,
 }
 
 /// How a call reached the method that answered it by name ([`Derivation::sent`]).
@@ -7030,6 +7378,9 @@ impl Derivation {
             ran,
             each,
             sent,
+            callers,
+            // The parameter's own, not what is computed from it.
+            left_out: _,
         } = other;
         self.signatures.extend(signatures);
         self.constant = self.constant.take().or(constant);
@@ -7049,6 +7400,7 @@ impl Derivation {
         self.ran = self.ran.take().or(ran);
         self.each = self.each.take().or(each);
         self.sent = self.sent.take().or(sent);
+        self.callers = self.callers.take().or(callers);
     }
 
     /// Which tier this answer is, read from what was followed to reach it.
@@ -7077,6 +7429,9 @@ impl Derivation {
             each,
             // Which call a sender made, not what the answer rests on.
             sent: _,
+            callers,
+            // A note for the parameter's card, not a weaker rung.
+            left_out: _,
         } = self;
         // The name rung beats everything. A chain through three signatures that *ended* at a guess
         // is a guess: the weakest rung is what the answer rests on.
@@ -7098,6 +7453,7 @@ impl Derivation {
             && yielded.is_none()
             && ran.is_none()
             && each.is_none()
+            && callers.is_none()
         {
             return Tier::Resolved;
         }
@@ -7166,6 +7522,37 @@ pub struct FromBody {
     pub method: String,
     pub file: String,
     pub line: u32,
+}
+
+/// Whether the call `receiver` hands back a value nothing reads: it reaches a framework's macro, one
+/// class's member that a body of knowledge says is called for what it declares
+/// ([`knowledge::Knowledge::discards_value`]). The type coverage leaves such a call out.
+#[must_use]
+pub fn discarded(sources: &Sources<'_>, uri_id: UriId, receiver: &Receiver, scope: &Scope) -> bool {
+    let receiver = match receiver {
+        Receiver::Spelled { was, .. } => was,
+        other => other,
+    };
+    let Receiver::Returned { on, method, .. } = receiver else {
+        return false;
+    };
+    let Some(owner) = method_receiver(sources, uri_id, on, scope).and_then(|typed| typed.one())
+    else {
+        return false;
+    };
+    let on_self = matches!(**on, Receiver::SelfObject(_));
+    let member = StringId::from(&format!("{method}()"));
+    let found = reach(sources, uri_id, owner, member, on_self);
+    let Some((owner, _)) = found
+        .and_then(|found| sources.graph.declarations().get(&found))
+        .and_then(|declaration| declaration.name().rsplit_once('#'))
+    else {
+        return false;
+    };
+    sources
+        .knowledge
+        .modules()
+        .any(|module| module.discards_value(owner, method))
 }
 
 /// The declaration whose members can be written after a `.` on `receiver`.
@@ -7303,6 +7690,7 @@ pub fn method_receiver(
                         written,
                         safe: false,
                         on_self: false,
+                        on: None,
                     },
                     scope,
                 );
@@ -7349,6 +7737,7 @@ pub fn method_receiver(
                 },
                 safe: *safe,
                 on_self: matches!(on.as_ref(), Receiver::SelfObject(_)),
+                on: Some(on),
             };
             // The receiver is typed once, for both questions below.
             let owner = method_receiver(sources, uri_id, on, scope);
@@ -7366,8 +7755,12 @@ pub fn method_receiver(
             {
                 return answer;
             }
+            // What a class method hands back may take its class's calls, whether or not the
+            // receiver is typed. See [`handed_to_the_class`].
             let answer = match owner
                 .and_then(|owner| returned_by(sources, uri_id, on, owner, call, scope))
+                .or_else(|| handed_to_the_class(sources, uri_id, on, call, scope))
+                .or_else(|| keyed_by_class_calls(sources, uri_id, on, call, scope))
             {
                 Some(typed) if typed.derivation.tier() != Tier::Guessed => Some(typed),
                 answer => converted(sources, uri_id, on, call, scope).or(answer),
@@ -7407,6 +7800,7 @@ pub fn method_receiver(
                     },
                     safe: *safe,
                     on_self: matches!(on.as_ref(), Receiver::SelfObject(_)),
+                    on: Some(on),
                 },
                 scope,
                 *index,
@@ -7439,6 +7833,7 @@ pub fn method_receiver(
                 },
                 safe: *safe,
                 on_self: matches!(on.as_ref(), Receiver::SelfObject(_)),
+                on: Some(on),
             },
             Handing {
                 index: *index,
@@ -7472,6 +7867,14 @@ pub fn method_receiver(
         // One side of `block_given?`: its value, wherever it is reached. A read for one call
         // leaves out the side that call cannot reach before asking ([`unreached`]).
         Receiver::BlockGiven { value, .. } => method_receiver(sources, uri_id, value, scope),
+        // **An assignment's value is also held by what it was written to**: what the object held
+        // when it was made ([`Typed::shaped`]) may be written into through that name.
+        Receiver::Stored(value) => {
+            method_receiver(sources, uri_id, value, scope).map(|mut typed| {
+                typed.shaped = None;
+                typed
+            })
+        }
         // A proc literal: a `Proc` that remembers which one, for a call of it. See [`proc_value`].
         // `->` is syntax. `lambda { }` and `proc { }` are calls, typed as any other, with their
         // tier, and are the literal only where Ruby's own method answered.
@@ -7578,6 +7981,7 @@ pub(crate) fn rebound_self(
             return Some(match bound {
                 Runs::Made(class) => made_for(graph, class, &site.method),
                 Runs::Each { of, classes } => each_of(graph, of, classes, sources.object),
+                Runs::Instance(class) => instance_for(graph, class, &site.method),
                 Runs::Refused => None,
             });
         }
@@ -7661,6 +8065,18 @@ fn made_for(graph: &Indexed, class: &str, method: &str) -> Option<Typed> {
     let singleton = singleton_of(graph, declared(graph, class)?)?;
     Some(Typed::of(
         singleton,
+        Derivation {
+            ran: Some(method.to_owned()),
+            ..Derivation::default()
+        },
+    ))
+}
+
+/// An object of the class a generator named for a block ([`Runs::Instance`]), or `None` where
+/// the graph does not hold it.
+fn instance_for(graph: &Indexed, class: &str, method: &str) -> Option<Typed> {
+    Some(Typed::of(
+        declared(graph, class)?,
         Derivation {
             ran: Some(method.to_owned()),
             ..Derivation::default()
@@ -7940,7 +8356,630 @@ fn returned_by(
         typed.derivation.view = Some(reached.how);
         return Some(typed);
     }
+    // **A call on `self` in a module's instance method that the module lacks** is made on the
+    // object of whichever class runs the method ([`run_by`]).
+    if let Receiver::SelfObject(at) = on
+        && owner.one() == sources.scope_at(uri_id, *at).caller(sources.graph)
+        && let Some(answer) = run_by(sources, uri_id, *at, call, scope)
+    {
+        return Some(answer);
+    }
     either_receiver(sources, uri_id, owner, call, scope)
+}
+
+/// A call on what a class method hands back that takes the class methods a convention declared
+/// for its class ([`knowledge::Knowledge::passes_to_the_class`]): `UserMailer.with(user: u).welcome`
+/// is `UserMailer.welcome`, a delivery of the action.
+///
+/// Only a member the convention declared beside the instance method it runs answers
+/// ([`knowledge::Knowledge::run_from_the_class`], by the `def` at the member's place): the value
+/// takes nothing else, and raises on any other name.
+fn handed_to_the_class(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    on: &Receiver,
+    call: Call<'_>,
+    scope: &Scope,
+) -> Option<Typed> {
+    let Receiver::Returned {
+        on: inner,
+        method: passed,
+        ..
+    } = on
+    else {
+        return None;
+    };
+    let graph = sources.graph;
+    let class_object = passed_through(sources, uri_id, inner, passed, scope)?;
+    let one = class_object.one()?;
+    let found = reach(sources, uri_id, one, StringId::from(&call.member()), false)?;
+    let ancestors = ancestor_names(graph, instance_of(graph, one)?);
+    for definition in locator::definitions_of(graph, found) {
+        let Origin::Declared(site) = sources
+            .generated
+            .origin(definition.uri_id(), definition.offset().start())
+        else {
+            return None;
+        };
+        let document = sources.memo.reads.documents.of(&site.uri, sources.read)?;
+        let name = document.rebase.span_to_buffer(ByteSpan {
+            start: site.selection.0,
+            end: site.selection.1,
+        })?;
+        let name = document
+            .source
+            .get(name.start as usize..name.end as usize)?;
+        sources
+            .knowledge
+            .modules()
+            .find_map(|module| module.run_from_the_class(name, &ancestors))
+            .filter(|runs| runs.names.iter().any(|named| named == call.method))?;
+    }
+    returned_for(sources, uri_id, class_object, found, call, scope)
+}
+
+/// A literal key read off a reader whose value a class method's calls fill
+/// ([`knowledge::Knowledge::keyed_by_a_class_call`]): ActionMailer's `params[:user]`, in a mailer, is
+/// what each `with(user: …)` passed on the class object of the mailer or a subclass, joined.
+///
+/// - **`params[:key]` adds `nil`**: a mailer made without `with`, or by a call that leaves the key
+///   out, holds none. `params.fetch(:key)` raises there instead.
+/// - **Only a call that writes its hash out answers.** One handing a hash, or a `**` splat, may
+///   hold the key with anything: no answer. What a call passes that nothing types is left out,
+///   and the answer says so ([`Derivation::left_out`]), as a caller's argument is.
+/// - **Its calls are read as the callers rung reads a method's** ([`read_callers`]): in the
+///   documents naming one of the classes, fenced by the read's own document, on a receiver typed
+///   as one of their class objects; a call on anything else is another class's.
+fn keyed_by_class_calls(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    on: &Receiver,
+    call: Call<'_>,
+    scope: &Scope,
+) -> Option<Typed> {
+    let missing = match (call.method, call.arity) {
+        ("[]", Arity::Exactly(1)) => true,
+        ("fetch", Arity::Exactly(1)) => false,
+        _ => return None,
+    };
+    let [
+        Receiver::Literal {
+            symbol: Some(key), ..
+        },
+    ] = call.written.positional
+    else {
+        return None;
+    };
+    // A local spelled like the method, with no write, is read as the call.
+    let on = match on {
+        Receiver::Spelled { was, .. } => was.as_ref(),
+        other => other,
+    };
+    let Receiver::Returned {
+        on: reader_on,
+        method: reader,
+        arity: Arity::Exactly(0),
+        ..
+    } = on
+    else {
+        return None;
+    };
+    if !matches!(reader_on.as_ref(), Receiver::SelfObject(_)) {
+        return None;
+    }
+    let graph = sources.graph;
+    let here = scope.caller(graph)?;
+    if !matches!(
+        graph.declarations().get(&here),
+        Some(Declaration::Namespace(Namespace::Class(_)))
+    ) {
+        return None;
+    }
+    let reached = reach(
+        sources,
+        uri_id,
+        here,
+        StringId::from(&format!("{reader}()")),
+        true,
+    )?;
+    let filled_by = {
+        let name = graph.declarations().get(&reached)?.name();
+        sources
+            .knowledge
+            .modules()
+            .find_map(|module| module.keyed_by_a_class_call(name))?
+    };
+    let callers = &graph.callers;
+    let asked: KeyedRead = (here, key.to_string(), missing);
+    let held = (asked.clone(), callers.open.borrow().len());
+    if let Some(answer) = callers.keyed.borrow().get(&held) {
+        return answer.clone();
+    }
+    if callers.keyed_open.borrow().contains(&asked) {
+        return None;
+    }
+    let outermost = callers.keyed_open.borrow().is_empty();
+    callers.keyed_open.borrow_mut().push(asked);
+    let answer = {
+        let _opened = KeyedOpen(callers);
+        let memo = Memo::new(sources.read, sources.held_exits);
+        class_calls_keyed(
+            &reading_callers(sources, &memo),
+            uri_id,
+            here,
+            filled_by,
+            key,
+            missing,
+        )
+    };
+    if outermost {
+        callers.keyed.borrow_mut().insert(held, answer.clone());
+    }
+    answer
+}
+
+/// Pops [`Callers::keyed_open`] however the answer ends.
+struct KeyedOpen<'c>(&'c Callers);
+
+impl Drop for KeyedOpen<'_> {
+    fn drop(&mut self) {
+        self.0.keyed_open.borrow_mut().pop();
+    }
+}
+
+/// [`keyed_by_class_calls`] once the read is known: every call of `filled_by` on the class object
+/// of `class` or a subclass, and the value each passes at `key`.
+fn class_calls_keyed(
+    sources: &Sources<'_>,
+    read_in: UriId,
+    class: DeclarationId,
+    filled_by: &str,
+    key: &str,
+    missing: bool,
+) -> Option<Typed> {
+    let graph = sources.graph;
+    let objects = descendants_closed(graph, class, false).ok()?;
+    let classes: HashSet<DeclarationId> = objects.iter().copied().collect();
+    let naming = naming_documents(
+        graph,
+        &RunnerSet {
+            objects,
+            ancestors: classes.clone(),
+            through: Vec::new(),
+            per_object: false,
+        },
+    );
+    let home = graph.documents().get(&read_in)?.uri().to_owned();
+    let fence = environment::Fence::at(Some(&home), sources.layout);
+    let sites: Vec<super::indexed::Call> = graph
+        .calls_named(filled_by)
+        .iter()
+        .copied()
+        .filter(|(document, _, _)| naming.contains(document))
+        .filter(|(document, _, _)| {
+            graph
+                .documents()
+                .get(document)
+                .is_some_and(|found| !fenced_out(fence, found.uri()))
+        })
+        .collect();
+    if sites.len() > CALLER_SITES {
+        return None;
+    }
+    let folds = Folds::of(graph);
+    let mut join = Join::default();
+    let mut unread = false;
+    let mut counted = 0usize;
+    let mut held_shapes: HashMap<UriId, CallShapes> = HashMap::new();
+    for &(document, start, end) in &sites {
+        let uri = graph.documents().get(&document)?.uri().to_owned();
+        let read = sources.memo.reads.documents.of(&uri, sources.read)?;
+        let at = read.rebase.span_to_buffer(ByteSpan { start, end })?.start;
+        let shapes = match held_shapes.get(&document) {
+            Some(shapes) => Rc::clone(shapes),
+            None => {
+                let offsets: Vec<u32> = sites
+                    .iter()
+                    .filter(|(other, _, _)| *other == document)
+                    .filter_map(|&(_, start, end)| {
+                        Some(read.rebase.span_to_buffer(ByteSpan { start, end })?.start)
+                    })
+                    .collect();
+                let shapes = call_shapes(
+                    &graph.callers,
+                    (sources.held_exits, &uri),
+                    document,
+                    filled_by,
+                    &read.source,
+                    &offsets,
+                );
+                held_shapes.insert(document, Rc::clone(&shapes));
+                shapes
+            }
+        };
+        let shape = shapes.get(&at)?.rebased(&read.rebase)?;
+        let shape = match shape {
+            Receiver::Spelled { was, .. } => *was,
+            other => other,
+        };
+        let (on, arity, arguments, keywords) = match shape {
+            Receiver::Returned {
+                on,
+                arity,
+                arguments,
+                keywords,
+                ..
+            } => (on, arity, arguments, keywords),
+            _ => return None,
+        };
+        let scope = sources.scope_at(document, start);
+        // A receiver nothing types may be any object: another class's call, left out.
+        let Some(owner) = method_receiver(sources, document, &on, &scope)
+            .filter(|owner| owner.derivation.tier() != Tier::Guessed)
+        else {
+            unread = true;
+            continue;
+        };
+        let Some(made) = owner.one().and_then(|one| instance_of(graph, one)) else {
+            continue;
+        };
+        if !classes.contains(&made) {
+            continue;
+        }
+        // Only a hash written out says what it holds.
+        let (Arity::Keyed(0), true, Some(keywords)) = (arity, arguments.is_empty(), keywords)
+        else {
+            return None;
+        };
+        // A call that leaves the key out holds `nil` there, which [`Typed::or_nil`] adds below.
+        let Some((_, value)) = keywords.iter().find(|(written, _)| written == key) else {
+            continue;
+        };
+        match method_receiver(sources, document, value, &scope)
+            .filter(|typed| typed.derivation.tier() != Tier::Guessed)
+        {
+            Some(mut typed) => {
+                typed.derivation.assignments.clear();
+                unread |= typed.derivation.left_out;
+                join.add(typed, &folds);
+                counted += 1;
+            }
+            None => unread = true,
+        }
+    }
+    if counted == 0 {
+        return None;
+    }
+    let mut typed = join.finish(&folds)?;
+    if missing {
+        typed = typed.or_nil();
+    }
+    typed.same = false;
+    typed.made = None;
+    typed.procs = None;
+    typed.shaped = None;
+    typed.derivation.assignments.clear();
+    typed.derivation.callers = Some(format!(
+        "{}.{filled_by}",
+        graph.declarations().get(&class)?.name()
+    ));
+    typed.derivation.left_out = unread;
+    Some(typed)
+}
+
+/// A call on `self` in a module's instance method that the module's own lookup has no member for:
+/// the call made on each class whose objects run the method ([`self_runners`]), joined as a
+/// union's is ([`narrowed`]). One class that has it and answers nothing refuses the whole.
+fn run_by(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    at: u32,
+    call: Call<'_>,
+    scope: &Scope,
+) -> Option<Typed> {
+    let runners = self_runners(sources, uri_id, at, &call.member())?;
+    let folds = Folds::of(sources.graph);
+    let mut join = Join::default();
+    for &class in runners.classes() {
+        let one = returned_on(
+            sources,
+            uri_id,
+            Typed::of(class, runners.derivation.clone()),
+            call,
+            scope,
+        )?;
+        join.add(one, &folds);
+    }
+    join.finish(&folds)
+}
+
+/// How many classes a call on a module's `self` is made on ([`self_runners`]), a sanity guard: the
+/// corpora's widest is far below it.
+const SELF_RUNNERS: usize = 512;
+
+/// The classes `self` may be at `at`, inside a module's instance method, for a call of `member`
+/// (keyed with its parentheses) the module's own lookup has no member for: each class whose
+/// objects run the method ([`module_runners`]) and whose lookup has it, as one union naming the
+/// module ([`Derivation::each`]).
+///
+/// - **Ruby looks the call up from the object's class**, which is one of these. A class whose
+///   lookup lacks the member raises there and adds nothing, as on a union ([`narrowed`]).
+/// - **An object nothing here shows is left out** (one the module is `extend`ed onto at run time,
+///   a view a helper runs in, what a `method_missing` answers): the union is narrower than
+///   Ruby's there, never another class's, as with a caller nothing records ([`read_callers`]).
+/// - **Asked once the rungs above have read `self` as the module's object**: no block a signature
+///   rebinds and no body read for one object ([`method_receiver`]'s `SelfObject` arm).
+/// - **`None`** where the `def` is written in a block (`class_methods do`, which runs on something
+///   else), where the module has the member, where no class has it, for a gem's module
+///   ([`module_runners`]), and past [`SELF_RUNNERS`].
+pub(crate) fn self_runners(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    at: u32,
+    member: &str,
+) -> Option<Typed> {
+    let graph = sources.graph;
+    let (module, runners) = running_self(sources, uri_id, at)?;
+    let member = StringId::from(member);
+    if reach(sources, uri_id, module, member, true).is_some() {
+        return None;
+    }
+    let mut classes = runners.to_vec();
+    classes.retain(|class| reach(sources, uri_id, *class, member, true).is_some());
+    if classes.is_empty() || classes.len() > SELF_RUNNERS {
+        return None;
+    }
+    let derivation = Derivation {
+        each: Some(graph.declarations().get(&module)?.name().to_owned()),
+        ..Derivation::default()
+    };
+    let folds = Folds::of(graph);
+    let mut join = Join::default();
+    for class in classes {
+        join.add(Typed::of(class, derivation.clone()), &folds);
+    }
+    join.finish(&folds)
+}
+
+/// The module whose instance method `self` is written in at `at`, and every class whose objects
+/// run it ([`module_runners`]): `None` where `self` there is not such a method's (a class body, a
+/// singleton method), where the `def` is written in a block (`class_methods do`, which runs on
+/// something else), and for a gem's module. Asked once the rungs above have read `self` as the
+/// module's object ([`self_runners`]); completion asks it for a bare word and `self.`.
+pub(crate) fn running_self(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    at: u32,
+) -> Option<(DeclarationId, Rc<[DeclarationId]>)> {
+    let graph = sources.graph;
+    let module = sources.scope_at(uri_id, at).caller(graph)?;
+    if !matches!(
+        graph.declarations().get(&module),
+        Some(Declaration::Namespace(Namespace::Module(_)))
+    ) {
+        return None;
+    }
+    let written = innermost_def(graph, uri_id, at)?;
+    if sources.memo.blocks.written_in_a_block(graph, written) {
+        return None;
+    }
+    Some((module, module_runners(sources, module).ok()?))
+}
+
+/// The narrowest `def` around `at` in one document.
+fn innermost_def(graph: &Graph, uri_id: UriId, at: u32) -> Option<&Definition> {
+    graph
+        .documents()
+        .get(&uri_id)?
+        .definitions()
+        .iter()
+        .filter_map(|id| graph.definitions().get(id))
+        .filter(|definition| matches!(definition, Definition::Method(_)))
+        .filter(|definition| definition.offset().start() <= at && at < definition.offset().end())
+        .min_by_key(|definition| definition.offset().end() - definition.offset().start())
+}
+
+/// Every class whose objects run a module's instance methods ([`read_module_runners`]), held with
+/// the graph ([`Callers::modules`]).
+fn module_runners(sources: &Sources<'_>, module: DeclarationId) -> ModuleRunners {
+    let callers = &sources.graph.callers;
+    if let Some(held) = callers.modules.borrow().get(&module) {
+        return held.clone();
+    }
+    let answer = read_module_runners(sources, module).map(Rc::from);
+    callers.modules.borrow_mut().insert(module, answer.clone());
+    answer
+}
+
+/// The module's descendants, closed ([`descendants_closed`]: its includers and theirs, their
+/// subclasses, and a class or module object that `extend`s it where rubydex links it), and what a
+/// hook mixes it, or a module of that closure, into ([`hooked`]), that are classes or class
+/// objects, less those only the suite loads where the module's own file is not the suite's. Empty
+/// where nothing includes it. Only the application's own module: a gem's runs in whatever its gem
+/// builds.
+fn read_module_runners(
+    sources: &Sources<'_>,
+    module: DeclarationId,
+) -> Result<Vec<DeclarationId>, &'static str> {
+    let graph = sources.graph;
+    let uris = |id: DeclarationId| -> Vec<&str> {
+        graph
+            .declarations()
+            .get(&id)
+            .map(|declaration| {
+                declaration
+                    .definitions()
+                    .iter()
+                    .filter_map(|definition| graph.definitions().get(definition))
+                    .filter_map(|definition| graph.documents().get(definition.uri_id()))
+                    .map(|document| document.uri())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let own = uris(module);
+    if own.iter().any(|uri| !sources.layout.is_own(uri)) {
+        return Err("not the application's");
+    }
+    let fence = environment::Fence::at(own.first().copied(), sources.layout);
+    let kind = |id: &DeclarationId| match graph.declarations().get(id) {
+        Some(Declaration::Namespace(namespace)) => Some(namespace),
+        _ => None,
+    };
+    let closure = descendants_closed(graph, module, false)?;
+    let mut objects: HashSet<DeclarationId> = closure.iter().copied().collect();
+    // **What a hook is handed is each includer** (`self.included(base)`), or each object that
+    // extends the module (`self.extended(base)`): `base.extend(ClassMethods)` makes every
+    // includer's class object run `ClassMethods`, and a subclass's inherits it.
+    let hooks = hooked(sources);
+    for mixed in closure
+        .iter()
+        .filter(|id| matches!(kind(id), Some(Namespace::Module(_))))
+    {
+        for hooking in hooks.get(mixed).into_iter().flatten() {
+            let handed = descendants_closed(graph, hooking.module, false)?;
+            let targets = handed.into_iter().skip(1).filter_map(|base| {
+                let base = match (hooking.hook, kind(&base)) {
+                    ("extended", Some(Namespace::SingletonClass(_))) => {
+                        locator::attached_class(graph, base)
+                    }
+                    (
+                        "included" | "prepended",
+                        Some(Namespace::Class(_) | Namespace::Module(_)),
+                    ) => Some(base),
+                    _ => None,
+                }?;
+                match hooking.extends {
+                    true => singleton_of(graph, base),
+                    false => Some(base),
+                }
+            });
+            for target in targets {
+                objects.extend(descendants_closed(graph, target, false)?);
+            }
+        }
+    }
+    let mut runners: Vec<DeclarationId> = objects
+        .into_iter()
+        .filter(|id| {
+            let read = match kind(id) {
+                Some(Namespace::Class(_)) => *id,
+                Some(Namespace::SingletonClass(_)) => {
+                    locator::attached_class(graph, *id).unwrap_or(*id)
+                }
+                _ => return false,
+            };
+            uris(read).iter().any(|uri| !fenced_out(fence, uri))
+        })
+        .collect();
+    // The graph's order of descendants is not the text's: a union is read in the names' order.
+    runners.sort_by_cached_key(|id| {
+        graph
+            .declarations()
+            .get(id)
+            .map(|declaration| declaration.name().to_owned())
+    });
+    Ok(runners)
+}
+
+/// One hook that mixes a module into what it is handed ([`hooked`]).
+struct Hooking {
+    /// The module whose hook it is.
+    module: DeclarationId,
+    /// `included`, `extended` or `prepended`.
+    hook: &'static str,
+    /// It `extend`s, rather than `include` or `prepend`.
+    extends: bool,
+}
+
+/// [`hooked`]'s answer: each module a hook mixes in, and the hooks.
+type Hooked = Rc<HashMap<DeclarationId, Vec<Hooking>>>;
+
+/// Every module the project's own hooks mix into what they are handed
+/// ([`cursor::hook_mixins`]), held with the graph ([`Callers::hooked`]): Ruby calls a module's
+/// `self.included(base)` with each class or module that includes it, `self.prepended` with each
+/// that prepends it, and `self.extended` with each object that extends it.
+fn hooked(sources: &Sources<'_>) -> Hooked {
+    let graph = sources.graph;
+    if let Some(held) = graph.callers.hooked.borrow().as_ref() {
+        return Rc::clone(held);
+    }
+    let mut found: HashMap<DeclarationId, Vec<Hooking>> = HashMap::new();
+    let mut walked: HashMap<UriId, Rc<[cursor::HookMixin]>> = HashMap::new();
+    // A module's own hook (`Q::<Q>#included()`), each of its `def`s in the project's own text.
+    let hooks = ["included", "extended", "prepended"]
+        .into_iter()
+        .flat_map(|hook| {
+            graph
+                .members_named(&format!("{hook}()"))
+                .iter()
+                .map(move |declared| (hook, *declared))
+        })
+        .filter_map(|(hook, declared)| {
+            let owner = *graph.declarations().get(&declared)?.owner_id();
+            let module = locator::attached_class(graph, owner).filter(|module| {
+                matches!(
+                    graph.declarations().get(module),
+                    Some(Declaration::Namespace(Namespace::Module(_)))
+                )
+            })?;
+            Some((hook, declared, module))
+        })
+        .flat_map(|(hook, declared, module)| {
+            locator::definitions_of(graph, declared)
+                .into_iter()
+                .map(move |definition| (hook, module, definition))
+        });
+    for (hook, module, definition) in hooks {
+        let document = *definition.uri_id();
+        let Some((read, at)) = graph
+            .documents()
+            .get(&document)
+            .map(|found| found.uri())
+            .filter(|uri| sources.layout.is_own(uri))
+            .and_then(|uri| sources.memo.reads.documents.of(uri, sources.read))
+            .and_then(|read| {
+                let at = read.rebase.span_to_buffer(ByteSpan {
+                    start: definition.offset().start(),
+                    end: definition.offset().start(),
+                })?;
+                Some((read, at.start))
+            })
+        else {
+            continue;
+        };
+        let mixins = walked
+            .entry(document)
+            .or_insert_with(|| cursor::hook_mixins(&read.source).into());
+        let mixed = mixins
+            .iter()
+            .filter(|mixin| mixin.hook_at == at)
+            .filter_map(|mixin| {
+                let mixed = match mixin.mixed {
+                    None => module,
+                    Some(end) => {
+                        let target = constant_at(
+                            graph,
+                            document,
+                            read.rebase.to_graph(end)?,
+                            sources.layout,
+                        )?;
+                        locator::alias_target(graph, target).unwrap_or(target)
+                    }
+                };
+                Some((mixed, mixin.mixer == "extend"))
+            });
+        for (mixed, extends) in mixed {
+            found.entry(mixed).or_default().push(Hooking {
+                module,
+                hook,
+                extends,
+            });
+        }
+    }
+    let found = Rc::new(found);
+    *graph.callers.hooked.borrow_mut() = Some(Rc::clone(&found));
+    found
 }
 
 /// [`returned_by`] past the view's rung: `T`'s answer, and `nil`'s where the receiver may be `nil`.
@@ -7951,6 +8990,11 @@ fn either_receiver(
     call: Call<'_>,
     scope: &Scope,
 ) -> Option<Typed> {
+    // `&.` on `nil` alone skips the call: the answer is `nil`, never what `NilClass` would answer.
+    let nil = DeclarationId::from("NilClass");
+    if call.safe && owner.classes == [nil] {
+        return Some(Typed::of(nil, owner.derivation));
+    }
     if !owner.nilable {
         return returned_on(sources, uri_id, owner, call, scope);
     }
@@ -8100,6 +9144,18 @@ fn returned_on(
     // **A key a body of knowledge keeps is what it holds there** ([`keyed`]).
     if sources.types.keyed.contains(&found)
         && let Some(answer) = keyed(sources, &owner, found, call)
+    {
+        return Some(answer);
+    }
+    // **A value made from the literal arguments the call is written with** ([`shaped`]).
+    if sources.types.shaped.contains(&found)
+        && let Some(answer) = shaped(sources, uri_id, &owner, found, call, scope)
+    {
+        return Some(answer);
+    }
+    // **A read the member that made its receiver decides** ([`read_off`]).
+    if sources.types.read_off.contains(&found)
+        && let Some(answer) = read_off(sources, uri_id, &owner, found, call, scope)
     {
         return Some(answer);
     }
@@ -8565,6 +9621,7 @@ fn forward(
             },
             safe: false,
             on_self: true,
+            on: None,
         };
         returned_on(sources, uri_id, owner.clone(), asked, scope)?
     };
@@ -8572,6 +9629,7 @@ fn forward(
         method,
         safe: false,
         on_self: false,
+        on: None,
         ..call
     };
     let mut answer = either_receiver(sources, uri_id, first, handed, scope)?;
@@ -8685,7 +9743,7 @@ fn scoped_beside(
                 end: *call,
             })?
             .start;
-        let exits = document.lambdas().get(&at)?;
+        let exits = &document.lambdas().get(&at)?.exits;
         let scope = sources.scope_at(uri_id, *call);
         // **Read for the class the scope was called on** ([`Sources::object`]): written in a
         // concern's `included do`, the lambda's `self` is that class's relation, not every
@@ -9172,10 +10230,10 @@ fn read_setter_values(
             })
         })
     };
-    // A receiver or value typed, and not by a guess, or `None`, with [`Reads::pending`] saying
-    // whether it is only not known yet.
-    let sure = |document: UriId, shape: &Receiver, scope: &Scope| -> Option<Typed> {
-        let typed = pending_aware(sources, || method_receiver(sources, document, shape, scope))?;
+    // A receiver or value typed for `typing`, and not by a guess, or `None`, with
+    // [`Reads::pending`] saying whether it is only not known yet.
+    let sure = |typing: &Sources<'_>, document: UriId, shape: &Receiver, scope: &Scope| {
+        let typed = pending_aware(sources, || method_receiver(typing, document, shape, scope))?;
         if typed.derivation.tier() == Tier::Guessed {
             reads.pending.set(false);
             return None;
@@ -9184,29 +10242,67 @@ fn read_setter_values(
     };
     let cursor = graph.documents().get(&uri_id)?.uri().to_owned();
     let fence = environment::Fence::at(Some(&cursor), sources.layout);
+    let held: HashSet<UriId> = hierarchies
+        .iter()
+        .flat_map(|hierarchy| hierarchy.documents.iter().map(|(_, document)| *document))
+        .collect();
+    // **The one object the read is on** ([`fold_objects`]'s): a call on `self` written in an
+    // ancestor's body is typed for it, so what an `initialize` there passes is what this object's
+    // constructions pass ([`from_constructions`]).
+    let one_object = match hierarchies {
+        [one] if sources.object.is_none() && !one.class_side => one.objects.first().copied(),
+        _ => None,
+    };
+    let for_object = Sources {
+        object: one_object,
+        ..*sources
+    };
 
-    let mut documents: Vec<(&str, UriId)> = graph
+    // The application's calls, and **a call on `self` in a library's file of the object's
+    // classes** (`self.object = object` in a gem's `initialize`): it writes this object's
+    // variable. Such a library call only adds: one nothing types is left out, not refused.
+    let mut documents: Vec<(&str, UriId, bool)> = graph
         .calls_named(&writer)
         .iter()
         .filter_map(|(document, _, _)| {
             let uri = graph.documents().get(document)?.uri();
-            application(sources, &fence, uri).then_some((uri, *document))
+            if application(sources, &fence, uri) {
+                Some((uri, *document, true))
+            } else {
+                held.contains(document).then_some((uri, *document, false))
+            }
         })
         .collect();
     documents.sort_unstable();
     documents.dedup();
     let mut values: Vec<Typed> = Vec::new();
     let mut nil = false;
-    for (uri, document) in documents {
+    for (uri, document, own) in documents {
         // A document that cannot be read may hold a write: nothing can be said.
         let read = reads.documents.of(uri, sources.read)?;
         for setter in &read.shapes(uri, sources.held_exits).setters {
             if setter.set || setter.name != name {
                 continue;
             }
+            let on_self = matches!(setter.on, Receiver::SelfObject(_));
+            if !own && !on_self {
+                continue;
+            }
             let place = read.rebase.to_graph(setter.at)?;
             let scope = sources.scope_at(document, place);
-            let on = sure(document, &setter.on.rebased(&read.rebase)?, &scope)?;
+            let inherited = on_self
+                && one_object.is_some_and(|base| {
+                    scope
+                        .nesting_id(graph)
+                        .is_some_and(|written| written != base && descends(graph, base, written))
+                });
+            let typing = if inherited { &for_object } else { sources };
+            let Some(on) = sure(typing, document, &setter.on.rebased(&read.rebase)?, &scope) else {
+                if !own && !reads.pending.get() {
+                    continue;
+                }
+                return None;
+            };
             if !reaches(&on) {
                 continue;
             }
@@ -9215,17 +10311,18 @@ fn read_setter_values(
                 nil = true;
                 continue;
             }
-            let mut value = sure(document, &value, &scope)?;
+            let Some(mut value) = sure(typing, document, &value, &scope) else {
+                if !own && !reads.pending.get() {
+                    continue;
+                }
+                return None;
+            };
             // Offsets into another file, which every consumer would draw against the asking one.
             value.derivation.assignments.clear();
             values.push(value);
         }
     }
 
-    let held: HashSet<UriId> = hierarchies
-        .iter()
-        .flat_map(|hierarchy| hierarchy.documents.iter().map(|(_, document)| *document))
-        .collect();
     let mut senders: Vec<(&str, UriId, bool)> = cursor::SENDERS
         .iter()
         .flat_map(|sender| {
@@ -9258,7 +10355,7 @@ fn read_setter_values(
             }
             let place = read.rebase.to_graph(sent.at)?;
             let scope = sources.scope_at(document, place);
-            let on = sure(document, &sent.on.rebased(&read.rebase)?, &scope)?;
+            let on = sure(sources, document, &sent.on.rebased(&read.rebase)?, &scope)?;
             if reaches(&on) {
                 reads.pending.set(false);
                 return None;
@@ -9848,6 +10945,7 @@ fn called_by_name(
             },
             safe: false,
             on_self: false,
+            on: None,
         },
         scope,
     )
@@ -9977,14 +11075,217 @@ pub struct ProcBinding {
 /// by walking out from the innermost literal read; `None` outside any.
 fn proc_parameter(sources: &Sources<'_>, uri_id: UriId, at: u32, index: usize) -> Option<Typed> {
     let reads = &sources.memo.reads;
-    let mut key = sources.bound?;
-    loop {
-        let binding = reads.proc_bindings.borrow().get(&key).cloned()?;
+    let mut key = sources.bound;
+    while let Some(binding) = key.and_then(|held| reads.proc_bindings.borrow().get(&held).cloned())
+    {
         if binding.at == (uri_id, at) {
             return binding.positional.get(index)?.clone();
         }
-        key = binding.outer?;
+        key = binding.outer;
     }
+    // **A `scope`'s lambda no call bound is what every call of the scope passes it**
+    // ([`scoped_lambda`]).
+    let member = scope_member(sources, uri_id, at)?;
+    from_callers(sources, member, &ParameterSlot::Positional(index))
+}
+
+/// Whether a member's declared return carries a lambda's value ([`Return::Scoped`]).
+fn returns_scoped(sources: &Sources<'_>, member: DeclarationId) -> bool {
+    let Some(declared) = sources.types.declared_return(member) else {
+        return false;
+    };
+    if let Return::Union(members) = &declared.of {
+        members.contains(&Return::Scoped)
+    } else {
+        false
+    }
+}
+
+/// The class method a call declared from the lambda literal starting at `at` (graph coordinates)
+/// ([`Return::Scoped`]): `scope :recent, ->(n) { … }`'s `Story.recent`, where exactly one is. Its
+/// callers are the lambda's ([`ScopedLambda::members`]).
+fn scope_member(sources: &Sources<'_>, uri_id: UriId, at: u32) -> Option<DeclarationId> {
+    let graph = sources.graph;
+    let uri = graph.documents().get(&uri_id)?.uri().to_owned();
+    // Asked before the text is walked: most lambdas no generator placed anything around.
+    if sources.generated.generated_around(&uri, at).is_empty() {
+        return None;
+    }
+    let document = sources.memo.reads.documents.of(&uri, sources.read)?;
+    let literal = document
+        .rebase
+        .span_to_buffer(ByteSpan { start: at, end: at })?
+        .start;
+    let call = document
+        .lambdas()
+        .iter()
+        .find(|(_, handed)| handed.at == literal)
+        .map(|(call, _)| *call)?;
+    let call = document.rebase.to_graph(call)?;
+    let mut class_side = scoped_members(sources, &uri, call)
+        .into_iter()
+        .filter(|member| {
+            graph.declarations().get(member).is_some_and(|declaration| {
+                matches!(
+                    graph.declarations().get(declaration.owner_id()),
+                    Some(Declaration::Namespace(Namespace::SingletonClass(_)))
+                )
+            })
+        });
+    let member = class_side.next()?;
+    class_side.next().is_none().then_some(member)
+}
+
+/// Every member the call starting at `call` (graph coordinates) in `uri` declared from its lambda
+/// ([`Return::Scoped`]): a `scope`'s class method and its relation's.
+fn scoped_members(sources: &Sources<'_>, uri: &str, call: u32) -> HashSet<DeclarationId> {
+    let graph = sources.graph;
+    sources
+        .generated
+        .generated_around(uri, call)
+        .into_iter()
+        .filter(|(_, _, full)| *full == call)
+        .filter_map(|(generated, span, _)| {
+            graph
+                .documents()
+                .get(&generated)?
+                .definitions()
+                .iter()
+                .filter_map(|id| graph.definitions().get(id))
+                .filter(|definition| matches!(definition, Definition::Method(_)))
+                .find(|definition| (span.0..span.1).contains(&definition.offset().start()))
+                .and_then(|definition| graph.definition_to_declaration_id(definition).copied())
+        })
+        .filter(|member| returns_scoped(sources, *member))
+        .collect()
+}
+
+/// The lambda a member declared from it runs ([`Return::Scoped`]), where the callers rung binds
+/// the member's calls ([`handed_to_lambda`]).
+struct ScopedLambda {
+    document: UriId,
+    uri: String,
+    /// Where the literal starts, in the graph's coordinates.
+    at: u32,
+    /// Every member that runs it: a call reaching any of them is its caller.
+    members: HashSet<DeclarationId>,
+}
+
+/// [`ScopedLambda`] for a member whose return is a lambda's value, found at the member's one place
+/// as [`scoped_beside`] finds it.
+fn scoped_lambda(sources: &Sources<'_>, found: DeclarationId) -> Option<ScopedLambda> {
+    if !returns_scoped(sources, found) {
+        return None;
+    }
+    let graph = sources.graph;
+    // Its one place: a scope written in two files has two, and which lambda runs is whichever
+    // file Ruby loaded last.
+    let mut places: Vec<(String, u32)> = locator::definitions_of(graph, found)
+        .iter()
+        .map(|definition| {
+            match sources
+                .generated
+                .origin(definition.uri_id(), definition.offset().start())
+            {
+                Origin::Declared(site) => Some((site.uri.clone(), site.full.0)),
+                Origin::OnDisk | Origin::Unknown => None,
+            }
+        })
+        .collect::<Option<_>>()?;
+    places.sort();
+    places.dedup();
+    let [(uri, call)] = places.as_slice() else {
+        return None;
+    };
+    let document = sources.memo.reads.documents.of(uri, sources.read)?;
+    let start = document
+        .rebase
+        .span_to_buffer(ByteSpan {
+            start: *call,
+            end: *call,
+        })?
+        .start;
+    let literal = document.lambdas().get(&start)?.at;
+    Some(ScopedLambda {
+        document: UriId::from(uri.as_str()),
+        uri: uri.clone(),
+        at: document.rebase.to_graph(literal)?,
+        members: scoped_members(sources, uri, *call),
+    })
+}
+
+/// What the call at `site` hands the parameter at `slot` of a member's lambda ([`ScopedLambda`]),
+/// bound as Ruby binds a lambda: a count it does not take raises, and a slot left empty holds its
+/// default. Keywords, a splat, and a `proc` are left out.
+fn handed_to_lambda(
+    sources: &Sources<'_>,
+    lambda: &ScopedLambda,
+    slot: &ParameterSlot,
+    site: &Site<'_>,
+) -> Result<CallerHands, Refusal> {
+    let index = match slot {
+        ParameterSlot::Positional(index) => *index,
+        ParameterSlot::Keyword(_) => return Ok(CallerHands::Unread),
+    };
+    let handed = site.positional.len();
+    // A splat or keywords pass what nothing counts.
+    if site.arity != Arity::Exactly(handed as u32) {
+        return Ok(CallerHands::Unread);
+    }
+    let unreadable = || ("unreadable caller", lambda.uri.clone());
+    let document = sources
+        .memo
+        .reads
+        .documents
+        .of(&lambda.uri, sources.read)
+        .ok_or_else(unreadable)?;
+    let start = document
+        .rebase
+        .span_to_buffer(ByteSpan {
+            start: lambda.at,
+            end: lambda.at,
+        })
+        .ok_or_else(unreadable)?
+        .start;
+    let shapes = document.shapes(&lambda.uri, sources.held_exits);
+    // A `proc` binds as a block does, which this does not read.
+    let Some(parameters) = shapes
+        .procs
+        .get(&start)
+        .filter(|shape| shape.lambda)
+        .and_then(|shape| shape.parameters.as_ref())
+    else {
+        return Ok(CallerHands::Unread);
+    };
+    let most = if parameters.rest {
+        usize::MAX
+    } else {
+        parameters.required + parameters.defaults.len()
+    };
+    if !(parameters.required..=most).contains(&handed) {
+        return Ok(CallerHands::Raises);
+    }
+    let typed = match site.positional.get(index) {
+        Some(value) => method_receiver(sources, site.document, value, site.scope),
+        // Left out, so it holds its default, read where the lambda is written.
+        None => parameters
+            .defaults
+            .get(index - parameters.required)
+            .and_then(|default| default.rebased(&document.rebase))
+            .and_then(|default| {
+                let scope = sources.scope_at(lambda.document, lambda.at);
+                method_receiver(sources, lambda.document, &default, &scope)
+            }),
+    };
+    Ok(
+        match typed.filter(|typed| typed.derivation.tier() != Tier::Guessed) {
+            Some(mut typed) => {
+                typed.derivation.assignments.clear();
+                CallerHands::Value(Box::new(typed))
+            }
+            None => CallerHands::Unread,
+        },
+    )
 }
 
 /// Whether a `lambda { }`, `proc { }` or `Proc.new { }` was answered by Ruby's own method, so the
@@ -10089,7 +11390,11 @@ fn proc_value(
         let mut positional = Vec::with_capacity(positions);
         for index in 0..positions {
             positional.push(match handed.get(index) {
-                Some(value) => value.clone(),
+                // The key below knows nothing of what an object held when it was made.
+                Some(value) => value.clone().map(|mut value| {
+                    value.shaped = None;
+                    value
+                }),
                 None if index < parameters.required => Some(Typed::of(
                     declared(graph, "NilClass")?,
                     Derivation::default(),
@@ -10456,6 +11761,9 @@ struct Call<'c> {
     safe: bool,
     /// Written on `self`, or with no receiver: the one place Ruby lets a private member be called.
     on_self: bool,
+    /// The receiver as written, where the call is made on the object it names: `None` for a call
+    /// this crate makes on another object (a forwarded or a bound method's).
+    on: Option<&'c Receiver>,
 }
 
 impl Call<'_> {
@@ -10687,6 +11995,435 @@ fn keyed(
     spelled_type(graph, spelled, derivation)
 }
 
+/// What a read hands back where the member that made its receiver decides it
+/// ([`generated::READ_OFF`]), as the body of knowledge that knows it spells it, through the registry.
+///
+/// - **The receiver is a call with no receiver, no arguments and no block**, as written: `params`,
+///   not a local holding what it returned, whose object a write may have changed. Its member is
+///   looked up on `self`, so the registry is told which declaration made the object.
+/// - **Arguments are what the text says**: a string's or a symbol's text, or nothing.
+/// - **Keywords are not a read's**, and refuse.
+/// - **A receiver that carries what a read of each key hands back answers from that**
+///   ([`Typed::shaped`], [`shaped_read`]), whatever wrote it.
+/// - **Derived**, with the member's signature named.
+fn read_off(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    owner: &Typed,
+    found: DeclarationId,
+    call: Call<'_>,
+    scope: &Scope,
+) -> Option<Typed> {
+    let graph = sources.graph;
+    if call
+        .written
+        .keywords
+        .is_some_and(|keywords| !keywords.is_empty())
+    {
+        return None;
+    }
+    if let Some(shape) = &owner.shaped {
+        return shaped_read(graph, owner, found, call, shape);
+    }
+    // A local spelled like the method, with no write, is read as the call.
+    let on = match call.on? {
+        Receiver::Spelled { was, .. } => was.as_ref(),
+        other => other,
+    };
+    let Receiver::Returned {
+        on: holder,
+        method: reader,
+        block: Block::None,
+        arguments,
+        keywords,
+        ..
+    } = on
+    else {
+        return None;
+    };
+    if !arguments.is_empty()
+        || keywords
+            .as_deref()
+            .is_some_and(|keywords| !keywords.is_empty())
+        || !matches!(holder.as_ref(), Receiver::SelfObject(_))
+    {
+        return None;
+    }
+    let def = match holder.as_ref() {
+        Receiver::SelfObject(at) => enclosing_method(graph, uri_id, *at),
+        _ => None,
+    };
+    let holder = method_receiver(sources, uri_id, holder, scope)?.one()?;
+    let ancestors: Vec<&str> = linearized(graph, holder)?
+        .ancestors()
+        .iter()
+        .filter_map(|ancestor| match ancestor {
+            Ancestor::Complete(id) => Some(graph.declarations().get(id)?.name()),
+            Ancestor::Partial(_) => None,
+        })
+        .collect();
+    let reader = reach(
+        sources,
+        uri_id,
+        holder,
+        StringId::from(&format!("{reader}()")),
+        true,
+    )?;
+    let reader = graph.declarations().get(&reader)?.name().to_owned();
+    let member = graph.declarations().get(&found)?.name().to_owned();
+    let arguments: Vec<knowledge::Written> =
+        call.written.positional.iter().map(written_as).collect();
+    let read = knowledge::Read {
+        member: &member,
+        reader: &reader,
+        arguments: &arguments,
+        block: !matches!(call.block, Block::None),
+        own: sources.layout.is_own(graph.documents().get(&uri_id)?.uri()),
+        ancestors: &ancestors,
+        def: def.as_deref(),
+    };
+    let spelled = sources
+        .knowledge
+        .modules()
+        .find_map(|module| module.read_type(&read))?;
+    let mut derivation = owner.derivation.clone();
+    derivation.signatures.push(member);
+    spelled_union(graph, &spelled, derivation)
+}
+
+/// A read of one literal key off a value that carries what each read hands back
+/// ([`Typed::shaped`]): the member's row for that key, or nothing for a key it does not list.
+fn shaped_read(
+    graph: &Graph,
+    owner: &Typed,
+    found: DeclarationId,
+    call: Call<'_>,
+    shape: &knowledge::Shape,
+) -> Option<Typed> {
+    let ([argument], Arity::Exactly(1), false) =
+        (call.written.positional, call.arity, call.block.written())
+    else {
+        return None;
+    };
+    let key = match written_as(argument) {
+        knowledge::Written::Symbol(key) | knowledge::Written::Text(key) => key,
+        _ => return None,
+    };
+    let member = graph.declarations().get(&found)?.name().to_owned();
+    let spelled = shape.reads.get(&(member.clone(), key))?;
+    let mut derivation = owner.derivation.clone();
+    derivation.signatures.push(member);
+    spelled_union(graph, spelled, derivation)
+}
+
+/// What a call hands back where its value is made from the literal arguments it is written with
+/// ([`generated::SHAPED`]), as the body of knowledge that knows the member spells it, carrying
+/// what a read of the value hands back ([`Typed::shaped`]).
+///
+/// - **Arguments are what the text says** ([`written_as`]): a name, a list or a hash of names,
+///   or nothing readable, as a splat is.
+/// - **The receiver goes as the chain of calls it is written as** ([`chain_of`]): which member
+///   made the value, and which reads were made of it on the way.
+/// - **Derived**, with the member's signature named.
+fn shaped(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    owner: &Typed,
+    found: DeclarationId,
+    call: Call<'_>,
+    scope: &Scope,
+) -> Option<Typed> {
+    let graph = sources.graph;
+    let member = graph.declarations().get(&found)?.name().to_owned();
+    // Arguments it cannot count (a splat, a spent budget) are one it cannot read.
+    let arguments: Vec<knowledge::Written> = match call.arity {
+        Arity::Exactly(counted) | Arity::Keyed(counted) | Arity::Spread(counted)
+            if call.written.positional.len() == counted as usize =>
+        {
+            call.written
+                .positional
+                .iter()
+                .map(|argument| written_at(sources, uri_id, argument))
+                .collect()
+        }
+        _ => vec![knowledge::Written::Other],
+    };
+    let keywords: Option<Vec<(String, knowledge::Written)>> =
+        call.written.keywords.map(|written| {
+            written
+                .iter()
+                .map(|(name, value)| (name.clone(), written_at(sources, uri_id, value)))
+                .collect()
+        });
+    let chain = call.on.and_then(|on| chain_of(sources, uri_id, on, scope));
+    let ancestors: Vec<&str> = chain
+        .as_ref()
+        .and_then(|chain| linearized(graph, chain.on))
+        .map(|linearized| {
+            linearized
+                .ancestors()
+                .iter()
+                .filter_map(|ancestor| match ancestor {
+                    Ancestor::Complete(id) => Some(graph.declarations().get(id)?.name()),
+                    Ancestor::Partial(_) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let shaping = knowledge::Shaping {
+        member: &member,
+        arguments: &arguments,
+        keywords: keywords.as_deref(),
+        chain: chain
+            .as_ref()
+            .map(|chain| (chain.reader.as_str(), chain.links.as_slice())),
+        own: sources.layout.is_own(graph.documents().get(&uri_id)?.uri()),
+        ancestors: &ancestors,
+    };
+    let shape = sources
+        .knowledge
+        .modules()
+        .find_map(|module| module.shaped_type(&shaping))?;
+    let mut derivation = owner.derivation.clone();
+    derivation.signatures.push(member);
+    let mut typed = spelled_union(graph, &shape.spelled, derivation)?;
+    if !shape.reads.is_empty() {
+        typed.shaped = Some(Rc::new(shape));
+    }
+    Some(typed)
+}
+
+/// A receiver written as a chain of calls down to one with no receiver, no arguments and no block
+/// ([`shaped`]).
+struct Chain {
+    /// `self`'s class, where that first call is written.
+    on: DeclarationId,
+    /// The member that first call reached, as its declaration is named.
+    reader: String,
+    /// Each call after it, outermost last, looked up on the class the first one answers.
+    links: Vec<knowledge::Link>,
+}
+
+/// [`Chain`] for a receiver, or `None` where it is anything else.
+fn chain_of(sources: &Sources<'_>, uri_id: UriId, on: &Receiver, scope: &Scope) -> Option<Chain> {
+    let graph = sources.graph;
+    // Each call above the first, outermost first: its name, its positionals, and whether it wrote
+    // anything else (a block, keywords, an argument it cannot count), which no read of keys does.
+    let mut calls: Vec<(&str, &[Receiver], bool)> = Vec::new();
+    let mut link = on;
+    let (root, below, reader) = loop {
+        let unwrapped = match link {
+            Receiver::Spelled { was, .. } => was.as_ref(),
+            other => other,
+        };
+        let Receiver::Returned {
+            on: below,
+            method,
+            block,
+            arity,
+            arguments,
+            keywords,
+            ..
+        } = unwrapped
+        else {
+            return None;
+        };
+        // `Arity::Exactly(0)`: no argument and no keyword.
+        if matches!(below.as_ref(), Receiver::SelfObject(_))
+            && *arity == Arity::Exactly(0)
+            && !block.written()
+        {
+            break (unwrapped, below.as_ref(), method);
+        }
+        let more = block.written()
+            || keywords
+                .as_deref()
+                .is_none_or(|keywords| !keywords.is_empty())
+            || *arity != Arity::Exactly(arguments.len() as u32);
+        calls.push((method, arguments, more));
+        link = below;
+    };
+    let on = method_receiver(sources, uri_id, below, scope)?.one()?;
+    let reader = reach(
+        sources,
+        uri_id,
+        on,
+        StringId::from(&format!("{reader}()")),
+        true,
+    )?;
+    let holder = method_receiver(sources, uri_id, root, scope)?.one()?;
+    let mut links = Vec::new();
+    for (method, arguments, more) in calls.into_iter().rev() {
+        let member = reach(
+            sources,
+            uri_id,
+            holder,
+            StringId::from(&format!("{method}()")),
+            false,
+        )?;
+        links.push(knowledge::Link {
+            member: graph.declarations().get(&member)?.name().to_owned(),
+            arguments: arguments.iter().map(written_as).collect(),
+            more,
+        });
+    }
+    Some(Chain {
+        on,
+        reader: graph.declarations().get(&reader)?.name().to_owned(),
+        links,
+    })
+}
+
+/// An argument as the text writes it, for a body of knowledge: a symbol's name, a string's text,
+/// a list or a hash of names ([`cursor::Literals`]), or anything else.
+fn written_as(argument: &Receiver) -> knowledge::Written {
+    match argument {
+        Receiver::Literal {
+            symbol: Some(name), ..
+        } => knowledge::Written::Symbol(name.to_string()),
+        Receiver::Literal {
+            text: cursor::Text(Some(text)),
+            ..
+        } => knowledge::Written::Text(text.to_string()),
+        Receiver::Literal {
+            names: cursor::Literals(Some(names)),
+            ..
+        } => names_as(names),
+        _ => knowledge::Written::Other,
+    }
+}
+
+/// [`written_as`], with a constant read as the list of names it holds ([`constant_names`]).
+fn written_at(sources: &Sources<'_>, uri_id: UriId, argument: &Receiver) -> knowledge::Written {
+    match argument {
+        Receiver::Constant(offset) => constant_names(sources, uri_id, *offset)
+            .map_or(knowledge::Written::Other, |names| names_as(&names)),
+        other => written_as(other),
+    }
+}
+
+/// The literal of names the constant whose path ends at `offset` holds, or `None` where it may hold
+/// anything else.
+///
+/// - **One assignment, a literal of names frozen as written** ([`cursor::frozen_constants`]),
+///   read in the file the graph says declares it, as [`assigned_to`] reads one. A class, a module
+///   or an alias is no list, and a constant assigned twice holds whichever ran last.
+/// - **A namespace rubydex invented over that one assignment is still the constant.** rubydex
+///   takes a value that is a call written with a `.` (`%i[a].freeze`) for a class it may build,
+///   and promotes the constant to a `Todo` once a method is called on it anywhere (`KEYS.map`).
+/// - **Nothing writes it again with an operator.** `KEYS += [:c]` puts a new list under the old
+///   name, and rubydex records it as a reference, not a definition: every reference resolved to
+///   the constant is read in its own document, and one such write, or one that cannot be read,
+///   refuses.
+fn constant_names(sources: &Sources<'_>, uri_id: UriId, offset: u32) -> Option<Rc<cursor::Names>> {
+    let graph = sources.graph;
+    let constant = constant_at(graph, uri_id, offset, sources.layout)?;
+    let declaration = graph.declarations().get(&constant)?;
+    if !matches!(
+        declaration,
+        Declaration::Constant(_) | Declaration::Namespace(Namespace::Todo(_))
+    ) {
+        return None;
+    }
+    // A span the graph recorded, in its document's buffer, and that document read.
+    let written = |uri_id: UriId, start: u32, end: u32| {
+        let uri = graph.documents().get(&uri_id)?.uri();
+        let document = sources.memo.reads.documents.of(uri, sources.read)?;
+        let found = document.rebase.span_to_buffer(ByteSpan { start, end })?;
+        Some((document, (found.start, found.end)))
+    };
+    let definitions = locator::definitions_of(graph, constant);
+    let [definition @ Definition::Constant(_)] = definitions.as_slice() else {
+        return None;
+    };
+    let (document, span) = written(
+        *definition.uri_id(),
+        definition.offset().start(),
+        definition.offset().end(),
+    )?;
+    let names = Rc::clone(document.constants().frozen.get(&span)?);
+    for reference in declaration.constant_references()? {
+        let reference = graph.constant_references().get(reference)?;
+        let (document, span) = written(
+            reference.uri_id(),
+            reference.offset().start(),
+            reference.offset().end(),
+        )?;
+        if document.constants().rewritten.contains(&span) {
+            return None;
+        }
+    }
+    Some(names)
+}
+
+/// [`written_as`] for a literal of names.
+fn names_as(names: &cursor::Names) -> knowledge::Written {
+    match names {
+        cursor::Names::Symbol(name) => knowledge::Written::Symbol(name.to_string()),
+        cursor::Names::Text(text) => knowledge::Written::Text(text.to_string()),
+        cursor::Names::List(items) => {
+            knowledge::Written::List(items.iter().map(names_as).collect())
+        }
+        cursor::Names::Pairs(pairs) => knowledge::Written::Pairs(
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), names_as(value)))
+                .collect(),
+        ),
+    }
+}
+
+/// The name of the innermost `def` around a graph offset in a document, or `None` outside every
+/// one.
+fn enclosing_method(graph: &Graph, uri_id: UriId, at: u32) -> Option<String> {
+    let document = graph.documents().get(&uri_id)?;
+    let mut found: Option<(u32, u32, StringId)> = None;
+    for definition in document
+        .definitions()
+        .iter()
+        .filter_map(|id| graph.definitions().get(id))
+    {
+        let Definition::Method(method) = definition else {
+            continue;
+        };
+        let span = definition.offset();
+        if span.start() > at || at >= span.end() {
+            continue;
+        }
+        if found.is_none_or(|(start, end, _)| span.end() - span.start() < end - start) {
+            found = Some((span.start(), span.end(), *method.str_id()));
+        }
+    }
+    let (_, _, name) = found?;
+    let name = graph.strings().get(&name)?.as_str();
+    // rubydex keys a method with its parentheses (`core-invariants.md`).
+    Some(name.strip_suffix("()").unwrap_or(name).to_owned())
+}
+
+/// A union a body of knowledge spells, `nil` and `bool` written out (`String | bool | nil`), joined
+/// as any values are ([`Join`]). One member the graph does not declare refuses the whole.
+fn spelled_union(graph: &Graph, spelled: &str, derivation: Derivation) -> Option<Typed> {
+    let folds = Folds::of(graph);
+    let mut join = Join::default();
+    for member in spelled.split(" | ") {
+        match member {
+            "nil" => join.nil(),
+            "bool" => {
+                for half in ["TrueClass", "FalseClass"] {
+                    join.add(
+                        Typed::of(declared(graph, half)?, derivation.clone()),
+                        &folds,
+                    );
+                }
+            }
+            other => {
+                join.add(spelled_type(graph, other, derivation.clone())?, &folds);
+            }
+        }
+    }
+    join.finish(&folds)
+}
+
 /// A type a body of knowledge spells (`String`, `Hash[Symbol, untyped]`), as a [`Typed`]: its head
 /// and each argument the graph declares, `untyped` holding nothing.
 fn spelled_type(graph: &Graph, spelled: &str, derivation: Derivation) -> Option<Typed> {
@@ -10842,6 +12579,7 @@ fn called_method(
             method: &bound.name,
             safe: false,
             on_self: bound.private,
+            on: None,
             ..call
         },
         scope,
@@ -10892,6 +12630,7 @@ fn bound_return(
             },
             safe: false,
             on_self: bound.private,
+            on: None,
         },
         scope,
     )?;
@@ -10950,6 +12689,8 @@ struct Passed {
     /// Whether the call wrote a braceless hash ([`Arity::Keyed`]), which a method with no keyword
     /// parameters receives as one more positional.
     keyed: bool,
+    /// Whether that hash is `**` splats alone ([`Arity::Spread`]), which pass nothing when empty.
+    spread: bool,
     /// The call's block, for a body that `yield`s to it ([`Receiver::Yield`]).
     handed: Handed,
     /// Whether the call passed a block, for a body that asks ([`Receiver::BlockGiven`]).
@@ -10996,6 +12737,9 @@ pub struct Binding {
     handed: Handed,
     /// Whether the call passed a block, for a `block_given?` in the body ([`unreached`]).
     given: Option<bool>,
+    /// The call wrote a count of positionals the method rejects: Ruby raises `ArgumentError` there,
+    /// so the parameters hold nothing from it.
+    unfit: bool,
     /// The [`ReadKey`] part: a hash of the method and of what is bound. Never `0`, which is none.
     key: u64,
 }
@@ -11003,15 +12747,28 @@ pub struct Binding {
 impl Binding {
     /// What a call binds, or `None` where it binds nothing typed.
     ///
-    /// - **Positionals only in a `def` of required and optional positionals**, in every definition
-    ///   alike, since [`ParameterSlot::Positional`] counts exactly those, in written order. A rest
-    ///   or a trailing required parameter moves which argument lands where by the call's count,
-    ///   so no positional binds; keywords still do.
-    /// - **Only a count Ruby accepts**: at least the required ones, at most every positional.
+    /// - **Positionals by index, in every definition alike**, since [`ParameterSlot::Positional`]
+    ///   counts the required and optional ones, in written order. A `*rest` or `...` after them
+    ///   takes what is past them; a trailing required parameter moves which argument lands where by
+    ///   the call's count, so no positional binds there; keywords still do.
+    /// - **Only a count Ruby accepts**: at least the required ones, at most every positional where
+    ///   nothing takes the rest.
     /// - **Keywords by name, only where every definition declares that keyword.** A method that
     ///   takes none receives a braceless hash as one more positional, a `Hash` (Ruby 3's rule;
     ///   so `create!(name: x)` reads `attributes.is_a?(Array)` as ruled out).
     fn of(sources: &Sources<'_>, method: DeclarationId, passed: &Passed) -> Option<Self> {
+        Self::bind(sources, method, passed, false)
+    }
+
+    /// [`Self::of`], and with `keep_untyped` a binding even where nothing the call passed is
+    /// typed: the callers rung ([`from_callers`]) reads one slot of it, and the others must not
+    /// refuse that one.
+    fn bind(
+        sources: &Sources<'_>,
+        method: DeclarationId,
+        passed: &Passed,
+        keep_untyped: bool,
+    ) -> Option<Self> {
         use std::hash::{Hash, Hasher};
         let graph = sources.graph;
         let mut shape: Option<Shape> = None;
@@ -11043,14 +12800,27 @@ impl Binding {
         let shape = shape?;
         // A braceless hash to a method with no keyword parameters is one more positional.
         let hashed = passed.keyed && !shape.takes_keywords;
+        // `**opts` alone passes nothing where it is empty: both counts must be ones Ruby accepts,
+        // and the slot the hash would fill holds a `Hash` or its default, which nothing says.
+        let maybe_empty = hashed && passed.spread;
+        let accepts = |count: usize| {
+            count >= shape.required && (!shape.placed || count <= shape.required + shape.optional)
+        };
         let placed = passed.positional.as_ref().filter(|written| {
-            let count = written.len() + usize::from(hashed);
-            shape.placed && count >= shape.required && count <= shape.required + shape.optional
+            shape.leading
+                && accepts(written.len() + usize::from(hashed))
+                && (!maybe_empty || accepts(written.len()))
         });
+        // A count Ruby rejects, so the call raises before the body runs (or, beside a `**opts`,
+        // may).
+        let unfit = shape.leading && passed.positional.is_some() && placed.is_none();
         let mut positional = placed.cloned().unwrap_or_default();
         if hashed && placed.is_some() {
-            positional
-                .push(declared(graph, "Hash").map(|hash| Typed::of(hash, Derivation::default())));
+            positional.push(if maybe_empty {
+                None
+            } else {
+                declared(graph, "Hash").map(|hash| Typed::of(hash, Derivation::default()))
+            });
         }
         let keywords: Vec<(String, Option<Typed>)> = passed
             .keywords
@@ -11087,7 +12857,8 @@ impl Binding {
             ),
             _ => (Vec::new(), None),
         };
-        if defaults.is_empty()
+        if !keep_untyped
+            && defaults.is_empty()
             && matches!(passed.handed, Handed::Nothing)
             && passed.given.is_none()
             && positional
@@ -11155,6 +12926,7 @@ impl Binding {
             at,
             handed: passed.handed.clone(),
             given: passed.given,
+            unfit,
             key: hasher.finish().max(1),
         })
     }
@@ -11165,8 +12937,12 @@ impl Binding {
 struct Shape {
     required: usize,
     optional: usize,
-    /// No rest and no trailing required positional, so positionals land by index.
+    /// No rest and no trailing required positional: a count above the positionals is one Ruby
+    /// rejects.
     placed: bool,
+    /// No trailing required positional, so the required and optional positionals land by index
+    /// whatever follows them (a `*rest` or `...` takes the arguments past them).
+    leading: bool,
     /// Every keyword parameter's name, sorted.
     keywords: Vec<String>,
     /// The keywords with a default, sorted.
@@ -11181,6 +12957,7 @@ impl Shape {
             required: 0,
             optional: 0,
             placed: true,
+            leading: true,
             keywords: Vec::new(),
             optional_keywords: Vec::new(),
             takes_keywords: false,
@@ -11189,7 +12966,11 @@ impl Shape {
             match parameter {
                 Parameter::RequiredPositional(_) => shape.required += 1,
                 Parameter::OptionalPositional(_) => shape.optional += 1,
-                Parameter::RestPositional(_) | Parameter::Post(_) => shape.placed = false,
+                Parameter::RestPositional(_) => shape.placed = false,
+                Parameter::Post(_) => {
+                    shape.placed = false;
+                    shape.leading = false;
+                }
                 Parameter::RequiredKeyword(named) => {
                     shape
                         .keywords
@@ -11202,9 +12983,14 @@ impl Shape {
                     shape.optional_keywords.push(name);
                     shape.takes_keywords = true;
                 }
-                // `...` takes a call's keywords as `**` does: a braceless hash is no
-                // positional of a `def f(a, ...)`.
-                Parameter::RestKeyword(_) | Parameter::Forward(_) => shape.takes_keywords = true,
+                Parameter::RestKeyword(_) => shape.takes_keywords = true,
+                // `...` is `*, **, &`: any count after the leading positionals, and a call's
+                // keywords as `**` takes them, so a braceless hash is no positional of a
+                // `def f(a, ...)`.
+                Parameter::Forward(_) => {
+                    shape.placed = false;
+                    shape.takes_keywords = true;
+                }
                 _ => {}
             }
         }
@@ -11432,6 +13218,8 @@ fn passed_to(
             .filter(|typed| typed.derivation.tier() != Tier::Guessed)
             .map(|mut typed| {
                 typed.derivation.assignments.clear();
+                // The body may write into what it is handed, and its memo knows nothing of this.
+                typed.shaped = None;
                 typed
             })
     };
@@ -11461,8 +13249,12 @@ fn passed_to(
                 bound: sources.bound,
                 made: sources.made,
             }),
-        written => block_value(sources, uri_id, written, scope)
-            .map_or(Handed::Nothing, |value| Handed::Value(Box::new(value))),
+        written => {
+            block_value(sources, uri_id, written, scope).map_or(Handed::Nothing, |mut value| {
+                value.shaped = None;
+                Handed::Value(Box::new(value))
+            })
+        }
     };
     Some(Passed {
         positional,
@@ -11470,9 +13262,75 @@ fn passed_to(
         // A spread that may be empty still counts: the slot it may fill is then read as unknown,
         // not as its default.
         keyed: matches!(arity, Arity::Keyed(_) | Arity::Spread(_)),
+        spread: matches!(arity, Arity::Spread(_)),
         handed,
         given: None,
     })
+}
+
+/// [`passed_to`] for one slot: only the argument a caller's read of `slot` can land on is typed.
+///
+/// **Why:** the callers rung reads one parameter at a time, and typing every argument (and the
+/// block) of every caller was most of what an answer cost. The binding places written arguments by
+/// position and keywords by name, so the argument at the slot's own position or name is the only
+/// one its value can come from; every other one is left unknown, which the binding keeps
+/// ([`Binding::bind`] with `keep_untyped`) and the answer never reads.
+fn passed_at_slot(
+    sources: &Sources<'_>,
+    uri_id: UriId,
+    arity: Arity,
+    written: Called<'_>,
+    slot: &ParameterSlot,
+    scope: &Scope,
+) -> Passed {
+    let typed = |argument: &Receiver| {
+        method_receiver(sources, uri_id, argument, scope)
+            .filter(|typed| typed.derivation.tier() != Tier::Guessed)
+            .map(|mut typed| {
+                typed.derivation.assignments.clear();
+                // The body may write into what it is handed, and its memo knows nothing of this.
+                typed.shaped = None;
+                typed
+            })
+    };
+    let positional = match arity {
+        Arity::Exactly(counted) | Arity::Keyed(counted) | Arity::Spread(counted)
+            if written.positional.len() == counted as usize =>
+        {
+            Some(
+                written
+                    .positional
+                    .iter()
+                    .enumerate()
+                    .map(|(at, argument)| match slot {
+                        ParameterSlot::Positional(index) if *index == at => typed(argument),
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    };
+    let keywords = written.keywords.map(|written| {
+        written
+            .iter()
+            .map(|(name, value)| {
+                let value = match slot {
+                    ParameterSlot::Keyword(wanted) if wanted == name => typed(value),
+                    _ => None,
+                };
+                (name.clone(), value)
+            })
+            .collect()
+    });
+    Passed {
+        positional,
+        keywords,
+        keyed: matches!(arity, Arity::Keyed(_) | Arity::Spread(_)),
+        spread: matches!(arity, Arity::Spread(_)),
+        handed: Handed::Nothing,
+        given: None,
+    }
 }
 
 /// What a **method parameter** is: what the enclosing `def`'s signature declares, and nothing else.
@@ -11507,7 +13365,7 @@ fn from_parameter(
     // ([`Sources::made`]), for its `initialize`'s.
     let Some(declared) = sources.types.parameter(found, slot) else {
         let reads = &sources.memo.reads;
-        let bound = [sources.bound, sources.made]
+        let Some(bound) = [sources.bound, sources.made]
             .into_iter()
             .flatten()
             .find_map(|key| {
@@ -11517,7 +13375,66 @@ fn from_parameter(
                     .get(&key)
                     .filter(|bound| bound.method == found)
                     .cloned()
-            })?;
+            })
+        else {
+            // The `def` being read is its class's own member; the lookup above finds a prepended
+            // module's first, whose callers say nothing about what its `super` passes on.
+            let own = graph
+                .declarations()
+                .get(&here)
+                .and_then(Declaration::as_namespace)
+                .and_then(|namespace| {
+                    namespace
+                        .members()
+                        .get(&StringId::from(&format!("{method}()")))
+                        .copied()
+                })?;
+            // **An `initialize` read for one object is what that object's constructions pass**
+            // ([`from_constructions`]), never another class's: the object knows which class was
+            // built, and a base class's every subclass passes something else.
+            if method == "initialize"
+                && let Some(object) = sources.object
+                && matches!(
+                    graph.declarations().get(&object),
+                    Some(Declaration::Namespace(Namespace::Class(_)))
+                )
+                && descends(graph, object, here)
+            {
+                // **Refused for a class written as a value** ([`handed_on`]): code that is handed
+                // it may build it with what nothing here shows (`mount_uploader :cover,
+                // CoverUploader` builds it with a `Symbol`), so the constructions read are not all
+                // of them (decided 2026-10-04: "we want correct answers").
+                if handed_on(sources, object) {
+                    return None;
+                }
+                let built = from_constructions(sources, own, slot, object);
+                // **A class with no `initialize` of its own whose constructions say nothing is
+                // answered as the class whose `initialize` it runs** (the user's rule,
+                // 2026-10-03): what every construction of that class or a subclass passes. A
+                // policy only a gem builds holds what the application builds its siblings with.
+                let inherits = graph
+                    .declarations()
+                    .get(&object)
+                    .and_then(Declaration::as_namespace)
+                    .is_some_and(|namespace| {
+                        !namespace
+                            .members()
+                            .contains_key(&StringId::from("initialize()"))
+                    });
+                // **Only where nothing builds it**: one built with what nothing here reads holds
+                // that, not its siblings' arguments.
+                let unread = graph
+                    .callers
+                    .left_out
+                    .borrow()
+                    .contains(&(own, slot.clone(), object));
+                if built.is_none() && object != here && inherits && !unread {
+                    return from_constructions(sources, own, slot, here);
+                }
+                return built;
+            }
+            return from_callers(sources, own, slot);
+        };
         // **Left out at this call, so it holds its default**, read in the method's own scope with
         // this call's binding: `def f(a, b = a)` gives `b` what was passed as `a`.
         if let Some((_, default)) = bound.defaults.iter().find(|(held, _)| held == slot) {
@@ -11535,6 +13452,17 @@ fn from_parameter(
                 .clone(),
         };
     };
+    declared_parameter(sources, found, here, declared)
+}
+
+/// What a parameter's signature declares, read against the class the `def` hangs off.
+fn declared_parameter(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    here: DeclarationId,
+    declared: &Returned,
+) -> Option<Typed> {
+    let graph = sources.graph;
     // **A declared type that names every object (`Object`, `BasicObject`, `Class`, `Module`) is no
     // type, and must not displace the rungs below.** The same refusal the module makes for a
     // `Namespace::Todo`, applied to a parameter. an engine writes
@@ -11561,6 +13489,2441 @@ fn from_parameter(
             .faceted(declared)
             .holding(arguments),
     )
+}
+
+/// What a method's own parameter holds where no call is read for it: what its signature declares,
+/// else what every caller passes ([`from_callers`]). The parameter's card and its method's card.
+#[must_use]
+pub fn parameter_type(
+    sources: &Sources<'_>,
+    method: DeclarationId,
+    slot: &ParameterSlot,
+) -> Option<Typed> {
+    let here = *sources.graph.declarations().get(&method)?.owner_id();
+    match sources.types.parameter(method, slot) {
+        Some(declared) => declared_parameter(sources, method, here, declared),
+        None => from_callers(sources, method, slot),
+    }
+}
+
+/// Whether the local read `read` (graph coordinates, in `document`) holds nothing but the value
+/// its method's parameter came in with: no write reaches it. The parameter's own card is then the
+/// read's.
+#[must_use]
+pub fn reads_a_parameter(sources: &Sources<'_>, document: UriId, read: &Receiver) -> bool {
+    parameter_of_read(sources, document, read).is_some()
+}
+
+/// The parameter a local read holds, where no write reaches it ([`reads_a_parameter`]).
+fn parameter_of_read(sources: &Sources<'_>, document: UriId, read: &Receiver) -> Option<Receiver> {
+    let read = match read {
+        Receiver::Spelled { was, .. } => was.as_ref(),
+        other => other,
+    };
+    let Receiver::Variable(read) = read else {
+        return None;
+    };
+    let uri = sources.graph.documents().get(&document)?.uri().to_owned();
+    let text = sources.memo.reads.documents.of(&uri, sources.read)?;
+    let shapes = text.shapes(&uri, sources.held_exits);
+    let reaching = shapes.variables.reaching(*read)?;
+    if !reaching.writes.is_empty() || reaching.nil || reaching.instance.is_some() {
+        return None;
+    }
+    let bound = reaching.bound.as_ref()?.rebased(&text.rebase)?;
+    matches!(bound, Receiver::Parameter { .. }).then_some(bound)
+}
+
+/// How many parameters' callers one answer may lead through: `a(x)` typed by `b`'s argument,
+/// which is `c`'s parameter, typed by its callers, and so on. Depth 3 and 6 answered the same over
+/// the six reference corpora, and 3 costs half the time.
+const CALLER_HOPS: usize = 3;
+
+/// How many classes may run one method before its callers are not read: a guard against a method
+/// on `Object`, which every class runs.
+const CALLER_RUNNERS: usize = 4096;
+
+/// How many calls of a name, past the fence, are read for one parameter. **A sanity guard**: over
+/// the six corpora 4,096 answered what 1,024 does, at the same cost, and 64 answered 4 calls fewer.
+const CALLER_SITES: usize = 1024;
+
+/// Names something other than a written call invokes: Ruby's own protocols, run from C, and the
+/// hooks it calls on its own.
+const INVOKED_BY_RUBY: &[&str] = &[
+    "==",
+    "===",
+    "eql?",
+    "equal?",
+    "<=>",
+    "hash",
+    "coerce",
+    "each",
+    "each_pair",
+    "to_proc",
+    "method_missing",
+    "respond_to_missing?",
+    "respond_to?",
+    "initialize_copy",
+    "initialize_dup",
+    "initialize_clone",
+    "inspect",
+    "to_s",
+    "to_str",
+    "to_a",
+    "to_ary",
+    "to_h",
+    "to_hash",
+    "to_i",
+    "to_int",
+    "to_f",
+    "to_r",
+    "to_c",
+    "to_sym",
+    "to_regexp",
+    "to_path",
+    "to_io",
+    "as_json",
+    "to_json",
+    "marshal_load",
+    "marshal_dump",
+    "_dump",
+    "_load",
+    "encode_with",
+    "init_with",
+    "inherited",
+    "included",
+    "extended",
+    "prepended",
+    "method_added",
+    "singleton_method_added",
+    "const_missing",
+    "append_features",
+    "extend_object",
+    "included_modules",
+    "freeze",
+    "dup",
+    "clone",
+    "then",
+    "tap",
+];
+
+/// Names something may call where nothing is written, besides every written call: Ruby, Rack and
+/// every `&callable` call `call` on an object they were handed. Their written calls are read, and
+/// the answer is always marked ([`Derivation::left_out`]), as a name spelled into a call nothing
+/// reads is.
+const CALLED_UNWRITTEN: &[&str] = &["call"];
+
+/// What every caller passes each parameter, **per graph and buffer state**.
+///
+/// Held in [`Indexed`] and dropped by every write and every `didChange`, since an answer reads
+/// types across the whole graph and every calling buffer.
+#[derive(Default)]
+pub struct Callers {
+    /// Each parameter's answer, by method, slot, how many levels it could still go down, and the
+    /// object it was read for ([`from_constructions`]): an answer asked deeper has fewer, so each
+    /// depth has its own and none depends on which was asked first.
+    held: RefCell<HeldAnswers>,
+    /// The parameters being answered, outermost first: one asked again is a cycle.
+    open: RefCell<Vec<(DeclarationId, ParameterSlot)>>,
+    /// The lowest [`Self::open`] index a loop reached back to while the current answer was being
+    /// read: an answer that reached above itself depends on what was open, and is not kept.
+    low: Cell<Option<usize>>,
+    /// Who can run each method ([`runners`]), by the method and the object it is read for.
+    runners: RefCell<HashMap<(DeclarationId, Option<DeclarationId>), Runners>>,
+    /// Every name a symbol, a `%i[]` word or a one-word string spells in the project's own
+    /// documents ([`spelled_as`]), noted by the indexer while it holds each text, so only those
+    /// documents are read to answer: **not dropped by a write**, only by the indexing that replaces
+    /// a document.
+    names: RefCell<SpelledNames>,
+    /// Every `alias` and `alias_method`, by the name it renames.
+    aliased: RefCell<Option<Rc<Aliases>>>,
+    /// Each text's call shapes for one name, by the document, the name and the text's hash: **kept
+    /// across writes and edits**, since a shape is a function of the text alone, and an edit
+    /// re-reads only the document it changed.
+    shapes: RefCell<HashMap<(UriId, String), (u64, CallShapes)>>,
+    /// Every call's shape in one text, by the document and the text's hash: one parse answers every
+    /// name a caller document is asked about.
+    every: RefCell<HashMap<UriId, (u64, CallShapes)>>,
+    /// Every `super` in one text ([`cursor::supers`]), by the document and the text's hash: **kept
+    /// across writes and edits**, as the call shapes are.
+    supers: RefCell<HashMap<UriId, (u64, SuperSites)>>,
+    /// Each own document's literals spelling a name, and where each is written
+    /// ([`cursor::spelled_uses`]), by the document and its text's hash: **kept across writes and
+    /// edits**, as the call shapes are.
+    spelled: RefCell<HashMap<UriId, (u64, SpelledUses)>>,
+    /// What a literal key read off a reader holds ([`keyed_by_class_calls`]), by the class `self`
+    /// is, the key, whether a missing key is `nil`, and how many parameters' callers were open
+    /// (a value read deeper has fewer hops left): dropped with [`Self::held`]. Kept only where no
+    /// other keyed read was open, which a loop back to it would have cut short.
+    keyed: RefCell<HashMap<(KeyedRead, usize), Option<Typed>>>,
+    /// The keyed reads being answered: one asked again is a loop, and answers nothing.
+    keyed_open: RefCell<Vec<KeyedRead>>,
+    /// The classes whose objects run each module's instance methods ([`module_runners`]), by the
+    /// module: dropped by every write.
+    modules: RefCell<HashMap<DeclarationId, ModuleRunners>>,
+    /// What the project's own hooks mix into what they are handed ([`hooked`]): dropped by every
+    /// write.
+    hooked: RefCell<Option<Hooked>>,
+    /// Each object's `initialize` parameter whose constructions are written but none is read
+    /// (`Coined.new` past its own `self.new`, an argument nothing types), by method, slot and
+    /// object: the object was built, with what nothing here says, so no other class's
+    /// constructions stand in for its own ([`from_parameter`]). Dropped with [`Self::held`].
+    left_out: RefCell<HashSet<(DeclarationId, ParameterSlot, DeclarationId)>>,
+}
+
+/// One text's [`cursor::supers`].
+type SuperSites = Rc<[cursor::SuperSite]>;
+
+/// [`module_runners`]' answer.
+type ModuleRunners = Result<Rc<[DeclarationId]>, &'static str>;
+
+/// One literal key read ([`keyed_by_class_calls`]): the class `self` is, the key, and whether a
+/// missing key is `nil`.
+type KeyedRead = (DeclarationId, String, bool);
+
+/// One text's [`cursor::spelled_uses`].
+type SpelledUses = Rc<HashMap<String, Vec<cursor::SpelledUse>>>;
+
+/// How many texts' every-call shapes [`Callers::every`] holds before it starts again: a caller
+/// document is usually asked about several names in a row, and one parse then answers them all.
+const EVERY_CALL_TEXTS: usize = 64;
+
+/// [`Callers::names`]: the names each own document spells, and the documents spelling each name.
+#[derive(Default)]
+struct SpelledNames {
+    of: HashMap<UriId, Box<[String]>>,
+    spelled_in: HashMap<String, Vec<UriId>>,
+    /// Each document's interpolated names ([`super::indexer::Named::patterns`]).
+    patterns: HashMap<UriId, Box<[cursor::SentPattern]>>,
+}
+
+/// [`Callers::held`]: each answer by method, slot, depth left and object.
+type HeldAnswers =
+    HashMap<(DeclarationId, ParameterSlot, usize, Option<DeclarationId>), Option<Typed>>;
+
+/// [`runners`]' answer.
+type Runners = Result<Rc<RunnerSet>, &'static str>;
+
+/// Who can run one method ([`runners`]).
+struct RunnerSet {
+    /// The classes and modules whose objects run it: its owner and every descendant.
+    objects: Vec<DeclarationId>,
+    /// Every class or module in their linearizations, on the method's side, themselves included.
+    ancestors: HashSet<DeclarationId>,
+    /// The `initialize`s right before this one in the lookup of a class of the object that reaches
+    /// an override first: what each `super` in them passes is what the parameter holds there
+    /// ([`built_as`]). Empty for a method read without an object.
+    through: Vec<DeclarationId>,
+    /// Read for one object ([`built_as`]): a class runs this `initialize` for it only where it is
+    /// one of [`Self::objects`] or above one, never as a sibling whose lookup also reaches it.
+    per_object: bool,
+}
+
+impl RunnerSet {
+    /// Whether a `new` on `class`'s class object, or at run time a subclass's, may build an object
+    /// that runs `found`, an `initialize` its lookup reaches as `target`: a runner or a class above
+    /// one, or read without an object, any class whose lookup reaches it.
+    fn may_build(
+        &self,
+        class: DeclarationId,
+        target: Option<DeclarationId>,
+        found: DeclarationId,
+    ) -> bool {
+        self.ancestors.contains(&class) || (!self.per_object && target == Some(found))
+    }
+}
+
+/// One document's calls of one name, by where each name starts ([`cursor::every_call`]).
+type CallShapes = Rc<HashMap<u32, Receiver>>;
+
+impl Callers {
+    /// Drop everything read from the graph: it was written. What is checked against content
+    /// hashes (spelled names, call shapes) is only marked to be checked again.
+    pub fn forget(&self) {
+        self.forget_buffers();
+        self.runners.borrow_mut().clear();
+        self.modules.borrow_mut().clear();
+        self.hooked.borrow_mut().take();
+        self.aliased.borrow_mut().take();
+    }
+
+    /// The names a document now spells, replacing what it spelled before; empty for a document
+    /// that left the graph or is not the project's own.
+    pub fn note_names(&self, document: UriId, named: &super::indexer::Named) {
+        let names = named.names.as_slice();
+        let mut held = self.names.borrow_mut();
+        let SpelledNames {
+            of,
+            spelled_in,
+            patterns,
+        } = &mut *held;
+        if named.patterns.is_empty() {
+            patterns.remove(&document);
+        } else {
+            patterns.insert(document, named.patterns.clone().into());
+        }
+        if let Some(before) = of.remove(&document) {
+            for name in before.iter() {
+                if let Some(documents) = spelled_in.get_mut(name) {
+                    documents.retain(|id| *id != document);
+                    if documents.is_empty() {
+                        spelled_in.remove(name);
+                    }
+                }
+            }
+        }
+        if names.is_empty() {
+            return;
+        }
+        for name in names {
+            spelled_in.entry(name.clone()).or_default().push(document);
+        }
+        of.insert(document, names.into());
+    }
+
+    /// Every document is about to be indexed again.
+    pub fn forget_names(&self) {
+        *self.names.borrow_mut() = SpelledNames::default();
+    }
+
+    /// Drop every answer: a buffer changed, and a caller in it may pass another thing. The call
+    /// shapes stay: each is keyed by the text it was read from.
+    pub fn forget_buffers(&self) {
+        self.held.borrow_mut().clear();
+        self.keyed.borrow_mut().clear();
+        self.left_out.borrow_mut().clear();
+    }
+
+    /// A loop reached back to the parameter open at `index`.
+    fn reach_back(&self, index: usize) {
+        self.low
+            .set(Some(self.low.get().map_or(index, |low| low.min(index))));
+    }
+}
+
+/// Pops [`Callers::open`] however the answer ends, a contained panic included.
+struct Opened<'c>(&'c Callers);
+
+impl Drop for Opened<'_> {
+    fn drop(&mut self) {
+        self.0.open.borrow_mut().pop();
+    }
+}
+
+/// The kind of a shape, for a refusal's trace.
+fn shape_kind(shape: &Receiver) -> String {
+    let text = format!("{shape:?}");
+    text.split(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap_or("")
+        .to_owned()
+}
+
+type Refusal = (&'static str, String);
+
+/// A parameter nothing declares and no binding answers, typed by **what every call
+/// that can reach its method passes it**: the join of each call's argument at that slot.
+///
+/// Strict, and only for the application's own methods. Every call of the name in the project,
+/// gems included, is read. A call on a union one of whose classes can run it joins; one that
+/// reaches another method on a class that cannot run this one adds nothing, and so does one whose
+/// count Ruby rejects, or one on a receiver nothing types (unless no other method has the name).
+/// An alias's calls are read as the method's ([`called_as`]), and a literal spelling the name as
+/// what it does with it ([`spelled_as`]). An untyped or guessed argument is left out, and any sign
+/// of a caller no call records (an override that may `super`, a prepend, the name built around an
+/// interpolation, a writer, a protocol Ruby runs itself, a framework's own call) refuses the whole
+/// answer. A call in a test tree or a migration does not count, by the fence of the method's own
+/// document.
+fn from_callers(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    slot: &ParameterSlot,
+) -> Option<Typed> {
+    callers_for(sources, found, slot, None)
+}
+
+/// What an object's `initialize` parameter holds: **what every construction of the object's class
+/// or a subclass passes there**, the user's rule (2026-10-03). `AccountSerializer#username` reads
+/// `object`, which a gem's `initialize` wrote from its first parameter: the application's
+/// `AccountSerializer.new(account)` put an `Account` there, and another serializer's construction
+/// put nothing there for this object.
+///
+/// Read as [`from_callers`] reads a method's calls, with the classes built ([`built_as`]) as the
+/// runners: a `new` on a constant naming one of them, or on a receiver typed as one of their class
+/// objects or a class object above them. A gem's `initialize` is read too: its callers here are
+/// the application's constructions, and the gem's own, on receivers nothing types, are left out
+/// as any such call is. A class built only through an override, a custom `self.new` or an
+/// unresolved ancestor is left out, and the answer marked ([`Derivation::left_out`]).
+fn from_constructions(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    slot: &ParameterSlot,
+    object: DeclarationId,
+) -> Option<Typed> {
+    callers_for(sources, found, slot, Some(object))
+}
+
+/// Whether `class` or a subclass is written as a value anywhere the graph references it
+/// ([`cursor::constants_handed_on`]): handed to code that may build it where no `new` here shows
+/// (`mount_uploader :cover, CoverUploader`). Fenced as the class's own document fences its
+/// constructions ([`read_callers`]): a spec's `describe Foo` is the suite's. Only a Ruby text's
+/// reference counts. One whose text cannot be read or placed may be one.
+fn handed_on(sources: &Sources<'_>, class: DeclarationId) -> bool {
+    let graph = sources.graph;
+    let Ok(classes) = descendants_closed(graph, class, true) else {
+        return true;
+    };
+    let home = locator::definitions_of(graph, class)
+        .iter()
+        .find_map(|definition| graph.documents().get(definition.uri_id()))
+        .map(|document| document.uri().to_owned());
+    let fence = environment::Fence::at(home.as_deref(), sources.layout);
+    classes.iter().any(|class| {
+        graph
+            .declarations()
+            .get(class)
+            .and_then(Declaration::constant_references)
+            .into_iter()
+            .flatten()
+            .any(|reference| {
+                let placed = || {
+                    let reference = graph.constant_references().get(reference)?;
+                    let uri = graph.documents().get(&reference.uri_id())?.uri();
+                    // Only Ruby hands a class to code: a signature or a generated declaration
+                    // (a `Struct` constant's namespace) names it and builds nothing.
+                    if fenced_out(fence, uri) || !writes_ruby(uri) {
+                        return Some(false);
+                    }
+                    let document = sources.memo.reads.documents.of(uri, sources.read)?;
+                    let span = document.rebase.span_to_buffer(ByteSpan {
+                        start: reference.offset().start(),
+                        end: reference.offset().end(),
+                    })?;
+                    Some(document.handed().contains(&(span.start, span.end)))
+                };
+                placed().unwrap_or(true)
+            })
+    })
+}
+
+/// [`read_callers`]' refusal for an object whose constructions are written but none is read
+/// ([`Callers::left_out`]).
+const CONSTRUCTIONS_LEFT_OUT: &str = "constructions left out";
+
+/// [`from_callers`], and [`from_constructions`] where `object` is the object's class.
+fn callers_for(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    slot: &ParameterSlot,
+    object: Option<DeclarationId>,
+) -> Option<Typed> {
+    let callers = &sources.graph.callers;
+    let depth = callers.open.borrow().len();
+    // As deep as answers go. The same at this depth whatever was asked first.
+    if depth >= CALLER_HOPS {
+        return None;
+    }
+    let pair = (found, slot.clone());
+    // Back at a parameter being answered through something computed from it (`x + 1`), not
+    // passed straight back ([`passed_back`]): nothing says what that adds.
+    if let Some(index) = callers.open.borrow().iter().position(|open| *open == pair) {
+        callers.reach_back(index);
+        return None;
+    }
+    let key = (found, slot.clone(), CALLER_HOPS - depth, object);
+    if let Some(held) = callers.held.borrow().get(&key) {
+        return held.clone();
+    }
+    let outer_low = callers.low.replace(None);
+    callers.open.borrow_mut().push(pair);
+    let outcome = {
+        let _opened = Opened(callers);
+        // A read of its own: nothing the asking read was in the middle of (the object whose body
+        // it reads, the call it is read for, a cycle's round) may leak into what the callers pass,
+        // and nothing one answer read may leak into the next.
+        let memo = Memo::new(sources.read, sources.held_exits);
+        read_callers(&reading_callers(sources, &memo), found, slot, object)
+    };
+    // A loop back to this parameter itself is settled here; one further up is not.
+    let above = callers.low.get().filter(|low| *low < depth);
+    callers.low.set(match (outer_low, above) {
+        (Some(one), Some(two)) => Some(one.min(two)),
+        (one, two) => one.or(two),
+    });
+    let answer = match outcome {
+        Ok(typed) => Some(typed),
+        Err((reason, detail)) => {
+            if reason == CONSTRUCTIONS_LEFT_OUT
+                && let Some(object) = object
+            {
+                callers
+                    .left_out
+                    .borrow_mut()
+                    .insert((found, slot.clone(), object));
+            }
+            let method = sources.graph.declarations().get(&found);
+            let built = object
+                .and_then(|object| sources.graph.declarations().get(&object))
+                .map_or(String::new(), |object| {
+                    format!(" built as {}", object.name())
+                });
+            tracing::trace!(
+                "callers of {}{built} at {slot:?} refused: {reason} {detail}",
+                method.map_or("", |method| method.name())
+            );
+            None
+        }
+    };
+    if above.is_none() {
+        callers.held.borrow_mut().insert(key, answer.clone());
+    }
+    answer
+}
+
+/// The sources a read of what callers pass starts from: nothing the asking read was in the middle
+/// of (the object whose body it reads, the call it is read for, a hop count) carries over, and
+/// `memo` is the read's own.
+fn reading_callers<'b, 'c: 'b>(sources: &Sources<'c>, memo: &'b Memo<'b>) -> Sources<'b> {
+    Sources {
+        memo,
+        constant_hops: 0,
+        body_hops: 0,
+        object: None,
+        bound: None,
+        made: None,
+        extended: None,
+        ..*sources
+    }
+}
+
+/// The [`Callers::open`] index of the parameter a call passes **straight back**
+/// at `slot`, as written: `def a(x) = b(x)` beside `def b(y) = a(y)`.
+///
+/// Such a call adds nothing: every value in the loop came into it through some other call, and
+/// those are all read. So the call is left out of the join instead of refusing it, the least
+/// answer the loop allows. Anything computed from the parameter (`x + 1`) is not this.
+fn passed_back(
+    sources: &Sources<'_>,
+    document: UriId,
+    arity: Arity,
+    positional: &[Receiver],
+    keywords: Option<&[(String, Receiver)]>,
+    slot: &ParameterSlot,
+) -> Option<usize> {
+    let written = match slot {
+        ParameterSlot::Positional(index) => match arity {
+            Arity::Exactly(counted) | Arity::Keyed(counted)
+                if positional.len() == counted as usize =>
+            {
+                positional.get(*index)?
+            }
+            _ => return None,
+        },
+        ParameterSlot::Keyword(name) => &keywords?.iter().find(|(key, _)| key == name)?.1,
+    };
+    let written = match written {
+        Receiver::Spelled { was, .. } => was.as_ref(),
+        other => other,
+    };
+    // A read of a local that only the parameter's own value reaches: no write on any path.
+    let bound;
+    let written = match written {
+        Receiver::Variable(_) => {
+            bound = parameter_of_read(sources, document, written)?;
+            &bound
+        }
+        other => other,
+    };
+    let Receiver::Parameter { at, method, slot } = written else {
+        return None;
+    };
+    let here = sources.scope_at(document, *at).caller(sources.graph)?;
+    let method = member_of(
+        sources,
+        document,
+        here,
+        StringId::from(&format!("{method}()")),
+    )?;
+    sources
+        .graph
+        .callers
+        .open
+        .borrow()
+        .iter()
+        .position(|(open, held)| *open == method && held == slot)
+}
+
+/// Whether a `new` call reaches `initialize` through `Class#new` (or a `new`
+/// nothing declares), as [`made_by`] requires.
+fn plain_new(sources: &Sources<'_>, document: UriId, class_object: Option<DeclarationId>) -> bool {
+    let graph = sources.graph;
+    class_object
+        .and_then(|singleton| member_of(sources, document, singleton, StringId::from("new()")))
+        .is_none_or(|new| {
+            graph
+                .declarations()
+                .get(&new)
+                .is_some_and(|declaration| declaration.name() == "Class#new()")
+        })
+}
+
+/// Every class or module in the linearization of something that can run `found`,
+/// or why its callers cannot be trusted to be every call that runs it.
+///
+/// - **Who runs it:** its owner and every descendant (subclasses, includers, theirs), closed; for
+///   a singleton method, the attached class and its subclasses, on their class side.
+/// - **Anything before the owner in a runner's linearization that declares the name** may take the
+///   call and `super` into it with arguments no call of the name records: an override below, a
+///   module a subclass includes, one prepended anywhere. Refused.
+///
+/// For an object's `initialize` ([`from_constructions`]), the classes built as it ([`built_as`]).
+fn runners(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    member: StringId,
+    object: Option<DeclarationId>,
+) -> Runners {
+    let callers = &sources.graph.callers;
+    if let Some(held) = callers.runners.borrow().get(&(found, object)) {
+        return held.clone();
+    }
+    let answer = match object {
+        Some(object) => built_as(sources, found, member, object),
+        None => read_runners(sources, found, member),
+    }
+    .map(Rc::new);
+    callers
+        .runners
+        .borrow_mut()
+        .insert((found, object), answer.clone());
+    answer
+}
+
+/// The classes a construction of `object` builds that run `found`, an `initialize`, as their own
+/// lookup's answer: `object` and every subclass, closed.
+///
+/// - **A class whose lookup reaches something else first** (an override, a module declaring one,
+///   a prepend) runs `found` only through the `super` of the `initialize` right before it, whose
+///   calls are read instead ([`RunnerSet::through`]), where [`read_runners`] refuses the whole
+///   answer.
+/// - **An unresolved ancestor before it may be such a one, and refuses**, as [`read_runners`]
+///   does; [`instance_read`] refuses such an object's variables before asking.
+fn built_as(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    member: StringId,
+    object: DeclarationId,
+) -> Result<RunnerSet, &'static str> {
+    let graph = sources.graph;
+    let namespace_of = |id: &DeclarationId| {
+        graph
+            .declarations()
+            .get(id)
+            .and_then(Declaration::as_namespace)
+    };
+    let owner = *graph
+        .declarations()
+        .get(&found)
+        .ok_or("no declaration")?
+        .owner_id();
+    let mut objects = Vec::new();
+    let mut ancestors = HashSet::new();
+    let mut through = Vec::new();
+    for class in descendants_closed(graph, object, true)? {
+        let namespace = namespace_of(&class).ok_or("no namespace")?;
+        // The last `initialize` the lookup meets before `found`'s owner, and whether it gets there.
+        let mut before = None;
+        let mut reached = false;
+        for ancestor in namespace.ancestors().iter() {
+            match ancestor {
+                Ancestor::Complete(id) if *id == owner => {
+                    reached = true;
+                    break;
+                }
+                Ancestor::Complete(id) => {
+                    if let Some(declared) =
+                        namespace_of(id).and_then(|above| above.members().get(&member))
+                    {
+                        before = Some(*declared);
+                    }
+                }
+                Ancestor::Partial(_) => return Err("unresolved ancestor"),
+            }
+        }
+        match (reached, before) {
+            (false, _) => {}
+            (true, None) => {
+                objects.push(class);
+                ancestors.extend(namespace.ancestors().iter().filter_map(
+                    |ancestor| match ancestor {
+                        Ancestor::Complete(id) => Some(*id),
+                        Ancestor::Partial(_) => None,
+                    },
+                ));
+            }
+            (true, Some(before)) => {
+                if !through.contains(&before) {
+                    through.push(before);
+                }
+            }
+        }
+    }
+    Ok(RunnerSet {
+        objects,
+        ancestors,
+        through,
+        per_object: true,
+    })
+}
+
+/// Each `super` written in a Ruby `def` of `method`, in graph coordinates, with its document;
+/// `None` where one cannot be read (no Ruby `def`, a text that cannot be read or placed).
+///
+/// One text's sites are held across requests by its content hash ([`Callers::supers`]).
+fn super_sites(
+    sources: &Sources<'_>,
+    method: DeclarationId,
+) -> Option<Vec<(UriId, cursor::SuperSite)>> {
+    let graph = sources.graph;
+    let mut found = Vec::new();
+    let mut ruby = false;
+    let written = locator::definitions_of(graph, method)
+        .into_iter()
+        .filter(|definition| matches!(definition, Definition::Method(_)))
+        .filter(|definition| {
+            graph
+                .documents()
+                .get(definition.uri_id())
+                .is_some_and(|document| writes_ruby(document.uri()))
+        });
+    for definition in written {
+        let document = *definition.uri_id();
+        let uri = graph.documents().get(&document)?.uri().to_owned();
+        ruby = true;
+        let read = sources.memo.reads.documents.of(&uri, sources.read)?;
+        let span = read.rebase.span_to_buffer(ByteSpan {
+            start: definition.offset().start(),
+            end: definition.offset().end(),
+        })?;
+        let text = xxhash_rust::xxh3::xxh3_64(read.source.as_bytes());
+        let callers = &graph.callers;
+        let held = callers
+            .supers
+            .borrow()
+            .get(&document)
+            .filter(|(seen, _)| *seen == text)
+            .map(|(_, sites)| Rc::clone(sites));
+        let sites = held.unwrap_or_else(|| {
+            let sites: SuperSites = cursor::supers(&read.source).into();
+            callers
+                .supers
+                .borrow_mut()
+                .insert(document, (text, Rc::clone(&sites)));
+            sites
+        });
+        for site in sites
+            .iter()
+            .filter(|site| site.def == (span.start, span.end))
+        {
+            let keywords = match &site.keywords {
+                Some(keywords) => Some(
+                    keywords
+                        .iter()
+                        .map(|(name, value)| Some((name.clone(), value.rebased(&read.rebase)?)))
+                        .collect::<Option<Vec<_>>>()?,
+                ),
+                None => None,
+            };
+            found.push((
+                document,
+                cursor::SuperSite {
+                    at: read.rebase.to_graph(site.at)?,
+                    def: (definition.offset().start(), definition.offset().end()),
+                    arity: site.arity,
+                    arguments: site
+                        .arguments
+                        .iter()
+                        .map(|argument| argument.rebased(&read.rebase))
+                        .collect::<Option<_>>()?,
+                    keywords,
+                },
+            ));
+        }
+    }
+    ruby.then_some(found)
+}
+
+/// `start` and every descendant (subclasses, includers, theirs), closed, at most
+/// [`CALLER_RUNNERS`]; with `classes_only`, a module's includers are left out.
+fn descendants_closed(
+    graph: &Graph,
+    start: DeclarationId,
+    classes_only: bool,
+) -> Result<Vec<DeclarationId>, &'static str> {
+    let mut objects = vec![start];
+    let mut seen: HashSet<DeclarationId> = HashSet::from([start]);
+    let mut next = 0;
+    while next < objects.len() {
+        let namespace = graph
+            .declarations()
+            .get(&objects[next])
+            .and_then(Declaration::as_namespace)
+            .ok_or("no namespace")?;
+        next += 1;
+        for descendant in namespace.descendants() {
+            if !seen.insert(*descendant) {
+                continue;
+            }
+            let Some(Declaration::Namespace(kind)) = graph.declarations().get(descendant) else {
+                continue;
+            };
+            if classes_only && !matches!(kind, Namespace::Class(_)) {
+                continue;
+            }
+            objects.push(*descendant);
+            if objects.len() > CALLER_RUNNERS {
+                return Err("runners cap");
+            }
+        }
+    }
+    Ok(objects)
+}
+
+/// Whether a call written at `uri` is outside what `fence` reads: a test or migration tree the
+/// reading document is not in, or a document outside the project.
+fn fenced_out(fence: environment::Fence<'_>, uri: &str) -> bool {
+    (fence.on_trees() && fence.unloadable(uri)) || fence.outside(uri)
+}
+
+fn read_runners(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    member: StringId,
+) -> Result<RunnerSet, &'static str> {
+    let graph = sources.graph;
+    let namespace_of = |id: &DeclarationId| {
+        graph
+            .declarations()
+            .get(id)
+            .and_then(Declaration::as_namespace)
+    };
+    let owner = *graph
+        .declarations()
+        .get(&found)
+        .ok_or("no declaration")?
+        .owner_id();
+    let singleton = matches!(
+        graph.declarations().get(&owner),
+        Some(Declaration::Namespace(Namespace::SingletonClass(_)))
+    );
+    let start = if singleton {
+        locator::attached_class(graph, owner).ok_or("no attached class")?
+    } else {
+        owner
+    };
+    let objects = descendants_closed(graph, start, singleton)?;
+    let mut ancestors = HashSet::new();
+    for object in &objects {
+        // The side the method is looked up on: a class with nothing on its class side has no
+        // singleton here, and nothing there to take the call.
+        let side = if singleton {
+            singleton_of(graph, *object)
+        } else {
+            Some(*object)
+        };
+        let Some(side) = side else {
+            continue;
+        };
+        let namespace = namespace_of(&side).ok_or("no namespace")?;
+        let mut before = true;
+        for ancestor in namespace.ancestors().iter() {
+            match ancestor {
+                Ancestor::Complete(id) if *id == owner => before = false,
+                Ancestor::Complete(id) => {
+                    if before
+                        && namespace_of(id)
+                            .is_some_and(|above| above.members().contains_key(&member))
+                    {
+                        return Err("overridden");
+                    }
+                }
+                Ancestor::Partial(_) if before => return Err("unresolved ancestor"),
+                Ancestor::Partial(_) => {}
+            }
+        }
+        ancestors.insert(side);
+        ancestors.extend(
+            namespace
+                .ancestors()
+                .iter()
+                .filter_map(|ancestor| match ancestor {
+                    Ancestor::Complete(id) => Some(*id),
+                    Ancestor::Partial(_) => None,
+                }),
+        );
+    }
+    Ok(RunnerSet {
+        objects,
+        ancestors,
+        through: Vec::new(),
+        per_object: false,
+    })
+}
+
+/// Ruby's own calls that take a method's name and call nothing by it: they ask about, define,
+/// hide or rename one (an `alias_method` is read as an alias, [`called_as`]), compare it, or read a
+/// hash's key or a constant by it.
+const UNCALLED: [&str; 30] = [
+    "respond_to?",
+    "method_defined?",
+    "public_method_defined?",
+    "private_method_defined?",
+    "protected_method_defined?",
+    "attr",
+    "attr_reader",
+    "attr_writer",
+    "attr_accessor",
+    "private",
+    "public",
+    "protected",
+    "private_class_method",
+    "public_class_method",
+    "alias_method",
+    "define_method",
+    "define_singleton_method",
+    "remove_method",
+    "undef_method",
+    "==",
+    "!=",
+    "===",
+    "eql?",
+    "equal?",
+    "include?",
+    "[]",
+    "fetch",
+    "dig",
+    "key?",
+    "const_get",
+];
+
+/// What the project's own code does with one name it spells ([`spelled_as`]).
+#[derive(Default)]
+struct Spellings {
+    /// Each call that sends the name (`send(:greet, x)`): its document, the sender's name and
+    /// where that starts in the graph's text.
+    sent: Vec<(UriId, String, u32)>,
+    /// Each call a framework makes with no arguments on an object of the class whose body writes
+    /// it (`before_action :greet`): its document and where the literal starts in the graph's text.
+    bare: Vec<(UriId, u32)>,
+    /// The first literal nothing reads (`method(:greet)`, `CALLBACKS = %i[greet]`), for the trace:
+    /// what it is handed is a caller no call shows.
+    unread: Option<String>,
+}
+
+/// What every symbol, `%i[]` word and one-word string spelling `name` in the project's own code
+/// does with it, read where each is written ([`cursor::spelled_uses`]): **a name is a caller only
+/// where something calls by it**.
+///
+/// - The first argument of `send`, `__send__`, `public_send`, `try` or `try!` is **a call of the
+///   name**, with the arguments after it, read as one written out ([`sent_as_called`]).
+/// - Ruby's own calls that ask about, define, hide or compare a name ([`UNCALLED`]), a `when`, a
+///   hash's key, an `alias` or an `undef` call nothing.
+/// - A body of knowledge says what its framework does with a name its macro is passed
+///   ([`knowledge::Knowledge::spelled_use`]): names it, or calls the method with nothing on the
+///   class whose body writes the macro.
+/// - **Anything else may call it with anything** (`method(:greet)`, `map(&:greet)`, a gem's DSL,
+///   a constant holding it): a caller no call shows, left out like an untyped argument.
+///
+/// Only the documents the indexer saw spell the name ([`Callers::note_names`]), each asked again
+/// whether it is still the project's own (gem discovery can move a directory out), and fenced as
+/// a call written there is.
+fn spelled_as(
+    sources: &Sources<'_>,
+    name: &str,
+    fence: environment::Fence<'_>,
+) -> Result<Spellings, Refusal> {
+    let graph = sources.graph;
+    let documents: Vec<UriId> = graph
+        .callers
+        .names
+        .borrow()
+        .spelled_in
+        .get(name)
+        .cloned()
+        .unwrap_or_default();
+    let mut found = Spellings::default();
+    for document in documents {
+        let Some(uri) = graph
+            .documents()
+            .get(&document)
+            .map(|found| found.uri().to_owned())
+        else {
+            continue;
+        };
+        if !sources.layout.is_own(&uri) || fenced_out(fence, &uri) {
+            continue;
+        }
+        let read = sources
+            .memo
+            .reads
+            .documents
+            .of(&uri, sources.read)
+            .ok_or(("unreadable caller", uri.clone()))?;
+        let uses = spelled_uses(&graph.callers, document, &read.source);
+        let path = DocUri::from_graph_uri(&uri).and_then(|written| written.to_file_path());
+        for one in uses.get(name).map_or(&[][..], Vec::as_slice) {
+            let mut unread = |what: &str| {
+                found
+                    .unread
+                    .get_or_insert_with(|| format!("{what} {uri}:{}", one.at));
+            };
+            let sender = match &one.how {
+                cursor::Spelling::Argument { call, .. } => {
+                    super::indexer::SENDERS.contains(&call.as_str())
+                }
+                _ => false,
+            };
+            // A string is text everywhere but where a call takes a method's name.
+            if one.text && !sender {
+                continue;
+            }
+            let cursor::Spelling::Argument { call, key, first } = &one.how else {
+                match one.how {
+                    cursor::Spelling::Compared => {}
+                    _ => unread("held"),
+                }
+                continue;
+            };
+            if sender && !call.ends_with("method") {
+                match first.and_then(|first| read.rebase.to_graph(first)) {
+                    Some(at) => found.sent.push((document, call.clone(), at)),
+                    None => unread(call),
+                }
+                continue;
+            }
+            if UNCALLED.contains(&call.as_str()) {
+                continue;
+            }
+            let spelled = knowledge::Spelled {
+                call,
+                key: key.as_deref(),
+                path: path.as_deref(),
+            };
+            match sources
+                .knowledge
+                .modules()
+                .find_map(|module| module.spelled_use(&spelled))
+            {
+                Some(knowledge::NameUse::Named) => {}
+                Some(knowledge::NameUse::CalledBare) => match read.rebase.to_graph(one.at) {
+                    Some(at) => found.bare.push((document, at)),
+                    None => unread(call),
+                },
+                None => unread(&format!(
+                    "{call}{}",
+                    key.as_deref()
+                        .map_or(String::new(), |key| format!(" {key}:"))
+                )),
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// One document's [`cursor::spelled_uses`], held by its text's hash.
+fn spelled_uses(callers: &Callers, document: UriId, source: &str) -> SpelledUses {
+    let text = xxhash_rust::xxh3::xxh3_64(source.as_bytes());
+    if let Some((_, held)) = callers
+        .spelled
+        .borrow()
+        .get(&document)
+        .filter(|(seen, _)| *seen == text)
+    {
+        return Rc::clone(held);
+    }
+    let uses = Rc::new(cursor::spelled_uses(source));
+    callers
+        .spelled
+        .borrow_mut()
+        .insert(document, (text, Rc::clone(&uses)));
+    uses
+}
+
+/// A call of a sender ([`spelled_as`]) as the call of the name its first argument spells: on the
+/// same receiver, with the arguments after it, as [`named_call`] reads one. `None` where the first
+/// argument is not that literal, or where the call cannot be read.
+fn sent_as_called(shape: Receiver, name: &str) -> Option<Receiver> {
+    let Receiver::Returned {
+        on,
+        block,
+        arity,
+        arguments,
+        keywords,
+        safe,
+        ..
+    } = shape
+    else {
+        return None;
+    };
+    let arity = match arity {
+        Arity::Exactly(counted) => Arity::Exactly(counted.checked_sub(1)?),
+        Arity::Keyed(counted) => Arity::Keyed(counted.checked_sub(1)?),
+        Arity::Spread(counted) => Arity::Spread(counted.checked_sub(1)?),
+        Arity::Unknown => Arity::Unknown,
+    };
+    let mut arguments = arguments.into_iter();
+    // No shape is no claim: what follows the name is left out at the slot.
+    let spelled = match arguments.next() {
+        Some(Receiver::Literal { symbol, text, .. }) => {
+            symbol.as_deref() == Some(name) || text.0.as_deref() == Some(name)
+        }
+        Some(_) => false,
+        None => true,
+    };
+    spelled.then(|| Receiver::Returned {
+        on,
+        method: name.to_owned(),
+        block,
+        arity,
+        arguments: arguments.collect(),
+        keywords,
+        safe,
+    })
+}
+
+/// Whether a call that builds a method's name around an interpolation (`send("handle_#{x}", y)`)
+/// may run `found` and hand its parameter at `slot` something: a name it can build, and a slot it
+/// fills, or one left to its default. A call whose count leaves a required slot empty raises before
+/// the method runs, so it hands nothing.
+///
+/// A call sent to `self` reaches only methods `self` runs: its class, and every class it is
+/// written in can be, is in `runners` where it can run `found`.
+fn built_by_a_send(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    name: &str,
+    slot: &ParameterSlot,
+    runners: &HashSet<DeclarationId>,
+) -> bool {
+    let graph = sources.graph;
+    let names = graph.callers.names.borrow();
+    let matching: Vec<Option<u8>> = names
+        .patterns
+        .iter()
+        .filter(|(document, _)| {
+            graph
+                .documents()
+                .get(document)
+                .is_some_and(|found| sources.layout.is_own(found.uri()))
+        })
+        .flat_map(|(document, patterns)| patterns.iter().map(move |pattern| (*document, pattern)))
+        .filter(|(document, pattern)| {
+            name.len() >= pattern.head.len() + pattern.tail.len()
+                && name.starts_with(pattern.head.as_str())
+                && name.ends_with(pattern.tail.as_str())
+                // `new` sent to `self` is sent to a class object, which `runners` does not count.
+                && (name == "new"
+                    || pattern.on_self.is_none_or(|at| {
+                        sources
+                            .scope_at(*document, at)
+                            .caller(graph)
+                            .is_none_or(|class| runners.contains(&class))
+                    }))
+        })
+        .map(|(_, pattern)| pattern.passed)
+        .collect();
+    if matching.is_empty() {
+        return false;
+    }
+    // Whether the slot must be passed: a required positional with every one before it required
+    // too, or a required keyword. Anything else, or definitions that disagree, may hold a default.
+    let mut required: Option<bool> = None;
+    for definition in locator::definitions_of(graph, found) {
+        let Definition::Method(written) = definition else {
+            continue;
+        };
+        let Some(parameters) = written.signatures().as_slice().first() else {
+            return true;
+        };
+        let this = match slot {
+            ParameterSlot::Positional(index) => {
+                let positional: Vec<&Parameter> = parameters
+                    .iter()
+                    .filter(|parameter| {
+                        !matches!(
+                            parameter,
+                            Parameter::RequiredKeyword(_)
+                                | Parameter::OptionalKeyword(_)
+                                | Parameter::RestKeyword(_)
+                                | Parameter::Block(_)
+                        )
+                    })
+                    .collect();
+                positional
+                    .iter()
+                    .take(index + 1)
+                    .all(|parameter| matches!(parameter, Parameter::RequiredPositional(_)))
+                    && positional.len() > *index
+            }
+            ParameterSlot::Keyword(wanted) => parameters.iter().any(|parameter| {
+                matches!(parameter, Parameter::RequiredKeyword(named)
+                    if graph.strings().get(named.str()).is_some_and(|text| text.as_str() == wanted))
+            }),
+        };
+        match required {
+            None => required = Some(this),
+            Some(seen) if seen == this => {}
+            Some(_) => return true,
+        }
+    }
+    let Some(required) = required else {
+        return true;
+    };
+    matching.iter().any(|passed| match (passed, slot) {
+        (None, _) => true,
+        // It fills the slot with something nothing types.
+        (Some(passed), ParameterSlot::Positional(index)) if usize::from(*passed) > *index => true,
+        // It leaves the slot empty: its default, unless it must be passed.
+        (Some(_), _) => !required,
+    })
+}
+
+/// The names one text spells as a symbol (`:name`), a `%i[]`/`%I[]` word, or a one-word string.
+pub(super) fn spell(text: &[u8], names: &mut HashSet<String>) {
+    let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let start = |byte: u8| byte.is_ascii_alphabetic() || byte == b'_';
+    let take = |from: usize| -> (usize, usize) {
+        let mut end = from;
+        while end < text.len() && word(text[end]) {
+            end += 1;
+        }
+        if end < text.len() && matches!(text[end], b'?' | b'!' | b'=') {
+            end += 1;
+        }
+        (from, end)
+    };
+    let mut at = 0;
+    while at < text.len() {
+        let byte = text[at];
+        match byte {
+            b':' if at + 1 < text.len()
+                && start(text[at + 1])
+                && (at == 0 || !(word(text[at - 1]) || text[at - 1] == b':')) =>
+            {
+                let (from, end) = take(at + 1);
+                names.insert(String::from_utf8_lossy(&text[from..end]).into_owned());
+                at = end;
+            }
+            b'"' | b'\'' if at + 1 < text.len() && start(text[at + 1]) => {
+                let (from, end) = take(at + 1);
+                if end < text.len() && text[end] == byte {
+                    names.insert(String::from_utf8_lossy(&text[from..end]).into_owned());
+                    at = end + 1;
+                } else {
+                    at += 1;
+                }
+            }
+            b'%' if at + 2 < text.len() && matches!(text[at + 1], b'i' | b'I') => {
+                let close = match text[at + 2] {
+                    b'[' => b']',
+                    b'(' => b')',
+                    b'{' => b'}',
+                    b'<' => b'>',
+                    other => other,
+                };
+                let mut cursor = at + 3;
+                while cursor < text.len() && text[cursor] != close {
+                    if start(text[cursor]) {
+                        let (from, end) = take(cursor);
+                        names.insert(String::from_utf8_lossy(&text[from..end]).into_owned());
+                        cursor = end;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+                at = cursor + 1;
+            }
+            _ => at += 1,
+        }
+    }
+}
+
+/// Every `alias` and `alias_method`, by the old name as rubydex keys it (`size()`): the class or
+/// module each is written in, and the declaration of the name it adds ([`aliased`]).
+type Aliases = HashMap<StringId, Vec<(DeclarationId, DeclarationId)>>;
+
+/// [`Aliases`], read once per graph.
+fn aliased(sources: &Sources<'_>) -> Rc<Aliases> {
+    let callers = &sources.graph.callers;
+    if let Some(held) = callers.aliased.borrow().as_ref() {
+        return Rc::clone(held);
+    }
+    let graph = sources.graph;
+    let mut names: Aliases = HashMap::new();
+    for definition in graph.definitions().values() {
+        let Definition::MethodAlias(alias) = definition else {
+            continue;
+        };
+        let Some((declaration, owner)) = graph
+            .definition_to_declaration_id(definition)
+            .and_then(|id| Some((*id, *graph.declarations().get(id)?.owner_id())))
+        else {
+            continue;
+        };
+        names
+            .entry(*alias.old_name_str_id())
+            .or_default()
+            .push((owner, declaration));
+    }
+    let names = Rc::new(names);
+    *callers.aliased.borrow_mut() = Some(Rc::clone(&names));
+    names
+}
+
+/// One name a method runs under, and how its calls are read ([`called_as`]).
+struct CalledAs {
+    /// The name its calls are written with.
+    name: String,
+    /// What a call of it looks up, as rubydex keys a member.
+    member: StringId,
+    /// The declaration a call of it reaches where it runs the method: the method, or an alias.
+    reaches: DeclarationId,
+    /// Who runs the method under this name.
+    runners: Rc<RunnerSet>,
+    /// `new`, or an alias of it: the call builds an object, and the method is its `initialize`.
+    builds: bool,
+    /// A class method a framework installs beside the method, which runs it on a new instance of
+    /// the class it is called on ([`knowledge::Knowledge::run_from_the_class`]): a call reaching
+    /// the declaration beside it runs the method ([`installed_beside`]).
+    from_class: bool,
+}
+
+/// How one call the callers rung reads is written ([`read_callers`]).
+enum CallerWritten {
+    /// Out, with the name: `greet(x)`.
+    Out,
+    /// By a sender's first argument, the sender named: `send(:greet, x)` ([`spelled_as`]).
+    Sent(String),
+    /// By a framework, with no arguments, on an object of the class whose body writes the
+    /// literal: `before_action :greet`.
+    Bare,
+}
+
+impl CallerWritten {
+    /// The name the call's text writes at its place: the sender's, or the method's.
+    fn name<'a>(&'a self, method: &'a str) -> &'a str {
+        match self {
+            Self::Sent(sender) => sender,
+            Self::Out | Self::Bare => method,
+        }
+    }
+}
+
+/// Why calls of `name` cannot be every call that runs a method under it, if anything says so.
+fn unread_name(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    name: &str,
+    slot: &ParameterSlot,
+    runners: &RunnerSet,
+) -> Option<&'static str> {
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        return Some("operator");
+    }
+    if name.ends_with('=') {
+        return Some("writer");
+    }
+    if INVOKED_BY_RUBY.contains(&name) {
+        return Some("invoked by Ruby");
+    }
+    // A method a framework calls with arguments no written call shows: a body of knowledge says
+    // which, by the ancestors of every class that runs it.
+    let ancestors: Vec<&str> = runners
+        .ancestors
+        .iter()
+        .filter_map(|id| sources.graph.declarations().get(id))
+        .map(|declaration| declaration.name())
+        .collect();
+    if sources
+        .knowledge
+        .modules()
+        .any(|module| module.called_by_a_framework(name, &ancestors))
+    {
+        return Some("called by a framework");
+    }
+    built_by_a_send(sources, found, name, slot, &runners.ancestors).then_some("built by a send")
+}
+
+/// Every other name `found` runs under: **an alias's calls are its callers too**. An alias copies
+/// what its class or module finds under the old name, so it copies `found` where that lookup
+/// reaches it, or reaches an alias of it; one written anywhere else copies another method. For
+/// `initialize`, `new` renamed on the class object of a runner or of a class above one
+/// (`class << self; alias build new; end`), or on `Class` or `Module` themselves, builds as `new`
+/// does. Each name is held to every rule its method's own name is.
+fn called_as(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    slot: &ParameterSlot,
+    initialize: bool,
+    running: &RunnerSet,
+) -> Result<Vec<CalledAs>, Refusal> {
+    let graph = sources.graph;
+    let aliases = aliased(sources);
+    let new = DeclarationId::from("Class#new()");
+    let class_objects: HashSet<DeclarationId> = if initialize {
+        running
+            .ancestors
+            .iter()
+            .filter_map(|ancestor| singleton_of(graph, *ancestor))
+            .chain(["Class", "Module"].map(DeclarationId::from))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let own = graph
+        .declarations()
+        .get(&found)
+        .and_then(|declaration| declaration.name().rsplit_once('#'))
+        .map(|(_, name)| StringId::from(name))
+        .ok_or(("no declaration", String::new()))?;
+    let mut open = vec![(own, found, false)];
+    if initialize {
+        open.push((StringId::from("new()"), new, true));
+    }
+    let mut seen = HashSet::from([found]);
+    let mut names = Vec::new();
+    while let Some((old, copied, builds)) = open.pop() {
+        for &(owner, alias) in aliases.get(&old).map_or(&[][..], Vec::as_slice) {
+            let copies = if copied == new {
+                class_objects.contains(&owner)
+            } else {
+                locator::find_member(graph, owner, old).ok() == Some(copied)
+            };
+            if !copies || !seen.insert(alias) {
+                continue;
+            }
+            let Some(name) = graph
+                .declarations()
+                .get(&alias)
+                .and_then(|declaration| declaration.name().rsplit_once('#'))
+                .and_then(|(_, name)| name.strip_suffix("()"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let member = StringId::from(&format!("{name}()"));
+            let runners =
+                runners(sources, alias, member, None).map_err(|reason| (reason, name.clone()))?;
+            if let Some(reason) = unread_name(sources, found, &name, slot, &runners) {
+                return Err((reason, name));
+            }
+            open.push((member, alias, builds));
+            names.push(CalledAs {
+                name,
+                member,
+                reaches: alias,
+                runners,
+                builds,
+                from_class: false,
+            });
+        }
+    }
+    Ok(names)
+}
+
+/// One written call of a method's name, as the callers rung reads it ([`handed_at`]).
+struct Site<'a> {
+    document: UriId,
+    scope: &'a Scope,
+    arity: Arity,
+    positional: &'a [Receiver],
+    keywords: Option<&'a [(String, Receiver)]>,
+    /// `uri:offset`, for a refusal's trace.
+    written_at: &'a str,
+}
+
+/// What one call that can run the method hands its parameter ([`handed_at`]).
+enum CallerHands {
+    /// Something nothing types: the call is left out, and the answer says so
+    /// ([`Derivation::left_out`]).
+    Unread,
+    /// A value, typed where the call is written, or the default where the method is. Boxed: a
+    /// `Typed` is many times the other two.
+    Value(Box<Typed>),
+    /// Straight back from the parameter open at this [`Callers::open`] index ([`passed_back`]).
+    Back(usize),
+    /// A count of positionals the method rejects: Ruby raises before the parameter holds anything.
+    Raises,
+}
+
+/// What the call at `site` hands `found`'s parameter at `slot`, or why nothing can say.
+///
+/// A splat or `...` passes a count nothing knows, and a `**opts` beside the positionals of a
+/// method with no keywords a `Hash` or nothing: the slot either fills finds no value and refuses.
+fn handed_at(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    slot: &ParameterSlot,
+    site: &Site<'_>,
+) -> Result<CallerHands, Refusal> {
+    let refused = |reason: &'static str| (reason, site.written_at.to_owned());
+    if let Some(index) = passed_back(
+        sources,
+        site.document,
+        site.arity,
+        site.positional,
+        site.keywords,
+        slot,
+    ) {
+        return Ok(CallerHands::Back(index));
+    }
+    let passed = passed_at_slot(
+        sources,
+        site.document,
+        site.arity,
+        Called {
+            positional: site.positional,
+            keywords: site.keywords,
+        },
+        slot,
+        site.scope,
+    );
+    let binding = Binding::bind(sources, found, &passed, true).ok_or(refused("no binding"))?;
+    // Beside a `**opts`, which may be empty, Ruby may not raise.
+    if binding.unfit && !matches!(site.arity, Arity::Spread(_)) {
+        return Ok(CallerHands::Raises);
+    }
+    let given = match slot {
+        ParameterSlot::Positional(index) => binding.positional.get(*index).cloned().flatten(),
+        ParameterSlot::Keyword(name) => binding
+            .keywords
+            .iter()
+            .find(|(written, _)| written == name)
+            .and_then(|(_, typed)| typed.clone()),
+    };
+    let typed = match given {
+        Some(typed) => typed,
+        // Left out, so it holds its default, read where the method is written.
+        None => {
+            let Some((_, default)) = binding.defaults.iter().find(|(held, _)| held == slot) else {
+                return Ok(CallerHands::Unread);
+            };
+            let Some((written_in, start)) = binding.at else {
+                return Ok(CallerHands::Unread);
+            };
+            let scope = sources.scope_at(written_in, start);
+            let Some(typed) = method_receiver(sources, written_in, default, &scope) else {
+                return Ok(CallerHands::Unread);
+            };
+            typed
+        }
+    };
+    // A value only a guess types is read no better than one nothing types.
+    if typed.derivation.tier() == Tier::Guessed {
+        return Ok(CallerHands::Unread);
+    }
+    Ok(CallerHands::Value(Box::new(typed)))
+}
+
+/// The documents whose calls of a method are read: every document naming one of `runners`'
+/// objects, and every document writing the body of one of their ancestors, on either side (a bare
+/// call, a `new` in a class method, or `self.class.new`).
+fn naming_documents(graph: &Graph, runners: &RunnerSet) -> HashSet<UriId> {
+    let mut documents = HashSet::new();
+    for object in &runners.objects {
+        let references = graph
+            .declarations()
+            .get(object)
+            .and_then(Declaration::constant_references);
+        documents.extend(
+            references
+                .into_iter()
+                .flatten()
+                .filter_map(|id| graph.constant_references().get(id))
+                .map(|reference| reference.uri_id()),
+        );
+    }
+    let class_sides = runners
+        .objects
+        .iter()
+        .filter_map(|object| singleton_of(graph, *object))
+        .filter_map(|side| graph.declarations().get(&side)?.as_namespace())
+        .flat_map(|side| {
+            side.ancestors()
+                .iter()
+                .filter_map(|ancestor| match ancestor {
+                    Ancestor::Complete(id) => Some(*id),
+                    Ancestor::Partial(_) => None,
+                })
+                .collect::<Vec<_>>()
+        });
+    for body in runners.ancestors.iter().copied().chain(class_sides) {
+        if let Some(declaration) = graph.declarations().get(&body) {
+            documents.extend(
+                declaration
+                    .definitions()
+                    .iter()
+                    .filter_map(|id| graph.definitions().get(id))
+                    .map(|definition| *definition.uri_id()),
+            );
+        }
+    }
+    documents
+}
+
+/// The names of every class or module in the linearization of `found`'s own class, itself first.
+fn own_ancestors(graph: &Graph, found: DeclarationId) -> Vec<&str> {
+    graph
+        .declarations()
+        .get(&found)
+        .map(|declaration| ancestor_names(graph, *declaration.owner_id()))
+        .unwrap_or_default()
+}
+
+/// The names of every class or module in `namespace`'s linearization, itself first.
+fn ancestor_names(graph: &Graph, namespace: DeclarationId) -> Vec<&str> {
+    graph
+        .declarations()
+        .get(&namespace)
+        .and_then(Declaration::as_namespace)
+        .map(|namespace| {
+            namespace
+                .ancestors()
+                .iter()
+                .filter_map(|ancestor| match ancestor {
+                    Ancestor::Complete(id) => graph.declarations().get(id),
+                    Ancestor::Partial(_) => None,
+                })
+                .map(Declaration::name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `target` is a class method a convention declared beside a method `runners` run
+/// ([`knowledge::Knowledge::run_from_the_class`]): generated, on the class object of one of them.
+/// A call reaching it is made on that class or a subclass, whose lookup of the method reaches it,
+/// since nothing below it declares the name ([`runners`]).
+fn installed_beside(sources: &Sources<'_>, target: DeclarationId, runners: &RunnerSet) -> bool {
+    let graph = sources.graph;
+    let generated = locator::definitions_of(graph, target)
+        .iter()
+        .all(|definition| {
+            !matches!(
+                sources
+                    .generated
+                    .origin(definition.uri_id(), definition.offset().start()),
+                Origin::OnDisk
+            )
+        });
+    generated
+        && graph
+            .declarations()
+            .get(&target)
+            .and_then(|declaration| locator::attached_class(graph, *declaration.owner_id()))
+            .is_some_and(|class| runners.objects.contains(&class))
+}
+
+/// The class object a call through `passed` is made on: `Job.set(wait: 1)` hands `perform_later`
+/// on to `Job` ([`knowledge::Knowledge::passes_to_the_class`]). `None` where `inner` is not one
+/// class object a body of knowledge says so of, or where its `passed` is the project's own method,
+/// which may hand back anything.
+fn passed_through(
+    sources: &Sources<'_>,
+    document: UriId,
+    inner: &Receiver,
+    passed: &str,
+    scope: &Scope,
+) -> Option<Typed> {
+    let graph = sources.graph;
+    // A `?` has no one class ([`Typed::one`]).
+    let typed = method_receiver(sources, document, inner, scope)
+        .filter(|typed| typed.derivation.tier() != Tier::Guessed)?;
+    let one = typed.one()?;
+    let class = instance_of(graph, one)?;
+    let ancestors = ancestor_names(graph, class);
+    if !sources
+        .knowledge
+        .modules()
+        .any(|module| module.passes_to_the_class(passed, &ancestors))
+    {
+        return None;
+    }
+    let reached = reach(
+        sources,
+        document,
+        one,
+        StringId::from(&format!("{passed}()")),
+        false,
+    );
+    let own = reached.is_some_and(|reached| {
+        let written = defined_as_own(sources, reached).map_or(reached, |(written, _)| written);
+        locator::definitions_of(graph, written)
+            .iter()
+            .any(|definition| {
+                graph
+                    .documents()
+                    .get(definition.uri_id())
+                    .is_some_and(|document| sources.layout.is_own(document.uri()))
+            })
+    });
+    (!own).then_some(typed)
+}
+
+/// Whether a `new` on a union of class objects may run `found`, an `initialize`: one of its
+/// classes builds a runner. One that does through a `self.new` of its own refuses.
+fn union_builds(
+    sources: &Sources<'_>,
+    document: UriId,
+    found: DeclarationId,
+    runners: &RunnerSet,
+    classes: &[DeclarationId],
+    written_at: &str,
+) -> Result<bool, Refusal> {
+    let graph = sources.graph;
+    let mut builds = false;
+    for one in classes {
+        let Some(class) = instance_of(graph, *one) else {
+            continue;
+        };
+        let target = member_of(sources, document, class, StringId::from("initialize()"));
+        if runners.may_build(class, target, found) {
+            if !plain_new(sources, document, Some(*one)) {
+                return Err(("custom new", written_at.to_owned()));
+            }
+            builds = true;
+        }
+    }
+    Ok(builds)
+}
+
+/// The shapes of `document`'s calls of `called` that start at `offsets` (the text's own
+/// coordinates), held across requests and checked against the text and the offsets, all a shape
+/// depends on. A text not held is parsed once for every call in it ([`cursor::every_call`]), which
+/// answers the next name it is asked about.
+///
+/// **Its walk comes from the same parse** where `held` has none ([`HeldExits::keep`]): a caller's
+/// receiver and argument are read next, from that walk, for most caller documents (4,682 of the
+/// 5,517 texts the largest corpus's hints read call shapes from).
+fn call_shapes(
+    callers: &Callers,
+    held_walk: (&HeldExits, &str),
+    document: UriId,
+    called: &str,
+    source: &str,
+    offsets: &[u32],
+) -> CallShapes {
+    use std::hash::{Hash, Hasher};
+    let text = xxhash_rust::xxh3::xxh3_64(source.as_bytes());
+    let hash = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        offsets.hash(&mut hasher);
+        hasher.finish()
+    };
+    let key = (document, called.to_owned());
+    if let Some((_, held)) = callers
+        .shapes
+        .borrow()
+        .get(&key)
+        .filter(|(seen, _)| *seen == hash)
+    {
+        return Rc::clone(held);
+    }
+    let held = callers
+        .every
+        .borrow()
+        .get(&document)
+        .filter(|(seen, _)| *seen == text)
+        .map(|(_, every)| Rc::clone(every));
+    let every = held.unwrap_or_else(|| {
+        let (exits, uri) = held_walk;
+        let every = if exits.holds(uri, source) {
+            cursor::every_call(source)
+        } else {
+            let (every, shapes) = cursor::every_call_and_shapes(source);
+            exits.keep(uri, source, shapes);
+            every
+        };
+        let every = Rc::new(every);
+        let mut held = callers.every.borrow_mut();
+        if held.len() >= EVERY_CALL_TEXTS {
+            held.clear();
+        }
+        held.insert(document, (text, Rc::clone(&every)));
+        every
+    });
+    let made: CallShapes = Rc::new(
+        offsets
+            .iter()
+            .filter_map(|at| Some((*at, every.get(at)?.clone())))
+            .collect(),
+    );
+    callers
+        .shapes
+        .borrow_mut()
+        .insert(key, (hash, Rc::clone(&made)));
+    made
+}
+
+fn read_callers(
+    sources: &Sources<'_>,
+    found: DeclarationId,
+    slot: &ParameterSlot,
+    object: Option<DeclarationId>,
+) -> Result<Typed, Refusal> {
+    let graph = sources.graph;
+    let full = graph
+        .declarations()
+        .get(&found)
+        .map(|declaration| declaration.name().to_owned())
+        .ok_or(("no declaration", String::new()))?;
+    let method = full
+        .rsplit_once('#')
+        .and_then(|(_, name)| name.strip_suffix("()"))
+        .ok_or(("unnamed", String::new()))?
+        .to_owned();
+    if !method.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        return Err(("operator", String::new()));
+    }
+    if method.ends_with('=') {
+        return Err(("writer", String::new()));
+    }
+    if INVOKED_BY_RUBY.contains(&method.as_str()) {
+        return Err(("invoked by Ruby", String::new()));
+    }
+    // A member a call declared from a lambda runs the lambda, whose parameters its calls bind.
+    let lambda = scoped_lambda(sources, found);
+    // Only the application's own methods: the names a symbol or an interpolation can send are
+    // noted for its documents alone, so a gem may call its own method by a name nothing here sees.
+    // **Not for an object's `initialize`** ([`from_constructions`]): its callers are the
+    // application's constructions of the object, and a gem's own are left out as untyped.
+    let foreign = object.is_none()
+        && match &lambda {
+            Some(lambda) => !sources.layout.is_own(&lambda.uri),
+            None => locator::definitions_of(graph, found)
+                .iter()
+                .any(|definition| {
+                    graph
+                        .documents()
+                        .get(definition.uri_id())
+                        .is_none_or(|document| !sources.layout.is_own(document.uri()))
+                }),
+        };
+    if foreign {
+        return Err(("not the application's", String::new()));
+    }
+    let initialize = method == "initialize";
+    let called = if initialize { "new" } else { method.as_str() };
+    let member = StringId::from(&format!("{method}()"));
+    // An alias's calls may be the only ones, and so may a send's.
+    let renamed = {
+        let aliases = aliased(sources);
+        aliases.contains_key(&member)
+            || (initialize && aliases.contains_key(&StringId::from("new()")))
+    };
+    let spelled = graph.callers.names.borrow().spelled_in.contains_key(called);
+    let from_the_class = |ancestors: &[&str]| {
+        sources
+            .knowledge
+            .modules()
+            .find_map(|module| module.run_from_the_class(&method, ancestors))
+    };
+    if !renamed && !spelled && graph.calls_named(called).is_empty() {
+        // A class method a framework runs it from may be called, asked of its own class first.
+        let own = own_ancestors(graph, found);
+        let from = from_the_class(&own);
+        if !from.is_some_and(|from| {
+            from.names
+                .iter()
+                .any(|name| !graph.calls_named(name).is_empty())
+        }) {
+            return Err(("no call sites", String::new()));
+        }
+    }
+    let runners =
+        runners(sources, found, member, object).map_err(|reason| (reason, String::new()))?;
+    // A method a framework calls with arguments no written call shows: a body of knowledge says
+    // which, by the ancestors of every class that runs it.
+    let ancestors: Vec<&str> = runners
+        .ancestors
+        .iter()
+        .filter_map(|id| graph.declarations().get(id))
+        .map(|declaration| declaration.name())
+        .collect();
+    if sources
+        .knowledge
+        .modules()
+        .any(|module| module.called_by_a_framework(&method, &ancestors))
+    {
+        return Err(("called by a framework", String::new()));
+    }
+    if built_by_a_send(sources, found, called, slot, &runners.ancestors) {
+        return Err(("built by a send", String::new()));
+    }
+    let mut names = vec![CalledAs {
+        name: called.to_owned(),
+        member: if initialize {
+            StringId::from("new()")
+        } else {
+            member
+        },
+        reaches: if initialize {
+            DeclarationId::from("Class#new()")
+        } else {
+            found
+        },
+        runners: Rc::clone(&runners),
+        builds: initialize,
+        from_class: false,
+    }];
+    names.extend(called_as(sources, found, slot, initialize, &runners)?);
+    // A name something calls where nothing is written: its written calls are some of its callers.
+    // A construction of the object that is written but not read: it was built, with what
+    // nothing here says ([`Callers::left_out`]).
+    let mut built_unread = false;
+    let mut unread = names
+        .iter()
+        .any(|name| CALLED_UNWRITTEN.contains(&name.name.as_str()));
+    // **A framework's class method that runs it on a new instance** of the class it is called on
+    // (`Job.perform_later(x)`, a mailer's action on the class) is a caller too.
+    if let Some(from) = from_the_class(&ancestors) {
+        unread |= from.unwritten;
+        for name in &from.names {
+            match names.iter_mut().find(|known| known.name == *name) {
+                Some(known) => known.from_class = true,
+                None => names.push(CalledAs {
+                    name: name.clone(),
+                    member: StringId::from(&format!("{name}()")),
+                    reaches: found,
+                    runners: Rc::clone(&runners),
+                    builds: false,
+                    from_class: true,
+                }),
+            }
+        }
+    }
+    // Only a document that names a class running this method, or writes the body of one of their
+    // ancestors (a bare call, `self.class.new`), is read: a call typed as one elsewhere is left
+    // out, as one nothing types is, so the union is narrower there, never another class's.
+    let naming = naming_documents(graph, &runners);
+
+    // The fence is the method's own document's, or for an object's `initialize` the object's
+    // class's: a gem's `initialize` is fenced as the application class it builds.
+    let home = match (&lambda, object) {
+        (Some(lambda), _) => Some(lambda.uri.clone()),
+        (None, Some(object)) => locator::definitions_of(graph, object)
+            .iter()
+            .find_map(|definition| graph.documents().get(definition.uri_id()))
+            .map(|document| document.uri().to_owned()),
+        (None, None) => locator::definitions_of(graph, found)
+            .iter()
+            .find_map(|definition| graph.documents().get(definition.uri_id()))
+            .map(|document| document.uri().to_owned()),
+    };
+    let hand = |site: &Site<'_>| match &lambda {
+        Some(lambda) => handed_to_lambda(sources, lambda, slot, site),
+        None => handed_at(sources, found, slot, site),
+    };
+    let fence = environment::Fence::at(home.as_deref(), sources.layout);
+    // The calls the method's own document sees, before the cap: a spec's call is the suite's,
+    // and `context`, `post` or `to` are mostly a spec's.
+    // Each call, the name it is read as, and how it is written.
+    let mut admitted: Vec<(super::indexed::Call, usize, CallerWritten)> = Vec::new();
+    let mut verdict: Option<(UriId, bool)> = None;
+    for (index, name) in names.iter().enumerate() {
+        for &site in graph.calls_named(&name.name).iter() {
+            let document = site.0;
+            if !naming.contains(&document) {
+                continue;
+            }
+            let seen = match verdict {
+                Some((held, seen)) if held == document => seen,
+                _ => {
+                    let uri = graph
+                        .documents()
+                        .get(&document)
+                        .map(|found| found.uri())
+                        .ok_or(("unreadable caller", String::new()))?;
+                    let seen = !fenced_out(fence, uri);
+                    verdict = Some((document, seen));
+                    seen
+                }
+            };
+            if seen {
+                admitted.push((site, index, CallerWritten::Out));
+            }
+        }
+    }
+    // **A name spelled is a caller only where something calls by it** ([`spelled_as`]); one
+    // nothing reads is left out, as an untyped argument is.
+    for (index, name) in names.iter().enumerate() {
+        let spelled = spelled_as(sources, &name.name, fence)?;
+        if let Some(place) = spelled.unread {
+            tracing::trace!("callers of {full} at {slot:?} left out: spelled {place}");
+            unread = true;
+        }
+        for (document, sender, at) in spelled.sent {
+            if !naming.contains(&document) {
+                continue;
+            }
+            let end = at + sender.len() as u32;
+            admitted.push(((document, at, end), index, CallerWritten::Sent(sender)));
+        }
+        // A framework's call on an object is never `Class#new`.
+        if !name.builds {
+            for (document, at) in spelled.bare {
+                admitted.push(((document, at, at), index, CallerWritten::Bare));
+            }
+        }
+    }
+    if admitted.is_empty() && runners.through.is_empty() {
+        return Err(("no call sites", String::new()));
+    }
+    // A cost guard: each call types its receiver.
+    if admitted.len() > CALLER_SITES {
+        return Err(("cap", admitted.len().to_string()));
+    }
+    let sites = admitted;
+    let folds = Folds::of(graph);
+    let mut join = Join::default();
+    let mut counted = 0usize;
+    let mut skipped = 0usize;
+    let mut looped = 0usize;
+    let mut maybe = 0usize;
+    let callers = &graph.callers;
+    let reads = &sources.memo.reads;
+    let mut held_shapes: HashMap<(UriId, &str), CallShapes> = HashMap::new();
+    for ((document, start, end), index, how) in &sites {
+        let (document, start, end, index) = (*document, *start, *end, *index);
+        let called_as = &names[index];
+        let uri = graph
+            .documents()
+            .get(&document)
+            .map(|found| found.uri().to_owned())
+            .ok_or(("unreadable caller", String::new()))?;
+        let read = reads
+            .documents
+            .of(&uri, sources.read)
+            .ok_or(("unreadable caller", uri.clone()))?;
+        let at = read
+            .rebase
+            .span_to_buffer(ByteSpan { start, end })
+            .ok_or(("unreadable caller", uri.clone()))?
+            .start;
+        let scope = sources.scope_at(document, start);
+        let written_at = format!("{uri}:{at}");
+        // Whether a lookup that reaches `target` runs this method: the method, the alias the name
+        // copies, or a generated copy whose body is the method's `def` (a concern's
+        // `class_methods do`, [`defined_as_own`]).
+        let runs = |target: DeclarationId| {
+            target == found
+                || target == called_as.reaches
+                || defined_as_own(sources, target).is_some_and(|(written, _)| written == found)
+                || (called_as.from_class && installed_beside(sources, target, &runners))
+                || lambda
+                    .as_ref()
+                    .is_some_and(|lambda| lambda.members.contains(&target))
+        };
+        let shape = if let CallerWritten::Bare = how {
+            // On an object of the class whose body writes the macro: one nothing names adds
+            // nothing.
+            if scope.nesting_id(graph).is_none() {
+                skipped += 1;
+                continue;
+            }
+            Receiver::Returned {
+                on: Box::new(Receiver::SelfObject(start)),
+                method: called_as.name.clone(),
+                block: Block::None,
+                arity: Arity::Exactly(0),
+                arguments: Vec::new(),
+                keywords: Some(Vec::new()),
+                safe: false,
+            }
+        } else {
+            let written = how.name(&called_as.name);
+            let shapes = match held_shapes.get(&(document, written)) {
+                Some(shapes) => Rc::clone(shapes),
+                None => {
+                    // Where this document's calls of the name start in the text read.
+                    let offsets: Vec<u32> = sites
+                        .iter()
+                        .filter(|((other, _, _), name, how)| {
+                            *other == document && how.name(&names[*name].name) == written
+                        })
+                        .filter_map(|&((_, start, end), _, _)| {
+                            Some(read.rebase.span_to_buffer(ByteSpan { start, end })?.start)
+                        })
+                        .collect();
+                    let shapes = call_shapes(
+                        callers,
+                        (sources.held_exits, &uri),
+                        document,
+                        written,
+                        &read.source,
+                        &offsets,
+                    );
+                    held_shapes.insert((document, written), Rc::clone(&shapes));
+                    shapes
+                }
+            };
+            let shape = shapes
+                .get(&at)
+                .and_then(|shape| shape.rebased(&read.rebase))
+                .ok_or(("unshaped call", format!("{uri}:{at}")))?;
+            let shape = match shape {
+                Receiver::Spelled { was, .. } => *was,
+                other => other,
+            };
+            match how {
+                CallerWritten::Sent(_) => match sent_as_called(shape, &called_as.name) {
+                    Some(called) => called,
+                    None => {
+                        skipped += 1;
+                        continue;
+                    }
+                },
+                _ => shape,
+            }
+        };
+        // The class whose lookup the call makes and what that lookup reaches, or `None` where the
+        // receiver is not one known class.
+        let (lookup, arity, positional, keywords) = match &shape {
+            Receiver::Returned {
+                on,
+                method: written,
+                arity,
+                arguments,
+                keywords,
+                ..
+            } if !called_as.builds || *written == called_as.name => {
+                // Through a class method whose value takes the same calls for the same class
+                // (`Job.set(wait: 1).perform_later(x)`): the call is made on that class object.
+                let passing = match on.as_ref() {
+                    Receiver::Returned {
+                        on: inner,
+                        method: passed,
+                        ..
+                    } if called_as.from_class => {
+                        passed_through(sources, document, inner, passed, &scope)
+                    }
+                    _ => None,
+                };
+                let owner = match how {
+                    CallerWritten::Bare => scope
+                        .nesting_id(graph)
+                        .map(|class| Typed::of(class, Derivation::default())),
+                    _ => passing.or_else(|| method_receiver(sources, document, on, &scope)),
+                };
+                // **A receiver nothing types, or only a guess, is not read** (decided 2026-10-02:
+                // "We don't know `klass` type? We don't use it in the caller args then"): it may be
+                // any object, and what it passes is another method's as often as this one's. The
+                // answer is the readable calls' join, narrower than Ruby's where such a call does
+                // run it, never another method's argument. **Unless no other method has the
+                // name**: such a call runs this one or raises.
+                let Some(owner) = owner.filter(|owner| owner.derivation.tier() != Tier::Guessed)
+                else {
+                    let alone = graph
+                        .members_named(&format!("{}()", called_as.name))
+                        .iter()
+                        .all(|other| runs(*other));
+                    if called_as.builds || !alone {
+                        skipped += 1;
+                        continue;
+                    }
+                    let site = Site {
+                        document,
+                        scope: &scope,
+                        arity: *arity,
+                        positional: arguments,
+                        keywords: keywords.as_deref(),
+                        written_at: &written_at,
+                    };
+                    match hand(&site) {
+                        Ok(CallerHands::Value(typed)) => {
+                            unread |= typed.derivation.left_out;
+                            join.add(*typed, &folds);
+                            counted += 1;
+                            maybe += 1;
+                        }
+                        Ok(CallerHands::Back(index)) => {
+                            callers.reach_back(index);
+                            looped += 1;
+                        }
+                        Ok(CallerHands::Unread) => unread = true,
+                        Ok(CallerHands::Raises) | Err(_) => skipped += 1,
+                    }
+                    continue;
+                };
+                if let Some(classes) = owner.one().is_none().then(|| owner.classes()) {
+                    // A union may be any of its classes, so the call may run this method where
+                    // one of them can, and its argument joins.
+                    let private = matches!(on.as_ref(), Receiver::SelfObject(_));
+                    let may = if called_as.builds {
+                        match union_builds(sources, document, found, &runners, classes, &written_at)
+                        {
+                            // An object's class built by its own `self.new` is left out.
+                            Err(_) if object.is_some() => {
+                                unread = true;
+                                built_unread = true;
+                                skipped += 1;
+                                continue;
+                            }
+                            built => built?,
+                        }
+                    } else {
+                        classes.iter().any(|class| {
+                            called_as.runners.ancestors.contains(class)
+                                || reach(sources, document, *class, called_as.member, private)
+                                    .is_some_and(runs)
+                        })
+                    };
+                    if !may {
+                        skipped += 1;
+                        continue;
+                    }
+                    (None, *arity, arguments.clone(), keywords.clone())
+                } else {
+                    let one = owner.one().ok_or(("union receiver", written_at.clone()))?;
+                    // A sender the receiver writes itself (a socket's `send`) calls what it says;
+                    // one nothing declares is Ruby's, as a lookup that reaches nothing may be.
+                    let sends_privately = match how {
+                        CallerWritten::Sent(sender) => {
+                            let sending = reach(
+                                sources,
+                                document,
+                                one,
+                                StringId::from(&format!("{sender}()")),
+                                true,
+                            );
+                            let sending = sending
+                                .map(|sending| namer(sources, sending).filter(|namer| namer.calls));
+                            match sending {
+                                None => matches!(sender.as_str(), "send" | "__send__"),
+                                Some(Some(namer)) => namer.private,
+                                Some(None) => {
+                                    skipped += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => false,
+                    };
+                    let (receiver, target) = if called_as.builds {
+                        // A `new` on an object is its class's own method, not `Class#new`.
+                        let Some(class) = instance_of(graph, one) else {
+                            skipped += 1;
+                            continue;
+                        };
+                        // A renamed `new` builds only on a class object that finds the alias.
+                        if called_as.name != "new"
+                            && reach(sources, document, one, called_as.member, false)
+                                .is_some_and(|reached| reached != called_as.reaches)
+                        {
+                            skipped += 1;
+                            continue;
+                        }
+                        let target =
+                            member_of(sources, document, class, StringId::from("initialize()"));
+                        // It builds the class or a subclass, so it can run this `initialize`
+                        // only where that class is a runner or above one.
+                        if !runners.may_build(class, target, found) {
+                            skipped += 1;
+                            continue;
+                        }
+                        // Its own `self.new` may hand `initialize` something else.
+                        if !plain_new(sources, document, Some(one)) {
+                            if object.is_some() {
+                                unread = true;
+                                built_unread = true;
+                                skipped += 1;
+                                continue;
+                            }
+                            return Err(("custom new", written_at));
+                        }
+                        (class, target)
+                    } else {
+                        // A relation hands a name it lacks to its model's class ([`delegated`]).
+                        let reached = reach(
+                            sources,
+                            document,
+                            one,
+                            called_as.member,
+                            sends_privately || matches!(on.as_ref(), Receiver::SelfObject(_)),
+                        )
+                        .or_else(|| {
+                            delegated(sources, document, one, called_as.member)
+                                .map(|(_, found)| found)
+                        });
+                        (one, reached)
+                    };
+                    (
+                        Some((receiver, target)),
+                        *arity,
+                        arguments.clone(),
+                        keywords.clone(),
+                    )
+                }
+            }
+            Receiver::Instance {
+                at,
+                arity,
+                arguments,
+                keywords,
+            } if called_as.builds => {
+                // A constant names the class itself, which runs this `initialize` only where it is
+                // one of the runners; one nothing resolves is left out, like any untyped receiver.
+                let Some(class) = constant_at(graph, document, *at, sources.layout)
+                    .filter(|class| runners.objects.contains(class))
+                else {
+                    skipped += 1;
+                    continue;
+                };
+                if !plain_new(sources, document, singleton_of(graph, class)) {
+                    if object.is_some() {
+                        unread = true;
+                        built_unread = true;
+                        skipped += 1;
+                        continue;
+                    }
+                    return Err(("custom new", written_at));
+                }
+                let target = member_of(sources, document, class, StringId::from("initialize()"));
+                (
+                    Some((class, target)),
+                    *arity,
+                    arguments.clone(),
+                    keywords.clone(),
+                )
+            }
+            // A call of the enclosing `def`'s own `&block` (`block.call(x)`): Ruby made it a
+            // `Proc`, so it runs `Proc#call`, another method.
+            Receiver::Yield { .. } => {
+                skipped += 1;
+                continue;
+            }
+            _ => {
+                return Err((
+                    "unshaped call",
+                    format!("{} {written_at}", shape_kind(&shape)),
+                ));
+            }
+        };
+        // The classes whose objects can take the call and run this method under its name.
+        let above = if called_as.builds {
+            &runners.ancestors
+        } else {
+            &called_as.runners.ancestors
+        };
+        match lookup {
+            // A union one of whose classes may run this method: its argument is joined.
+            None => maybe += 1,
+            Some((_, Some(target))) if runs(target) => {}
+            // Another method, or none, statically. It is this one at runtime only if an object
+            // that runs this one can be the receiver: a class that runs it descends from the
+            // receiver's. Anything else (an `include` made at run time, `method_missing`) is no
+            // call this reads.
+            Some((receiver, _)) if above.contains(&receiver) => {}
+            Some(_) => {
+                skipped += 1;
+                continue;
+            }
+        }
+        let site = Site {
+            document,
+            scope: &scope,
+            arity,
+            positional: &positional,
+            keywords: keywords.as_deref(),
+            written_at: &written_at,
+        };
+        match hand(&site)? {
+            // **What nothing types is left out, not refused** (decided 2026-10-02): a call ya-lsp
+            // cannot read is a limit of the tool. The answer is narrower than Ruby's there, and its
+            // card says so.
+            CallerHands::Unread => {
+                unread = true;
+                built_unread = true;
+            }
+            CallerHands::Value(typed) => {
+                unread |= typed.derivation.left_out;
+                join.add(*typed, &folds);
+                counted += 1;
+            }
+            CallerHands::Back(index) => {
+                callers.reach_back(index);
+                looped += 1;
+            }
+            CallerHands::Raises => skipped += 1,
+        }
+    }
+    // **A class built through an override reaches the parameter through a `super`**: each one in
+    // the `initialize` right before this one is a call of it, read for the object, so the
+    // override's own parameters are what the object's constructions pass ([`from_constructions`]).
+    // One whose `def` cannot be read is left out.
+    let typing = Sources { object, ..*sources };
+    for &before in &runners.through {
+        let Some(sites) = super_sites(sources, before) else {
+            unread = true;
+            built_unread = true;
+            continue;
+        };
+        for (document, written) in &sites {
+            let scope = sources.scope_at(*document, written.at);
+            let written_at = format!(
+                "{}:{}",
+                graph
+                    .documents()
+                    .get(document)
+                    .map_or("", |found| found.uri()),
+                written.at
+            );
+            let site = Site {
+                document: *document,
+                scope: &scope,
+                arity: written.arity,
+                positional: &written.arguments,
+                keywords: written.keywords.as_deref(),
+                written_at: &written_at,
+            };
+            match handed_at(&typing, found, slot, &site)? {
+                CallerHands::Unread => {
+                    unread = true;
+                    built_unread = true;
+                }
+                CallerHands::Value(typed) => {
+                    unread |= typed.derivation.left_out;
+                    join.add(*typed, &folds);
+                    counted += 1;
+                }
+                CallerHands::Back(index) => {
+                    callers.reach_back(index);
+                    looped += 1;
+                }
+                CallerHands::Raises => skipped += 1,
+            }
+        }
+    }
+    if counted == 0 {
+        return Err((
+            if object.is_some() && built_unread {
+                CONSTRUCTIONS_LEFT_OUT
+            } else {
+                "no caller reaches it"
+            },
+            format!("skipped {skipped} looped {looped} maybe {maybe}"),
+        ));
+    }
+    let mut typed = join.finish(&folds).ok_or(("no join", String::new()))?;
+    typed.same = false;
+    typed.made = None;
+    typed.procs = None;
+    typed.shaped = None;
+    typed.derivation.assignments.clear();
+    typed.derivation.callers = Some(full);
+    typed.derivation.left_out = unread;
+    Ok(typed)
 }
 
 /// What `super` returns: the same method, on the first thing above this one that declares it.
@@ -11832,6 +16195,7 @@ fn read_body(
         made: returned,
         procs,
         bound: held,
+        shaped,
     } = {
         let object = match owner.classes.as_slice() {
             [one] if !owner.nilable => Some(*one),
@@ -11873,6 +16237,7 @@ fn read_body(
         made,
         procs,
         bound: held,
+        shaped,
     })
 }
 
@@ -12252,7 +16617,7 @@ fn made_from_block(sources: &Sources<'_>, found: DeclarationId, name: String) ->
 /// - **The variable is read as [`instance_read`] reads `@story` in a method of the same class**:
 ///   every write any class of the object makes, narrowed to the object a body is read for
 ///   ([`Sources::object`]), with `nil` joining unless every `initialize` writes it. An
-///   `attr_accessor`'s setter is a write nothing can type, so it answers nothing.
+///   `attr_accessor`'s variable holds what its setter's calls pass ([`setter_values`]).
 /// - **Which object's variable comes from [`scopes::readers`]**, the walk that places setters: 0
 ///   for a reader in a class body, 1 in `class << self`. A reader it does not place (in a block
 ///   straight in a namespace body, or on another object) answers nothing.
@@ -12307,6 +16672,7 @@ fn reader_return(sources: &Sources<'_>, found: DeclarationId, name: &str) -> Opt
             bound: None,
             instance: None,
             narrowed: Box::default(),
+            kept: false,
         };
         // No method: a reader is called, never dispatched, so no callback runs before it.
         let instance = cursor::InstanceRead {
@@ -12357,21 +16723,22 @@ impl Folds {
     /// A method that can return either is a predicate, and RBS calls that `bool`. A method that
     /// only ever returns `true` is not a predicate, and `true` is both narrower and correct. So
     /// only the **pair** folds, which is what RBS' `bool` means.
-    fn fold(
-        &self,
-        mut classes: Vec<DeclarationId>,
-        carried: bool,
-        derivation: Derivation,
-    ) -> Option<Typed> {
+    ///
+    /// **Only a lone pair folds to the carrier** ([`Typed::boolean`]). Beside another class both
+    /// halves stay classes of the union, so a call on `String | bool` runs on each of the three
+    /// ([`narrowed`]): `FalseClass` answers `blank?` unlike `TrueClass`, and neither has `to_i`.
+    /// The label still spells the pair `bool` (`render::typed`).
+    fn fold(&self, mut classes: Vec<DeclarationId>, derivation: Derivation) -> Option<Typed> {
         let pair = self.truth.is_some_and(|id| classes.contains(&id))
             && self.falsehood.is_some_and(|id| classes.contains(&id));
-        if pair {
+        let lone = pair && classes.len() == 2;
+        if lone {
             // `TrueClass` stays as the carrier and `FalseClass` is dropped, as [`Return::Bool`]
             // does: either half answers a `.` identically, and the reader sees `bool` either way.
             classes.retain(|class| Some(*class) != self.falsehood);
         }
         let mut typed = Typed::over(classes, derivation)?;
-        typed.boolean = pair || carried;
+        typed.boolean = lone;
         Some(typed)
     }
 }
@@ -12456,7 +16823,7 @@ impl Sides {
         if self.nil && folds.nil.is_none() {
             return None;
         }
-        let folded = folds.fold(classes, false, derivation)?;
+        let folded = folds.fold(classes, derivation)?;
         // Arguments are kept only where the fold left one class ([`body_return`]'s rule): a union's
         // positions belong to one half, and nothing says which.
         let folded = match folded.one() {
@@ -12482,6 +16849,9 @@ impl Sides {
 ///   good as its worse half. The first of equals is kept, and every assignment any value names.
 /// - **What travels with one value is dropped**: [`Typed::same`] and [`Typed::made`] describe an
 ///   object, and a join has none.
+/// - **What an object held when it was made is dropped too where the values were stored**
+///   ([`Typed::shaped`], [`Join::of_stores`]): code may write into a store before the read. One
+///   call's answers on each class it can run on, a method's exits and a local's writes keep it.
 #[derive(Default)]
 struct Join {
     kept: Sides,
@@ -12497,9 +16867,24 @@ struct Join {
     /// The method every value adding a class is bound to ([`Typed::bound`]), the same way: kept
     /// only while each is bound to the same method on the same classes.
     bound: Option<Option<Rc<Bound>>>,
+    /// What a read of each key hands back ([`Typed::shaped`]), the same way: kept only while each
+    /// value adding a class says the same, and never where [`Self::stores`].
+    shaped: Option<Option<Rc<knowledge::Shape>>>,
+    /// The values were stored by other code before the read ([`Join::of_stores`]).
+    stores: bool,
 }
 
 impl Join {
+    /// A join of values other code stored before the read (what the calls of a mailer's `with`
+    /// pass, a partial's locals), which drops what each object held when it was made
+    /// ([`Typed::shaped`]).
+    fn of_stores() -> Self {
+        Self {
+            stores: true,
+            ..Self::default()
+        }
+    }
+
     /// One more value. Answers whether it is now the weakest, the one whose provenance the answer
     /// carries.
     fn add(&mut self, typed: Typed, folds: &Folds) -> bool {
@@ -12524,6 +16909,11 @@ impl Join {
                 {
                     Some(seen)
                 }
+                _ => None,
+            });
+            self.shaped = Some(match (self.shaped.take(), &typed.shaped) {
+                (None, Some(held)) => Some(Rc::clone(held)),
+                (Some(Some(seen)), Some(held)) if seen == *held => Some(seen),
                 _ => None,
             });
         }
@@ -12573,6 +16963,7 @@ impl Join {
             .typed(folds, derivation, self.arguments.unwrap_or_default())?;
         joined.procs = self.procs.flatten().map(Rc::from);
         joined.bound = self.bound.flatten();
+        joined.shaped = self.shaped.flatten().filter(|_| !self.stores);
         Some(joined)
     }
 }
@@ -13008,22 +17399,15 @@ fn handed_to(
 ) -> Option<Typed> {
     let graph = sources.graph;
     let yielded = sources.types.yielded(found, index)?;
-    // The same answers the return side reads, from the same functions (see [`resolved`]). What the
-    // receiver holds is what `Array#each`'s `{ (E element) -> void }` asks for. A block parameter
-    // that is itself a generic (`each_slice`'s `(Array[E] slice)`) carries its element into the
-    // block below.
-    let declaration = resolved(sources, &yielded.of, owner, None)?;
-    let arguments = held_by_return(sources, &yielded.of, owner, None);
-
+    // The same answers the return side reads, from the same function (see [`typed_return`]).
+    // What the receiver holds is what `Array#each`'s `{ (E element) -> void }` asks for. A block
+    // parameter that is itself a generic (`each_slice`'s `(Array[E] slice)`) carries its element
+    // into the block below, and a union is each of its classes, as a union return is.
     let mut derivation = owner.derivation.clone();
     derivation
         .signatures
         .push(graph.declarations().get(&found)?.name().to_owned());
-    Some(
-        Typed::of(declaration, derivation)
-            .faceted(yielded)
-            .holding(arguments),
-    )
+    typed_return(sources, yielded, owner, None, &derivation)
 }
 
 /// A receiver that is only a name, answered by the one rung below the graph: its spelling.
@@ -14358,6 +18742,33 @@ Text#join/2+ -> String"
 
         types.clear();
         assert!(types.is_empty());
+    }
+
+    /// A rebuild throws the table away and harvests every signature again, so nothing a signature
+    /// once said may outlive it: a member once `void`, once a key lookup or once read off its
+    /// receiver keeps none of that, and a stand-in mixed in before is forgotten.
+    #[test]
+    fn clearing_the_table_forgets_every_row_a_signature_left() {
+        let mut types = Types::new();
+        types.harvest(
+            "file:///sig/one.rbs",
+            &format!(
+                "class Foo\n  def quiet: () -> void\n  def looked: () -> {KEYED}\n  \
+                 def read: () -> {READ_OFF}\nend\n\
+                 module Fmt\n  include RBS::Unnamed::Stand_In\nend\n"
+            ),
+        );
+        let quiet = DeclarationId::from("Foo#quiet()");
+        assert!(types.nothing(quiet).is_some());
+        assert!(!types.keyed.is_empty());
+        assert!(!types.read_off.is_empty());
+        assert!(!types.stand_ins.is_empty());
+
+        types.clear();
+        assert_eq!(types.nothing(quiet), None);
+        assert!(types.keyed.is_empty());
+        assert!(types.read_off.is_empty());
+        assert!(types.stand_ins.is_empty());
     }
 
     #[test]
@@ -18623,9 +23034,9 @@ end
 
     #[test]
     fn a_call_is_typed_by_its_method_s_body_with_this_call_s_arguments() {
-        // `bar` returns what it was passed, so it has no type of its own, and each call
-        // has the type of its argument. One request answers both calls: the binding is part of the
-        // read's memo key, so `bar(1)`'s answer is not reused for `bar("x")`.
+        // `bar` returns what it was passed, so its own type is what its callers pass, and each
+        // call has the type of its own argument. One request answers both calls: the binding is part
+        // of the read's memo key, so `bar(1)`'s answer is not reused for `bar("x")`.
         let source = "\
 class Foo
   def self.bar(baz)
@@ -18655,7 +23066,8 @@ end
         let (mut harness, uri) = with_types(source);
         assert_eq!(
             drawn_hints(source, &harness.hints_in(&uri)),
-            "  def one -> Integer\n  def two -> String\n  def three -> Integer\n    n: Integer = Foo.bar(1)\n  def four -> Integer"
+            "  def self.bar(baz) -> Integer | String\n  def one -> Integer\n  def two -> String\n  \
+             def three -> Integer\n    n: Integer = Foo.bar(1)\n  def four -> Integer"
         );
     }
 
@@ -18663,7 +23075,9 @@ end
     fn keywords_bind_by_name_and_a_splat_binds_none() {
         // A keyword binds its parameter by name, whatever the order. `**opts` could pass any
         // keyword, so it binds nothing; and a method with no keyword parameters takes a braceless
-        // hash as one more positional, a `Hash` (Ruby 3's rule).
+        // hash as one more positional, a `Hash` (Ruby 3's rule). The same holds for what the callers
+        // pass a `def`: `kw`'s splatting caller is left out of its margin, and `three` reads `kw`
+        // with what the other callers pass.
         let source = "\
 class Foo
   def self.kw(name:, count: 1)
@@ -18704,7 +23118,9 @@ end
         let (mut harness, uri) = with_types(source);
         assert_eq!(
             drawn_hints(source, &harness.hints_in(&uri)),
-            "  def one -> String\n  def two -> Integer\n  def four -> Hash\n  def five -> Integer"
+            "  def self.kw(name:, count: 1) -> String | Integer\n  def self.mix(a, b: nil) -> Integer\n  \
+             def self.plain(a) -> Hash\n  def one -> String\n  def two -> Integer\n  \
+             def three(opts) -> String | Integer\n  def four -> Hash\n  def five -> Integer"
         );
     }
 
@@ -18713,7 +23129,8 @@ end
         // At a call that passed nothing, the parameter holds its default, read in the method's own
         // scope with the call's binding (`b = a`). A braceless hash to a method with no keywords
         // fills the next positional, a `Hash` and not left out; after `**h` which keywords were
-        // passed is unknown.
+        // passed is unknown. A `def`'s margin joins its callers' the same way, leaving out the
+        // `**h` call, whose keywords nothing reads.
         let source = "\
 class Foo
   def self.d(a = 10)
@@ -18762,8 +23179,10 @@ end
         let (mut harness, uri) = with_types(source);
         assert_eq!(
             drawn_hints(source, &harness.hints_in(&uri)),
-            "  def one -> Integer\n  def two -> String\n  def three -> Integer\n  def four -> Hash\n  \
-             def six -> String"
+            "  def self.d(a = 10) -> Integer | String\n  def self.dk(name: \"x\") -> String\n  \
+             def self.chain(a, b = a) -> Integer\n  def self.hashy(a, b = nil) -> Hash\n  \
+             def one -> Integer\n  def two -> String\n  def three -> Integer\n  def four -> Hash\n  \
+             def five(h) -> String\n  def six -> String"
         );
     }
 
@@ -18847,8 +23266,8 @@ end
 
     #[test]
     fn a_call_s_card_shows_what_this_call_returns() {
-        // The method's card at its `def` has no type; at a call it has the call's, beside the name
-        // the reader hovered.
+        // The method's card at its `def` has no type, since a send may build its name and so hand
+        // it anything; at a call it has the call's, beside the name the reader hovered.
         let source = "\
 class Foo
   def self.bar(baz)
@@ -18859,6 +23278,10 @@ end
 class Probe
   def one
     Foo.bar(1)
+  end
+
+  def two(x)
+    Foo.send(\"ba#{x}\", 2)
   end
 end
 ";
@@ -18877,9 +23300,8 @@ end
 
     #[test]
     fn an_object_holds_what_new_passed_it() {
-        // `@user = user` has no type while `user` has none, so `Service#call` stays
-        // unlabelled. The object `Service.new("x")` built holds a `String` there, and a body read for
-        // it says so: through a local, a self-call, a left-out argument's default, `new` in the
+        // `@user = user` is what every `new` passes, so `Service#call` is their join. The object
+        // `Service.new("x")` built holds a `String` there, and a body read for it says so: through a local, a self-call, a left-out argument's default, `new` in the
         // class's own `self.run`, a body answering `self`, and an object passed to another's `new`.
         // One request answers several objects: what built each is part of the read's memo key, and
         // part of the key of any binding it is passed in. The local names its class, so it gets no
@@ -18960,7 +23382,1755 @@ end
         let (mut harness, uri) = with_types(source);
         assert_eq!(
             drawn_hints(source, &harness.hints_in(&uri)),
-            "  def itself_again -> Service\n  def one -> String\n  def two -> Integer\n  def three -> Integer\n  def four -> Integer\n  def five -> String\n  def six -> String\n  def seven -> Integer\n  def eight -> String"
+            "  def call -> String | Integer\n  def limit -> Integer\n  def via_self -> String | Integer\n  \
+             def itself_again -> Service\n  def self.run(user) -> String\n  \
+             def inner_call -> String | Integer\n  def one -> String\n  def two -> Integer\n  \
+             def three -> Integer\n  def four -> Integer\n  def five -> String\n  def six -> String\n  \
+             def seven -> Integer\n  def eight -> String"
+        );
+    }
+
+    #[test]
+    fn a_parameter_is_what_every_caller_passes() {
+        // No signature types `name`, so the margin on `greet` joins what each call passes, and
+        // `times` holds its default where a call leaves it out. A spec's call is the suite's, not
+        // the application's, and adds nothing.
+        let source = "\
+class Greeter
+  def greet(name)
+    name
+  end
+
+  def shout(word, times = 2)
+    times
+  end
+
+  def suite_only(a)
+    a
+  end
+end
+
+class Probe
+  def one
+    Greeter.new.greet(\"x\")
+  end
+
+  def two
+    Greeter.new.greet(nil)
+  end
+
+  def three
+    Greeter.new.shout(\"a\")
+  end
+
+  def four
+    Greeter.new.shout(\"b\", 3)
+  end
+end
+";
+        let (mut harness, uri) = with_types(source);
+        harness.write(
+            "spec/greeter_spec.rb",
+            "Greeter.new.greet(1)\nGreeter.new.suite_only(1)\n",
+        );
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def greet(name) -> String?\n  def shout(word, times = 2) -> Integer\n  \
+             def one -> String\n  def two -> nil\n  def three -> Integer\n  def four -> Integer"
+        );
+    }
+
+    #[test]
+    fn a_caller_nothing_records_refuses_the_parameter() {
+        // Each method here may run with something no written call shows, so none is typed: a name
+        // built around an interpolation, anything before the method in a runner's ancestors that
+        // may `super` into it (an override, a prepend, a module a subclass includes), an operator,
+        // a protocol Ruby runs itself, and more calls than the cap. A call passing what nothing types (an untyped value, a splat) is left out, and
+        // where it is the only one nothing is left. `control` is the same shape with none of these,
+        // and is typed.
+        let source = "\
+module Loud
+  def prepended_one(a)
+    super
+  end
+end
+
+module Intercept
+  def intercepted(a)
+    super(a.to_s)
+  end
+end
+
+class Box
+  prepend Loud
+
+  def control(a)
+    a
+  end
+
+  def untyped_arg(a)
+    a
+  end
+
+  def built(a)
+    a
+  end
+
+  def overridden(a)
+    a
+  end
+
+  def prepended_one(a)
+    a
+  end
+
+  def intercepted(a)
+    a
+  end
+
+  def +(other)
+    other
+  end
+
+  def each(a)
+    a
+  end
+
+  def splatted(a)
+    a
+  end
+
+  def many(a)
+    a
+  end
+end
+
+class Sub < Box
+  include Intercept
+
+  def overridden(a)
+    super
+  end
+end
+
+class Probe
+  def calls(thing, list, x)
+    Box.new.control(1)
+    Box.new.untyped_arg(thing)
+    Box.new.built(1)
+    Box.new.send(\"bu#{x}\", 1)
+    Box.new.overridden(1)
+    Box.new.prepended_one(1)
+    Box.new.intercepted(1)
+    Box.new + 1
+    Box.new.each(1)
+    Box.new.splatted(*list)
+MANY  end
+end
+"
+        .replace("MANY", &"    Box.new.many(1)\n".repeat(CALLER_SITES + 1));
+        let (mut harness, uri) = with_types(&source);
+        let (hints, logged) =
+            crate::testing::captured_logs(tracing::Level::TRACE, || harness.hints_in(&uri));
+        assert_eq!(
+            drawn_hints(&source, &hints),
+            "  def control(a) -> Integer\n  def calls(thing, list, x) -> Integer"
+        );
+        for (method, reason) in [
+            ("Box#untyped_arg()", "no caller reaches it"),
+            ("Box#built()", "built by a send"),
+            ("Box#overridden()", "overridden"),
+            ("Box#prepended_one()", "overridden"),
+            ("Box#intercepted()", "overridden"),
+            ("Box#+()", "operator"),
+            ("Box#each()", "invoked by Ruby"),
+            ("Box#splatted()", "no caller reaches it"),
+            ("Box#many()", "cap"),
+        ] {
+            let said = format!("callers of {method} at Positional(0) refused: {reason}");
+            assert!(logged.contains(&said), "{said}\n{logged}");
+        }
+    }
+
+    #[test]
+    fn a_method_named_call_is_what_its_written_calls_pass_and_more() {
+        // Ruby, Rack and every `&callable` may call `call` where nothing is written, so its written
+        // calls type the parameter, and its card always says more may come. rubydex records no
+        // call for `x.(a)`, which the mark covers. A `Proc`'s `call` is another method's, and so is
+        // a call of a `&block`, even in a body every object runs. An alias named `call` is read the
+        // same way.
+        let source = "\
+class Service
+  def call(account)
+    account
+  end
+end
+
+class Renamed
+  def run(job)
+    job
+  end
+  alias call run
+end
+
+class Probe
+  def one
+    Service.new.call(\"x\")
+    Service.new.(1)
+    ->(z) { z }.call(:s)
+    Renamed.new.call([1])
+  end
+
+  def handing(&block)
+    block.call(1)
+  end
+end
+
+class Object
+  def through(&block)
+    block.call(2)
+  end
+end
+";
+        let (mut harness, uri) = with_types(source);
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def call(account) -> String\n  def run(job) -> Array[Integer]\n  \
+             def one -> Array[Integer]"
+        );
+        for (needle, said) in [
+            ("account)", "account: String | untyped"),
+            ("job)", "job: Array[Integer] | untyped"),
+        ] {
+            let card = harness.hover_at(&uri, source, needle)["contents"]["value"]
+                .as_str()
+                .unwrap_or("null")
+                .to_owned();
+            assert_eq!(card, format!("```ruby\n{said}\n```"), "{needle}");
+        }
+    }
+
+    #[test]
+    fn a_job_and_a_mailer_are_what_their_class_methods_pass() {
+        // `perform_later` and `perform_now` on a job's class run `perform` on a new job, also
+        // after `set`, and a scheduler may enqueue it with anything, so its card says more may
+        // come. A mailer's action on the class runs the action, also after `with`. A Sidekiq
+        // worker's `perform` is not read, and a class method the project writes itself is its own
+        // method, which `with` does not hand on.
+        let (mut harness, _) = with_types("");
+        harness.write(
+            "lib/frameworks.rb",
+            "module ActiveJob\n  class Base\n  end\nend\n\nmodule ActionMailer\n  class Base\n  \
+             end\nend\n\nmodule Sidekiq\n  module Job\n  end\nend\n",
+        );
+        let job = "\
+class DigestJob < ActiveJob::Base
+  def perform(user, force = false)
+    user
+  end
+end
+
+class OwnJob < ActiveJob::Base
+  def self.perform_later(thing)
+    super(thing.id)
+  end
+
+  def perform(id)
+    id
+  end
+end
+
+class MyWorker
+  include Sidekiq::Job
+
+  def perform(id)
+    id
+  end
+end
+";
+        let job_uri = harness.write("app/jobs/digest_job.rb", job);
+        let mailer = "\
+class UserMailer < ActionMailer::Base
+  def self.helper
+    1
+  end
+
+  def welcome(user)
+    user
+  end
+end
+";
+        let mailer_uri = harness.write("app/mailers/user_mailer.rb", mailer);
+        let probe = "\
+class Probe
+  def run
+    DigestJob.perform_later(\"x\")
+    queued = DigestJob.set(wait: 1).perform_later(1.5)
+    DigestJob.perform_now(1)
+    OwnJob.perform_later([1])
+    MyWorker.perform_async(1)
+    UserMailer.welcome([1]).deliver_later
+    delivery = UserMailer.with(a: 1).welcome(\"y\")
+    other = UserMailer.with(a: 1).helper
+  end
+end
+";
+        let probe_uri = harness.write("app/models/probe.rb", probe);
+        harness.index();
+        // What `with` and `set` hand back takes the class methods Rails declared for the class,
+        // and nothing else.
+        assert_eq!(
+            drawn_hints(probe, &harness.hints_in(&probe_uri)),
+            "    queued: DigestJob | false = DigestJob.set(wait: 1).perform_later(1.5)\n    \
+             delivery: ActionMailer::MessageDelivery = UserMailer.with(a: 1).welcome(\"y\")"
+        );
+        assert_eq!(
+            drawn_hints(job, &harness.hints_in(&job_uri)),
+            "  def perform(user, force = false) -> String | Float | Integer"
+        );
+        assert_eq!(
+            drawn_hints(mailer, &harness.hints_in(&mailer_uri)),
+            "  def self.helper -> Integer\n  def welcome(user) -> Array | String"
+        );
+        for (uri, source, needle, said) in [
+            (
+                &job_uri,
+                job,
+                "user, force",
+                "user: String | Float | Integer | untyped",
+            ),
+            (&mailer_uri, mailer, "user)", "user: Array | String"),
+        ] {
+            let card = harness.hover_at(uri, source, needle)["contents"]["value"]
+                .as_str()
+                .unwrap_or("null")
+                .to_owned();
+            assert_eq!(card, format!("```ruby\n{said}\n```"), "{needle}");
+        }
+    }
+
+    #[test]
+    fn a_mailer_s_params_key_is_what_each_with_passes_there() {
+        // `params[:user]` in a mailer is what each `with(user: …)` on the mailer's class or a
+        // subclass passed, or `nil` (made without `with`, or by a call that leaves the key out);
+        // `fetch` raises there instead. A key no call passes answers nothing, and so does every
+        // key of a mailer one of whose calls hands a hash it does not write out, or that more calls
+        // than the cap fill. A call passing the key's own read back adds nothing, one passing
+        // another key's read adds that key's value, and a spec's call is the suite's. A receiver
+        // nothing types, or one no class object types, is another object's `with`. A module's
+        // `params`, and another object's, are not a mailer's.
+        let (mut harness, _) = with_types("");
+        harness.write(
+            "lib/frameworks.rb",
+            "module ActionMailer\n  module Parameterized\n    def params\n      @params ||= {}\n    \
+             end\n  end\n\n  class Base\n    include Parameterized\n  end\nend\n",
+        );
+        let mailer = "\
+module Shared
+  def peek
+    peeked = params[:user]
+  end
+end
+
+class UserMailer < ActionMailer::Base
+  include Shared
+
+  def welcome
+    user = params[:user]
+    count = params.fetch(:count)
+    other = params[:unknown]
+    alt = params[:alt]
+  end
+
+  def relay
+    UserMailer.with(user: params[:user]).welcome
+  end
+
+  def forward
+    UserMailer.with(alt: params[:count]).welcome
+  end
+end
+
+class SubMailer < UserMailer
+end
+
+class OtherMailer < ActionMailer::Base
+  def note
+    seen = params[:seen]
+  end
+end
+
+class BusyMailer < ActionMailer::Base
+  def ping
+    hit = params[:hit]
+  end
+end
+";
+        let uri = harness.write("app/mailers/user_mailer.rb", mailer);
+        harness.write(
+            "app/models/probe.rb",
+            "class Probe\n  def run(options, mailer)\n    UserMailer.with(user: \"x\", count: 1).welcome\n    \
+             UserMailer.with(user: 2).welcome\n    SubMailer.with(user: 1.5).welcome\n    \
+             OtherMailer.with(seen: 1).note\n    OtherMailer.with(options).note\n    \
+             mailer.with(user: [1]).welcome\n    \"x\".with(user: [1])\n    \
+             peeked = mailer.params[:user]\n  end\nend\n",
+        );
+        harness.write(
+            "spec/mailers/user_mailer_spec.rb",
+            "UserMailer.with(user: [1]).welcome\n",
+        );
+        harness.write(
+            "app/models/busy.rb",
+            &format!(
+                "class Busy\n  def run\n{}  end\nend\n",
+                "    BusyMailer.with(hit: 1).ping\n".repeat(CALLER_SITES + 1)
+            ),
+        );
+        harness.index();
+        assert_eq!(
+            drawn_hints(mailer, &harness.hints_in(&uri)),
+            "  def welcome -> Integer?\n    user: String? | Integer | Float = params[:user]\n    \
+             count: Integer = params.fetch(:count)\n    alt: Integer? = params[:alt]\n  \
+             def relay -> ActionMailer::MessageDelivery\n  def forward -> ActionMailer::MessageDelivery"
+        );
+    }
+
+    #[test]
+    fn a_call_on_a_receiver_nothing_types_is_not_read() {
+        // `thing` may be a `Pen` or an `Other`, and what `thing.write(1)` passes is one of theirs,
+        // not both: it is left out of each rather than joined into each. A call on a class that
+        // cannot run `Pen#write` is another method's. `sign` is the one method of its name, so
+        // `thing.sign(1)` runs it or raises, and joins.
+        let source = "\
+class Pen
+  def write(text)
+    text
+  end
+
+  def sign(name)
+    name
+  end
+end
+
+class Other
+  def write(text)
+    text
+  end
+end
+
+class Probe
+  def one
+    Pen.new.write(\"x\")
+    Pen.new.sign(\"x\")
+  end
+
+  def two(thing)
+    thing.write(1)
+    thing.sign(1)
+  end
+
+  def three(thing)
+    thing.write(1, 2)
+  end
+
+  def four
+    Other.new.write([1])
+  end
+
+  def five(thing, x)
+    thing.write(x)
+  end
+end
+";
+        let (mut harness, uri) = with_types(source);
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def write(text) -> String\n  def sign(name) -> String | Integer\n  \
+             def write(text) -> Array[Integer]\n  def one -> String\n  def four -> Array[Integer]"
+        );
+    }
+
+    #[test]
+    fn a_parameter_passed_back_to_itself_adds_nothing_and_a_hop_reads_the_next_callers() {
+        // `again(n, false)` passes `n` straight back: every value in the loop came in through the
+        // top-level call. `relay` hands its parameter on, so `take`'s is what `relay`'s callers pass.
+        let source = "\
+class Walker
+  def again(n, go)
+    again(n, false) if go
+    n
+  end
+
+  def relay(x)
+    take(x)
+  end
+
+  def take(y)
+    y
+  end
+end
+
+Walker.new.again(1, true)
+Walker.new.relay(\"s\")
+";
+        let (mut harness, uri) = with_types(source);
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def again(n, go) -> Integer\n  def relay(x) -> String\n  def take(y) -> String"
+        );
+    }
+
+    #[test]
+    fn a_rest_binds_what_comes_before_it_and_an_empty_spread_passes_nothing() {
+        // The positionals before a `*rest` or `...` land by index whatever the count. A `**opts`
+        // to a method with no keywords is a `Hash` where it holds something and nothing where it
+        // is empty, so the slot it would fill is unknown, at one call and for every caller; the
+        // slot past it holds its default either way.
+        let source = "\
+class Pad
+  def fill(a, b = 1)
+    b
+  end
+
+  def after(a, b = nil, c = 2)
+    c
+  end
+
+  def lead(a, *rest)
+    a
+  end
+
+  def fwd(a, ...)
+    a
+  end
+end
+
+class Probe
+  def one(opts)
+    Pad.new.fill(1, **opts)
+  end
+
+  def two(opts)
+    Pad.new.after(1, **opts)
+  end
+
+  def three
+    Pad.new.lead(1, 2, 3)
+  end
+
+  def four
+    Pad.new.fwd(\"x\", 2, k: 3)
+  end
+end
+";
+        let (mut harness, uri) = with_types(source);
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def after(a, b = nil, c = 2) -> Integer\n  def lead(a, *rest) -> Integer\n  \
+             def fwd(a, ...) -> String\n  def two(opts) -> Integer\n  def three -> Integer\n  \
+             def four -> String"
+        );
+    }
+
+    #[test]
+    fn a_gem_s_method_is_not_typed_by_its_callers() {
+        // A gem may call its own method by a name only its own symbols spell, which nothing here
+        // notes: at its `def` the parameter is untyped. A call still binds what it passes.
+        let gem = "\
+module Shouty
+  class Megaphone
+    def blare(word)
+      word
+    end
+  end
+end
+";
+        let (dir, elsewhere, env) = project_with_gem(gem);
+        let gem_uri = DocUri::from_path(&elsewhere.path().join("gems/shouty-1.2.3/lib/shouty.rb"))
+            .expect("a gem file's URI");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        // No core signatures here, so the argument is a class the application writes.
+        let source = "class Token\nend\n\nsaid = Shouty::Megaphone.new.blare(Token.new)\n";
+        let uri = harness.write("app/main.rb", source);
+        harness.index();
+        harness.index_gems();
+        let at_def = card(&mut harness, &gem_uri, gem, "blare(word)");
+        assert!(!at_def.contains("->"), "{at_def}");
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "said: Token = Shouty::Megaphone.new.blare(Token.new)"
+        );
+    }
+
+    #[test]
+    fn an_object_s_initialize_is_what_its_constructions_pass() {
+        // `thing` is read for a `PostView` or a `TopicView`, so `Base#initialize` holds what that
+        // class's `new` passed, never the other's: a `TopicView` built through a local holding
+        // its class does not reach `PostView`, and a class only ever a receiver, through a local
+        // or a conditional, is not handed on. A class written as a value that code may build
+        // (`register(Mounted)`) says nothing, even where its own `new` is read, and so does a
+        // `Base` object, which may be a `Mounted`: `label_of` and `mt` have no answer. `Coined`'s
+        // own `self.new` may pass anything, so its builds say nothing, and it is built, so its
+        // siblings' builds do not stand in for them; a class with no `initialize` of its own that
+        // nothing builds (`Lone`) is answered as `Base`, whose `initialize` it runs. A `Base` the
+        // code builds holds what that `new` passed, with `Own`'s write read per method, as an
+        // object of another class. A class built through its own `initialize`
+        // reaches `Base#initialize` through its `super`: `Loud` passes a `String` whatever it was
+        // built with, so a `LoudKid` holds one too; a bare `super` passes `Quiet`'s parameters as
+        // they are; `Swap` wrote its parameter first, so what it passes is left out. Read per
+        // method, the overrides refused all of them.
+        let source = "\
+class Base
+  def initialize(thing, label = \"x\")
+    @thing = thing
+    @label = label
+  end
+
+  attr_reader :thing
+
+  def label_of
+    thing
+  end
+end
+
+class Post
+end
+
+class Topic
+end
+
+class PostView < Base
+  def title
+    thing
+  end
+
+  def direct
+    @thing
+  end
+end
+
+class TopicView < Base
+  def title
+    thing
+  end
+
+  def copy
+    self.class.new(Topic.new)
+  end
+end
+
+class Own < Base
+  def initialize(x)
+    @thing = x
+  end
+end
+
+class Lone < Base
+  def l
+    thing
+  end
+end
+
+class Mounted < Base
+  def mt
+    thing
+  end
+end
+
+class Coined < Base
+  def self.new(*args)
+    super
+  end
+
+  def m
+    thing
+  end
+end
+
+class Loud < Base
+  def initialize(x)
+    super(x.to_s)
+  end
+
+  def said
+    thing
+  end
+end
+
+class LoudKid < Loud
+  def heard
+    thing
+  end
+end
+
+class Quiet < Base
+  def initialize(thing, label = \"q\")
+    super
+  end
+
+  def q
+    thing
+  end
+end
+
+class Swap < Base
+  def initialize(thing)
+    thing = 1
+    super
+  end
+
+  def s
+    thing
+  end
+end
+
+PostView.new(Post.new)
+TopicView.new(Topic.new)
+Loud.new(1)
+Quiet.new(Topic.new)
+Swap.new(Post.new)
+Own.new(Post.new)
+Coined.new(Post.new)
+(Post ? Coined : PostView).new(Post.new)
+klass = Coined
+klass.new(Post.new)
+sibling = TopicView
+sibling.new(Topic.new)
+made = Base.new(Post.new).thing
+Mounted.new(Post.new)
+register(Mounted)
+";
+        let (mut harness, uri) = with_types(source);
+        // A spec handing `Lone` to `describe` is the suite's, and leaves its fallback alone.
+        harness.write("spec/lone_spec.rb", "RSpec.describe(Lone) {}\n");
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def title -> Post\n  def direct -> Post\n  def title -> Topic\n  \
+             def l -> Post | Topic | String\n  def said -> String\n  def heard -> String\n  def q -> Topic\n\
+             made: Post = Base.new(Post.new).thing"
+        );
+    }
+
+    #[test]
+    fn a_class_a_spec_stubs_is_not_handed_on() {
+        // `Add` is built by its own `self.call`, and the application calls it on the constant: no
+        // code is handed the class. A spec's `allow(Add)` is the suite's, and a `Struct` written
+        // in its body does not move where the class is written.
+        let source = "\
+module Leaders
+  class Add
+    Result = Struct.new(:ok, keyword_init: true)
+
+    def self.call(user, role)
+      new(user, role).call
+    end
+
+    def initialize(user, role)
+      @user = user
+      @role = role
+    end
+
+    attr_reader :user
+
+    def call
+      user
+    end
+  end
+end
+
+class Person
+end
+
+Leaders::Add.call(Person.new, :x)
+";
+        let (mut harness, uri) = with_types(source);
+        harness.write(
+            "spec/add_spec.rb",
+            "RSpec.describe(Leaders::Add) { it { allow(Leaders::Add).to receive(:call) } }\n",
+        );
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "    def self.call(user, role) -> Person\n    def call -> Person"
+        );
+    }
+
+    #[test]
+    fn a_gem_s_initialize_is_what_the_application_builds_the_object_with() {
+        // The gem's own `initialize` is read for the object: `AccountSerializer`'s `object` is
+        // what the application's `AccountSerializer.new` passed, and so is `item`, which the gem
+        // writes through its own setter on `self`; one passing what nothing types is left out, and
+        // one on another object is that object's. The gem's own `new(thing)` passes what nothing
+        // types and is left out, and a spec's construction is the suite's.
+        let gem = "\
+module Shouty
+  class Serializer
+    attr_accessor :item
+
+    def initialize(object, options = {})
+      @object = object
+      @options = options
+      self.item = object
+    end
+
+    def reset
+      self.item = mystery
+    end
+
+    def self.copy(from, to)
+      to.item = from
+    end
+
+    attr_reader :object
+
+    def self.build(thing)
+      new(thing)
+    end
+  end
+end
+";
+        let (dir, _elsewhere, env) = project_with_gem(gem);
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        // No core signatures here, so every argument is a class the application writes, and
+        // `NilClass` is declared for the `nil` a class built on a library's joins.
+        let source = "\
+class NilClass
+end
+
+class Account
+end
+
+class Tag
+end
+
+class AccountSerializer < Shouty::Serializer
+  def username
+    object
+  end
+
+  def direct
+    @object
+  end
+
+  def first
+    item
+  end
+
+  def held
+    @item
+  end
+end
+
+class TagSerializer < Shouty::Serializer
+  def label
+    object
+  end
+end
+
+AccountSerializer.new(Account.new)
+TagSerializer.new(Tag.new, {})
+";
+        let uri = harness.write("app/main.rb", source);
+        harness.write(
+            "spec/serializer_spec.rb",
+            "AccountSerializer.new(Tag.new)\n",
+        );
+        harness.index();
+        harness.index_gems();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def username -> Account?\n  def direct -> Account?\n  def first -> Account?\n  \
+             def held -> Account?\n  def label -> Tag?"
+        );
+    }
+
+    #[test]
+    fn a_caller_may_run_the_method_from_any_receiver_and_hops_end_at_a_depth() {
+        // `Pen#write` joins what a guessed receiver, a union and a class without the method pass,
+        // since each may be a `Pen` at run time. A chain of parameters is read `CALLER_HOPS`
+        // deep, so `d` is untyped; a class method's callers are read on the class side; a bare
+        // call leaving out an argument passes its default.
+        let source = "\
+class Account
+end
+
+class Pen
+  def write(text)
+    text
+  end
+end
+
+class Chain
+  def a(x)
+    b(x)
+  end
+
+  def b(x)
+    c(x)
+  end
+
+  def c(x)
+    d(x)
+  end
+
+  def d(x)
+    x
+  end
+
+  def opt(a = 1)
+    a
+  end
+
+  def use_opt
+    opt
+  end
+end
+
+class Maker
+  def self.make(a)
+    a
+  end
+end
+
+class Kid < Maker
+end
+
+class Inc
+  include Nowhere
+
+  def im(a)
+    a
+  end
+end
+
+module Mixin
+  def mix(a)
+    a
+  end
+end
+
+class Mixed
+  include Mixin
+end
+
+class MixedAgain < Mixed
+  include Mixin
+end
+
+class Probe
+  def one
+    s = \"s\"
+    Pen.new.write(s)
+  end
+
+  def two(c)
+    (c ? Pen.new : Account.new).write(2)
+  end
+
+  def three
+    pen.write(3)
+  end
+
+  def four
+    Account.new.write(4)
+  end
+
+  def five
+    Chain.new.a(1)
+  end
+
+  def six
+    Maker.make(1)
+  end
+
+  def seven
+    Inc.new.im(1)
+    MixedAgain.new.mix(1)
+  end
+end
+";
+        let (mut harness, uri) = with_types(source);
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def write(text) -> String | Integer\n  def a(x) -> Integer\n  def b(x) -> Integer\n  \
+             def c(x) -> Integer\n  def opt(a = 1) -> Integer\n  def use_opt -> Integer\n  \
+             def self.make(a) -> Integer\n  def im(a) -> Integer\n  def mix(a) -> Integer\n  \
+             def one -> String\n  def two(c) -> Integer\n  def five -> Integer\n  def six -> Integer\n  \
+             def seven -> Integer"
+        );
+    }
+
+    #[test]
+    fn a_caller_the_index_cannot_read_refuses_too() {
+        // A prepend nothing declares may take the call; a name `self` builds and sends; a keyword
+        // sent by a built name; `new` through a class's own `self.new`. An argument only a guess
+        // types, as a default too, is left out, and nothing else calls `take` or `pick`. A send
+        // that leaves a required slot empty raises, so `mapped` is typed; `klass.new(1)`'s receiver
+        // nothing types, so `Widget#v` is what `Widget.new(5)` passed; and the loop through
+        // `n.succ` is left out, so `count` is what the top-level call passes.
+        let source = "\
+class Pre
+  prepend Missing
+
+  def pm(a)
+    a
+  end
+end
+
+class Sender
+  def handle_a(x)
+    x
+  end
+
+  def keyed(k:)
+    k
+  end
+
+  def mapped(a)
+    a
+  end
+
+  def run(kind)
+    send(\"handle_#{kind}\", 1)
+    send(\"key#{kind}\", k: 1)
+    send(\"map#{kind}\")
+    send(\"zz#{kind}\", *kind)
+    public_send
+    kind.()
+  end
+end
+
+class Account
+end
+
+class Holder
+  def take(v)
+    v
+  end
+
+  def pick(v = account)
+    v
+  end
+end
+
+class Money
+  def self.new(x)
+    super(x)
+  end
+
+  def initialize(c)
+    @c = c
+  end
+
+  def cents
+    @c
+  end
+
+  def again
+    made = Money
+    made.new(2)
+  end
+end
+
+class Widget
+  def initialize(v)
+    @v = v
+  end
+
+  def v
+    @v
+  end
+end
+
+class Counter
+  def count(n, go)
+    count(n.succ, false) if go
+    n
+  end
+end
+
+class Probe
+  def calls(klass)
+    Pre.new.pm(1)
+    Sender.new.handle_a(1)
+    Sender.new.keyed(k: 1)
+    Sender.new.mapped(1)
+    Holder.new.take(account)
+    Holder.new.pick
+    Money.new(1)
+    Widget.new(5)
+    klass.new(1)
+    Counter.new.count(1, true)
+  end
+end
+";
+        let (mut harness, uri) = with_types(source);
+        let (hints, logged) =
+            crate::testing::captured_logs(tracing::Level::TRACE, || harness.hints_in(&uri));
+        assert_eq!(
+            drawn_hints(source, &hints),
+            "  def mapped(a) -> Integer\n  def again -> Money\n  def v -> Integer\n  \
+             def count(n, go) -> Integer\n  def calls(klass) -> Integer"
+        );
+        for (method, slot, reason) in [
+            ("Pre#pm()", "Positional(0)", "unresolved ancestor"),
+            ("Sender#handle_a()", "Positional(0)", "built by a send"),
+            ("Sender#keyed()", "Keyword(\"k\")", "built by a send"),
+            ("Holder#take()", "Positional(0)", "no caller reaches it"),
+            ("Holder#pick()", "Positional(0)", "no caller reaches it"),
+            ("Money#initialize()", "Positional(0)", "custom new"),
+        ] {
+            let said = format!("callers of {method} at {slot} refused: {reason}");
+            assert!(logged.contains(&said), "{said}\n{logged}");
+        }
+    }
+
+    #[test]
+    fn every_new_counts_toward_initialize_s_cap() {
+        // `initialize`'s calls are the `new`s in the documents that name its class: past the cap
+        // the answer refuses without reading them.
+        let source = format!(
+            "class Grown\n  def initialize(g)\n    @g = g\n  end\n\n  def g\n    @g\n  end\nend\n\n{}",
+            "Grown.new(1)\n".repeat(CALLER_SITES + 1)
+        );
+        let (mut harness, uri) = with_types(&source);
+        let (hints, logged) =
+            crate::testing::captured_logs(tracing::Level::TRACE, || harness.hints_in(&uri));
+        assert_eq!(drawn_hints(&source, &hints), "null");
+        let capped = format!(
+            "callers of Grown#initialize() at Positional(0) refused: cap {}",
+            CALLER_SITES + 1
+        );
+        assert!(logged.contains(&capped), "{logged}");
+    }
+
+    #[test]
+    fn the_call_shapes_held_start_again_past_their_cap() {
+        // More caller texts than are held at once: the next is read afresh, and every answer
+        // stays what its callers pass.
+        let source = "\
+class Wide
+  def first(a)
+    a
+  end
+
+  def second(a)
+    a
+  end
+end
+";
+        let (mut harness, uri) = with_types(source);
+        for n in 0..=EVERY_CALL_TEXTS {
+            let name = if n % 2 == 0 { "first" } else { "second" };
+            harness.write(
+                &format!("lib/caller_{n}.rb"),
+                &format!("Wide.new.{name}(1)\n"),
+            );
+        }
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def first(a) -> Integer\n  def second(a) -> Integer"
+        );
+    }
+
+    #[test]
+    fn initialize_reads_the_new_calls_where_its_class_is_named() {
+        // `Grown`'s callers are the `new`s in the documents that name it or write an ancestor's
+        // body, so the many `Other.new`s elsewhere are not read and do not reach the cap.
+        // `Built` inherits a class method that hands `new` a splat, which is left out.
+        let source = "\
+class Grown
+  def initialize(g)
+    @g = g
+  end
+
+  def g
+    @g
+  end
+end
+
+class Base
+  def self.call(*args)
+    new(*args)
+  end
+end
+
+class Built < Base
+  def initialize(b)
+    @b = b
+  end
+
+  def b
+    @b
+  end
+end
+
+class Other
+end
+
+Grown.new(1)
+Built.new(\"x\")
+";
+        let (mut harness, uri) = with_types(source);
+        harness.write("lib/others.rb", &"Other.new\n".repeat(CALLER_SITES + 1));
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def g -> Integer\n  def self.call(*args) -> Base\n  def b -> String"
+        );
+    }
+
+    #[test]
+    fn a_method_reads_its_calls_only_where_one_of_its_classes_is_named() {
+        // `near.rb` names `Account`, and `Sticker`'s body is an ancestor's, so their calls join.
+        // `far.rb` types its receiver as an `Account` through `Shelf#account`'s signature but names
+        // only `Shelf`: its call is left out, as one nothing types is.
+        let source = "\
+class Account
+  include Sticker
+
+  def label(text)
+    text
+  end
+end
+";
+        let (mut harness, uri) = with_types(source);
+        harness.write(
+            "lib/sticker.rb",
+            "module Sticker\n  def stick\n    label(2)\n  end\nend\n",
+        );
+        harness.write("lib/shelf.rb", "class Shelf\nend\n");
+        harness.write(
+            "sig/shelf.rbs",
+            "class Shelf\n  def account: () -> Account\nend\n",
+        );
+        harness.write("lib/near.rb", "Account.new.label(\"near\")\n");
+        harness.write("lib/far.rb", "Shelf.new.account.label(1.5)\n");
+        harness.index();
+        // Calls are read in document order, and a temporary root reorders the documents.
+        let hints = drawn_hints(source, &harness.hints_in(&uri));
+        let mut joined: Vec<&str> = hints
+            .strip_prefix("  def label(text) -> ")
+            .unwrap_or(&hints)
+            .split(" | ")
+            .collect();
+        joined.sort_unstable();
+        assert_eq!(joined, ["Integer", "String"], "{hints}");
+    }
+
+    #[test]
+    fn a_new_counts_for_the_classes_its_receiver_can_build() {
+        // `new` in `Shape.build` runs on `self`, which `Square.build(2)` makes a `Square`; a `new`
+        // on a union of class objects may build either; one on a string is `String`'s own method;
+        // `Lonely` is named in no document with a `new`, so nothing can build it.
+        let source = "\
+class Shape
+  def initialize(size)
+    @size = size
+  end
+
+  def self.build(size)
+    new(size)
+  end
+end
+
+class Square < Shape
+  def initialize(side)
+    @side = side
+  end
+
+  def side
+    @side
+  end
+end
+
+class Circle
+  def initialize(r)
+    @r = r
+  end
+
+  def r
+    @r
+  end
+end
+
+Square.build(2)
+pick = rand > 0.5 ? Square : Circle
+pick.new(3)
+Square.new(\"s\")
+Circle.new(1.5)
+\"x\".new(4)
+";
+        let (mut harness, uri) = with_types(source);
+        let lonely = harness.write(
+            "lib/lonely.rb",
+            "class Lonely\n  def initialize(l)\n    @l = l\n  end\n\n  def l\n    @l\n  end\nend\n",
+        );
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def self.build(size) -> Shape\n  def side -> Integer | String\n  def r -> Integer | Float"
+        );
+        let (_, logged) =
+            crate::testing::captured_logs(tracing::Level::TRACE, || harness.hints_in(&lonely));
+        assert!(
+            logged
+                .contains("callers of Lonely#initialize() at Positional(0) refused: no call sites"),
+            "{logged}"
+        );
+    }
+
+    #[test]
+    fn an_alias_s_calls_are_callers_too() {
+        // `Loud`'s `shout` copies `Greeter#greet`, `Other`'s `hi` an alias of its own `greet`, and
+        // `Base`'s class object `new`, which `Built` inherits: their calls join. `Quiet#shout` is
+        // another method, and `Elsewhere`'s `make` cannot build a `Built`, so theirs do not.
+        let source = "\
+class Greeter
+  def initialize(tone)
+    @tone = tone
+  end
+
+  def tone
+    @tone
+  end
+
+  def greet(name)
+    name
+  end
+end
+
+class Loud < Greeter
+  alias shout greet
+end
+
+class Quiet
+  def shout(word)
+    word
+  end
+end
+
+class Other
+  def greet(word)
+    word
+  end
+  alias hello greet
+  alias hi hello
+end
+
+class Elsewhere
+  class << self
+    alias make new
+  end
+end
+
+class Base
+  class << self
+    alias build new
+  end
+end
+
+class Built < Base
+  def initialize(b)
+    @b = b
+  end
+
+  def b
+    @b
+  end
+end
+
+class Counter
+  def initialize(start)
+    @start = start
+  end
+  alias restart initialize
+
+  def start
+    @start
+  end
+
+  def zero
+    restart(2.0)
+    self
+  end
+end
+
+module Sided
+  def initialize(side)
+    @side = side
+  end
+
+  def side
+    @side
+  end
+end
+
+class Shaped
+  include Sided
+
+  class << self
+    alias build new
+  end
+end
+
+class Lone
+  include Sided
+
+  def self.build(x)
+    x
+  end
+end
+
+Greeter.new(1).greet(\"x\")
+Loud.new(2).shout(3)
+Quiet.new.shout(nil)
+Other.new.greet(2)
+Other.new.hi(2.0)
+Built.new(3)
+Built.build(\"s\")
+Elsewhere.make(nil)
+Counter.new(1)
+Shaped.build(1)
+Lone.build(nil)
+";
+        let (mut harness, uri) = with_types(source);
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def tone -> Integer\n  def greet(name) -> String | Integer\n  def shout(word) -> nil\n  \
+             def greet(word) -> Integer | Float\n  def b -> Integer | String\n  \
+             def start -> Integer | Float\n  def zero -> Counter\n  def side -> Integer\n  \
+             def self.build(x) -> nil"
+        );
+    }
+
+    #[test]
+    fn an_alias_name_is_held_to_every_rule_its_method_s_name_is() {
+        let source = "\
+class Plain
+  def add(x)
+    x
+  end
+  alias + add
+
+  def label(x)
+    x
+  end
+  alias to_s label
+
+  def put(x)
+    x
+  end
+  alias store= put
+
+  def kept(x)
+    x
+  end
+  alias held kept
+
+  def sent(x)
+    x
+  end
+  alias dispatched sent
+end
+
+class Child < Plain
+  def held(x)
+    super
+  end
+end
+
+plain = Plain.new
+plain.add(1)
+plain.label(1)
+plain.put(1)
+plain.kept(1)
+plain.sent(1)
+plain.send(\"dis#{plain}\", 1)
+";
+        let (mut harness, uri) = with_types(source);
+        let (hints, logged) =
+            crate::testing::captured_logs(tracing::Level::TRACE, || harness.hints_in(&uri));
+        assert!(hints.is_null(), "{hints}");
+        for (method, reason) in [
+            ("Plain#add()", "operator +"),
+            ("Plain#label()", "invoked by Ruby to_s"),
+            ("Plain#put()", "writer store="),
+            ("Plain#kept()", "overridden held"),
+            ("Plain#sent()", "built by a send dispatched"),
+        ] {
+            let said = format!("callers of {method} at Positional(0) refused: {reason}");
+            assert!(logged.contains(&said), "{said}\n{logged}");
+        }
+    }
+
+    #[test]
+    fn a_custom_new_refuses_only_the_class_it_builds() {
+        // `Money`'s own `self.new` may hand its `initialize` anything; `Widget.new` is still read,
+        // and so is a `new` whose class has no `initialize` of its own to find.
+        let source = "\
+class Money
+  def self.new(x)
+    super(x)
+  end
+
+  def initialize(c)
+    @c = c
+  end
+
+  def cents
+    @c
+  end
+end
+
+class Plain
+end
+
+class Widget
+  def initialize(v)
+    @v = v
+  end
+
+  def v
+    @v
+  end
+end
+
+Money.new(1)
+Plain.new
+Widget.new(\"w\")
+";
+        let (mut harness, uri) = with_types(source);
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def v -> String"
+        );
+    }
+
+    #[test]
+    fn a_spelled_name_is_a_symbol_a_word_or_a_one_word_string() {
+        // What `send`, `try` or a callback can call a method by. A constant path, a keyword's
+        // label and a sentence are none.
+        let mut found = HashSet::new();
+        spell(
+            br#"send(:shout, 'quiet', "two words", "x?") %i[a b!] %I(c) %i{d} %i<e> %i|f| Foo::Bar a:b :"q" :@iv"#,
+            &mut found,
+        );
+        let mut names: Vec<String> = found.into_iter().collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["a", "b!", "c", "d", "e", "f", "q", "quiet", "shout", "x?"]
+        );
+        // A text that ends inside a name: the name it holds so far, and nothing past the end.
+        for (text, held) in [
+            (&b"x = :last"[..], &["last"][..]),
+            (b"x = :ask?", &["ask?"]),
+            (b"'open", &[]),
+            (b"%i[one tw", &["one", "tw"]),
+            (b"%i", &[]),
+            (b"x :", &[]),
+        ] {
+            let mut found = HashSet::new();
+            spell(text, &mut found);
+            let mut names: Vec<String> = found.into_iter().collect();
+            names.sort();
+            assert_eq!(names, held, "{}", String::from_utf8_lossy(text));
+        }
+    }
+
+    #[test]
+    fn a_spelled_name_is_a_caller_only_where_something_calls_by_it() {
+        // - `send`, `__send__` and `public_send`'s first argument is the call, with the arguments
+        //   after it, on the same receiver; a class's own `send` calls what it says, and a
+        //   `send(:new, …)` builds;
+        // - asking about the name, aliasing it, comparing it, a `when` and a hash's key call
+        //   nothing, and neither does a name a routes file or a callback's `only:` holds;
+        // - a callback calls its method with nothing, so the default joins;
+        // - `method(:x)` and a constant holding the name may call it with anything: what the
+        //   written calls pass joins, and the card says something was left out.
+        let source = "\
+class Widget
+  def initialize(size = nil)
+    @size = size
+  end
+
+  def sent(sent_value)
+    sent_value
+  end
+
+  def only_sent(only_value)
+    only_value
+  end
+
+  def named(named_value)
+    named_value
+  end
+  alias_method :also, :named
+
+  def looked_up(looked_value)
+    looked_value
+  end
+
+  def held(held_value)
+    held_value
+  end
+end
+
+class Socket
+  def send(message, flags)
+    1
+  end
+end
+
+HANDLERS = %i[held]
+
+class Probe
+  def calls(x)
+    w = Widget.new
+    w.send(:sent, 1)
+    w.public_send(:sent, \"x\")
+    Socket.new.send(:sent, nil)
+    Widget.new.__send__(:only_sent, 2.5)
+    Widget.new.named(1)
+    w.respond_to?(:named)
+    case x when :named then 1 end
+    { :named => 2 }
+    x == :named
+    Widget.new.looked_up(1)
+    w.method(:looked_up)
+    Widget.new.held(1)
+    Widget.send(:new, 1)
+    w.send(\"sent\", 2.0)
+    puts \"looked_up\"
+    (x ? Widget.new : Probe.new).named(5)
+    (x ? Socket.new : 1).named(nil)
+  end
+end
+
+before_action :named
+
+class PostsController
+  before_action :load_page, only: %i[show only_sent]
+  skip_before_action :named
+
+  def show
+    load_page(3)
+  end
+
+  private
+
+  def load_page(page = nil)
+    page
+  end
+end
+";
+        let mut harness = signed(
+            &[("core/core.rbs", &format!("{TYPED_RBS}\n{SENDERS_RBS}"))],
+            "",
+        );
+        harness.write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  resources :widgets, only: %i[new sent]\n  get :only_sent\nend\n",
+        );
+        // A spec's literal is the suite's, as its calls are; a `new` sent in a document naming no
+        // class that runs `initialize` builds none of them.
+        harness.write("spec/widget_spec.rb", "Widget.new.method(:named)\n");
+        harness.write(
+            "lib/builder.rb",
+            "def build(kind) = kind.send(:new, \"s\")\n",
+        );
+        let uri = harness.write("app/models/widget.rb", source);
+        harness.index();
+        harness.index_gems();
+        for (needle, said) in [
+            ("size = nil)", "size: Integer?"),
+            ("sent_value)", "sent_value: Integer | String | Float"),
+            ("only_value)", "only_value: Float"),
+            ("named_value)", "named_value: Integer"),
+            ("looked_value)", "looked_value: Integer | untyped"),
+            ("held_value)", "held_value: Integer | untyped"),
+            ("page = nil)", "page: Integer?"),
+        ] {
+            let card = harness.hover_at(&uri, source, needle)["contents"]["value"]
+                .as_str()
+                .unwrap_or("null")
+                .to_owned();
+            assert_eq!(card, format!("```ruby\n{said}\n```"), "{needle}");
+        }
+    }
+
+    #[test]
+    fn a_concern_s_class_method_is_called_through_each_includer() {
+        // `class_methods do` writes the `def` once, and each including class's class object gets a
+        // generated copy that runs it: a call reaching the copy is a call of the `def`.
+        let source = "\
+module Cached
+  extend ActiveSupport::Concern
+
+  class_methods do
+    def vary_by(value)
+      value
+    end
+  end
+end
+
+class PostsController
+  include Cached
+  vary_by \"Accept\"
+end
+";
+        let mut harness = signed(&[("core/core.rbs", TYPED_RBS)], "");
+        harness.write(
+            "lib/active_support/concern.rb",
+            "module ActiveSupport\n  module Concern\n  end\nend\n",
+        );
+        let uri = harness.write("app/controllers/posts_controller.rb", source);
+        harness.index();
+        harness.index_gems();
+        let card = harness.hover_at(&uri, source, "value)")["contents"]["value"]
+            .as_str()
+            .unwrap_or("null")
+            .to_owned();
+        assert_eq!(card, "```ruby\nvalue: String\n```");
+    }
+
+    #[test]
+    fn an_edited_caller_changes_the_answer() {
+        // What every caller passes is held with the graph, and the write an edit makes drops it:
+        // the caller now passes something else, or sends the name something more, and then no
+        // longer does.
+        let source = "\
+class Greeter
+  def greet(name)
+    name
+  end
+end
+";
+        let (mut harness, uri) = with_types(source);
+        let caller = harness.write("lib/caller.rb", "Greeter.new.greet(\"x\")\n");
+        harness.write("lib/other.rb", "handlers = [:shared]\n");
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def greet(name) -> String"
+        );
+        harness.open(&caller, "Greeter.new.greet(\"x\")\n");
+        harness.change(
+            &caller,
+            "Greeter.new.greet(1)\nGreeter.new.send(:greet, 2.5)\nhandlers = %i[shared]\n",
+        );
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def greet(name) -> Integer | Float"
+        );
+        harness.change(&caller, "Greeter.new.greet(1)\n");
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def greet(name) -> Integer"
         );
     }
 
@@ -18970,7 +25140,8 @@ end
         //   `x` is no parameter of `initialize`.
         // - **A class's own `self.new`** may hand `initialize` something else (`super(amount.to_s)`),
         //   so nothing binds, and `Money#amount` stays unknown.
-        // - **A parent's `initialize` runs where the class has none**, and binds.
+        // - **A parent's `initialize` runs where the class has none**, and binds; `Child#name` is
+        //   what every `new` that runs it passes.
         // - **`Class#new` as core declares it** binds, as a `new` nothing declares does.
         let source = "\
 class Other
@@ -19033,7 +25204,7 @@ end
         );
         assert_eq!(
             drawn_hints(source, &harness.hints_in(&uri)),
-            "  def three -> String"
+            "  def name -> String\n  def three -> String"
         );
     }
 
@@ -19041,9 +25212,10 @@ end
     fn a_reader_returns_its_variable_on_the_object() {
         // A reader has no body, so it read nothing before. It returns its variable, read as
         // a method of its class reads it: on the object a body is read for (`Presenter`'s `topic` is
-        // what `new` passed), on the class object in `class << self` (`nil` joins, since a class
-        // object runs no `initialize`), and behind a setter with what its calls pass: none here
-        //. A `def` of the same name is the override, read as before.
+        // what `new` passed, and at its `title` what every `new` passes), on the class object in
+        // `class << self` (`nil` joins, since a class object runs no `initialize`), and behind a
+        // setter with what its calls pass: none here. A `def` of the same name is the override,
+        // read as before.
         let source = "\
 class Topic
   def title
@@ -19122,7 +25294,9 @@ end
         let (mut harness, uri) = with_types(source);
         assert_eq!(
             drawn_hints(source, &harness.hints_in(&uri)),
-            "  def title -> String\n  def self.setup -> String\n  def topic -> Integer\n  def one -> Topic\n  def two -> String\n  def three -> String?\n  def four -> Topic\n  def five -> Integer"
+            "  def title -> String\n  def title -> String\n  def self.setup -> String\n  \
+             def topic -> Integer\n  def one -> Topic\n  def two -> String\n  def three -> String?\n  \
+             def four -> Topic\n  def five -> Integer"
         );
         let markdown = card(&mut harness, &uri, source, "topic\n  end\n\n  def two");
         assert!(markdown.contains("Fixed#topic -> Topic"), "{markdown}");
@@ -20496,27 +26670,67 @@ end
     }
 
     #[test]
-    fn the_held_walk_lets_go_of_everything_once_it_is_full() {
-        // A session is unbounded and its cache must not be. Dropping everything rather than the
-        // oldest is deliberate (see `HELD_DOCUMENTS`). What matters is that the bound exists and
-        // the cache keeps answering after it fires.
-        let source = "def title\n  \"x\"\nend\n";
-        let held = HeldExits::new();
-        for n in 0..HELD_DOCUMENTS {
-            held.of(&format!("file:///{n}.rb"), source);
-        }
-        assert_eq!(held.len(), HELD_DOCUMENTS);
+    fn the_held_let_go_of_the_least_recently_used_once_their_texts_pass_the_budget() {
+        // A session is unbounded and its caches must not be, but letting every walk go at once
+        // re-walked the files a session was still reading (`HELD_WALK_BYTES`).
+        let held = |store: &Recent<u8>| {
+            let mut names: Vec<String> = store.held.keys().map(|name| name.to_string()).collect();
+            names.sort_unstable();
+            (names, store.bytes)
+        };
+        let mut store = Recent::within(10);
+        store.put("a", 1, 4, 1);
+        store.put("b", 1, 4, 2);
+        assert_eq!(store.get("a", 1), Some(&1));
+        assert_eq!(store.get("a", 2), None, "another version of a is not held");
 
-        let over = held.of("file:///over.rb", source);
-        assert_eq!(held.len(), 1, "the cache grew past its bound");
-        assert_eq!(*over, cursor::shapes(source));
+        // `a` was used after `b`, so `b` goes.
+        store.put("c", 1, 4, 3);
+        assert_eq!(held(&store), (vec!["a".to_owned(), "c".to_owned()], 8));
+
+        // A new version of a document takes its old one's place and bytes.
+        store.put("a", 2, 2, 4);
+        assert_eq!(held(&store), (vec!["a".to_owned(), "c".to_owned()], 6));
+        assert_eq!(store.get("a", 1), None, "the edit kept the old value");
+
+        // One document let go is that one alone.
+        store.forget("a");
+        assert_eq!(held(&store), (vec!["c".to_owned()], 4));
+
+        // A text past the budget alone is held until the next one comes.
+        store.put("big", 1, 12, 5);
+        assert_eq!(held(&store), (vec!["big".to_owned()], 12));
+        store.put("d", 1, 1, 6);
+        assert_eq!(held(&store), (vec!["d".to_owned()], 1));
     }
 
     #[test]
-    fn a_held_text_answers_only_its_own_version_and_lets_go_once_full() {
+    fn a_held_walk_asked_whether_it_is_held_is_used_and_kept() {
+        // The margin asks before it walks its own parse, and the type side reads the walk next.
+        let source = "def title\n  \"x\"\nend\n";
+        let held = HeldExits {
+            walks: RefCell::new(HeldWalks(Recent::within(2 * source.len()))),
+            ..HeldExits::default()
+        };
+        held.of("file:///a.rb", source);
+        held.of("file:///b.rb", source);
+        assert!(held.holds("file:///a.rb", source));
+        assert!(!held.holds("file:///a.rb", "def other = 1\n"));
+        held.keep("file:///c.rb", source, cursor::shapes(source));
+        assert_eq!(held.len(), 2);
+        assert!(
+            held.holds("file:///a.rb", source),
+            "the walk just asked for was let go"
+        );
+        assert!(!held.holds("file:///b.rb", source));
+    }
+
+    #[test]
+    fn a_held_text_answers_only_its_own_version_until_its_document_opens() {
         let held = HeldExits::new();
         let rebase = Rebase::identity(3);
         held.keep_text("file:///a.rb", 1, &Rc::from("old"), rebase);
+        held.keep_text("file:///b.rb", 1, &Rc::from("bee"), rebase);
         assert_eq!(
             held.text("file:///a.rb", 1),
             Some((Rc::from("old"), rebase))
@@ -20526,25 +26740,82 @@ end
             None,
             "another version is not this text"
         );
-        assert_eq!(held.text("file:///b.rb", 1), None);
+        assert_eq!(held.text("file:///c.rb", 1), None);
 
         // Kept again at a new version: the old one is gone, and so are its bytes.
         held.keep_text("file:///a.rb", 2, &Rc::from("new"), rebase);
         assert_eq!(held.text("file:///a.rb", 1), None);
-        assert_eq!(held.texts.borrow().bytes, 3);
+        assert_eq!(held.texts.borrow().0.bytes, 6);
 
-        // Past the bound everything goes, and what was just kept is held.
-        let big: Rc<str> = Rc::from("x".repeat(HELD_TEXT_BYTES - 1));
-        held.keep_text("file:///big.rb", 3, &big, rebase);
-        assert_eq!(
-            held.text("file:///a.rb", 2),
-            None,
-            "the texts grew past their bound"
+        // A document that opens is answered by its buffer; every other text stays.
+        held.forget_text("file:///a.rb");
+        assert_eq!(held.text("file:///a.rb", 2), None);
+        assert!(held.text("file:///b.rb", 1).is_some());
+    }
+
+    /// What an object held when it was made ([`Typed::shaped`]) is kept by every join of one
+    /// call's or one method's answers where each value carries the same, by a local's fold
+    /// ([`fold_kept`]), and dropped by a store's fold ([`fold_reached`]), a join of stored values
+    /// ([`Join::of_stores`]) and any value that disagrees.
+    #[test]
+    fn what_an_object_held_when_made_is_dropped_by_a_store() {
+        let (harness, _uri) = with_types(
+            "class Story
+end
+",
         );
-        assert!(held.text("file:///big.rb", 3).is_some());
-
-        held.forget_texts();
-        assert_eq!(held.text("file:///big.rb", 3), None);
+        let graph = &harness.analysis.graph;
+        let folds = Folds::of(graph);
+        let story = declared(graph, "Story").expect("a class");
+        let shape = |spelled: &str| {
+            Rc::new(knowledge::Shape {
+                spelled: spelled.to_owned(),
+                reads: std::collections::BTreeMap::new(),
+            })
+        };
+        let made = shape("Story");
+        let shaped = |shape: &Rc<knowledge::Shape>| {
+            let mut typed = Typed::of(story, Derivation::default());
+            typed.shaped = Some(Rc::clone(shape));
+            typed
+        };
+        let kept = |join: Join, values: &[Typed]| {
+            let mut join = join;
+            for value in values {
+                join.add(value.clone(), &folds);
+            }
+            join.nil();
+            join.finish(&folds).and_then(|typed| typed.shaped)
+        };
+        let one = shaped(&made);
+        assert_eq!(
+            kept(Join::default(), &[one.clone(), one.clone()]),
+            Some(Rc::clone(&made))
+        );
+        assert_eq!(kept(Join::of_stores(), std::slice::from_ref(&one)), None);
+        assert_eq!(
+            kept(Join::default(), &[one.clone(), shaped(&shape("Other"))]),
+            None
+        );
+        assert_eq!(
+            kept(
+                Join::default(),
+                &[one.clone(), Typed::of(story, Derivation::default())]
+            ),
+            None
+        );
+        assert_eq!(
+            fold_kept(graph, vec![one.clone()], false).and_then(|typed| typed.shaped),
+            Some(Rc::clone(&made))
+        );
+        assert_eq!(
+            fold_reached(graph, vec![one.clone()], false).and_then(|typed| typed.shaped),
+            None
+        );
+        assert_eq!(
+            fold_reached(graph, vec![one.clone(), one], true).and_then(|typed| typed.shaped),
+            None
+        );
     }
 
     #[test]
@@ -20881,6 +27152,94 @@ end
     }
 
     #[test]
+    fn a_union_holding_bool_is_answered_on_each_half() {
+        // `String | bool` keeps `TrueClass` and `FalseClass` as two classes of the union, spelled
+        // `bool`, so a call runs on each of the three: `to_i` only `String` has, `blank?` each half
+        // answers its own way, `tap` hands back each class. Folding the pair to one carrier here
+        // made every call refuse, as if the union were one class that has nothing.
+        let source = "\
+class Report
+  def run
+    either = Probe.new.sb
+    shown = Probe.new.sb.to_s
+    blank = Probe.new.sb.blank?
+    number = Probe.new.sb.to_i
+    tapped = Probe.new.sb.tap { |held| held }
+    lone = Probe.new.flag.blank?
+  end
+end
+";
+        let (mut harness, uri) = with_rbs(
+            source,
+            "class String\n  def to_i: () -> Integer\n  def to_s: () -> String\n  def blank?: () -> bool\nend\n\
+             class TrueClass\n  def to_s: () -> String\n  def blank?: () -> false\nend\n\
+             class FalseClass\n  def to_s: () -> String\n  def blank?: () -> true\nend\n\
+             class Probe\n  def sb: () -> (String | bool)\n  def flag: () -> bool\nend\n",
+        );
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def run -> bool
+    either: String | bool = Probe.new.sb
+    shown: String = Probe.new.sb.to_s
+    blank: bool = Probe.new.sb.blank?
+    number: Integer = Probe.new.sb.to_i
+    tapped: String | bool = Probe.new.sb.tap { |held| held }
+    lone: bool = Probe.new.flag.blank?"
+        );
+    }
+
+    #[test]
+    fn a_member_only_a_block_writes_on_object_leaves_the_walk_going_to_kernel() {
+        // rubydex files a `def` written in a block on `Object`, where Ruby never puts it. The root
+        // gate refuses that member, and the walk goes on to `Kernel`, as Ruby's does: `Foo` has
+        // `Kernel#freeze`, and a union keeps `Foo` instead of answering for `String` alone.
+        let source = "\
+class Foo
+end
+
+Point = Struct.new(:x) do
+  def freeze
+    super
+  end
+end
+
+class Report
+  def one
+    Foo.new.freeze
+  end
+
+  def either
+    pick = stamped? ? \"x\" : Foo.new
+    pick.freeze
+  end
+end
+
+module Stamp
+  def stamp
+    freeze
+  end
+end
+";
+        let (mut harness, uri) = with_rbs(source, "module Kernel\n  def freeze: () -> self\nend\n");
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            // The `def` in the block keeps its declaring class, as a margin on a `def` does.
+            "  def freeze -> Object
+  def one -> Foo
+  def either -> String | Foo
+  def stamp -> Stamp"
+        );
+        let kernel = jumps(&mut harness, &uri, source, "freeze\n  end\n\n  def either");
+        assert_eq!(kernel.len(), 1, "{kernel:?}");
+        assert!(kernel[0].starts_with("core.rbs:"), "{kernel:?}");
+        // A module's `self` has `Object`'s methods past its own ancestors, so its walk goes on
+        // from `Object`'s.
+        let kernel = jumps(&mut harness, &uri, source, "freeze\n  end\nend\n");
+        assert_eq!(kernel.len(), 1, "{kernel:?}");
+        assert!(kernel[0].starts_with("core.rbs:"), "{kernel:?}");
+    }
+
+    #[test]
     fn a_conditional_read_as_a_value_is_whichever_branch_ran() {
         // A method's own exits already split a tail-position conditional; a conditional *assigned*
         // is one value, whichever branch ran (`Receiver::Either`), joined like exits:
@@ -20955,6 +27314,45 @@ end
     size: Integer | String = (\"a\".length rescue \"none\")
   def begun -> Integer | String
     size: Integer | String = begin"
+        );
+    }
+
+    #[test]
+    fn a_begin_that_rescues_nothing_hands_back_its_last_statement() {
+        // A memo written `@x ||= begin … end` holds the block's last value, a `retry` is no exit,
+        // and a match group is a `String` or `nil`.
+        let source = "\
+class Report
+  def range
+    @range ||= begin
+      from = 1
+      from.to_s
+    end
+  end
+
+  def label
+    range.upcase
+  end
+
+  def fetched
+    \"x\".upcase
+  rescue IOError
+    retry
+  end
+
+  def group(text)
+    text =~ /(a)/
+    $1
+  end
+end
+";
+        let (mut harness, uri) = with_types(source);
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def range -> String
+  def label -> String
+  def fetched -> String
+  def group(text) -> String?"
         );
     }
 
@@ -21055,6 +27453,8 @@ class Report
   def label(value) = value.to_s
   def maybe(value) = value&.to_s
   def sure = Label.new&.to_s
+  def never = nil&.to_s
+  def none = nil&.length
   def shouted(value) = value.to_s.upcase
   def money = Money.new.to_s
   def labelled = Label.new.to_s
@@ -21075,6 +27475,8 @@ end
   def label(value) -> String = value.to_s
   def maybe(value) -> String? = value&.to_s
   def sure -> String = Label.new&.to_s
+  def never -> nil = nil&.to_s
+  def none -> nil = nil&.length
   def shouted(value) -> String = value.to_s.upcase
   def money -> Integer = Money.new.to_s
   def labelled -> String = Label.new.to_s"
@@ -22292,6 +28694,277 @@ end
   validates :name, if: -> { flagged: true = active? }
     saved: true = active?"
         );
+    }
+
+    #[test]
+    fn a_scope_s_lambda_is_what_every_call_of_the_scope_passes() {
+        // A `scope`'s lambda runs with what each call of the scope passes, on the class or on a
+        // relation. A slot a call leaves empty holds its default, a count the lambda does not take
+        // raises and adds nothing, and a splat passes what nothing counts. A `*rest` takes any
+        // count. A scope written twice runs the lambda Ruby read last, and the first is never
+        // run; one written in two files runs whichever file loaded last, so neither is read. A
+        // `proc` body binds as a block does, and an association's lambda is no scope's:
+        // neither is read, nor a lambda beside a call that declares nothing. A class method
+        // called on a relation is the model's, which the relation hands the name to
+        // (`delegated`).
+        let (mut harness, _, _) = models_project("");
+        harness.write("app/models/application_record.rb", CONCERNS);
+        harness.write(
+            "app/models/entry.rb",
+            "class Entry < ApplicationRecord\n  belongs_to :ledger\nend\n",
+        );
+        let reopened = "class Ledger\n  scope :split, ->(a) { here = a }\nend\n";
+        let reopened_uri = harness.write("app/models/ledger/split.rb", reopened);
+        let source = "\
+class Ledger < ApplicationRecord
+  scope :since, ->(day, limit = 10) { kept = day; cap = limit; where(day: day) }
+  scope :twice, ->(a) { first = a }
+  scope :twice, ->(a) { second = a }
+  scope :spread, ->(a, *rest) { head = a }
+  scope :loose, proc { |a| held = a }
+  scope :split, ->(a) { there = a }
+  has_many :entries, ->(owner) { found = owner }
+  validates :name, if: ->(record) { seen = record }
+
+  def self.digest(value)
+    value
+  end
+end
+";
+        let uri = harness.write("app/models/ledger.rb", source);
+        harness.write(
+            "app/models/probe.rb",
+            "class Probe\n  def run(list)\n    Ledger.since(\"x\")\n    Ledger.where(a: 1).since(1, 2.5)\n    \
+             Ledger.since([1], 2, 3)\n    Ledger.since\n    Ledger.since(*list)\n    \
+             Ledger.where(a: 1).digest(\"z\")\n    Ledger.twice(1)\n    Ledger.spread(1, 2, 3)\n    \
+             Ledger.loose(1)\n    Ledger.split(1)\n  end\nend\n",
+        );
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  scope :since, ->(day, limit = 10) { kept: String | Integer = day; cap = limit; \
+             where(day: day) }\n  scope :since, ->(day, limit = 10) { kept = day; \
+             cap: Integer | Float = limit; where(day: day) }\n  \
+             scope :twice, ->(a) { second: Integer = a }\n  \
+             scope :spread, ->(a, *rest) { head: Integer = a }\n  def self.digest(value) -> String"
+        );
+        assert_eq!(
+            drawn_hints(reopened, &harness.hints_in(&reopened_uri)),
+            "null"
+        );
+    }
+
+    #[test]
+    fn a_call_on_a_modules_self_it_lacks_is_each_running_class_s() {
+        // `self` in a module's instance method is an object of a class that runs it. A name the
+        // module lacks is each such class's member, joined; a class without it raises there, and
+        // one that may answer through `method_missing` is not read. A name the module has is still
+        // its own. An object nothing shows (`thing.extend(Loose)`) is left out, so the union is
+        // narrower than Ruby's, never another class's. A hook's `base` is each includer. Where the
+        // `def` runs on something else (`class_methods do`), nothing is said.
+        let source = "\
+module Greeting
+  def greet
+    title
+  end
+
+  def shout
+    loud
+  end
+
+  def own
+    helper
+  end
+
+  def helper
+    1
+  end
+
+  class_methods do
+    def build
+      title
+    end
+  end
+end
+
+class Person
+  include Greeting
+  def title = \"x\"
+  def loud = 1.5
+end
+
+class Robot
+  include Greeting
+  def title = 2
+end
+
+module Loose
+  def loose
+    title
+  end
+end
+
+class Holder
+  include Loose
+  def title = \"x\"
+end
+
+thing = Object.new
+thing.extend(Loose)
+
+module Lonely
+  def lonely
+    title
+  end
+end
+
+module Kit
+  extend self
+  def self.tool = 1
+  def kit
+    tool
+  end
+end
+
+module Tools
+  module_function
+
+  def tidy
+    tool_name
+  end
+
+  def self.tool_name = \"t\"
+end
+
+module Haunt
+  def haunt
+    title
+  end
+end
+
+class Ghost
+  include Haunt
+  def method_missing(*) = nil
+end
+
+class Spook
+  include Haunt
+  def title = \"x\"
+end
+
+module Nested
+  def nested
+    title
+  end
+end
+
+module Wrapper
+  included do
+    include Nested
+  end
+end
+
+module Finder
+  def self.included(base)
+    base.extend(ClassMethods)
+    base.extend(self)
+    base.include(Extra)
+    base.extend(Missing)
+  end
+
+  module ClassMethods
+    def lookup
+      registry
+    end
+  end
+
+  def described
+    label
+  end
+end
+
+class Catalog
+  include Finder
+  def self.registry = [1]
+  def self.label = \"c\"
+  def label = 3
+end
+
+class Shelf < Catalog
+  def self.registry = 2
+end
+
+module Extra
+  def extra
+    label
+  end
+end
+
+class Odd
+  def self.included(base) = base.extend(Extra)
+end
+";
+        let (mut harness, uri) = with_types(source);
+        harness.write(
+            "spec/greeting_spec.rb",
+            "class FakePerson\n  include Greeting\n  def title = [1]\nend\n",
+        );
+        harness.index();
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def greet -> String | Integer\n  def shout -> Float\n  def own -> Integer\n  \
+             def helper -> Integer\n  def title -> String = \"x\"\n  def loud -> Float = 1.5\n  \
+             def title -> Integer = 2\n  def loose -> String\n  def title -> String = \"x\"\n  \
+             def self.tool -> Integer = 1\n  def kit -> Integer\n  def tidy -> String\n  \
+             def self.tool_name -> String = \"t\"\n  def haunt -> String\n  \
+             def method_missing(*) -> nil = nil\n  def title -> String = \"x\"\n    \
+             def lookup -> Array | Integer\n  def described -> Integer | String\n  \
+             def self.registry -> Array[Integer] = [1]\n  def self.label -> String = \"c\"\n  \
+             def label -> Integer = 3\n  def self.registry -> Integer = 2\n  \
+             def extra -> Integer"
+        );
+        assert_eq!(
+            linked(&harness.definition_at(&uri, source, "title\n  end\n\n  def shout")),
+            ["main.rb:26:6", "main.rb:32:6"]
+        );
+    }
+
+    #[test]
+    fn a_gem_s_module_and_too_many_running_classes_say_nothing_of_self() {
+        // A gem's module runs in whatever its gem builds, so its `self` stays the module. Past
+        // `SELF_RUNNERS` running classes, a sanity guard, a call on `self` answers nothing.
+        let gem = "\
+module Shouty
+  module Loud
+    def shout
+      title
+    end
+  end
+end
+";
+        let (dir, elsewhere, env) = project_with_gem(gem);
+        let gem_uri = DocUri::from_path(&elsewhere.path().join("gems/shouty-1.2.3/lib/shouty.rb"))
+            .expect("a gem file's URI");
+        let mut harness = Harness::at_with_env(dir, PositionEncoding::Utf16, env);
+        let mut source = String::from(
+            "class Speaker\n  include Shouty::Loud\n  include Near\n  def title = Speaker.new\nend\n\n\
+             module Near\n  def near\n    title\n  end\nend\n\n\
+             module Wide\n  def wide\n    title\n  end\nend\n",
+        );
+        for index in 0..=SELF_RUNNERS {
+            source.push_str(&format!(
+                "\nclass Wide{index}\n  include Wide\n  def title = Speaker.new\nend\n"
+            ));
+        }
+        let uri = harness.write("app/main.rb", &source);
+        harness.index();
+        harness.index_gems();
+        let at_def = card(&mut harness, &gem_uri, gem, "shout");
+        assert!(!at_def.contains("->"), "{at_def}");
+        let wide = card(&mut harness, &uri, &source, "wide");
+        assert!(!wide.contains("->"), "{wide}");
+        let near = card(&mut harness, &uri, &source, "near");
+        assert!(near.contains("-> Speaker"), "{near}");
     }
 
     #[test]

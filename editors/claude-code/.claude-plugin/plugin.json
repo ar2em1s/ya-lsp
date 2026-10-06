@@ -1,7 +1,7 @@
 {
   "name": "ya-lsp",
   "description": "Ruby language server: definition, implementations, hover, references, type and call hierarchy, rename and completion over a graph the server builds itself — no Ruby runtime.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": { "name": "ar2em1s" },
   "homepage": "https://github.com/ar2em1s/ya-lsp",
   "license": "MIT",

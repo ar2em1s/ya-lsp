@@ -4,6 +4,160 @@ The server, the VS Code extension and the Claude Code plugin ship as one version
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.1.0] — 2026-10-06
+
+### Added
+
+- **A key read off a controller's `params` is what a request can carry.** `params[:id]`,
+  `params.fetch(:page)` (or `fetch(:page, {})`) and `params.dig(:a, :b)` are `String | Integer |
+  Float | bool | Array | ActionController::Parameters | ActionDispatch::Http::UploadedFile`, or
+  `nil`, and `params.require(:post)` the same without `nil`, so `params[:q].strip` is a `String` and
+  `params.require(:post).permit(…)` a `Parameters`. A key the application writes joins what it
+  writes there (`params[:locale] = :en` adds `Symbol`), and so does a route's default
+  (`defaults: { format: :json }`). A write it cannot read, a parser of its own, or `params` handed
+  to a method that writes into what it is given leaves the key, or every key, unanswered, as before;
+  a hash or an array written under a key leaves every read below a key so.
+- **A key read off what `permit` or `expect` hands back is what its filter lets through.** With
+  `def post_params = params.require(:post).permit(:title, tags: [], meta: {})`,
+  `post_params[:title]` is `String | Integer | Float | bool | ActionDispatch::Http::UploadedFile`
+  or `nil`, `post_params[:tags]` an `Array` or `nil`, `post_params[:meta]` a `Parameters` or
+  `nil`; `fetch` drops the `nil` a missing key gives, and `require` every `nil`.
+  `params.expect(post: [:title])` is the `Parameters` itself, read the same way, and
+  `params.expect(tags: [])` an `Array`. Only off the controller's own `params`, by literal keys
+  (`require`, `fetch`, `[]`, `dig`), with a filter written as literals or held in a constant
+  assigned once a frozen list of them (`FIELDS = %i[title body].freeze`, never written again with
+  `+=`), and only while nothing can have written into the value: through the call itself, a `def`
+  that hands it back, and a local never written into, passed on or given a second name. A
+  memoized instance variable, a local passed to a method, a key the filter does not name, a
+  splatted filter (`permit(*FIELDS)`), and a write below the key in the request answer as before.
+- **A route segment every route to the action requires is a `String`.** With `resources :posts`,
+  `params[:id]` in `PostsController#show`, in a `before_action :set_post, only: :show`, and in a
+  private helper only those actions call, is a `String`, so `Post.find(params[:id])` is a `Post`,
+  not a `Post | Array`. A key a route's default gives is that default's class. Any route ya-lsp
+  cannot read that may reach the action, a concern's method, or a method named by a symbol leaves
+  it the request union.
+- **A parameter no signature types is what every call passes it.** `def greet(name)` called with
+  `"x"` in one place and `nil` in another has `name` as a `String?`, so its margin, its card and
+  every read of its body say what it returns, where before only a call's own arguments could.
+  Calls through an `alias` count too, and so do `send(:greet, x)`, `public_send` and `try` with a
+  literal name, and a callback (`before_action :greet` calls it with nothing). Only the
+  application's own methods: a name built for `send`, an override or module that may `super` into
+  it, a Sidekiq worker's `perform` or a channel's action leave it untyped. A call whose argument
+  ya-lsp cannot type, and a name handed to something that may call it with anything
+  (`method(:greet)`, a gem's DSL), are left out, and the parameter's own card says so:
+  `name: String | untyped`. A call on a receiver ya-lsp cannot type is not read, unless no other
+  method has that name. Only the files that name one of the method's classes, or write the body of
+  a class or module above one, are read: a call in a file that names none of them is left out,
+  even where its receiver is one.
+- **More calls count as a parameter's callers.** A method named `call` is what its written calls
+  pass (`service.call(account)`), and its card always says more may come (`| untyped`): Ruby, Rack
+  and `&callable` call it where nothing is written. A job's `perform` is what `perform_later` and
+  `perform_now` pass on its class, also after `set(wait: …)`, and always says more may come, since
+  a scheduler can enqueue it. A mailer's action is what `UserMailer.welcome(user)` and
+  `UserMailer.with(…).welcome(user)` pass. A `scope` lambda's parameters are what each call of the
+  scope passes, on the model or on a relation, and a class method called on a relation counts as
+  called on its model.
+- **An object holds what its own class was built with.** Where `Base#initialize(thing)` writes
+  `@thing = thing` (or `self.thing = thing`), `thing` in `class PostView < Base` is what
+  `PostView.new(…)` and its subclasses' `new` passed, not what every class built on `Base` is
+  given. A class with its own `initialize` passes what its `super` passes (a bare `super`, its own
+  parameters). A gem's `initialize` is read the same way: a serializer's `object` is what the
+  application builds it with (`AccountSerializer.new(account)`). A construction ya-lsp cannot see
+  (a gem building the object itself, a custom `self.new`) is left out, so the type may be narrower
+  than what runs. **A class the application hands to other code has no answer**
+  (`mount_uploader :cover, CoverUploader`, `serializer: AccountSerializer`): that code builds it
+  with what nothing shows, so a `CoverUploader`'s `mounted_as` is no longer `nil`. A class with no
+  `initialize` of its own that the application never builds (a policy only Pundit builds) holds
+  what every class running that `initialize` is built with.
+- **A concern or module calling a method its includers have is typed.** In a module's instance
+  method, `params`, `errors.add(…)` or an association the including classes declare is each
+  including class's answer, joined (`String | Integer` where two includers differ), the jump goes
+  to each class's method, and completion offers their members. Subclasses count, and so does a class object a hook extends
+  (`def self.included(base) = base.extend(ClassMethods)` makes `ClassMethods`' methods run on each
+  includer's class). A name the module has itself is still its own. An object ya-lsp does not see
+  the module mixed into (`obj.extend(M)` at run time) is left out, so the union may be narrower
+  than Ruby's; a `def` inside `class_methods do` and a gem's module are not read this way.
+- **`UserMailer.with(user: u).welcome` is an `ActionMailer::MessageDelivery`**, and
+  `Job.set(wait: 1).perform_later(x)` the job or `false`. In a mailer, `params[:user]` is what each
+  `with(user: …)` passed, or `nil`; a call that hands `with` a hash it does not write out leaves
+  every key unanswered.
+- **A `begin … end` that rescues nothing is its last statement**, so a memo written
+  `@range ||= begin … end` has the type of what the block ends with. A method whose `rescue` ends
+  in `retry` is typed by the body it runs again, and `$1` or `$&` is a `String?`.
+- **A FactoryBot callback's block is handed what the factory builds.** In `factory :user`,
+  `after(:create) { |user| … }` has `user` as a `User`, or a union where a child factory builds
+  another class, and `create(:post)` inside the block is a `Post`. `before(:build)` is handed
+  `nil`. The evaluator stays untyped, and so does a callback ya-lsp cannot read whole: `after(:all)`,
+  a name it builds, a factory only Ruby names below this one, or a block with more than two
+  parameters.
+- **A block parameter a signature types as a union (`Integer | Float`) is that union**, as a
+  union return already was.
+- **An API controller's `params` is the request's, as a `Base` controller's is.**
+  `ActionController::API` includes its modules in a loop ya-lsp did not read, so `params` under it
+  was `Metal`'s and answered nothing; every rule above now applies, and `render`, `redirect_to` and
+  the callbacks are found there too.
+- **`SecureRandom.hex`, `uuid`, `alphanumeric` and the rest of `Random::Formatter` are `String`s.**
+  Ruby's signatures write them on a stand-in module that `Random::Formatter` includes, and the `def`
+  in Ruby's own library was read instead.
+- **ActiveSupport's `String#blank?` is a `bool`, `parameterize` a `String` and `Array.wrap` an
+  `Array`.** A record's `changes` is a `HashWithIndifferentAccess`, and `previous_changes` and
+  `saved_changes` are that or, before any save, an empty `Hash`.
+- **A local, a block parameter and a method parameter have a hover card**: `name: String`, at its
+  assignment, a read, or the `def` line.
+- **A method's card writes each parameter's type before it**:
+  `Greeter#greet(String | untyped name, Integer times = 2) -> String`.
+
+### Changed
+
+- **Completion no longer waits for inlay hints while you type.** VS Code asks for hints again after
+  nearly every keystroke, and each ask first brought the index up to date with the edit, so the
+  next keystroke's completion queued behind it. A hint request now waits until typing pauses for
+  half a second and is answered right after the update that pause brings anyway; the hints already
+  on screen stay there meanwhile. On four mid-size reference apps the median completion while
+  typing went from 30–120 ms back to 4–6 ms, what it is with hints off. New hints show about half a
+  second after typing stops.
+- **Hints after an edit come back sooner on a large app.** Each edit re-checked which routes prove
+  a request's keys by parsing again every file a routes file's helper methods are written in, and
+  every project file's methods; both are now read again only where a file changed. And the index
+  of every method call is built when the project finishes loading, not by the first hint or hover
+  that reads a method's callers.
+- **A long session on a large app holds about 160 MB less**, for 5–10% more time answering:
+  1.17 GB after 29,000 requests on the largest reference app, was 1.33. What files are read into
+  between requests is kept for at most 8 MB of their text, was 64, and closed files' text for at
+  most 16 MB, was 64. Hints over the busiest files of the five smaller reference apps take the same
+  time as before.
+
+### Fixed
+
+- **Editing only a routes file's helper method, or a module a controller includes, updates what a
+  request's keys are typed as.** The routes are read again at the next check after the edit, not
+  after some later edit to another file.
+- **A `scope` written twice in one class is the second one**, as in Rails: its return was read
+  from the first lambda, and a jump went to the first line.
+- **A factory whose `parent:` is not written as a literal no longer builds its own name's class.**
+  `factory :admin, parent: base` made `create(:admin)` an `Admin`, where FactoryBot builds the
+  parent's class; ya-lsp now says nothing there.
+- **`x&.to_s` on a value that is only `nil` is `nil`**, not `String`: `&.` skips the call there.
+- **A value that can be `true`, `false` or something else answers its calls.** `String | bool`
+  answered nothing for `to_s`, `to_i` or `blank?`; each call now runs on every class of the value,
+  so `to_i` is an `Integer` (only `String` has it) and `blank?` a `bool`.
+- **A method written inside a block in some gem no longer hides `Kernel`'s.** One `def freeze`
+  inside a `Struct.new do … end` anywhere in the bundle made `Foo.new.freeze` a guess, and a value
+  that could be a `Foo` or a `String` answer `String` alone. The lookup now goes on to `Kernel`, as
+  Ruby's does.
+- **`f(1, **opts)` no longer says the next parameter is a `Hash`.** An empty `opts` passes nothing,
+  so that parameter may hold its default; it is now left untyped at that call. The parameters
+  before a `*rest` or `...` are now typed by what the call passes, as Ruby places them by position.
+- **A gem added or installed while the server runs is indexed without a restart.** The bundle was
+  found once, at startup, so after `bundle add` or `bundle install` the new gems had no hover,
+  jumps, completion or inlay hints until a restart. A change to `Gemfile.lock` (or `gems.locked`,
+  or the lockfile beside `BUNDLE_GEMFILE`) now re-indexes the project when it changed what the
+  bundle is: a gem locked, removed, installed or moved, another Ruby, or RSpec, i18n or Rails
+  support turned on or off by `auto`. A lockfile written again with the same bundle, as every
+  `bundle install` does, re-indexes nothing.
+
 ## [1.0.0] — 2026-09-30
 
 ### Added
@@ -1698,7 +1852,8 @@ name wherever the receiver cannot be named.
   ya-lsp can be confidently wrong rather than merely absent.
 - **A Ruby file outside every workspace folder gets no server**, because there is no root to index.
 
-[Unreleased]: https://github.com/ar2em1s/ya-lsp/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/ar2em1s/ya-lsp/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v1.1.0
 [1.0.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v1.0.0
 [0.6.0]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.6.0
 [0.5.1]: https://github.com/ar2em1s/ya-lsp/releases/tag/v0.5.1

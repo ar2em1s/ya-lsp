@@ -454,6 +454,31 @@ impl Synthesized {
             .collect()
     }
 
+    /// Every declaration `source` implied whose place's whole construct holds `offset`: the
+    /// generated document, the declaration's span in it, and where the construct starts. The way
+    /// back from a lambda to the `scope` call that declared a member from it.
+    #[must_use]
+    pub fn generated_around(&self, source: &str, offset: u32) -> Vec<(UriId, (u32, u32), u32)> {
+        self.sources
+            .get(&UriId::from(source))
+            .into_iter()
+            .flatten()
+            .filter_map(|uri| {
+                let id = UriId::from(uri.as_str());
+                Some((id, self.documents.get(&id)?))
+            })
+            .flat_map(|(id, generated)| {
+                generated
+                    .mappings
+                    .iter()
+                    .filter(|mapping| {
+                        mapping.declared.full.0 <= offset && offset < mapping.declared.full.1
+                    })
+                    .map(move |mapping| (id, mapping.generated, mapping.declared.full.0))
+            })
+            .collect()
+    }
+
     /// Every generated document that wrote a member whose place is a name, and those names.
     ///
     /// The read half of the two-step: a generator states the names while the graph is empty, and

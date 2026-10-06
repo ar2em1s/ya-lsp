@@ -32,7 +32,7 @@
 //! In a view or helper, `render x` with an object renders the object's partial
 //! (`to_partial_path`), never a template.
 //!
-//! # What a call hands the partial (backlog 56)
+//! # What a call hands the partial
 //!
 //! Each call also says which locals it passes ([`Locals`]): the keys of `render "x", k: v` and of
 //! `locals: { k: v }`, the object of `object:` and the elements of `collection:` under `as:` or
@@ -52,7 +52,7 @@ use super::syntax::{keyword, symbol_or_string};
 pub const RENDER_CALLS: [&str; 5] = ["render", "render_to_string", "mail", "partial!", "array!"];
 
 /// The local jbuilder's template handler defines, and the class it holds: `json`, a
-/// `JbuilderTemplate` (backlog 57). Its `partial!`, `array!` and any key written with `partial:`
+/// `JbuilderTemplate`. Its `partial!`, `array!` and any key written with `partial:`
 /// render a jbuilder partial.
 pub const JBUILDER: (&str, &str) = ("json", "JbuilderTemplate");
 
@@ -68,14 +68,14 @@ pub struct Render {
     /// A receiver is written: the call renders on another object, with variables no class here
     /// writes.
     pub elsewhere: bool,
-    /// What it hands the partial it renders as locals (backlog 56).
+    /// What it hands the partial it renders as locals.
     pub locals: Locals,
-    /// Written on jbuilder's `json` (backlog 57): a JSON lookup, which finds jbuilder partials
+    /// Written on jbuilder's `json`: a JSON lookup, which finds jbuilder partials
     /// alone.
     pub json: bool,
 }
 
-/// The locals a render call hands a partial (backlog 56).
+/// The locals a render call hands a partial.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Locals {
     /// Each local the call names, with what it holds. Empty for a call that passes none.
@@ -131,7 +131,7 @@ pub enum Value {
     /// `_iteration` beside a collection: an `ActionView::PartialIteration`.
     Iteration,
     /// The expression written at this span, or one element where it is a collection (it answers
-    /// `to_ary`): what jbuilder hands a partial under `as:` (backlog 57).
+    /// `to_ary`): what jbuilder hands a partial under `as:`.
     Either((u32, u32)),
 }
 
@@ -463,7 +463,7 @@ fn on_json(node: &CallNode<'_>) -> bool {
     })
 }
 
-/// What a call on `json` renders and the locals it passes (backlog 57), as `JbuilderTemplate`
+/// What a call on `json` renders and the locals it passes, as `JbuilderTemplate`
 /// does:
 ///
 /// - `json.partial! "x", k: v`: every option but `partial:`, `as:`, `collection:` and `cached:`
@@ -758,7 +758,7 @@ fn literal_class(value: &Node<'_>) -> Default {
     })
 }
 
-/// The partial a record of `class` renders as (`to_partial_path`, backlog 56): `Admin::Post` is
+/// The partial a record of `class` renders as (`to_partial_path`): `Admin::Post` is
 /// `admin/posts/post`, `ActiveModel::Name`'s collection and element. `None` where the name does
 /// not inflect.
 #[must_use]
@@ -1009,7 +1009,7 @@ end
         )
     }
 
-    /// Backlog 56: what each shape of call hands a partial as its locals.
+    /// What each shape of call hands a partial as its locals.
     #[test]
     fn a_render_call_says_which_locals_it_passes() {
         let source = "\
@@ -1091,7 +1091,7 @@ render(**args)
         );
     }
 
-    /// Backlog 57: jbuilder's calls on `json`, read as `JbuilderTemplate` reads its options.
+    /// Jbuilder's calls on `json`, read as `JbuilderTemplate` reads its options.
     #[test]
     fn a_jbuilder_call_says_which_locals_it_passes() {
         let source = "\

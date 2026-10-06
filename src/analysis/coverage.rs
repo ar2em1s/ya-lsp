@@ -1,6 +1,6 @@
 //! `ya-lsp coverage`: what share of the calls a project's own code makes ya-lsp can type.
 //!
-//! **The question is the typing probe's** (`tmp/bench/callsites.py`), asked in process: at a call,
+//! **The question is the one a hover asks**, asked in process: at a call,
 //! what [`cursor::type_of`] → [`types::method_receiver`] says it returns, the reader the margin
 //! uses for `x = call`. A call is *typed* where the answer is Resolved or Derived and can be
 //! spelled, which is where that margin would draw a label; a guess, an unnameable type and no
@@ -67,15 +67,36 @@ pub struct Coverage {
     pub typed: usize,
     /// Calls sampled.
     pub asked: usize,
+    /// Sampled calls that reach a framework's macro, whose value nothing reads after all
+    /// ([`types::discarded`]): out of the share.
+    pub discarded: usize,
     /// Calls the sample was drawn from.
     pub calls: usize,
 }
 
 impl Coverage {
+    /// The sampled calls the share is of: those whose value is read.
+    #[must_use]
+    pub fn counted(self) -> usize {
+        self.asked - self.discarded
+    }
+
+    /// The calls the share stands for: the population less the macro calls the sample found, in
+    /// proportion (all of them where every call was asked).
+    #[must_use]
+    pub fn standing(self) -> usize {
+        if self.asked == 0 {
+            return self.calls;
+        }
+        let kept = self.counted() as f64 / self.asked as f64;
+        (self.calls as f64 * kept).round() as usize
+    }
+
     /// The sampled share typed, in percent. `None` where there was nothing to ask.
     #[must_use]
     pub fn percent(self) -> Option<f64> {
-        (self.asked > 0).then(|| 100.0 * self.typed as f64 / self.asked as f64)
+        let counted = self.counted();
+        (counted > 0).then(|| 100.0 * self.typed as f64 / counted as f64)
     }
 
     /// Half the 95% interval around [`Self::percent`], in points. `None` where every call was
@@ -87,11 +108,11 @@ impl Coverage {
     ///   calls leaves less unknown, and one that is all of them leaves nothing.
     #[must_use]
     pub fn margin(self) -> Option<f64> {
-        if self.asked == 0 || self.asked >= self.calls {
+        if self.counted() == 0 || self.asked >= self.calls {
             return None;
         }
-        let asked = self.asked as f64;
-        let calls = self.calls as f64;
+        let asked = self.counted() as f64;
+        let calls = self.standing() as f64;
         let share = (self.typed as f64 + 2.0) / (asked + 4.0);
         let finite = ((calls - asked) / (calls - 1.0)).sqrt();
         Some(100.0 * Z * (share * (1.0 - share) / (asked + 4.0)).sqrt() * finite)
@@ -180,12 +201,12 @@ fn command_with(
     let result = match coverage.margin() {
         Some(margin) => format!(
             "Type coverage: {percent:.1}% ± {margin:.1}% ({} of {} sampled)",
-            grouped(coverage.asked),
-            counted(coverage.calls, "call")
+            grouped(coverage.counted()),
+            counted(coverage.standing(), "call")
         ),
         None => format!(
             "Type coverage: {percent:.1}% (all {})",
-            counted(coverage.calls, "call")
+            counted(coverage.standing(), "call")
         ),
     };
     let _ = writeln!(out, "{result}");
@@ -366,44 +387,55 @@ impl Analysis {
         let sample = sample(calls.len(), size, SEED);
         let total = sample.len();
         let mut typed = 0;
+        let mut discarded = 0;
         let mut done = 0;
         say(Step::Checked { done, total });
         // Grouped by file (the draw is sorted and the calls are in file order), so each text is
         // read and parsed once.
         for chunk in sample.chunk_by(|a, b| calls[*a].0 == calls[*b].0) {
             let uri = &files[calls[chunk[0]].0];
-            typed += self
+            let counted = self
                 .with_text(uri, |text| {
                     let parsed = cursor::Parsed::new(text.text());
                     let rebase = self.rebase_for(uri, text.text());
                     chunk
                         .iter()
-                        .filter(|index| self.typed_at(uri, &parsed, &rebase, calls[**index].1))
-                        .count()
+                        .map(|index| self.counted_at(uri, &parsed, &rebase, calls[*index].1))
+                        .collect::<Vec<Counted>>()
                 })
-                .unwrap_or(0);
+                .unwrap_or_default();
+            typed += counted.iter().filter(|one| **one == Counted::Typed).count();
+            discarded += counted
+                .iter()
+                .filter(|one| **one == Counted::Discarded)
+                .count();
             done += chunk.len();
             say(Step::Checked { done, total });
         }
         Coverage {
             typed,
             asked: total,
+            discarded,
             calls: calls.len(),
         }
     }
 
-    /// Whether the call whose message starts at `offset` is typed: the probe's question, one call
-    /// at a time with a fresh memo, as a request would ask it.
+    /// What the call whose message starts at `offset` counts as: the probe's question, one call at
+    /// a time with a fresh memo, as a request would ask it.
     ///
-    /// **A panic is a call not typed**, contained here as `Analysis::serve` contains a request's:
-    /// one call rubydex cannot answer must not cost the run.
-    fn typed_at(
+    /// - **Ruby's own `raise` and `fail` are typed**, as `bot`: they never return, which is all
+    ///   there is to say of them, and their method's `!` says it ([`cursor::never_returns`]).
+    /// - **A framework's macro is no used call** ([`types::discarded`]): its value is read by
+    ///   nobody, wherever Ruby would hand it on.
+    /// - **A panic is a call not typed**, contained here as `Analysis::serve` contains a request's:
+    ///   one call rubydex cannot answer must not cost the run.
+    fn counted_at(
         &self,
         uri: &DocUri,
         parsed: &cursor::Parsed<'_>,
         rebase: &super::position::Rebase,
         offset: u32,
-    ) -> bool {
+    ) -> Counted {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let read = |uri: &str| self.read_of(uri);
             let memo = types::Memo::new(&read, &self.exits);
@@ -412,21 +444,39 @@ impl Analysis {
             let at = rebase.to_graph(offset)?;
             let (_, _, receiver) = cursor::type_of(parsed, offset)?;
             let receiver = receiver.rebased(rebase)?;
+            if cursor::never_returns(&receiver) {
+                return Some(Counted::Typed);
+            }
             let scope = types::Scope::at(sources.graph, uri_id, at);
+            if types::discarded(&sources, uri_id, &receiver, &scope) {
+                return Some(Counted::Discarded);
+            }
             let typed = types::method_receiver(&sources, uri_id, &receiver, &scope)?;
             let sure = matches!(
                 typed.derivation.tier(),
                 types::Tier::Resolved | types::Tier::Derived
             );
-            Some(
-                sure && render::typed(sources.graph, &typed)
-                    .is_some_and(|spelled| !spelled.is_empty()),
-            )
+            let typed_here = sure
+                && render::typed(sources.graph, &typed).is_some_and(|spelled| !spelled.is_empty());
+            Some(if typed_here {
+                Counted::Typed
+            } else {
+                Counted::Untyped
+            })
         }))
         .ok()
         .flatten()
-        .unwrap_or(false)
+        .unwrap_or(Counted::Untyped)
     }
+}
+
+/// What one sampled call counts as ([`Analysis::counted_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Counted {
+    Typed,
+    Untyped,
+    /// A framework's macro, whose value nothing reads: out of the share.
+    Discarded,
 }
 
 /// `size` indices out of `0..population`, drawn uniformly without replacement and sorted: every
@@ -948,6 +998,7 @@ end
         let near_half = Coverage {
             typed: 956,
             asked: 2_000,
+            discarded: 0,
             calls: 27_855,
         };
         assert_eq!(format!("{:.1}", near_half.percent().unwrap()), "47.8");
@@ -956,6 +1007,7 @@ end
         let most = Coverage {
             typed: 956,
             asked: 2_000,
+            discarded: 0,
             calls: 2_500,
         };
         assert!(most.margin().unwrap() < near_half.margin().unwrap() / 2.0);
@@ -963,12 +1015,14 @@ end
         let all = Coverage {
             typed: 2_000,
             asked: 2_000,
+            discarded: 0,
             calls: 27_855,
         };
         assert!(all.margin().unwrap() > 0.0);
         let census = Coverage {
             typed: 3,
             asked: 4,
+            discarded: 0,
             calls: 4,
         };
         assert_eq!(census.percent(), Some(75.0));
@@ -976,10 +1030,32 @@ end
         let nothing = Coverage {
             typed: 0,
             asked: 0,
+            discarded: 0,
             calls: 0,
         };
         assert_eq!(nothing.percent(), None);
         assert_eq!(nothing.margin(), None);
+        assert_eq!(nothing.standing(), 0);
+        // A macro call the sample found is out of the share, and out of the calls in proportion.
+        let macros = Coverage {
+            typed: 956,
+            asked: 2_000,
+            discarded: 400,
+            calls: 27_855,
+        };
+        assert_eq!(macros.counted(), 1_600);
+        assert_eq!(macros.standing(), 22_284);
+        assert_eq!(format!("{:.1}", macros.percent().unwrap()), "59.8");
+        assert!(macros.margin().unwrap() > near_half.margin().unwrap());
+        // Every sampled call a macro's: nothing to say.
+        let only_macros = Coverage {
+            typed: 0,
+            asked: 4,
+            discarded: 4,
+            calls: 4,
+        };
+        assert_eq!(only_macros.percent(), None);
+        assert_eq!(only_macros.margin(), None);
     }
 
     #[test]
@@ -1104,6 +1180,61 @@ end
         ] {
             assert!(lines.contains(&said), "{said}: {err}");
         }
+    }
+
+    #[test]
+    fn a_raise_is_typed_and_a_macro_s_value_is_no_used_call() {
+        let (dir, _elsewhere, env) =
+            crate::analysis::testing::project_with_gem_file("lib/shouty.rb", "class Shouty\nend\n");
+        let root = dir.path();
+        let write = |relative: &str, source: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        };
+        write(
+            "ya-lsp.toml",
+            "[gems]\ndefault_gems = false\n\n[rbs]\nenabled = false\n",
+        );
+        write(
+            "lib/story.rb",
+            "\
+module ActiveRecord
+  class Base
+    def self.belongs_to(name)
+      name
+    end
+  end
+end
+
+class Story < ActiveRecord::Base
+  def self.relate
+    belongs_to(:author)
+  end
+
+  def check
+    raise(\"no\")
+  end
+
+  def copy
+    Story.new
+  end
+
+  def broken
+    Story.new.nothing
+  end
+end
+",
+        );
+        let (out, err, measured) = command_at(root, false, env, SAMPLE);
+        assert!(measured, "{err}");
+        // `belongs_to` is Rails' macro, which nothing reads; `raise` never returns, each `new` is a
+        // `Story`, and a `Story` has no `nothing`.
+        assert!(
+            err.lines().any(|line| line == "Found 5 calls in 1 file."),
+            "{err}"
+        );
+        assert_eq!(out, "Type coverage: 75.0% (all 4 calls)\n");
     }
 
     #[test]

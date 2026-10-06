@@ -53,6 +53,11 @@ that have it.
   `types::rebound_self`): an example group, a concern's `included do`, a `[self: T]` block. Each
   class is one more `Expression` receiver beside the lexical one, since hover asks it first
   (`locator::rebound_call`) and falls back to the lexical answer.
+- **So is each class that runs a module's instance method** (`completion::running`,
+  `types::running_self`), at a bare word and after `self.`: hover answers a name the module lacks
+  from them (`types::self_runners`). Where no block rebinds `self` and the `def` is not written in
+  a block. Past `MAX_UNION_CLASSES`, only the ones no other of them is above: every subclass has
+  their members, so a concern on a base class with a hundred subclasses lists the base's.
 
 ## What `self` is
 

@@ -190,8 +190,8 @@ fn worth_saying(was: &Receiver) -> bool {
         // wrap `cursor::bindings_in` applies would read as "not worth saying", and every
         // destructured target would go unlabelled, including those the tuple table answers.
         Receiver::Destructured { of, .. } => worth_saying(of),
-        // One side of `block_given?`, worth what it holds.
-        Receiver::BlockGiven { value, .. } => worth_saying(value),
+        // One side of `block_given?`, and an assignment's value, worth what each holds.
+        Receiver::BlockGiven { value, .. } | Receiver::Stored(value) => worth_saying(value),
         // `lambda { }` and `proc { }` are calls, worth what a call is: nothing on the line says
         // `Kernel#lambda` makes a `Proc`, and a class may define its own `proc`.
         Receiver::Proc {
@@ -642,7 +642,10 @@ end
 
         // The card says what the margin says, and so does a call's.
         let card = card(&mut harness, &uri, source, "maybe(1)");
-        assert!(card.contains("Gate#maybe(x) -> String?!"), "{card}");
+        assert!(
+            card.contains("Gate#maybe(Integer | untyped x) -> String?!"),
+            "{card}"
+        );
         let signed = harness.hover_at(&uri, source, "either(x)");
         let signed = signed["contents"]["value"].as_str().unwrap_or_default();
         assert!(signed.contains("-> String!"), "{signed}");
@@ -1230,6 +1233,68 @@ end
   def on_the_singleton -> String
   def of_a_body -> String
   def of_an_inherited_body -> Integer"
+        );
+    }
+
+    #[test]
+    fn a_ruby_def_answers_what_rbs_writes_for_it_on_a_stand_in() {
+        // `SecureRandom.hex` written out: Ruby's `random/formatter.rb` writes `def hex` on
+        // `Random::Formatter`, and RBS writes its signature on `RBS::Unnamed::Random_Formatter`,
+        // which `module Random::Formatter` includes. The `def` is found first and its body types
+        // nothing, so the stand-in's row is the `def`'s own, on either side of what mixes it in,
+        // and under a Ruby alias of it.
+        //
+        // `through_a_module` is the refusal: `Thing` reaches the stand-in only through `Fmt`, so
+        // its own `def hex` may be a different method. `its_own_row` keeps the signature `Fmt`
+        // writes itself, and a stand-in declared nowhere, or a constant on one, adds nothing.
+        let source = "class Reader
+  def hexed
+    Rng.hex
+  end
+
+  def aliased
+    Rng.uuid_v4
+  end
+
+  def on_the_class_object
+    Maker.hex
+  end
+
+  def through_a_module
+    Thing.new.hex
+  end
+
+  def its_own_row
+    Rng.base
+  end
+end
+";
+        let (mut harness, uri) = with_declared_types(
+            source,
+            "module RBS\n  module Unnamed\n    module Stand_In\n      VERSION: String\n      \
+             def hex: (?Integer? n) -> String\n      def uuid: () -> String\n      \
+             def base: () -> String\n    end\n  end\nend\n\
+             module Fmt\n  include RBS::Unnamed::Stand_In\n  def base: () -> Integer\nend\n\
+             module Maker\n  extend RBS::Unnamed::Stand_In\nend\n\
+             module Lost\n  include RBS::Unnamed::Nowhere\nend\n",
+        );
+        harness.write(
+            "app/fmt.rb",
+            "module Fmt\n  def hex(n = nil)\n    gen(n).unpack1(\"H*\")\n  end\n\n  \
+             def uuid\n    gen(16).unpack1(\"H*\")\n  end\n  alias uuid_v4 uuid\n\n  \
+             def base\n    gen(1)\n  end\nend\n\n\
+             module Rng\n  extend Fmt\nend\n\n\
+             module Maker\n  def self.hex(n = nil)\n    gen(n)\n  end\nend\n\n\
+             class Thing\n  include Fmt\n\n  def hex\n    gen(1)\n  end\nend\n",
+        );
+        harness.index();
+
+        assert_eq!(
+            drawn_hints(source, &harness.hints_in(&uri)),
+            "  def hexed -> String
+  def aliased -> String
+  def on_the_class_object -> String
+  def its_own_row -> Integer"
         );
     }
 
@@ -2058,11 +2123,15 @@ end
     if (found: Integer? = [1].first)
       a: Integer = found
       a: Integer? = value
-  def parse(value) -> String | Integer
+  def parse(value) -> String
+  def pick(record) -> String
   def dead_ends -> String
   def dead_branch -> String
+  def keys_of(object) -> Integer
   def dead_else -> Integer
+  def extract(content) -> String
   def dead_write -> String
+  def forwarding(target, ...) -> Integer
   def forwarded -> Integer"
         );
     }

@@ -90,6 +90,19 @@ pub struct Indexed {
     /// Every call of a method, by the name it is called by: filled one name at a time, as asked.
     /// See [`Self::calls_named`].
     calls: std::cell::RefCell<HashMap<StringId, Rc<[Call]>>>,
+    /// Every call of every method, by name, once [`Self::calls_named`] has scanned for enough
+    /// names that one pass over the call index is cheaper than another scan.
+    ///
+    /// **The one index a write does not drop.** It is checked against each document's content hash
+    /// on the next question instead, and only the documents that changed are read again: an edit
+    /// to one file re-indexes that file, and a pass over the whole call index per keystroke was
+    /// most of what reading callers cost after an edit.
+    every_call: std::cell::RefCell<Option<CallIndex>>,
+    /// Whether [`Self::every_call`] was checked against the graph since the last write.
+    every_call_checked: std::cell::Cell<bool>,
+    /// What every caller passes each parameter, held while the graph and the
+    /// buffers stay as they were ([`types::Callers`]).
+    pub(super) callers: types::Callers,
     /// Every class a view can run on. Lazy for [`Self::members`]' reason. See [`Self::renderers`].
     renderers: OnceCell<Rc<[DeclarationId]>>,
     /// Each of those and the layouts its views are rendered in. See [`Self::layouts`].
@@ -103,6 +116,120 @@ pub struct Indexed {
     /// What the fences read off each document's path: filled one document at a time, as asked.
     /// See [`Self::paths`].
     paths: environment::HeldPaths,
+}
+
+/// How many names [`Indexed::calls_named`] scans for one at a time before it indexes every call.
+const EVERY_CALL_AFTER: usize = 2;
+
+/// [`Indexed::every_call`]: every call by name, and what each document added, by the content it
+/// was read from.
+#[derive(Default)]
+struct CallIndex {
+    by_name: HashMap<StringId, Rc<[Call]>>,
+    /// Each document's content hash and the names it calls.
+    documents: HashMap<UriId, (u64, Box<[StringId]>)>,
+}
+
+impl CallIndex {
+    fn named(&self, name: StringId) -> Rc<[Call]> {
+        self.by_name
+            .get(&name)
+            .map_or_else(|| Rc::from([]), Rc::clone)
+    }
+
+    /// Read again every document whose content changed, appeared or went away since the last
+    /// check, and nothing else.
+    fn catch_up(&mut self, graph: &Graph) {
+        // The first build reads rubydex's call index straight through, one pass, rather than one
+        // lookup per reference a document lists.
+        if self.documents.is_empty() {
+            let mut every: HashMap<StringId, Vec<Call>> = HashMap::new();
+            let mut named: HashMap<UriId, Vec<StringId>> = HashMap::new();
+            for reference in graph.method_references().values() {
+                let name = *reference.str();
+                every.entry(name).or_default().push((
+                    reference.uri_id(),
+                    reference.offset().start(),
+                    reference.offset().end(),
+                ));
+                named.entry(reference.uri_id()).or_default().push(name);
+            }
+            self.by_name = every
+                .into_iter()
+                .map(|(name, mut calls)| {
+                    calls.sort_unstable();
+                    (name, Rc::from(calls))
+                })
+                .collect();
+            for (id, document) in graph.documents() {
+                let mut names = named.remove(id).unwrap_or_default();
+                names.sort_unstable();
+                names.dedup();
+                self.documents
+                    .insert(*id, (document.content_hash(), names.into_boxed_slice()));
+            }
+            return;
+        }
+        let mut gone: std::collections::HashSet<UriId> = std::collections::HashSet::new();
+        let mut added: HashMap<StringId, Vec<Call>> = HashMap::new();
+        let mut touched: std::collections::HashSet<StringId> = std::collections::HashSet::new();
+        let present: std::collections::HashSet<UriId> = graph.documents().keys().copied().collect();
+        self.documents.retain(|id, (_, names)| {
+            if present.contains(id) {
+                return true;
+            }
+            gone.insert(*id);
+            touched.extend(names.iter().copied());
+            false
+        });
+        for (id, document) in graph.documents() {
+            let hash = document.content_hash();
+            if let Some((held, names)) = self.documents.get(id) {
+                if *held == hash {
+                    continue;
+                }
+                gone.insert(*id);
+                touched.extend(names.iter().copied());
+            }
+            let mut names: Vec<StringId> = Vec::new();
+            for reference in document
+                .method_references()
+                .iter()
+                .filter_map(|reference| graph.method_references().get(reference))
+            {
+                let name = *reference.str();
+                names.push(name);
+                touched.insert(name);
+                added.entry(name).or_default().push((
+                    reference.uri_id(),
+                    reference.offset().start(),
+                    reference.offset().end(),
+                ));
+            }
+            names.sort_unstable();
+            names.dedup();
+            self.documents.insert(*id, (hash, names.into_boxed_slice()));
+        }
+        for name in touched {
+            let mut calls: Vec<Call> = self
+                .by_name
+                .get(&name)
+                .map(|held| {
+                    held.iter()
+                        .filter(|(document, _, _)| !gone.contains(document))
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default();
+            calls.extend(added.remove(&name).unwrap_or_default());
+            if calls.is_empty() {
+                self.by_name.remove(&name);
+            } else {
+                calls.sort_unstable();
+                self.by_name.insert(name, Rc::from(calls));
+            }
+        }
+    }
 }
 
 /// One call site: its document and the span rubydex filed it under.
@@ -133,6 +260,9 @@ impl Default for Indexed {
             cycles: OnceCell::new(),
             reflective: OnceCell::new(),
             calls: std::cell::RefCell::default(),
+            every_call: std::cell::RefCell::default(),
+            every_call_checked: std::cell::Cell::new(false),
+            callers: types::Callers::default(),
             renderers: OnceCell::new(),
             layouts: OnceCell::new(),
             spans: std::cell::RefCell::default(),
@@ -233,6 +363,8 @@ impl Indexed {
         self.cycles.take();
         self.reflective.take();
         self.calls.get_mut().clear();
+        self.every_call_checked.set(false);
+        self.callers.forget();
         self.renderers.take();
         self.layouts.take();
         self.spans.get_mut().clear();
@@ -322,6 +454,21 @@ impl Indexed {
         })
     }
 
+    /// Build [`Self::every_call`] now, at the end of startup ([`Analysis::generate`]), so the first
+    /// request that reads a method's callers does not: one pass over every call, 45–170 ms over
+    /// the six reference corpora, that a hint or a hover would otherwise wait for. Caught up, not
+    /// rebuilt, where it is held already.
+    ///
+    /// [`Analysis::generate`]: super::Analysis
+    pub fn index_every_call(&self) {
+        let mut every = self.every_call.borrow_mut();
+        let index = every.get_or_insert_with(CallIndex::default);
+        if !self.every_call_checked.get() {
+            index.catch_up(&self.graph);
+            self.every_call_checked.set(true);
+        }
+    }
+
     /// Every call of a method named `name`, sorted, whatever it is called on.
     ///
     /// A scan of rubydex's whole call index, so each name is scanned once per graph, not once per
@@ -330,6 +477,20 @@ impl Indexed {
         let wanted = StringId::from(name);
         if let Some(held) = self.calls.borrow().get(&wanted) {
             return Rc::clone(held);
+        }
+        // **Past a handful of names, one pass for all of them.** Each scan walks the whole call
+        // index; a reader asking for the callers of every parameter in a file asks for hundreds.
+        let held = self.every_call.borrow().is_some();
+        if held || self.calls.borrow().len() >= EVERY_CALL_AFTER {
+            let mut every = self.every_call.borrow_mut();
+            let index = every.get_or_insert_with(CallIndex::default);
+            if !held || !self.every_call_checked.get() {
+                index.catch_up(&self.graph);
+                self.every_call_checked.set(true);
+            }
+            let calls = index.named(wanted);
+            self.calls.borrow_mut().insert(wanted, Rc::clone(&calls));
+            return calls;
         }
         let mut calls: Vec<Call> = self
             .graph
@@ -1250,6 +1411,103 @@ mod tests {
             assert_eq!(&*own.directory, directory);
             assert_eq!(own.unloadable, unloadable, "{}", own.directory);
         }
+    }
+
+    /// Past [`EVERY_CALL_AFTER`] names the calls come from one index of every call, caught up by
+    /// content hash after each write. Whatever was built, edited, added or deleted, it answers
+    /// what a scan of the graph answers.
+    #[test]
+    fn the_call_index_answers_what_a_scan_answers_across_writes() {
+        let scanned = |indexed: &Indexed, name: &str| -> Vec<super::Call> {
+            let wanted = rubydex::model::ids::StringId::from(name);
+            let mut calls: Vec<super::Call> = indexed
+                .graph
+                .method_references()
+                .values()
+                .filter(|reference| *reference.str() == wanted)
+                .map(|reference| {
+                    (
+                        reference.uri_id(),
+                        reference.offset().start(),
+                        reference.offset().end(),
+                    )
+                })
+                .collect();
+            calls.sort_unstable();
+            calls
+        };
+        let names: Vec<String> = (0..=super::EVERY_CALL_AFTER)
+            .map(|n| format!("m{n}"))
+            .collect();
+        let index = |indexed: &mut Indexed, uri: &str, source: &str| {
+            assert!(indexer::index_source(
+                indexed.graph_mut(),
+                uri,
+                source,
+                &LanguageId::Ruby,
+            ));
+        };
+        let every = |indexed: &Indexed| {
+            for name in names.iter().map(String::as_str).chain(["shared", "gone"]) {
+                assert_eq!(
+                    indexed.calls_named(name).to_vec(),
+                    scanned(indexed, name),
+                    "{name}"
+                );
+            }
+        };
+
+        let mut indexed = Indexed::default();
+        let all: String = names.iter().map(|name| format!("x.{name}\n")).collect();
+        index(
+            &mut indexed,
+            "file:///p/a.rb",
+            &format!("{all}x.shared\nx.gone\n"),
+        );
+        index(&mut indexed, "file:///p/b.rb", "x.shared\ny.shared(1)\n");
+        // The first names are scanned one at a time; the one past them builds the index.
+        every(&indexed);
+        assert!(indexed.every_call.borrow().is_some());
+
+        // An edit, a new document and a deleted one, each read again alone.
+        index(&mut indexed, "file:///p/a.rb", &format!("{all}x.shared\n"));
+        index(&mut indexed, "file:///p/c.rb", "z.gone\nz.shared\n");
+        indexed.graph_mut().delete_document("file:///p/b.rb");
+        every(&indexed);
+        indexed.graph_mut().delete_document("file:///p/c.rb");
+        every(&indexed);
+        assert!(indexed.calls_named("gone").is_empty());
+
+        // Built ahead of any question (`index_every_call`), the index answers from the first name,
+        // and a later write is caught up, not rebuilt.
+        let mut ahead = Indexed::default();
+        index(
+            &mut ahead,
+            "file:///p/a.rb",
+            &format!("{all}x.shared\nx.gone\n"),
+        );
+        ahead.index_every_call();
+        assert!(ahead.every_call.borrow().is_some());
+        assert!(ahead.calls.borrow().is_empty(), "nothing was asked yet");
+        every(&ahead);
+        index(&mut ahead, "file:///p/b.rb", "y.gone\n");
+        ahead.index_every_call();
+        every(&ahead);
+        // Asked again with nothing written, it reads nothing.
+        let held = ahead
+            .every_call
+            .borrow()
+            .as_ref()
+            .map(|index| index.documents.len());
+        ahead.index_every_call();
+        assert_eq!(
+            ahead
+                .every_call
+                .borrow()
+                .as_ref()
+                .map(|index| index.documents.len()),
+            held
+        );
     }
 
     /// The whole design, said as an assertion: an index of the graph dies with the graph.
